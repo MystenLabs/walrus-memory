@@ -127,6 +127,38 @@ export function annotateHealthResult(
         : `${block.text} account=${accountId}`;
 }
 
+/** Write tools whose replayed calls must carry an idempotency key so the
+ * server can de-duplicate a reconnect replay that re-sends an already-accepted
+ * request. The key is minted once per logical call and mutated into
+ * `params.arguments` before the message is tracked in `inFlight`, so every
+ * replay carries the same key the original POST used. */
+const IDEMPOTENT_WRITE_TOOLS = new Set([
+    "memwal_remember_bulk",
+]);
+
+/**
+ * Inject a stable idempotency key into an outbound `tools/call` for a write
+ * tool. Mutates `msg.params.arguments` in place — call BEFORE the message
+ * is stored in `inFlight` so reconnect replays carry the same key.
+ *
+ * No-op when:
+ *   - the message is not a `tools/call` for a write tool, or
+ *   - the caller already supplied a `_idempotency_key`.
+ */
+export function applyIdempotencyKey(msg: RpcMessage): RpcMessage {
+    if (msg.method !== "tools/call") return msg;
+    const params = msg.params as
+        | { name?: string; arguments?: Record<string, unknown> }
+        | undefined;
+    if (!params || typeof params.name !== "string" || !IDEMPOTENT_WRITE_TOOLS.has(params.name)) {
+        return msg;
+    }
+    const args = (params.arguments ??= {});
+    if (typeof args._idempotency_key === "string") return msg;
+    args._idempotency_key = randomUUID();
+    return msg;
+}
+
 export function applyDefaultNamespace(msg: RpcMessage, namespace?: string): RpcMessage {
     if (!namespace) return msg;
     if (msg.method !== "tools/call") return msg;
@@ -2209,6 +2241,11 @@ export async function runBridge(
                 // calls that didn't pass one. Mutates msg in place so the
                 // forwarded — and any replayed-on-reconnect — copy carries it.
                 applyDefaultNamespace(msg, config.namespace);
+
+                // Stamp write tools with a stable idempotency key so that a
+                // reconnect replay is deduplicated by the server instead of
+                // minting a second paid Walrus blob (issue #1045).
+                applyIdempotencyKey(msg);
 
                 // Track `tools/list` requests so the SSE pump can splice
                 // our local tools into the upstream response.

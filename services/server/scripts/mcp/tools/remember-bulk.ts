@@ -34,6 +34,10 @@ const REMEMBER_BULK_INPUT = {
         .describe(
             "Optional namespace bucket applied to every fact. Defaults to the session's namespace when omitted."
         ),
+    _idempotency_key: z
+        .string()
+        .optional()
+        .describe("Bridge-injected replay dedup key — agents should not set this."),
 } as const;
 
 /**
@@ -68,7 +72,7 @@ export function registerRememberBulkTool(
                 " Walrus storage is append-only: a stored secret cannot be deleted, so each entry is stripped of credential shapes before writing and entries that are nothing but a secret are dropped, with a note saying which. The batch is screened as a whole, so splitting a credential's label into one entry and its value into another does not get it past the filter.",
             inputSchema: REMEMBER_BULK_INPUT,
         },
-        wrapTool<{ facts: string[]; namespace?: string }>(session, "memwal_remember_bulk", async ({ facts, namespace }) => {
+        wrapTool<{ facts: string[]; namespace?: string; _idempotency_key?: string }>(session, "memwal_remember_bulk", async ({ facts, namespace, _idempotency_key }) => {
             // Every entry is sanitized BEFORE the batch is handed to the SDK.
             // Walrus is append-only, so a credential that lands cannot be
             // taken back (WALM-642). An entry that survives keeps its safe
@@ -129,15 +133,14 @@ export function registerRememberBulkTool(
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
             const accepted = await withAcceptDeadline(
-                // Safe to wrap despite bulk having no idempotency key: the
-                // retry only fires on rejections that never reached the
-                // handler, so no job row can exist to duplicate.
                 withRelayerRetry(
-                    () => session.memwal.rememberBulkAsync(items),
+                    () => session.memwal.rememberBulkAsync(items, {
+                        idempotencyKey: _idempotency_key,
+                    }),
                     "save these facts",
                 ),
                 "memwal_remember_bulk batch",
-                { idempotent: false },
+                { idempotent: !!_idempotency_key },
             );
 
             // Pair each job with its fact up front. Every later branch needs
