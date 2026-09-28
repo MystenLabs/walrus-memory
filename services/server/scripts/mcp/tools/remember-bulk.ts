@@ -132,16 +132,18 @@ export function registerRememberBulkTool(
             // Two steps rather than `rememberBulkAndWait`, for the same reason
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
-            // TODO(#1045): forward _idempotency_key to the relayer once
-            // the server upgrades its SDK dep to workspace:* (published
-            // 0.1.7 does not accept the second argument yet).
+            // TODO(#1045): forward _idempotency_key once the server
+            // upgrades its SDK dep to workspace:* (published 0.1.7
+            // lacks the second argument). Until then the key is
+            // accepted but not forwarded, so dedup does not fire and
+            // the endpoint is still non-idempotent.
             const accepted = await withAcceptDeadline(
                 withRelayerRetry(
                     () => session.memwal.rememberBulkAsync(items),
                     "save these facts",
                 ),
                 "memwal_remember_bulk batch",
-                { idempotent: !!_idempotency_key },
+                { idempotent: false },
             );
 
             // Pair each job with its fact up front. Every later branch needs
