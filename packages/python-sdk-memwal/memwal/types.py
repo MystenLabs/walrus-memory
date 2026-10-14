@@ -85,6 +85,14 @@ class RememberResult:
 
 
 @dataclass
+class ForgetResult:
+    """Result from POST /api/forget. Walrus blobs are not deleted."""
+
+    deleted: int
+    namespace: str
+    owner: str
+
+@dataclass
 class RecallMemory:
     """A single recalled memory."""
 

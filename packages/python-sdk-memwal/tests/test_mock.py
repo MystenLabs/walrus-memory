@@ -119,9 +119,12 @@ async def test_mock_supports_jobs_bulk_analyze_forget_and_clear():
     analyzed = await mock.analyze_and_wait("durable analyzed fact", "analysis")
     assert analyzed.facts[0].text == "durable analyzed fact"
 
-    assert mock.forget("mock-blob-000001") is True
-    assert mock.forget("missing") is False
-    assert mock.clear("one") == 1
+    assert mock.forget_blob("mock-blob-000001") is True
+    assert mock.forget_blob("missing") is False
+    forgotten = await mock.forget("one")
+    assert forgotten.namespace == "one"
+    assert forgotten.deleted >= 0
+    assert mock.clear("one") == 0
     assert (await mock.recall("bulk", namespace="one")).total == 0
 
 

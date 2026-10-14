@@ -20,6 +20,7 @@ from .types import (
     AskMemory,
     AskResult,
     EmbedResult,
+    ForgetResult,
     HealthResult,
     NamespacesResult,
     NamespaceSummary,
@@ -489,13 +490,18 @@ class MemWalMock:
             "build": {},
         }
 
-    def forget(self, blob_id: str) -> bool:
+    def forget_blob(self, blob_id: str) -> bool:
         for index, memory in enumerate(self._memories):
             if memory.blob_id == blob_id:
                 self._memories.pop(index)
                 self._jobs.pop(memory.job_id, None)
                 return True
         return False
+
+    async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        resolved = namespace or self._namespace
+        deleted = self.clear(resolved)
+        return ForgetResult(deleted=deleted, namespace=resolved, owner=self._owner)
 
     def clear(self, namespace: Optional[str] = None) -> int:
         removed = [
@@ -714,8 +720,11 @@ class MemWalMockSync:
     def compatibility(self) -> Dict[str, Any]:
         return self._run(self._inner.compatibility())
 
-    def forget(self, blob_id: str) -> bool:
-        return self._inner.forget(blob_id)
+    def forget_blob(self, blob_id: str) -> bool:
+        return self._inner.forget_blob(blob_id)
+
+    def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        return self._run(self._inner.forget(namespace))
 
     def clear(self, namespace: Optional[str] = None) -> int:
         return self._inner.clear(namespace)

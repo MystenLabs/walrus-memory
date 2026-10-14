@@ -66,6 +66,7 @@ from .types import (
     RememberManualResult,
     RememberResult,
     RestoreResult,
+    ForgetResult,
     ScoringWeights,
 )
 from .utils import delegate_key_to_public_key, delegate_key_to_sui_address
@@ -118,6 +119,7 @@ __all__ = [
     "AnalyzedFact",
     "HealthResult",
     "RestoreResult",
+    "ForgetResult",
     "NamespaceSummary",
     "NamespacesResult",
     "ScoringWeights",

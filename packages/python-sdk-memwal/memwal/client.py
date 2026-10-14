@@ -70,6 +70,7 @@ from .types import (
     RememberBulkStatusItem,
     RememberBulkStatusResult,
     RememberJobStatus,
+    ForgetResult,
     RememberManualOptions,
     RememberManualResult,
     RememberResult,
@@ -1244,6 +1245,21 @@ class MemWal:
             dropped_count=dropped,
         )
 
+    async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Delete this owner's index rows for ``namespace``.
+
+        Wraps ``POST /api/forget``. Walrus blobs persist; the rows stop being
+        retrievable. Defaults to the client namespace.
+        """
+        data = await self._signed_request("POST", "/api/forget", {
+            "namespace": namespace or self._namespace,
+        })
+        return ForgetResult(
+            deleted=int(data["deleted"]),
+            namespace=data["namespace"],
+            owner=data["owner"],
+        )
+
     async def analyze(
         self,
         text: str,
@@ -2395,6 +2411,10 @@ class MemWalSync:
         """Synchronous version of :meth:`MemWal.recall` (accepts
         :class:`RecallParams` for the recommended object-style call)."""
         return self._run(self._inner.recall(query, limit, namespace, max_distance))
+
+    def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget`."""
+        return self._run(self._inner.forget(namespace))
 
     def analyze(
         self,
