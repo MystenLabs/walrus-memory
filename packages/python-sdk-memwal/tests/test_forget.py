@@ -15,7 +15,9 @@ class CaptureMemWal(MemWal):
             "minSupportedSdk": {"python": "0.0.0"},
         }
 
-    async def _signed_request(self, method, path, body, accepted_statuses=(200,), include_seal_session=True):
+    async def _signed_request(
+        self, method, path, body, accepted_statuses=(200,), include_seal_session=True,
+    ):
         self.captured.append((method, path, body))
         return {"deleted": 2, "namespace": body["namespace"], "owner": "0xowner"}
 
