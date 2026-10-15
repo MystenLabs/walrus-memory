@@ -587,3 +587,11 @@ test("MemWalMock.recall uses a positional namespace when the options object omit
     await mock.recall("fact", options, "profile");
     assert.deepEqual(options, { limit: 5 });
 });
+
+test("MemWalMock.remember rejects zero-width text instead of storing it", async () => {
+    const mock = MemWalMock.create();
+    await assert.rejects(() => mock.remember("\u200B"), /text cannot be empty/);
+    await assert.rejects(() => mock.remember("\uFEFF"), /text cannot be empty/);
+    const stored = await mock.remember("hello\u200Bworld");
+    assert.equal(typeof stored.job_id, "string");
+});
