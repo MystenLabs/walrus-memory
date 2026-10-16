@@ -1251,9 +1251,12 @@ class MemWal:
         Wraps ``POST /api/forget``. Walrus blobs persist; the rows stop being
         retrievable. Defaults to the client namespace.
         """
-        data = await self._signed_request("POST", "/api/forget", {
-            "namespace": namespace or self._namespace,
-        })
+        data = await self._signed_request(
+            "POST",
+            "/api/forget",
+            {"namespace": namespace or self._namespace},
+            include_seal_session=False,
+        )
         return ForgetResult(
             deleted=int(data["deleted"]),
             namespace=data["namespace"],

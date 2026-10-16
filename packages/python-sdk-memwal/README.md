@@ -213,6 +213,7 @@ Create a new async client.
 | `await analyze(text, namespace?)` | Extract and store facts |
 | `await ask(question, limit?, namespace?)` | Ask a question answered using memories |
 | `await restore(namespace, limit?)` | Restore a namespace |
+| `await forget(namespace?)` | Delete index rows for the namespace. Walrus blobs stay. Returns `ForgetResult`. |
 | `await list_namespaces(cursor?, limit?)` | List namespaces that hold memories; paginate on `has_more` |
 | `await health()` | Check server health |
 | `await remember_manual(opts)` | Store encrypted payload + pre-computed vector |
