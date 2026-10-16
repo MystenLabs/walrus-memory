@@ -47,6 +47,10 @@ Unreleased.
 - `RecallMemory` and `RecallManualHit` include `created_at` and `score`. (#1178)
 - `RecallParams` accepts `scoring_weights` and `sort`. `recall()` forwards them on `POST /api/recall`. (#1062)
 
+### Changed
+
+- **Breaking (mock):** `MemWalMock.forget(blob_id)` is renamed to `forget_blob(blob_id)`. `MemWalMock.forget` now matches the client: it is async, clears a namespace, and returns `ForgetResult`. An un-awaited `assert mock.forget(blob_id)` in an existing test gets a truthy coroutine and passes without deleting anything, so move those calls to `forget_blob`. (#1061)
+
 ### Fixed
 
 - The default `server_url` is `https://relayer.memory.walrus.xyz`, matching the TypeScript SDK. `env="local"` still selects `http://127.0.0.1:8000`. (#1064)
