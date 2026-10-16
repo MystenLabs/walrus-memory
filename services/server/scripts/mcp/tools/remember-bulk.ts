@@ -40,6 +40,59 @@ const REMEMBER_BULK_INPUT = {
         .describe("Bridge-injected replay dedup key — agents should not set this."),
 } as const;
 
+type BulkAccepted = { job_ids: string[]; total?: number; status?: string };
+
+/** How long an accepted bulk call is remembered for replay dedup. A reconnect
+ * replay arrives within seconds; ten minutes is generous headroom. */
+export const BULK_REPLAY_TTL_MS = 10 * 60_000;
+const BULK_REPLAY_MAX_ENTRIES = 1_000;
+
+/** Accepted (or in-flight) bulk calls by idempotency key, scoped to the
+ * session's MemWal client so one owner's key never answers another's call. */
+const acceptedBulk = new WeakMap<object, Map<string, { at: number; result: Promise<BulkAccepted> }>>();
+
+async function acceptOnce(
+    session: MemWalSession,
+    key: string,
+    accept: () => Promise<BulkAccepted>,
+): Promise<BulkAccepted> {
+    const owner = session.memwal as unknown as object;
+    let byKey = acceptedBulk.get(owner);
+    if (!byKey) acceptedBulk.set(owner, (byKey = new Map()));
+    const now = Date.now();
+    for (const [k, v] of byKey) {
+        if (now - v.at > BULK_REPLAY_TTL_MS || byKey.size > BULK_REPLAY_MAX_ENTRIES) byKey.delete(k);
+        else break; // insertion-ordered: the rest are newer
+    }
+    const hit = byKey.get(key);
+    if (hit) return hit.result;
+    const result = accept();
+    byKey.set(key, { at: now, result });
+    // A call that failed to be accepted wrote nothing we can point at; let a
+    // replay try again rather than replaying the failure forever.
+    result.catch(() => {
+        if (byKey!.get(key)?.result === result) byKey!.delete(key);
+    });
+    return result;
+}
+
+/** Call `rememberBulkAsync` with the bridge key. Typed loosely because the
+ * pinned published SDK declares no options argument; newer SDKs forward it
+ * to `/api/remember/bulk` as `idempotency_key`. */
+function rememberBulkAsyncWithKey(
+    session: MemWalSession,
+    items: Array<{ text: string; namespace?: string }>,
+    idempotencyKey: string | undefined,
+): Promise<BulkAccepted> {
+    const fn = session.memwal.rememberBulkAsync as unknown as (
+        items: Array<{ text: string; namespace?: string }>,
+        options?: { idempotencyKey?: string },
+    ) => Promise<BulkAccepted>;
+    return idempotencyKey
+        ? fn.call(session.memwal, items, { idempotencyKey })
+        : fn.call(session.memwal, items);
+}
+
 /**
  * memwal_remember_bulk — persist several durable facts in one batched request.
  *
@@ -132,19 +185,28 @@ export function registerRememberBulkTool(
             // Two steps rather than `rememberBulkAndWait`, for the same reason
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
-            // TODO(#1045): forward _idempotency_key once the server
-            // upgrades its SDK dep to workspace:* (published 0.1.7
-            // lacks the second argument). Until then the key is
-            // accepted but not forwarded, so dedup does not fire and
-            // the endpoint is still non-idempotent.
-            const accepted = await withAcceptDeadline(
-                withRelayerRetry(
-                    () => session.memwal.rememberBulkAsync(items),
-                    "save these facts",
-                ),
-                "memwal_remember_bulk batch",
-                { idempotent: false },
-            );
+            // Reconnect replay dedup (#1045 / WALM-725). The bridge stamps
+            // `_idempotency_key` once per logical call, so a replay of a call
+            // this process already accepted reuses that acceptance instead of
+            // POSTing `/api/remember/bulk` again and minting a second paid
+            // Walrus blob. The key is also handed to the SDK so the relayer's
+            // own `bulk:{key}:{i}` dedup applies once the SDK forwards it (the
+            // published SDK this package pins ignores the second argument).
+            const accept = () =>
+                withAcceptDeadline(
+                    withRelayerRetry(
+                        () => rememberBulkAsyncWithKey(session, items, _idempotency_key),
+                        "save these facts",
+                    ),
+                    "memwal_remember_bulk batch",
+                    // Still not safe to blind-retry: the relayer may not see
+                    // the key, so a retried POST after a lost reply could
+                    // land a second write.
+                    { idempotent: false },
+                );
+            const accepted = _idempotency_key
+                ? await acceptOnce(session, `${namespace ?? ""}\0${_idempotency_key}`, accept)
+                : await accept();
 
             // Pair each job with its fact up front. Every later branch needs
             // it, and the relayer returns job_ids in input order.

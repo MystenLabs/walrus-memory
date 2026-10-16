@@ -2242,9 +2242,12 @@ export async function runBridge(
                 // forwarded — and any replayed-on-reconnect — copy carries it.
                 applyDefaultNamespace(msg, config.namespace);
 
-                // Stamp write tools with a stable idempotency key so that a
-                // reconnect replay is deduplicated by the server instead of
-                // minting a second paid Walrus blob (issue #1045).
+                // Stamp write tools with a stable idempotency key, once per
+                // logical call, so a reconnect replay carries the same key as
+                // the original. The MCP server answers a replayed key it has
+                // already accepted from its own record instead of POSTing the
+                // bulk write again (issue #1045); relayer-side dedup on the
+                // key follows once the server's SDK forwards it.
                 applyIdempotencyKey(msg);
 
                 // Track `tools/list` requests so the SSE pump can splice
@@ -2523,9 +2526,10 @@ export async function runBridge(
      *
      * The relayer answers these with HTTP 202 and finishes the work in a
      * durable queue, so a client-side deadline cancels nothing: the write can
-     * still land minutes after we have given up waiting for the reply. And
-     * `/api/remember/bulk` carries no idempotency key — unlike the single
-     * path — so a blind retry mints a second paid blob that `recall` will then
+     * still land minutes after we have given up waiting for the reply. And a
+     * retry the agent issues is a NEW call with a NEW bridge idempotency key
+     * (only a transport replay reuses the key) — unlike the content-derived
+     * key on the single path — so a blind retry mints a second paid blob that `recall` will then
      * hide behind the first. Telling the user to "please retry" here is how a
      * lost reply turns into duplicate paid storage. */
     const MUTATING_TOOLS = new Set([
