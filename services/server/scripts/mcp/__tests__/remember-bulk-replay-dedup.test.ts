@@ -2,23 +2,33 @@
 process.env.MEMWAL_MCP_REMEMBER_WAIT_MS = "0";
 
 import assert from "node:assert/strict";
-import test, { type TestContext } from "node:test";
+import test, { beforeEach, type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { MemWalSession } from "../auth.js";
 
 const { createMcpServer } = await import("../server.js");
+const { resetBulkReplayCacheForTests } = await import("../tools/remember-bulk.js");
+
+beforeEach(() => resetBulkReplayCacheForTests());
+
+let owner = 0;
+/** A distinct caller identity per session unless one is passed in. */
+const identity = (id = ++owner) => ({ accountId: `0xacct${id}`, delegatePubKeyHex: `pub${id}` });
 
 /**
  * #1045 / WALM-725: a bridge reconnect replays an in-flight
  * `memwal_remember_bulk` with the same `_idempotency_key`. The replay must not
  * register a second batch (a second paid Walrus blob per fact), and the key
- * must be handed to the SDK so the relayer can dedup too.
+ * must be handed to the SDK so the relayer can dedup too. Reconnects that
+ * build a new session through `resolveAuth` are covered on the wire by
+ * remember-bulk-key-on-wire.test.ts.
  */
 function recordingSession() {
     const calls: Array<{ texts: string[]; options: unknown }> = [];
     let n = 0;
     const session = {
+        ...identity(),
         oauthScope: "memwal:read memwal:write",
         namespace: "default",
         memwal: {
@@ -94,6 +104,7 @@ test("a call with no key is never deduped", async (t) => {
 test("a key whose accept failed can be retried by a replay", async (t) => {
     let attempts = 0;
     const session = {
+        ...identity(),
         oauthScope: "memwal:read memwal:write",
         namespace: "default",
         memwal: {
@@ -110,4 +121,14 @@ test("a key whose accept failed can be retried by a replay", async (t) => {
     const second = await client.callTool({ name: "memwal_remember_bulk", arguments: args });
     assert.equal(attempts, 2);
     assert.match(text(second), /job-ok/);
+});
+
+test("the same key from a different account is not answered from another caller's record", async (t) => {
+    const a = recordingSession();
+    const b = recordingSession();
+    const args = { facts: ["shared fact"], _idempotency_key: "same-key" };
+    await (await clientFor(a.session, t)).callTool({ name: "memwal_remember_bulk", arguments: args });
+    await (await clientFor(b.session, t)).callTool({ name: "memwal_remember_bulk", arguments: args });
+    assert.equal(a.calls.length, 1);
+    assert.equal(b.calls.length, 1);
 });

@@ -47,50 +47,48 @@ type BulkAccepted = { job_ids: string[]; total?: number; status?: string };
 export const BULK_REPLAY_TTL_MS = 10 * 60_000;
 const BULK_REPLAY_MAX_ENTRIES = 1_000;
 
-/** Accepted (or in-flight) bulk calls by idempotency key, scoped to the
- * session's MemWal client so one owner's key never answers another's call. */
-const acceptedBulk = new WeakMap<object, Map<string, { at: number; result: Promise<BulkAccepted> }>>();
+/** Accepted (or in-flight) bulk calls, keyed by the caller's stable identity
+ * plus the bridge key. This is only a backstop: the key is also sent to the
+ * relayer, whose `bulk:{key}:{i}` dedup is what actually stops a second paid
+ * blob. It must NOT be keyed by `session.memwal`: a bridge reconnect opens a
+ * new MCP session and `resolveAuth` builds a new `MemWal` client, so an
+ * object-keyed map never sees the replay. */
+const acceptedBulk = new Map<string, { at: number; result: Promise<BulkAccepted> }>();
+
+/** Test hook: forget every accepted bulk call, as a sidecar restart would. */
+export function resetBulkReplayCacheForTests(): void {
+    acceptedBulk.clear();
+}
+
+/** Stable across reconnects: the same `{account, delegate}` that
+ * `resolveAuth` puts in the session key. Scope is left out because only a
+ * write-scoped session can reach this tool at all. */
+function replayOwner(session: MemWalSession): string {
+    return `${session.accountId}\0${session.delegatePubKeyHex}`;
+}
 
 async function acceptOnce(
     session: MemWalSession,
     key: string,
     accept: () => Promise<BulkAccepted>,
 ): Promise<BulkAccepted> {
-    const owner = session.memwal as unknown as object;
-    let byKey = acceptedBulk.get(owner);
-    if (!byKey) acceptedBulk.set(owner, (byKey = new Map()));
+    const mapKey = `${replayOwner(session)}\0${key}`;
     const now = Date.now();
-    for (const [k, v] of byKey) {
-        if (now - v.at > BULK_REPLAY_TTL_MS || byKey.size > BULK_REPLAY_MAX_ENTRIES) byKey.delete(k);
-        else break; // insertion-ordered: the rest are newer
+    for (const [k, v] of acceptedBulk) {
+        if (now - v.at > BULK_REPLAY_TTL_MS || acceptedBulk.size > BULK_REPLAY_MAX_ENTRIES) {
+            acceptedBulk.delete(k);
+        } else break; // insertion-ordered: the rest are newer
     }
-    const hit = byKey.get(key);
+    const hit = acceptedBulk.get(mapKey);
     if (hit) return hit.result;
     const result = accept();
-    byKey.set(key, { at: now, result });
+    acceptedBulk.set(mapKey, { at: now, result });
     // A call that failed to be accepted wrote nothing we can point at; let a
     // replay try again rather than replaying the failure forever.
     result.catch(() => {
-        if (byKey!.get(key)?.result === result) byKey!.delete(key);
+        if (acceptedBulk.get(mapKey)?.result === result) acceptedBulk.delete(mapKey);
     });
     return result;
-}
-
-/** Call `rememberBulkAsync` with the bridge key. Typed loosely because the
- * pinned published SDK declares no options argument; newer SDKs forward it
- * to `/api/remember/bulk` as `idempotency_key`. */
-function rememberBulkAsyncWithKey(
-    session: MemWalSession,
-    items: Array<{ text: string; namespace?: string }>,
-    idempotencyKey: string | undefined,
-): Promise<BulkAccepted> {
-    const fn = session.memwal.rememberBulkAsync as unknown as (
-        items: Array<{ text: string; namespace?: string }>,
-        options?: { idempotencyKey?: string },
-    ) => Promise<BulkAccepted>;
-    return idempotencyKey
-        ? fn.call(session.memwal, items, { idempotencyKey })
-        : fn.call(session.memwal, items);
 }
 
 /**
@@ -186,25 +184,37 @@ export function registerRememberBulkTool(
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
             // Reconnect replay dedup (#1045 / WALM-725). The bridge stamps
-            // `_idempotency_key` once per logical call, so a replay of a call
-            // this process already accepted reuses that acceptance instead of
-            // POSTing `/api/remember/bulk` again and minting a second paid
-            // Walrus blob. The key is also handed to the SDK so the relayer's
-            // own `bulk:{key}:{i}` dedup applies once the SDK forwards it (the
-            // published SDK this package pins ignores the second argument).
+            // `_idempotency_key` once per logical call, and the SDK sends it
+            // to `/api/remember/bulk` as `idempotency_key`, so the relayer
+            // answers a replay with the jobs it already queued (`bulk:{key}:{i}`,
+            // ON CONFLICT) instead of registering a second paid Walrus blob.
+            // `acceptOnce` additionally skips the second POST when this
+            // process has already accepted the same key for the same caller.
             const accept = () =>
                 withAcceptDeadline(
                     withRelayerRetry(
-                        () => rememberBulkAsyncWithKey(session, items, _idempotency_key),
+                        () =>
+                            _idempotency_key
+                                ? session.memwal.rememberBulkAsync(items, {
+                                      idempotencyKey: _idempotency_key,
+                                  })
+                                : session.memwal.rememberBulkAsync(items),
                         "save these facts",
                     ),
                     "memwal_remember_bulk batch",
-                    // Still not safe to blind-retry: the relayer may not see
-                    // the key, so a retried POST after a lost reply could
-                    // land a second write.
-                    { idempotent: false },
+                    // A transport replay of THIS call is deduplicated by its
+                    // key, but an agent retry is a new call with a new key, so
+                    // telling the agent a retry is safe would still be wrong.
+                    {
+                        idempotent: false,
+                        retryNote: _idempotency_key
+                            ? "Do NOT retry blindly — a new call carries a new idempotency key, so " +
+                              "a re-send can store every fact a SECOND time at full cost. Check " +
+                              "with memwal_recall first, and only re-send what is genuinely missing."
+                            : undefined,
+                    },
                 );
-            const accepted = _idempotency_key
+            const accepted: BulkAccepted = _idempotency_key
                 ? await acceptOnce(session, `${namespace ?? ""}\0${_idempotency_key}`, accept)
                 : await accept();
 

@@ -2244,10 +2244,10 @@ export async function runBridge(
 
                 // Stamp write tools with a stable idempotency key, once per
                 // logical call, so a reconnect replay carries the same key as
-                // the original. The MCP server answers a replayed key it has
-                // already accepted from its own record instead of POSTing the
-                // bulk write again (issue #1045); relayer-side dedup on the
-                // key follows once the server's SDK forwards it.
+                // the original (issue #1045). The MCP server sends it to the
+                // relayer as `idempotency_key` on `/api/remember/bulk`, and the
+                // relayer answers a replayed key with the jobs it already
+                // queued instead of registering a second paid Walrus blob.
                 applyIdempotencyKey(msg);
 
                 // Track `tools/list` requests so the SSE pump can splice
@@ -2527,10 +2527,10 @@ export async function runBridge(
      * The relayer answers these with HTTP 202 and finishes the work in a
      * durable queue, so a client-side deadline cancels nothing: the write can
      * still land minutes after we have given up waiting for the reply. And a
-     * retry the agent issues is a NEW call with a NEW bridge idempotency key
-     * (only a transport replay reuses the key) — unlike the content-derived
-     * key on the single path — so a blind retry mints a second paid blob that `recall` will then
-     * hide behind the first. Telling the user to "please retry" here is how a
+     * retry the agent issues of `memwal_remember_bulk` is a NEW call with a
+     * NEW bridge idempotency key (only a transport replay reuses the key,
+     * unlike the content-derived key on the single path), so a blind retry
+     * mints a second paid blob that `recall` will then hide behind the first. Telling the user to "please retry" here is how a
      * lost reply turns into duplicate paid storage. */
     const MUTATING_TOOLS = new Set([
         "memwal_remember",
