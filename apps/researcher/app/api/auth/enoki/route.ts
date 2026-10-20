@@ -7,6 +7,10 @@ import {
 import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha512";
 import { verifyAndConsumeEnokiChallenge } from "@/lib/auth/enoki-challenge";
+import {
+  assertDelegateAccountBinding,
+  DelegateAccountBindingError,
+} from "@/lib/auth/delegate-account";
 import { isSameOriginRequest } from "@/lib/auth/request-security";
 import {
   AuthRateLimitError,
@@ -121,6 +125,15 @@ export async function POST(request: Request) {
     const derivedPubKeyBytes = ed.getPublicKey(privKeyBytes);
     const derivedPublicKey = bytesToHex(derivedPubKeyBytes);
 
+    // The challenge only proves wallet control. Before storing anything,
+    // confirm on-chain that this key is a delegate of an active account the
+    // wallet owns, as Noter does at the same step (#1008).
+    await assertDelegateAccountBinding({
+      accountId,
+      owner: suiAddress,
+      publicKeyHex: derivedPublicKey,
+    });
+
     // Check if user already exists by suiAddress (e.g. partial setup from before)
     const existing = await getUserBySuiAddress(suiAddress);
 
@@ -146,6 +159,9 @@ export async function POST(request: Request) {
 
     return Response.json({ success: true, needsSetup: false });
   } catch (error) {
+    if (error instanceof DelegateAccountBindingError) {
+      return Response.json({ error: error.message }, { status: 401 });
+    }
     if (error instanceof AuthRateLimitError) {
       return Response.json(
         {
