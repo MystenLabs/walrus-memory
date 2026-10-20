@@ -75,6 +75,8 @@ import {
     clockDriftErrorFromResponse,
     assertFiniteScoringWeights,
     scoringWeightsToWire,
+    assertFiniteVector,
+    assertNonEmptyEncryptedData,
     derivedIdempotencyKey,
     derivedContentDedupeKey,
     derivedBulkIdempotencyKey,
@@ -1342,6 +1344,8 @@ export class MemWal {
      * ```
      */
     async rememberManual(opts: RememberManualOptions): Promise<RememberManualResult> {
+        assertNonEmptyEncryptedData(opts.encryptedData);
+        assertFiniteVector(opts.vector);
         return this.signedRequest<RememberManualResult>(
             "POST",
             "/api/remember/manual",
@@ -1385,6 +1389,7 @@ export class MemWal {
      * ```
      */
     async recallManual(opts: RecallManualOptions): Promise<RecallManualHitResult> {
+        assertFiniteVector(opts.vector);
         const limit = opts.limit !== undefined ? opts.limit : 10;
         if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
             throw new TypeError(
