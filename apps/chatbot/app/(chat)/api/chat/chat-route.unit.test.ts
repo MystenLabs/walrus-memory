@@ -20,7 +20,24 @@ const state = vi.hoisted(() => {
   const MESSAGE_A = "55555555-5555-4555-8555-555555555555";
   const MESSAGE_B = "66666666-6666-4666-8666-666666666666";
   const ORIGINAL_A = [{ type: "text", text: "A original text" }];
-  const ORIGINAL_B = [{ type: "text", text: "B original text" }];
+  // B is waiting on a tool approval, so the approval POST is a real
+  // continuation of B's chat (#1092).
+  const PENDING_TOOL = {
+    type: "tool-getWeather",
+    toolCallId: "call-b",
+    state: "approval-requested",
+    input: { city: "Hanoi" },
+    approval: { id: "approval-b" },
+  };
+  const ORIGINAL_B = [{ type: "text", text: "B original text" }, PENDING_TOOL];
+  const ANSWERED_B = [
+    { type: "text", text: "B original text" },
+    {
+      ...PENDING_TOOL,
+      state: "approval-responded",
+      approval: { id: "approval-b", approved: true },
+    },
+  ];
   const FINISHED_A = [{ type: "text", text: "A rewritten by approval" }];
   const FINISHED_B = [{ type: "text", text: "B finished text" }];
 
@@ -69,6 +86,77 @@ const state = vi.hoisted(() => {
       : null
   );
 
+  const claimPendingToolApproval = vi.fn(
+    async ({
+      id,
+      chatId,
+      toolCallId,
+      approvalId,
+    }: {
+      id: string;
+      chatId: string;
+      toolCallId: string;
+      approvalId: string;
+    }) => {
+      const row = messages.get(id);
+      if (!row || row.chatId !== chatId || !Array.isArray(row.parts)) {
+        return false;
+      }
+      const idx = row.parts.findIndex(
+        (p: Record<string, unknown>) =>
+          p?.state === "approval-requested" &&
+          p?.toolCallId === toolCallId &&
+          (p?.approval as Record<string, unknown> | undefined)?.id === approvalId
+      );
+      if (idx === -1) {
+        return false;
+      }
+      row.parts = row.parts.map((part, i) =>
+        i === idx
+          ? { ...(part as Record<string, unknown>), state: "approval-claimed" }
+          : part
+      );
+      return true;
+    }
+  );
+
+  const releasePendingToolApproval = vi.fn(
+    async ({
+      id,
+      chatId,
+      toolCallId,
+      approvalId,
+    }: {
+      id: string;
+      chatId: string;
+      toolCallId: string;
+      approvalId: string;
+    }) => {
+      const row = messages.get(id);
+      if (!row || row.chatId !== chatId || !Array.isArray(row.parts)) {
+        return false;
+      }
+      const idx = row.parts.findIndex(
+        (p: Record<string, unknown>) =>
+          p?.state === "approval-claimed" &&
+          p?.toolCallId === toolCallId &&
+          (p?.approval as Record<string, unknown> | undefined)?.id === approvalId
+      );
+      if (idx === -1) {
+        return false;
+      }
+      row.parts = row.parts.map((part, i) =>
+        i === idx
+          ? {
+              ...(part as Record<string, unknown>),
+              state: "approval-requested",
+            }
+          : part
+      );
+      return true;
+    }
+  );
+
   return {
     USER_B,
     CHAT_A,
@@ -77,11 +165,14 @@ const state = vi.hoisted(() => {
     MESSAGE_B,
     ORIGINAL_A,
     ORIGINAL_B,
+    ANSWERED_B,
     FINISHED_A,
     FINISHED_B,
     messages,
     pending,
     updateMessage,
+    claimPendingToolApproval,
+    releasePendingToolApproval,
     saveMessages,
     auth,
     getChatById,
@@ -93,13 +184,17 @@ vi.mock("@/app/(auth)/auth", () => ({ auth: state.auth }));
 vi.mock("@/lib/db/queries", () => ({
   getChatById: state.getChatById,
   getMessageCountByUserId: vi.fn(async () => 0),
-  getMessagesByChatId: vi.fn(async () => []),
+  getMessagesByChatId: vi.fn(async ({ id }: { id: string }) =>
+    [...state.messages.values()].filter((row) => row.chatId === id)
+  ),
   saveChat: vi.fn(async () => undefined),
   updateChatTitleById: vi.fn(async () => undefined),
   createStreamId: vi.fn(async () => undefined),
   deleteChatById: vi.fn(async () => undefined),
   saveMessages: state.saveMessages,
   updateMessage: state.updateMessage,
+  claimPendingToolApproval: state.claimPendingToolApproval,
+  releasePendingToolApproval: state.releasePendingToolApproval,
 }));
 
 vi.mock("ai", () => ({
@@ -188,7 +283,7 @@ function approvalRequest() {
       id: state.CHAT_B,
       messages: [
         { id: state.MESSAGE_A, role: "assistant", parts: state.ORIGINAL_A },
-        { id: state.MESSAGE_B, role: "assistant", parts: state.ORIGINAL_B },
+        { id: state.MESSAGE_B, role: "assistant", parts: state.ANSWERED_B },
       ],
       selectedChatModel: "openai/gpt-4o-mini",
       selectedVisibilityType: "private",

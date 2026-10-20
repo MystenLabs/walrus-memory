@@ -31,11 +31,13 @@ import { saveMemory } from "@/lib/ai/tools/save-memory";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
+  claimPendingToolApproval,
   createStreamId,
   deleteChatById,
   getChatById,
   getMessageCountByUserId,
   getMessagesByChatId,
+  releasePendingToolApproval,
   saveChat,
   saveMessages,
   updateChatTitleById,
@@ -47,7 +49,16 @@ import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
-import { type PostRequestBody, postRequestBodySchema } from "./schema";
+import {
+  type PostRequestBody,
+  postRequestBodySchema,
+  userMessageSchema,
+} from "./schema";
+import {
+  findPendingApprovalClaim,
+  mergeFinishedMessageParts,
+  type PendingApprovalClaim,
+} from "./tool-approval";
 
 export const maxDuration = 60;
 
@@ -133,211 +144,291 @@ export async function POST(request: Request) {
 
     const isToolApprovalFlow = Boolean(messages);
 
+    // The client also uses `messages` for an ordinary turn once the chat has
+    // an answered approval in its history (components/chat.tsx).
+    let newUserTurn: PostRequestBody["message"];
+    if (isToolApprovalFlow && messages?.at(-1)?.role === "user") {
+      const parsed = userMessageSchema.safeParse(messages.at(-1));
+      if (!parsed.success) {
+        return new ChatbotError("bad_request:api").toResponse();
+      }
+      newUserTurn = parsed.data;
+    }
+
     const chat = await getChatById({ id });
     let messagesFromDb: DBMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 
-    if (chat) {
-      if (chat.userId !== session.user.id) {
-        return new ChatbotError("forbidden:chat").toResponse();
+    let claimedApproval: PendingApprovalClaim | null = null;
+    const releaseClaimedApproval = async () => {
+      if (!claimedApproval) return;
+      const toRestore = claimedApproval;
+      claimedApproval = null;
+      try {
+        await releasePendingToolApproval({
+          id: toRestore.messageId,
+          chatId: id,
+          toolCallId: toRestore.toolCallId,
+          approvalId: toRestore.approvalId,
+        });
+      } catch (restoreError) {
+        console.error(
+          "[chat] failed to release claimed tool approval:",
+          summarizeErrorForLogging(restoreError)
+        );
       }
-      if (!isToolApprovalFlow) {
-        messagesFromDb = await getMessagesByChatId({ id });
-      }
-    } else if (message?.role === "user") {
-      await saveChat({
-        id,
-        userId: session.user.id,
-        title: "New chat",
-        visibility: selectedVisibilityType,
-      });
-      titlePromise = generateTitleFromUserMessage({ message });
-    }
-
-    const uiMessages = isToolApprovalFlow
-      ? (messages as ChatMessage[])
-      : [...convertToUIMessages(messagesFromDb), message as ChatMessage];
-
-    const geo = isVercel ? vercelFunctions.geolocation(request) : {};
-
-    const requestHints: RequestHints = {
-      longitude: geo.longitude,
-      latitude: geo.latitude,
-      city: geo.city,
-      country: geo.country,
     };
 
-    if (message?.role === "user") {
-      await saveMessages({
-        messages: [
-          {
-            chatId: id,
-            id: message.id,
-            role: "user",
-            parts: message.parts,
-            attachments: [],
-            createdAt: new Date(),
-          },
-        ],
-      });
-    }
+    try {
+      if (chat) {
+        if (chat.userId !== session.user.id) {
+          return new ChatbotError("forbidden:chat").toResponse();
+        }
+        if (isToolApprovalFlow) {
+          // The hourly limit counts stored user rows (#1092). A new user turn
+          // sent in `messages` is stored below like the single-message path;
+          // anything else must atomically claim a tool approval the model
+          // requested in this chat that is still pending, so neither sequential
+          // replay nor concurrent POSTs can fund extra generations.
+          if (newUserTurn === undefined) {
+            const stored = await getMessagesByChatId({ id });
+            const claim = findPendingApprovalClaim(stored, messages ?? []);
+            if (!claim) {
+              return new ChatbotError("bad_request:api").toResponse();
+            }
+            const didClaim = await claimPendingToolApproval({
+              id: claim.messageId,
+              chatId: id,
+              toolCallId: claim.toolCallId,
+              approvalId: claim.approvalId,
+            });
+            if (!didClaim) {
+              return new ChatbotError("bad_request:api").toResponse();
+            }
+            claimedApproval = claim;
+          }
+        } else {
+          messagesFromDb = await getMessagesByChatId({ id });
+        }
+      } else if (isToolApprovalFlow) {
+        // An approval can only answer a chat that already exists.
+        return new ChatbotError("not_found:chat").toResponse();
+      } else if (message?.role === "user") {
+        await saveChat({
+          id,
+          userId: session.user.id,
+          title: "New chat",
+          visibility: selectedVisibilityType,
+        });
+        titlePromise = generateTitleFromUserMessage({ message });
+      }
 
-    const isReasoningModel = isReasoningModelId(selectedChatModel);
+      const uiMessages = isToolApprovalFlow
+        ? (messages as ChatMessage[])
+        : [...convertToUIMessages(messagesFromDb), message as ChatMessage];
 
-    const modelMessages = await convertToModelMessages(uiMessages);
+      const geo = isVercel ? vercelFunctions.geolocation(request) : {};
 
-    const stream = createUIMessageStream({
-      originalMessages: isToolApprovalFlow ? uiMessages : undefined,
-      execute: async ({ writer: dataStream }) => {
-        const result = streamText({
-          model: useMemWal !== false
-            ? getMemWalModel(selectedChatModel, {
+      const requestHints: RequestHints = {
+        longitude: geo.longitude,
+        latitude: geo.latitude,
+        city: geo.city,
+        country: geo.country,
+      };
+
+      const userTurn = message?.role === "user" ? message : newUserTurn;
+      if (userTurn) {
+        await saveMessages({
+          messages: [
+            {
+              chatId: id,
+              id: userTurn.id,
+              role: "user",
+              parts: userTurn.parts,
+              attachments: [],
+              createdAt: new Date(),
+            },
+          ],
+        });
+      }
+
+      const isReasoningModel = isReasoningModelId(selectedChatModel);
+
+      const modelMessages = await convertToModelMessages(uiMessages);
+
+      let streamFailed = false;
+
+      const stream = createUIMessageStream({
+        originalMessages: isToolApprovalFlow ? uiMessages : undefined,
+        execute: async ({ writer: dataStream }) => {
+          const result = streamText({
+            model: useMemWal !== false
+              ? getMemWalModel(selectedChatModel, {
+                  namespace: memoryNamespace,
+                  memwalKey,
+                  memwalAccountId,
+                })
+              : getLanguageModel(selectedChatModel),
+            system: systemPrompt({ selectedChatModel, requestHints }),
+            messages: modelMessages,
+            maxOutputTokens: isReasoningModel
+              ? MAX_REASONING_OUTPUT_TOKENS
+              : MAX_OUTPUT_TOKENS,
+            stopWhen: stepCountIs(5),
+            activeTools: isReasoningModel
+              ? []
+              : [
+                "getWeather",
+                "createDocument",
+                "updateDocument",
+                "requestSuggestions",
+                "saveMemory",
+              ],
+            providerOptions: isReasoningModel
+              ? {
+                anthropic: {
+                  thinking: { type: "enabled", budgetTokens: 10_000 },
+                },
+              }
+              : undefined,
+            tools: {
+              getWeather,
+              createDocument: createDocument({ session, dataStream }),
+              updateDocument: updateDocument({ session, dataStream }),
+              requestSuggestions: requestSuggestions({ session, dataStream }),
+              saveMemory: saveMemory({
                 namespace: memoryNamespace,
                 memwalKey,
                 memwalAccountId,
-              })
-            : getLanguageModel(selectedChatModel),
-          system: systemPrompt({ selectedChatModel, requestHints }),
-          messages: modelMessages,
-          maxOutputTokens: isReasoningModel
-            ? MAX_REASONING_OUTPUT_TOKENS
-            : MAX_OUTPUT_TOKENS,
-          stopWhen: stepCountIs(5),
-          activeTools: isReasoningModel
-            ? []
-            : [
-              "getWeather",
-              "createDocument",
-              "updateDocument",
-              "requestSuggestions",
-              "saveMemory",
-            ],
-          providerOptions: isReasoningModel
-            ? {
-              anthropic: {
-                thinking: { type: "enabled", budgetTokens: 10_000 },
-              },
-            }
-            : undefined,
-          tools: {
-            getWeather,
-            createDocument: createDocument({ session, dataStream }),
-            updateDocument: updateDocument({ session, dataStream }),
-            requestSuggestions: requestSuggestions({ session, dataStream }),
-            saveMemory: saveMemory({
-              namespace: memoryNamespace,
-              memwalKey,
-              memwalAccountId,
-            }),
-          },
-          experimental_telemetry: {
-            isEnabled: isProductionEnvironment,
-            functionId: "stream-text",
-          },
-        });
-
-        dataStream.merge(
-          result.toUIMessageStream({ sendReasoning: isReasoningModel, sendFinish: false })
-        );
-
-        if (titlePromise) {
-          try {
-            const title = await titlePromise;
-            dataStream.write({ type: "data-chat-title", data: title });
-            updateChatTitleById({ chatId: id, title });
-          } catch (error) {
-            // Title generation is a non-fatal side effect of the response
-            // already being streamed below it (dataStream.merge above).
-            // Left unguarded, a title-model failure (bad slug, no credits,
-            // upstream 5xx) threw here and was caught by createUIMessageStream's
-            // own onError below, which turned an unrelated, recoverable
-            // title-gen failure into a fatal "error" part on the whole chat
-            // response — even though the real answer above continued to
-            // stream successfully. The chat still works without a title.
-            console.error(
-              "[chat] title generation failed:",
-              summarizeErrorForLogging(error)
-            );
-          }
-        }
-      },
-      generateId: generateUUID,
-      onFinish: async ({ messages: finishedMessages }) => {
-        if (isToolApprovalFlow) {
-          for (const finishedMsg of finishedMessages) {
-            const existingMsg = uiMessages.find((m) => m.id === finishedMsg.id);
-            if (existingMsg) {
-              await updateMessage({
-                id: finishedMsg.id,
-                chatId: id,
-                parts: finishedMsg.parts,
-              });
-            } else {
-              await saveMessages({
-                messages: [
-                  {
-                    id: finishedMsg.id,
-                    role: finishedMsg.role,
-                    parts: finishedMsg.parts,
-                    createdAt: new Date(),
-                    attachments: [],
-                    chatId: id,
-                  },
-                ],
-              });
-            }
-          }
-        } else if (finishedMessages.length > 0) {
-          await saveMessages({
-            messages: finishedMessages.map((currentMessage) => ({
-              id: currentMessage.id,
-              role: currentMessage.role,
-              parts: currentMessage.parts,
-              createdAt: new Date(),
-              attachments: [],
-              chatId: id,
-            })),
+              }),
+            },
+            experimental_telemetry: {
+              isEnabled: isProductionEnvironment,
+              functionId: "stream-text",
+            },
           });
-        }
-      },
-      onError: (error) => {
-        console.error(
-          "[chat] stream execute() error:",
-          summarizeErrorForLogging(error)
-        );
-        if (
-          error instanceof Error &&
-          error.message?.includes(
-            "AI Gateway requires a valid credit card on file to service requests"
-          )
-        ) {
-          return "AI Gateway requires a valid credit card on file to service requests. Please visit https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dadd-credit-card to add a card and unlock your free credits.";
-        }
-        return "Oops, an error occurred!";
-      },
-    });
 
-    return createUIMessageStreamResponse({
-      stream,
-      async consumeSseStream({ stream: sseStream }) {
-        if (!process.env.REDIS_URL) {
-          return;
-        }
-        try {
-          const streamContext = getStreamContext();
-          if (streamContext) {
-            const streamId = generateId();
-            await createStreamId({ streamId, chatId: id });
-            await streamContext.createNewResumableStream(
-              streamId,
-              () => sseStream
-            );
+          dataStream.merge(
+            result.toUIMessageStream({ sendReasoning: isReasoningModel, sendFinish: false })
+          );
+
+          if (titlePromise) {
+            try {
+              const title = await titlePromise;
+              dataStream.write({ type: "data-chat-title", data: title });
+              updateChatTitleById({ chatId: id, title });
+            } catch (error) {
+              // Title generation is a non-fatal side effect of the response
+              // already being streamed below it (dataStream.merge above).
+              // Left unguarded, a title-model failure (bad slug, no credits,
+              // upstream 5xx) threw here and was caught by createUIMessageStream's
+              // own onError below, which turned an unrelated, recoverable
+              // title-gen failure into a fatal "error" part on the whole chat
+              // response — even though the real answer above continued to
+              // stream successfully. The chat still works without a title.
+              console.error(
+                "[chat] title generation failed:",
+                summarizeErrorForLogging(error)
+              );
+            }
           }
-        } catch (_) {
-          // ignore redis errors
-        }
-      },
-    });
+        },
+        generateId: generateUUID,
+        onFinish: async ({ messages: finishedMessages, isAborted }) => {
+          if (isToolApprovalFlow) {
+            if (streamFailed || isAborted) {
+              await releaseClaimedApproval();
+              return;
+            }
+            claimedApproval = null;
+            const latestStored = await getMessagesByChatId({ id });
+            for (const finishedMsg of finishedMessages) {
+              const existingMsg = uiMessages.find((m) => m.id === finishedMsg.id);
+              if (existingMsg) {
+                const storedRow = latestStored.find((m) => m.id === finishedMsg.id);
+                const mergedParts = storedRow
+                  ? (mergeFinishedMessageParts(
+                      storedRow.parts,
+                      finishedMsg.parts
+                    ) as typeof finishedMsg.parts)
+                  : finishedMsg.parts;
+                await updateMessage({
+                  id: finishedMsg.id,
+                  chatId: id,
+                  parts: mergedParts,
+                });
+              } else {
+                await saveMessages({
+                  messages: [
+                    {
+                      id: finishedMsg.id,
+                      role: finishedMsg.role,
+                      parts: finishedMsg.parts,
+                      createdAt: new Date(),
+                      attachments: [],
+                      chatId: id,
+                    },
+                  ],
+                });
+              }
+            }
+          } else if (finishedMessages.length > 0) {
+            await saveMessages({
+              messages: finishedMessages.map((currentMessage) => ({
+                id: currentMessage.id,
+                role: currentMessage.role,
+                parts: currentMessage.parts,
+                createdAt: new Date(),
+                attachments: [],
+                chatId: id,
+              })),
+            });
+          }
+        },
+        onError: (error) => {
+          streamFailed = true;
+          void releaseClaimedApproval();
+          console.error(
+            "[chat] stream execute() error:",
+            summarizeErrorForLogging(error)
+          );
+          if (
+            error instanceof Error &&
+            error.message?.includes(
+              "AI Gateway requires a valid credit card on file to service requests"
+            )
+          ) {
+            return "AI Gateway requires a valid credit card on file to service requests. Please visit https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dadd-credit-card to add a card and unlock your free credits.";
+          }
+          return "Oops, an error occurred!";
+        },
+      });
+
+      return createUIMessageStreamResponse({
+        stream,
+        async consumeSseStream({ stream: sseStream }) {
+          if (!process.env.REDIS_URL) {
+            return;
+          }
+          try {
+            const streamContext = getStreamContext();
+            if (streamContext) {
+              const streamId = generateId();
+              await createStreamId({ streamId, chatId: id });
+              await streamContext.createNewResumableStream(
+                streamId,
+                () => sseStream
+              );
+            }
+          } catch (_) {
+            // ignore redis errors
+          }
+        },
+      });
+    } catch (innerError) {
+      await releaseClaimedApproval();
+      throw innerError;
+    }
   } catch (error) {
     const vercelId = request.headers.get("x-vercel-id");
 

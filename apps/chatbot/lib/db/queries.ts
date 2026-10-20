@@ -11,6 +11,7 @@ import {
   inArray,
   lt,
   type SQL,
+  sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -260,12 +261,142 @@ export async function updateMessage({
   parts: DBMessage["parts"];
 }) {
   try {
+    const incomingPartsJson = JSON.stringify(parts ?? []);
     return await db
       .update(message)
-      .set({ parts })
+      .set({
+        parts: sql`COALESCE((
+          SELECT jsonb_agg(
+            CASE
+              WHEN incoming->>'state' = 'approval-requested'
+                AND incoming->>'toolCallId' IS NOT NULL
+              THEN COALESCE(
+                (
+                  SELECT existing
+                  FROM jsonb_array_elements(${message.parts}::jsonb) AS existing
+                  WHERE existing->>'toolCallId' = incoming->>'toolCallId'
+                    AND existing->>'state' IS NOT NULL
+                    AND existing->>'state' <> 'approval-requested'
+                  LIMIT 1
+                ),
+                incoming
+              )
+              ELSE incoming
+            END
+            ORDER BY ord
+          )::json
+          FROM jsonb_array_elements(${incomingPartsJson}::jsonb) WITH ORDINALITY AS t(incoming, ord)
+        ), '[]'::json)`,
+      })
       .where(and(eq(message.id, id), eq(message.chatId, chatId)));
   } catch (_error) {
     throw new ChatbotError("bad_request:database", "Failed to update message");
+  }
+}
+
+export async function claimPendingToolApproval({
+  id,
+  chatId,
+  toolCallId,
+  approvalId,
+}: {
+  id: string;
+  chatId: string;
+  toolCallId: string;
+  approvalId: string;
+}): Promise<boolean> {
+  try {
+    const claimed = await db
+      .update(message)
+      .set({
+        parts: sql`(
+          SELECT jsonb_agg(
+            CASE
+              WHEN elem->>'state' = 'approval-requested'
+                AND elem->>'toolCallId' = ${toolCallId}
+                AND elem->'approval'->>'id' = ${approvalId}
+              THEN jsonb_set(elem, '{state}', '"approval-claimed"'::jsonb)
+              ELSE elem
+            END
+            ORDER BY ord
+          )::json
+          FROM jsonb_array_elements(${message.parts}::jsonb) WITH ORDINALITY AS t(elem, ord)
+        )`,
+      })
+      .where(
+        and(
+          eq(message.id, id),
+          eq(message.chatId, chatId),
+          sql`EXISTS (
+            SELECT 1
+            FROM json_array_elements(${message.parts}) AS elem
+            WHERE elem->>'state' = 'approval-requested'
+              AND elem->>'toolCallId' = ${toolCallId}
+              AND elem->'approval'->>'id' = ${approvalId}
+          )`
+        )
+      )
+      .returning({ id: message.id });
+
+    return claimed.length === 1;
+  } catch (_error) {
+    throw new ChatbotError(
+      "bad_request:database",
+      "Failed to claim pending tool approval"
+    );
+  }
+}
+
+export async function releasePendingToolApproval({
+  id,
+  chatId,
+  toolCallId,
+  approvalId,
+}: {
+  id: string;
+  chatId: string;
+  toolCallId: string;
+  approvalId: string;
+}): Promise<boolean> {
+  try {
+    const released = await db
+      .update(message)
+      .set({
+        parts: sql`(
+          SELECT jsonb_agg(
+            CASE
+              WHEN elem->>'state' = 'approval-claimed'
+                AND elem->>'toolCallId' = ${toolCallId}
+                AND elem->'approval'->>'id' = ${approvalId}
+              THEN jsonb_set(elem, '{state}', '"approval-requested"'::jsonb)
+              ELSE elem
+            END
+            ORDER BY ord
+          )::json
+          FROM jsonb_array_elements(${message.parts}::jsonb) WITH ORDINALITY AS t(elem, ord)
+        )`,
+      })
+      .where(
+        and(
+          eq(message.id, id),
+          eq(message.chatId, chatId),
+          sql`EXISTS (
+            SELECT 1
+            FROM json_array_elements(${message.parts}) AS elem
+            WHERE elem->>'state' = 'approval-claimed'
+              AND elem->>'toolCallId' = ${toolCallId}
+              AND elem->'approval'->>'id' = ${approvalId}
+          )`
+        )
+      )
+      .returning({ id: message.id });
+
+    return released.length === 1;
+  } catch (_error) {
+    throw new ChatbotError(
+      "bad_request:database",
+      "Failed to release pending tool approval"
+    );
   }
 }
 
