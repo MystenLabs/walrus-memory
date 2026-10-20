@@ -349,6 +349,17 @@ function isTransientPollingStatus(status: number): boolean {
     return status === 0 || status === 429 || status >= 500;
 }
 
+/**
+ * A list `limit` goes into the signed query string, so check it first.
+ * `String(NaN)`, `-1` or `2.5` were signed and sent verbatim (#1213). The
+ * message matches the recall/recallManual limit guards.
+ */
+function assertPositiveIntegerLimit(limit: unknown): void {
+    if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
+        throw new TypeError(`limit must be a positive integer, got ${limit}`);
+    }
+}
+
 function jsonBodyError(status: number, message: string): Error {
     return Object.assign(new Error(message), { status });
 }
@@ -1546,7 +1557,10 @@ export class MemWal {
 
         const params = new URLSearchParams();
         if (options.cursor !== undefined) params.set("updated_after", options.cursor);
-        if (options.limit !== undefined) params.set("limit", String(options.limit));
+        if (options.limit !== undefined) {
+            assertPositiveIntegerLimit(options.limit);
+            params.set("limit", String(options.limit));
+        }
         const query = params.toString();
 
         // Query string must be part of the signed path: the server verifies
@@ -1589,7 +1603,10 @@ export class MemWal {
 
         const params = new URLSearchParams();
         if (options.cursor !== undefined) params.set("updated_after", options.cursor);
-        if (options.limit !== undefined) params.set("limit", String(options.limit));
+        if (options.limit !== undefined) {
+            assertPositiveIntegerLimit(options.limit);
+            params.set("limit", String(options.limit));
+        }
         const query = params.toString();
 
         // Query string must be part of the signed path (see listNamespaces).
