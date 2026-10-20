@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 from datetime import datetime, timezone
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import nacl.signing
 
@@ -373,3 +374,23 @@ def sign_sui_personal_message(
     public_key_bytes = bytes(signing_key.verify_key)
     serialized = bytes([_SUI_ED25519_SCHEME_FLAG]) + signature_bytes + public_key_bytes
     return base64.b64encode(serialized).decode("ascii")
+
+
+def validate_max_distance(max_distance: Optional[float]) -> None:
+    """Reject a ``max_distance`` that would silently drop every hit (#1248).
+
+    The recall filter keeps ``distance < max_distance``. Every comparison with
+    NaN is False and real distances are never negative, so NaN or a negative
+    threshold returns an empty page that looks like an empty namespace.
+    Mirrors the TypeScript ``maxDistance`` guard (#1227).
+    """
+
+    if max_distance is None:
+        return
+    if (
+        isinstance(max_distance, bool)
+        or not isinstance(max_distance, (int, float))
+        or not math.isfinite(max_distance)
+        or max_distance < 0
+    ):
+        raise ValueError("max_distance must be a non-negative finite number")

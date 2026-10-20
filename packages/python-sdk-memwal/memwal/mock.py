@@ -38,6 +38,7 @@ from .types import (
     RememberResult,
     RestoreResult,
 )
+from .utils import validate_max_distance
 
 _MOCK_NAMESPACE_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -285,6 +286,7 @@ class MemWalMock:
             query_text = query
         _validate_text(query_text, "query")
         _check_limit(limit)
+        validate_max_distance(max_distance)
         if sort not in (None, "relevance", "recent"):
             raise ValueError("sort must be 'relevance' or 'recent'")
         resolved_namespace = self._namespace if namespace is None else namespace

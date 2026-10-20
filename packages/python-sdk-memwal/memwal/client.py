@@ -86,6 +86,7 @@ from .utils import (
     sha256_hex,
     sign_message,
     sign_sui_personal_message,
+    validate_max_distance,
 )
 
 T = TypeVar("T")
@@ -1206,7 +1207,9 @@ class MemWal:
             sort = params.sort
         else:
             query_text = query
+        _reject_blank_text(query_text, "query cannot be empty")
         _check_limit(limit)
+        validate_max_distance(max_distance)
         body = {
             "query": query_text,
             "limit": limit,
