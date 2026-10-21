@@ -4900,7 +4900,8 @@ the checkpoint it replied about",
             3,
         );
         assert!(
-            matches!(wrapped_after, WalletJobError::Transient(_)) && !wrapped_after.aborts_retries(),
+            matches!(wrapped_after, WalletJobError::Transient(_))
+                && !wrapped_after.aborts_retries(),
             "wrapped register price abort must stay Transient, got {:?}",
             wrapped_after
         );
@@ -4918,10 +4919,7 @@ the checkpoint it replied about",
         ] {
             assert!(!WalletJobError::is_gas_pool_budget_error(msg));
             let classified = WalletJobError::classify_sidecar_error(msg);
-            assert!(
-                matches!(classified, WalletJobError::Transient(_)),
-                "{msg}"
-            );
+            assert!(matches!(classified, WalletJobError::Transient(_)), "{msg}");
             let after = escalate_if_gas_pool_exhausted(classified, 3, 5, 3);
             assert!(matches!(after, WalletJobError::Transient(_)), "{msg}");
         }

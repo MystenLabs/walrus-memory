@@ -1443,7 +1443,9 @@ pub async fn remember_bulk(
 
         if inserted.rows_affected() == 0 {
             let existing = match item_key.as_deref() {
-                Some(key) => find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?,
+                Some(key) => {
+                    find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?
+                }
                 None => None,
             };
             let (existing_id, _, _, existing_fingerprint) = existing.ok_or_else(|| {
@@ -2119,7 +2121,9 @@ mod tests {
         .unwrap();
 
         // Lookup now finds it (this is what a retry hits → collapse, no new write).
-        let found = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let found = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             found,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2143,7 +2147,9 @@ mod tests {
         );
 
         // Original row is still the one that survives.
-        let still = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let still = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             still,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2196,7 +2202,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(insert_b.rows_affected(), 1, "same key in different namespace must succeed");
+        assert_eq!(
+            insert_b.rows_affected(),
+            1,
+            "same key in different namespace must succeed"
+        );
 
         // 3. Retry within ns-a collides and collapses (insert DO NOTHING).
         let retry_a = sqlx::query(
@@ -2210,13 +2220,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(retry_a.rows_affected(), 0, "retry within namespace must collapse");
+        assert_eq!(
+            retry_a.rows_affected(),
+            0,
+            "retry within namespace must collapse"
+        );
 
         // 4. Lookup returns the respective job per namespace.
-        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key).await.unwrap();
+        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key)
+            .await
+            .unwrap();
         assert_eq!(found_a.unwrap().0, job_a);
 
-        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key).await.unwrap();
+        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key)
+            .await
+            .unwrap();
         assert_eq!(found_b.unwrap().0, job_b);
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
@@ -2423,10 +2441,11 @@ mod tests {
 
         // Retry #2 while that restart is in flight: same row, no new claim, and
         // the insert path cannot mint a second job for the key.
-        let (again_id, again_status, again_blob, _) = find_remember_job_by_key(&pool, &owner, "ns", key)
-            .await
-            .unwrap()
-            .unwrap();
+        let (again_id, again_status, again_blob, _) =
+            find_remember_job_by_key(&pool, &owner, "ns", key)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(again_id, job_id);
         assert_eq!(
             existing_job_action(&again_status, again_blob.is_some()),
