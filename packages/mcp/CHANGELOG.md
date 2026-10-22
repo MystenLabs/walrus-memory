@@ -9,6 +9,10 @@ Unreleased. Package and plugin manifests are bumped manually to 0.0.16. The laun
 - Update `@modelcontextprotocol/sdk` to 1.32.1 for its transport security fixes.
 - Authenticated SSE GET/POST requests refuse redirects, and the server-supplied message endpoint must stay on the configured relayer origin. Custom authentication headers and tool arguments cannot be forwarded to a redirected origin. Deployments that relied on redirects must configure their final relayer URL directly.
 
+### Fixed
+
+- `memwal_remember_bulk` no longer registers a second paid Walrus blob when the bridge reconnects and replays the call. The bridge stamps each call with a stable idempotency key before tracking it, and the sidecar sends that key to the relayer, which answers a replayed key with the jobs it already queued. A bulk call the agent retries itself is a new call and gets a new key. (#1045)
+
 ## 0.0.15
 
 ### Security

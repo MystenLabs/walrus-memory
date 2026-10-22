@@ -2530,8 +2530,9 @@ export async function runBridge(
      * retry the agent issues of `memwal_remember_bulk` is a NEW call with a
      * NEW bridge idempotency key (only a transport replay reuses the key,
      * unlike the content-derived key on the single path), so a blind retry
-     * mints a second paid blob that `recall` will then hide behind the first. Telling the user to "please retry" here is how a
-     * lost reply turns into duplicate paid storage. */
+     * mints a second paid blob that `recall` will then hide behind the first.
+     * Telling the user to "please retry" here is how a lost reply turns into
+     * duplicate paid storage. */
     const MUTATING_TOOLS = new Set([
         "memwal_remember",
         "memwal_remember_bulk",

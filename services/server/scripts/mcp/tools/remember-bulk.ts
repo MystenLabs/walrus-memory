@@ -183,7 +183,7 @@ export function registerRememberBulkTool(
             // Two steps rather than `rememberBulkAndWait`, for the same reason
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
-            // Reconnect replay dedup (#1045 / WALM-725). The bridge stamps
+            // Reconnect replay dedup (#1045). The bridge stamps
             // `_idempotency_key` once per logical call, and the SDK sends it
             // to `/api/remember/bulk` as `idempotency_key`, so the relayer
             // answers a replay with the jobs it already queued (`bulk:{key}:{i}`,

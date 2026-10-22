@@ -1,5 +1,5 @@
 /**
- * #1045 / WALM-725, end to end on the wire.
+ * #1045, end to end on the wire.
  *
  * A bridge reconnect opens a NEW MCP session: `resolveAuth` runs again and
  * builds a NEW `MemWal` client. The bridge's `_idempotency_key` must still

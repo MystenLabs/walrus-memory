@@ -17,7 +17,7 @@ let owner = 0;
 const identity = (id = ++owner) => ({ accountId: `0xacct${id}`, delegatePubKeyHex: `pub${id}` });
 
 /**
- * #1045 / WALM-725: a bridge reconnect replays an in-flight
+ * #1045: a bridge reconnect replays an in-flight
  * `memwal_remember_bulk` with the same `_idempotency_key`. The replay must not
  * register a second batch (a second paid Walrus blob per fact), and the key
  * must be handed to the SDK so the relayer can dedup too. Reconnects that
