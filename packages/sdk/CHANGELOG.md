@@ -1,5 +1,11 @@
 # @mysten-incubation/memwal
 
+## 0.1.10
+
+### Fixed
+
+- A 2xx response that is valid JSON of the wrong shape raises an SDK error that names the endpoint, instead of a raw `TypeError`. `recall`, `analyzeAndWait`, `listMemories`, and `getRememberBulkStatus` (so `waitForRememberJobs`) name the missing `results`, `job_ids`, or `memories` array, and the bulk status error is not retried. `getRememberStatus` returns `not_found` and `waitForRememberJob` throws `MemWalRememberJobNotFoundError` when the status body is null or not an object. (WALM-860, #1247)
+
 ## 0.1.9
 
 ### Fixed
