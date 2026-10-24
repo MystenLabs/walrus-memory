@@ -433,7 +433,7 @@ Whether this client uses a connected wallet signer (vs. raw keypair).
 - `suiNetwork` defaults to `mainnet`
 - `sealServerConfigs` lets the client configure independent or committee SEAL servers; committee entries require `aggregatorUrl`
 - `sealKeyServers` remains supported as a legacy independent key server object ID override
-- All `@mysten/*` peer dependencies are loaded dynamically — only needed if you use `MemWalManual`
+- `@mysten/sui` and `@mysten/seal` are required peers for every client: the default `MemWal` client imports them on `recall()` to build the Seal session. `@mysten/walrus` is only needed for `MemWalManual`. All three are loaded dynamically
 
 ## `withMemWal`
 

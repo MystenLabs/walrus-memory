@@ -44,33 +44,33 @@ The Walrus Memory SDK gives your agents portable memory that works across apps, 
 <CodeGroup>
 
 ```bash npm
-npm install @mysten-incubation/memwal
+npm install @mysten-incubation/memwal @mysten/sui @mysten/seal
 ```
 
 ```bash pnpm
-pnpm add @mysten-incubation/memwal
+pnpm add @mysten-incubation/memwal @mysten/sui @mysten/seal
 ```
 
 ```bash yarn
-yarn add @mysten-incubation/memwal
+yarn add @mysten-incubation/memwal @mysten/sui @mysten/seal
 ```
 
 </CodeGroup>
 
-For `MemWalManual`, you also need the optional peer dependencies:
+`@mysten/sui` and `@mysten/seal` are required peers: the default `MemWal` client imports them on `recall()` to build the Seal session. For `MemWalManual`, also add `@mysten/walrus`:
 
 <CodeGroup>
 
 ```bash npm
-npm install @mysten/sui @mysten/seal @mysten/walrus
+npm install @mysten/walrus
 ```
 
 ```bash pnpm
-pnpm add @mysten/sui @mysten/seal @mysten/walrus
+pnpm add @mysten/walrus
 ```
 
 ```bash yarn
-yarn add @mysten/sui @mysten/seal @mysten/walrus
+yarn add @mysten/walrus
 ```
 
 </CodeGroup>

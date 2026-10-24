@@ -16,17 +16,17 @@ Important notes:
 ### Installation
 
 ```bash
-pnpm add @mysten-incubation/memwal
+pnpm add @mysten-incubation/memwal @mysten/sui @mysten/seal
 ```
 
-Optional peer dependencies:
+`@mysten/sui` and `@mysten/seal` are required peers (the default client imports them on `recall()`). Optional peer dependencies:
 
 ```bash
 # For Vercel AI SDK middleware
 pnpm add ai zod
 
 # For manual client (client-side SEAL encryption)
-pnpm add @mysten/sui @mysten/seal @mysten/walrus
+pnpm add @mysten/walrus
 ```
 
 ### Prerequisites
