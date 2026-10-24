@@ -348,6 +348,22 @@ function isTransientPollingStatus(status: number): boolean {
     return status === 0 || status === 429 || status >= 500;
 }
 
+/**
+ * Manual-mode vectors are signed as JSON, where NaN/Infinity become null and
+ * a missing vector is dropped, so check them before signing (#1211).
+ */
+function assertFiniteVector(vector: unknown): void {
+    if (
+        !Array.isArray(vector) ||
+        vector.length === 0 ||
+        !vector.every((v) => typeof v === "number" && Number.isFinite(v))
+    ) {
+        throw new TypeError(
+            "vector must be a non-empty array of finite numbers",
+        );
+    }
+}
+
 function jsonBodyError(status: number, message: string): Error {
     return Object.assign(new Error(message), { status });
 }
@@ -1280,6 +1296,10 @@ export class MemWal {
      * ```
      */
     async rememberManual(opts: RememberManualOptions): Promise<RememberManualResult> {
+        if (typeof opts.encryptedData !== "string" || opts.encryptedData.trim() === "") {
+            throw new TypeError("encryptedData must be a non-empty base64 string");
+        }
+        assertFiniteVector(opts.vector);
         return this.signedRequest<RememberManualResult>(
             "POST",
             "/api/remember/manual",
@@ -1323,6 +1343,7 @@ export class MemWal {
      * ```
      */
     async recallManual(opts: RecallManualOptions): Promise<RecallManualHitResult> {
+        assertFiniteVector(opts.vector);
         const limit = opts.limit !== undefined ? opts.limit : 10;
         if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
             throw new TypeError(
