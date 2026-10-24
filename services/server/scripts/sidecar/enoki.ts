@@ -127,15 +127,20 @@ export function isMoveAbortWalDestroyZero(message: string): boolean {
  * for the max-age refresh spends the attempt budget on the same snapshot.
  *
  * The two detectors stay disjoint, so one abort refreshes once.
+ * True means the client was refreshed. Callers that cached a prepare built
+ * from the old price must drop that cache themselves; this module does not
+ * know about upload flights.
  */
-export function refreshWalrusClientOnStaleWalPrice(message: string): void {
+export function refreshWalrusClientOnStaleWalPrice(message: string): boolean {
     if (isMoveAbortWalDestroyZero(message)) {
         refreshWalrusClient("walrus_wal_payment_destroy_zero");
-        return;
+        return true;
     }
     if (isMoveAbortBalanceSplit(message)) {
         refreshWalrusClient("walrus_wal_payment_balance_split");
+        return true;
     }
+    return false;
 }
 
 export async function callEnoki<T>(path: string, payload: unknown): Promise<T> {

@@ -109,18 +109,26 @@ test("a stale-price abort refreshes the Walrus client and other errors do not", 
 test("a price-up balance::split refreshes the client once", () => {
     assert.equal(isMoveAbortBalanceSplit(PROD_PRICE_UP_BALANCE_SPLIT), true);
     assert.equal(isMoveAbortWalDestroyZero(PROD_PRICE_UP_BALANCE_SPLIT), false);
+    let refreshed = false;
     assert.deepEqual(
         refreshedReasons(() => {
-            refreshWalrusClientOnStaleWalPrice(PROD_PRICE_UP_BALANCE_SPLIT);
+            refreshed = refreshWalrusClientOnStaleWalPrice(PROD_PRICE_UP_BALANCE_SPLIT);
         }),
         ["[walrus/client] refreshed reason=walrus_wal_payment_balance_split"],
     );
+    assert.equal(refreshed, true);
+    assert.equal(refreshWalrusClientOnStaleWalPrice("Sponsored transaction has expired"), false);
 });
 
 test("both upload routes drop the cached price on this abort", () => {
     const journal = readFileSync(new URL("../sidecar/routes/walrus-upload-journal.ts", import.meta.url), "utf8");
     const legacy = readFileSync(new URL("../sidecar/routes/walrus-upload.ts", import.meta.url), "utf8");
     assert.match(journal, /refreshWalrusClientOnStaleWalPrice\(message\)/);
+    assert.match(
+        journal,
+        /if \(refreshWalrusClientOnStaleWalPrice\(message\)\) \{\s*dropUploadStepFlightsForCheckpoint\(flightKey\);/,
+    );
     assert.match(legacy, /refreshWalrusClientOnStaleWalPrice\(message\)/);
     assert.doesNotMatch(legacy, /register_sponsor_balance_split/);
+    assert.doesNotMatch(legacy, /dropUploadStepFlightsForCheckpoint/);
 });

@@ -10,7 +10,7 @@ import {
 } from "../sidecar/retry/rpc.js";
 import { sealKeyFetchErrorCode } from "../sidecar/routes/seal.js";
 import { assertFinalizedTransactionSuccess } from "../sidecar/wallet.js";
-import { executeDirectSignedTransaction } from "../sidecar/enoki.js";
+import { executeDirectSignedTransaction, isMoveAbortBalanceSplit } from "../sidecar/enoki.js";
 
 test("shared-service failures preserve pre-submit and ambiguous state", () => {
     const unavailable = Object.assign(new Error("RPC unavailable"), { code: "UNAVAILABLE" });
@@ -97,6 +97,79 @@ test("a finalized failed transaction clears ambiguity but consumes the data budg
     assert.deepEqual(classifyDurableSideEffectError(failure, true, true), {
         code: "NO_SIDE_EFFECT",
     });
+});
+
+test("a landed price abort keeps the failure class and carries the MoveAbort text", () => {
+    const abort = "MoveAbort in 3rd command, abort code: 2, in '0x2::balance::split' (instruction 10)";
+    assert.throws(
+        () => assertFinalizedTransactionSuccess({
+            $kind: "FailedTransaction",
+            FailedTransaction: {
+                status: {
+                    success: false,
+                    error: { $kind: "MoveAbort", message: abort },
+                },
+            },
+        }, "registration transaction"),
+        (err: Error) => {
+            assert.ok(err instanceof FinalizedTransactionFailure);
+            assert.equal(err.message, `registration transaction was not successful: ${abort}`);
+            assert.equal(isMoveAbortBalanceSplit(err.message), true);
+            assert.deepEqual(classifyDurableSideEffectError(err, true, true), {
+                code: "NO_SIDE_EFFECT",
+            });
+            return true;
+        },
+    );
+    assert.throws(
+        () => assertFinalizedTransactionSuccess({
+            $kind: "FailedTransaction",
+            FailedTransaction: { status: { success: false, error: abort } },
+        }, "registration transaction"),
+        (err: Error) => {
+            assert.equal(err.message, `registration transaction was not successful: ${abort}`);
+            return true;
+        },
+    );
+    for (const error of [{}, null]) {
+        assert.throws(
+            () => assertFinalizedTransactionSuccess({
+                $kind: "FailedTransaction",
+                FailedTransaction: { status: { success: false, error } },
+            }, "registration transaction"),
+            (err: Error) => {
+                assert.equal(err.message, "registration transaction was not successful");
+                return true;
+            },
+        );
+    }
+});
+
+test("a landed certify or metadata abort does not carry MoveAbort text", () => {
+    const abort = "MoveAbort in 3rd command, abort code: 2, in '0x2::balance::split' (instruction 10)";
+    const failed = {
+        $kind: "FailedTransaction",
+        FailedTransaction: {
+            status: {
+                success: false,
+                error: { $kind: "MoveAbort", message: abort },
+            },
+        },
+    };
+    for (const label of [
+        "certification transaction 0xabc",
+        "metadata transfer transaction 0xabc",
+    ]) {
+        assert.throws(
+            () => assertFinalizedTransactionSuccess(failed, label),
+            (err: Error) => {
+                assert.ok(err instanceof FinalizedTransactionFailure);
+                assert.equal(err.message, `${label} was not successful`);
+                assert.equal(isMoveAbortBalanceSplit(err.message), false);
+                return true;
+            },
+        );
+    }
 });
 
 test("an unexpected finalization response remains ambiguous", () => {

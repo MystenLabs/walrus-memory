@@ -43,12 +43,36 @@ export const ADDRESS_BALANCE_WALLET_FALLBACK_POLICY: EnokiFallbackPolicy = {
     gasMode: "addressBalance",
 };
 
+function executionFailureText(error: unknown): string {
+    if (typeof error === "string") return error.trim();
+    if (!error || typeof error !== "object") return "";
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+    try {
+        const text = JSON.stringify(error, (_key, value) => (
+            typeof value === "bigint" ? value.toString() : value
+        ));
+        return text === "{}" ? "" : text;
+    } catch {
+        return "";
+    }
+}
+
 export function assertFinalizedTransactionSuccess(result: any, label: string): any {
     if (
         result?.$kind === "FailedTransaction"
         && result.FailedTransaction?.status?.success === false
     ) {
-        throw new FinalizedTransactionFailure(`${label} was not successful`);
+        // Only the register label keeps the MoveAbort text. A stale WAL price
+        // has to refresh the client and drop that prepare. Certify and metadata
+        // transfer have no prepared register left, and Rust treats any MoveAbort
+        // in the message as Permanent instead of retrying.
+        const detail = label === "registration transaction"
+            ? executionFailureText(result.FailedTransaction.status?.error)
+            : "";
+        throw new FinalizedTransactionFailure(
+            detail ? `${label} was not successful: ${detail}` : `${label} was not successful`,
+        );
     }
     if (
         result?.$kind === "Transaction"
