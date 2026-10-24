@@ -47,7 +47,12 @@ import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
-import { type PostRequestBody, postRequestBodySchema } from "./schema";
+import {
+  type PostRequestBody,
+  postRequestBodySchema,
+  userMessageSchema,
+} from "./schema";
+import { answersPendingApproval } from "./tool-approval";
 
 export const maxDuration = 60;
 
@@ -133,6 +138,17 @@ export async function POST(request: Request) {
 
     const isToolApprovalFlow = Boolean(messages);
 
+    // The client also uses `messages` for an ordinary turn once the chat has
+    // an answered approval in its history (components/chat.tsx).
+    let newUserTurn: PostRequestBody["message"];
+    if (isToolApprovalFlow && messages?.at(-1)?.role === "user") {
+      const parsed = userMessageSchema.safeParse(messages.at(-1));
+      if (!parsed.success) {
+        return new ChatbotError("bad_request:api").toResponse();
+      }
+      newUserTurn = parsed.data;
+    }
+
     const chat = await getChatById({ id });
     let messagesFromDb: DBMessage[] = [];
     let titlePromise: Promise<string> | null = null;
@@ -141,9 +157,23 @@ export async function POST(request: Request) {
       if (chat.userId !== session.user.id) {
         return new ChatbotError("forbidden:chat").toResponse();
       }
-      if (!isToolApprovalFlow) {
+      if (isToolApprovalFlow) {
+        // The hourly limit counts stored user rows (#1092). A new user turn
+        // sent in `messages` is stored below like the single-message path;
+        // anything else must answer a tool approval the model requested in
+        // this chat that is still pending.
+        if (newUserTurn === undefined) {
+          const stored = await getMessagesByChatId({ id });
+          if (!answersPendingApproval(stored, messages ?? [])) {
+            return new ChatbotError("bad_request:api").toResponse();
+          }
+        }
+      } else {
         messagesFromDb = await getMessagesByChatId({ id });
       }
+    } else if (isToolApprovalFlow) {
+      // An approval can only answer a chat that already exists.
+      return new ChatbotError("not_found:chat").toResponse();
     } else if (message?.role === "user") {
       await saveChat({
         id,
@@ -167,14 +197,15 @@ export async function POST(request: Request) {
       country: geo.country,
     };
 
-    if (message?.role === "user") {
+    const userTurn = message?.role === "user" ? message : newUserTurn;
+    if (userTurn) {
       await saveMessages({
         messages: [
           {
             chatId: id,
-            id: message.id,
+            id: userTurn.id,
             role: "user",
-            parts: message.parts,
+            parts: userTurn.parts,
             attachments: [],
             createdAt: new Date(),
           },
