@@ -283,7 +283,9 @@ class MemWalMock:
             raise ValueError("limit must be a non-negative integer")
         if sort not in (None, "relevance", "recent"):
             raise ValueError("sort must be 'relevance' or 'recent'")
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._namespace if namespace is None else namespace
+        if not resolved_namespace:
+            raise ValueError("namespace cannot be empty")
         query_tokens = _tokens(query_text)
         ranked = [
             (memory, _distance(query_tokens, memory.text))
@@ -509,7 +511,7 @@ class MemWalMock:
         blob_id: Optional[str] = None,
     ) -> _Memory:
         _validate_text(text)
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._namespace if namespace is None else namespace
         if not resolved_namespace:
             raise ValueError("namespace cannot be empty")
         self._sequence += 1
