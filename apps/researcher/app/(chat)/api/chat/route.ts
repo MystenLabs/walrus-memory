@@ -259,7 +259,7 @@ export async function POST(request: Request) {
           system: systemPrompt,
           messages: promptMessages,
           stopWhen: stepCountIs(10),
-          experimental_activeTools: isReasoningModel ? [] : [...activeToolNames],
+          activeTools: isReasoningModel ? [] : [...activeToolNames],
           tools: researchTools,
           experimental_telemetry: {
             isEnabled: isProductionEnvironment,
