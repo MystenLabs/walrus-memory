@@ -1333,9 +1333,11 @@ async fn main() {
         config.accounts_rate_limit.global_per_hour,
     );
     tracing::info!(
-        "  mcp rate limit: {}/min, {}/hr per IP; {}/min, {}/hr global",
+        "  mcp rate limit: {}/min, {}/hr per IP; {}/min, {}/hr per tenant; {}/min, {}/hr global",
         config.mcp_rate_limit.per_minute,
         config.mcp_rate_limit.per_hour,
+        config.mcp_rate_limit.tenant_per_minute,
+        config.mcp_rate_limit.tenant_per_hour,
         config.mcp_rate_limit.global_per_minute,
         config.mcp_rate_limit.global_per_hour,
     );
