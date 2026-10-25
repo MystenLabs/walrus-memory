@@ -57,20 +57,27 @@ jobs:
             )));
             const pkg = JSON.parse(require('node:fs').readFileSync('packages/mcp/package.json', 'utf8'));
             core.info('Package identity: ' + JSON.stringify({name: pkg.name, repository: pkg.repository}));
-            const response = await fetch(
-              'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/' + encodeURIComponent(pkg.name),
-              {method: 'POST', headers: {Authorization: 'Bearer ' + idToken}}
-            );
-            const data = await response.json().catch(() => ({}));
-            if (data.token) core.setSecret(data.token);
-            core.info('npm OIDC exchange HTTP status: ' + response.status);
-            if (!response.ok) {
-              core.info('npm OIDC error: ' + JSON.stringify({
+            let canonicalAccepted = false;
+            const variants = [
+              ['npm-escaped-name', pkg.name.replace('/', '%2f')],
+              ['fully-url-encoded', encodeURIComponent(pkg.name)],
+            ];
+            for (const [encoding, name] of variants) {
+              const response = await fetch(
+                'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/' + name,
+                {method: 'POST', headers: {Authorization: 'Bearer ' + idToken}}
+              );
+              const data = await response.json().catch(() => ({}));
+              if (data.token) core.setSecret(data.token);
+              core.info('npm OIDC exchange: ' + JSON.stringify({
+                encoding, status: response.status, accepted: response.ok,
                 code: data.code, error: data.error, message: data.message
               }));
-              throw new Error('npm rejected the workflow identity before publication');
+              if (encoding === 'npm-escaped-name') canonicalAccepted = response.ok;
             }
-            core.info('npm accepted the workflow identity; no token contents were logged.');
+            if (!canonicalAccepted) {
+              core.warning('npm canonical token exchange failed; the direct npm publish probe will verify independently.');
+            }
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -157,4 +164,11 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.ci_test && github.ref == 'refs/heads/codex/mcp-publish-ci-test'
         env:
           NPM_CONFIG_LOGLEVEL: http
-        run: .github/scripts/publish-prerelease.sh packages/mcp @mysten-incubation/memwal-mcp ci-test
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./packages/mcp/package.json').version")-ci-test.0"
+          node -e 'const fs = require("fs"); const p = "packages/mcp/package.json"; const pkg = JSON.parse(fs.readFileSync(p, "utf8")); pkg.version = process.argv[1]; fs.writeFileSync(p, JSON.stringify(pkg, null, 4) + "\n");' "$version"
+          out_dir="$RUNNER_TEMP/mcp-ci-test-pack"
+          mkdir -p "$out_dir"
+          (cd packages/mcp && pnpm pack --pack-destination "$out_dir")
+          npm publish "$out_dir"/*.tgz --tag ci-test --provenance --access public --loglevel verbose

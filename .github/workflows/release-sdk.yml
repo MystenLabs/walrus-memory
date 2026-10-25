@@ -145,17 +145,24 @@ jobs:
             core.info('Package identity: ' + JSON.stringify({name: pkg.name, repository: pkg.repository}));
             const publicResponse = await fetch('https://registry.npmjs.org/' + encodeURIComponent(pkg.name));
             core.info('Public package metadata HTTP status: ' + publicResponse.status);
-            const response = await fetch(
-              'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/' + encodeURIComponent(pkg.name),
-              {method: 'POST', headers: {Authorization: 'Bearer ' + idToken}}
-            );
-            const data = await response.json().catch(() => ({}));
-            if (data.token) core.setSecret(data.token);
-            core.info('npm OIDC exchange HTTP status: ' + response.status);
-            if (!response.ok) {
-              core.info('npm OIDC error: ' + JSON.stringify({
+            let canonicalAccepted = false;
+            const variants = [
+              ['npm-escaped-name', pkg.name.replace('/', '%2f')],
+              ['fully-url-encoded', encodeURIComponent(pkg.name)],
+            ];
+            for (const [encoding, name] of variants) {
+              const response = await fetch(
+                'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/' + name,
+                {method: 'POST', headers: {Authorization: 'Bearer ' + idToken}}
+              );
+              const data = await response.json().catch(() => ({}));
+              if (data.token) core.setSecret(data.token);
+              core.info('npm OIDC exchange: ' + JSON.stringify({
+                encoding, status: response.status, accepted: response.ok,
                 code: data.code, error: data.error, message: data.message
               }));
-              throw new Error('npm rejected the workflow identity before publication');
+              if (encoding === 'npm-escaped-name') canonicalAccepted = response.ok;
             }
-            core.info('npm accepted the workflow identity; no token contents were logged.');
+            if (!canonicalAccepted) {
+              throw new Error('npm rejected the canonical workflow token exchange');
+            }
