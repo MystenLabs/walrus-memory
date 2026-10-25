@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Update the published `@mysten-incubation/memwal` dependency from exact `0.1.8` to exact `0.1.10`, including the SDK's recall input validation and exported typed remember-job/rate-limit errors. Plugin runtime code is unchanged.
+- Update MemWal SDK dependency to `0.1.10`.
 
 ## 0.0.7
 

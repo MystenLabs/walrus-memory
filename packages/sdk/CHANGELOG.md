@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
+- Export typed remember-job and rate-limit errors for `instanceof` checks. (WALM-615, GH #687)
 
 ## 0.1.9
 
