@@ -159,4 +159,3 @@ jobs:
               throw new Error('npm rejected the workflow identity before publication');
             }
             core.info('npm accepted the workflow identity; no token contents were logged.');
-
