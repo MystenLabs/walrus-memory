@@ -1,10 +1,15 @@
 # @mysten-incubation/memwal
 
-## 0.1.9
+## 0.1.10
 
 ### Fixed
 
 - `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
+
+## 0.1.9
+
+### Fixed
+
 - `rememberBulk` and `rememberBulkAsync` send an idempotency key derived from the batch (a 30-minute bucket plus each item's namespace and text). A retry inside that window returns the same jobs instead of storing the batch again. An explicit `idempotencyKey` still wins. (#1080)
 - `listMemories()` pages every stored memory without a similarity query. It returns metadata only: no blob download and no decrypt. An optional namespace filter runs on the client, so a filtered page can be empty while `has_more` is true. (WALM-388)
 - `withMemWal` does not recall or auto-save on a tool-execution step. A later tool step reuses the recall cached for that user message. Auto-save still runs only on a user turn. (#1079)

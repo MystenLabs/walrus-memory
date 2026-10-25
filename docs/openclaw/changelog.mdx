@@ -28,8 +28,14 @@ questions:
   - What changed in the MemWal OpenClaw plugin changelog?
   - When was the MemWal OpenClaw plugin first released?
 answer: >-
-  The MemWal OpenClaw plugin (@mysten-incubation/oc-memwal) changelog tracks releases from the initial 0.0.1 through the current 0.0.7. The initial release included automatic memory recall via before_prompt_build hook, fact capture via agent_end hook, CLI commands (stats, search), and LLM tools (memory_search, memory_store). Version 0.0.3 rebranded MemWal to Walrus Memory, 0.0.4 added temporal anchoring via the occurredAt argument, 0.0.5 fixed an unresolvable workspace dependency that broke installs outside the monorepo, and 0.0.6 made openclaw plugins install succeed, registered the agent tools, and added a request timeout so a stalled relayer cannot block an agent turn. Version 0.0.7 interpolates ${ENV_VAR} only in privateKey so other fields stay literal and a secret cannot land in serverUrl, and pins memory_search and memory_store to the calling agent's namespace.
+  The MemWal OpenClaw plugin (@mysten-incubation/oc-memwal) changelog tracks releases from the initial 0.0.1 through the current 0.0.8. Version 0.0.8 updates the published SDK dependency from exact 0.1.8 to exact 0.1.10, including recall input validation and exported typed remember-job/rate-limit errors; plugin runtime code is unchanged. The initial release included automatic memory recall via before_prompt_build hook, fact capture via agent_end hook, CLI commands (stats, search), and LLM tools (memory_search, memory_store). Version 0.0.3 rebranded MemWal to Walrus Memory, 0.0.4 added temporal anchoring via the occurredAt argument, 0.0.5 fixed an unresolvable workspace dependency that broke installs outside the monorepo, and 0.0.6 made openclaw plugins install succeed, registered the agent tools, and added a request timeout so a stalled relayer cannot block an agent turn. Version 0.0.7 interpolates ${ENV_VAR} only in privateKey so other fields stay literal and a secret cannot land in serverUrl, and pins memory_search and memory_store to the calling agent's namespace.
 ---
+
+## 0.0.8
+
+### Fixed
+
+- Update the published `@mysten-incubation/memwal` dependency from exact `0.1.8` to exact `0.1.10`, including the SDK's recall input validation and exported typed remember-job/rate-limit errors. Plugin runtime code is unchanged.
 
 ## 0.0.7
 
