@@ -28,14 +28,14 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  The latest TypeScript SDK release is 0.1.10. Remember-job waits now throw exported, instanceof-checkable not-found, failed, and timeout errors, and batch waits throw MemWalRateLimitedError when every status read is rate-limited. Earlier releases are in the sections below.
+  Version 0.1.10 adds typed remember-job and rate-limit errors.
 ---
 
 ## 0.1.10
 
 ### Fixed
 
-- `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
+- Export typed remember-job and rate-limit errors for `instanceof` checks. (WALM-615, GH #687)
 
 ## 0.1.9
 
