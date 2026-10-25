@@ -10,12 +10,19 @@ on:
       - 'packages/openclaw-memory-memwal/**'
       - '.github/workflows/release-oc-memwal.yml'
   workflow_dispatch:
+    inputs:
+      ci_test:
+        description: Check npm OIDC authorization only; do not publish
+        required: false
+        type: boolean
+        default: false
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   release:
     name: Version & Publish
+    if: github.event_name != 'workflow_dispatch' || !inputs.ci_test
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -113,3 +120,46 @@ jobs:
       - name: Publish dev prerelease
         if: github.ref == 'refs/heads/dev'
         run: .github/scripts/publish-prerelease.sh packages/openclaw-memory-memwal @mysten-incubation/oc-memwal dev
+
+  oidc-probe:
+    name: Check npm OIDC authorization
+    if: github.event_name == 'workflow_dispatch' && inputs.ci_test && github.ref == 'refs/heads/codex/mcp-publish-ci-test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diagnose npm OIDC trust
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const idToken = await core.getIDToken('npm:registry.npmjs.org');
+            const claims = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64url').toString());
+            const keys = ['iss', 'aud', 'sub', 'repository', 'repository_id', 'repository_owner',
+              'repository_owner_id', 'workflow_ref', 'job_workflow_ref', 'ref',
+              'event_name', 'environment', 'runner_environment'];
+            core.info('OIDC identity: ' + JSON.stringify(Object.fromEntries(
+              keys.map(key => [key, claims[key] ?? null])
+            )));
+            const pkg = JSON.parse(require('node:fs').readFileSync('packages/openclaw-memory-memwal/package.json', 'utf8'));
+            core.info('Package identity: ' + JSON.stringify({name: pkg.name, repository: pkg.repository}));
+            const publicResponse = await fetch('https://registry.npmjs.org/' + encodeURIComponent(pkg.name));
+            core.info('Public package metadata HTTP status: ' + publicResponse.status);
+            const response = await fetch(
+              'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/' + encodeURIComponent(pkg.name),
+              {method: 'POST', headers: {Authorization: 'Bearer ' + idToken}}
+            );
+            const data = await response.json().catch(() => ({}));
+            if (data.token) core.setSecret(data.token);
+            core.info('npm OIDC exchange HTTP status: ' + response.status);
+            if (!response.ok) {
+              core.info('npm OIDC error: ' + JSON.stringify({
+                code: data.code, error: data.error, message: data.message
+              }));
+              throw new Error('npm rejected the workflow identity before publication');
+            }
+            core.info('npm accepted the workflow identity; no token contents were logged.');
+
