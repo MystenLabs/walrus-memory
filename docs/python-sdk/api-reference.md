@@ -194,7 +194,7 @@ Rebuild missing indexed entries for one namespace from Walrus. Incremental.
 RestoreResult(restored: int, skipped: int, total: int, namespace: str, owner: str, truncated: bool = False, failed: int = 0)
 ```
 
-`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob.
+`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob (a `sourceCapped` field is planned as a follow-up).
 
 ### `list_namespaces(cursor=None, limit=None) -> NamespacesResult`
 
