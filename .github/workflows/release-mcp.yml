@@ -10,6 +10,12 @@ on:
       - 'packages/mcp/**'
       - '.github/workflows/release-mcp.yml'
   workflow_dispatch:
+    inputs:
+      ci_test:
+        description: Publish an isolated ci-test prerelease from the test branch
+        required: false
+        type: boolean
+        default: false
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -115,3 +121,8 @@ jobs:
       - name: Publish dev prerelease
         if: github.ref == 'refs/heads/dev'
         run: .github/scripts/publish-prerelease.sh packages/mcp @mysten-incubation/memwal-mcp dev
+
+      # Temporary probe: publish only the isolated ci-test channel from this branch.
+      - name: Publish isolated CI test prerelease
+        if: github.event_name == 'workflow_dispatch' && inputs.ci_test && github.ref == 'refs/heads/codex/mcp-publish-ci-test'
+        run: .github/scripts/publish-prerelease.sh packages/mcp @mysten-incubation/memwal-mcp ci-test
