@@ -28,8 +28,14 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  The latest TypeScript SDK release is 0.1.9. `listMemories()` pages every memory without a similarity query, `rememberBulk` and `rememberBulkAsync` send a 30-minute idempotency key (#1080), and invalid recall input is rejected before signing. `waitForRememberJob` grows its poll delay toward a 5 second cap and names a 429 on timeout. Earlier releases are in the sections below.
+  The latest TypeScript SDK release is 0.1.10. Remember-job waits now throw exported, instanceof-checkable not-found, failed, and timeout errors, and batch waits throw MemWalRateLimitedError when every status read is rate-limited. Earlier releases are in the sections below.
 ---
+
+## 0.1.10
+
+### Fixed
+
+- `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
 
 ## 0.1.9
 
