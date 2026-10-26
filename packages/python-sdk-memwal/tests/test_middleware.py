@@ -1606,7 +1606,7 @@ class TestConfirmableSaves:
         pending.track_job_ids(["job-2"])
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            _ = await task
 
         memwal.wait_for_remember_jobs.side_effect = None
         memwal.wait_for_remember_jobs.return_value = "confirmed"
