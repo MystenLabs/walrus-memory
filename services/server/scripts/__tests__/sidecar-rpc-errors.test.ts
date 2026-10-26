@@ -4,6 +4,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import {
     classifyDurableSideEffectError,
+    CongestionCancelledTransaction,
     FinalizedTransactionFailure,
     isRetryableRpcError,
     isRetryableSharedInfraError,
@@ -97,6 +98,40 @@ test("a finalized failed transaction clears ambiguity but consumes the data budg
     assert.deepEqual(classifyDurableSideEffectError(failure, true, true), {
         code: "NO_SIDE_EFFECT",
     });
+});
+
+test("only a congestion cancel asks for a new transaction", () => {
+    const cancelled = new CongestionCancelledTransaction("congested");
+    assert.deepEqual(classifyDurableSideEffectError(cancelled, true, true), {
+        code: "CONGESTION_CANCELLED_TRANSACTION",
+    });
+
+    assert.throws(
+        () => assertFinalizedTransactionSuccess({
+            $kind: "FailedTransaction",
+            FailedTransaction: {
+                status: {
+                    success: false,
+                    error: { $kind: "CongestedObjects", message: "congested" },
+                },
+            },
+        }, "register"),
+        (err: unknown) => err instanceof CongestionCancelledTransaction,
+    );
+    assert.throws(
+        () => assertFinalizedTransactionSuccess({
+            $kind: "FailedTransaction",
+            FailedTransaction: {
+                status: {
+                    success: false,
+                    error: { $kind: "MoveAbort", message: "abort" },
+                },
+            },
+        }, "register"),
+        (err: unknown) => err instanceof FinalizedTransactionFailure
+            && !(err instanceof CongestionCancelledTransaction),
+        "a deterministic abort must keep replaying the same digest",
+    );
 });
 
 test("an unexpected finalization response remains ambiguous", () => {

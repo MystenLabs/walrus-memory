@@ -740,7 +740,9 @@ export function settleUploadStepFlight(
     flight.resolve(result);
     const code = (result.body as { code?: unknown } | null)?.code;
     if (rejectedPreparation && result.status >= 400
-        && (code === "NO_SIDE_EFFECT" || code === "INVALID_PREPARED_REGISTER_TRANSACTION")) {
+        && (code === "NO_SIDE_EFFECT"
+            || code === "INVALID_PREPARED_REGISTER_TRANSACTION"
+            || code === "CONGESTION_CANCELLED_TRANSACTION")) {
         // Rust clears the rejected transaction and asks to prepare again. A
         // cached prepare would otherwise hand it the same unusable sponsorship
         // for another minute. Evict only that exact prepared digest; completed
@@ -761,11 +763,6 @@ export function settleUploadStepFlight(
         if (uploadStepFlights.get(key) === flight) uploadStepFlights.delete(key);
     }, ttl);
     drop.unref?.();
-}
-
-/** Drop a settled flight immediately. The success TTL must not outlive a digest that can never land. */
-export function dropUploadStepFlight(key: string): void {
-    uploadStepFlights.delete(key);
 }
 
 export function resetUploadStepFlightsForTests(): void {
@@ -989,37 +986,18 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                         // digest lookup proves absence, lookup failures must
                         // preserve the prepared transaction for reconciliation.
                         if (reconcileOnly) submissionStarted = true;
-                        let blobObjectId: string;
-                        try {
-                            const result = await executePreparedRegisterTransaction(
-                                validated,
-                                suiClient,
-                                () => {
-                                    // A successful digest lookup proves the effect
-                                    // already exists; an execute call may create it.
-                                    submissionStarted = true;
-                                },
-                                currentSuiEpoch,
-                                reconcileOnly,
-                            );
-                            blobObjectId = createdBlobObjectIdFromTransaction(result);
-                        } catch (error: unknown) {
-                            // Prepare cached these exact bytes as a 200 for 60s.
-                            // Shared-object congestion finalizes that digest as
-                            // a failure, and a dead Enoki sponsorship can never
-                            // submit it either. The Rust step loop treats both
-                            // as "rebuild", then rejoins this cache and replays
-                            // the same digest until the step budget is gone.
-                            if (error instanceof NoSideEffectError) {
-                                dropUploadStepFlight(uploadStepFlightKey(
-                                    jobId,
-                                    "encoded",
-                                    encoded.blobId,
-                                    undefined,
-                                ));
-                            }
-                            throw error;
-                        }
+                        const result = await executePreparedRegisterTransaction(
+                            validated,
+                            suiClient,
+                            () => {
+                                // A successful digest lookup proves the effect
+                                // already exists; an execute call may create it.
+                                submissionStarted = true;
+                            },
+                            currentSuiEpoch,
+                            reconcileOnly,
+                        );
+                        const blobObjectId = createdBlobObjectIdFromTransaction(result);
                         await validateRegisteredBlob(blobObjectId, encoded);
                         step = registeredStep(encoded, blobObjectId, validated.digest);
                     } else {
