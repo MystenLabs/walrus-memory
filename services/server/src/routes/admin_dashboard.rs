@@ -118,27 +118,35 @@ pub async fn get_wallets(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<WalletsResponse>, AppError> {
     let sidecar_url = &state.config.sidecar_url;
-    let wallet_balances_url = format!("{}/internal/wallet-balances", sidecar_url);
+    let sidecar_data: SidecarWalletMetrics =
+        if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+            let v = crate::storage::walrus_native::fetch_wallet_balances_in_process().await;
+            serde_json::from_value(v)
+                .map_err(|e| AppError::Internal(format!("Invalid in-process wallet metrics: {e}")))?
+        } else {
+            let wallet_balances_url = format!("{}/internal/wallet-balances", sidecar_url);
 
-    let mut sidecar_request = state.http_client.get(&wallet_balances_url);
-    if let Some(secret) = state.config.sidecar_secret.as_deref() {
-        sidecar_request = sidecar_request.header("authorization", format!("Bearer {}", secret));
-    }
-    let response = sidecar_request.send().await.map_err(|e| {
-        AppError::Internal(format!("Failed to fetch sidecar wallet metrics: {}", e))
-    })?;
+            let mut sidecar_request = state.http_client.get(&wallet_balances_url);
+            if let Some(secret) = state.config.sidecar_secret.as_deref() {
+                sidecar_request =
+                    sidecar_request.header("authorization", format!("Bearer {}", secret));
+            }
+            let response = sidecar_request.send().await.map_err(|e| {
+                AppError::Internal(format!("Failed to fetch sidecar wallet metrics: {}", e))
+            })?;
 
-    if !response.status().is_success() {
-        return Err(AppError::Internal(format!(
-            "Sidecar wallet metrics returned status {}",
-            response.status()
-        )));
-    }
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!(
+                    "Sidecar wallet metrics returned status {}",
+                    response.status()
+                )));
+            }
 
-    let sidecar_data: SidecarWalletMetrics = response
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Invalid sidecar wallet metrics: {}", e)))?;
+            response
+                .json()
+                .await
+                .map_err(|e| AppError::Internal(format!("Invalid sidecar wallet metrics: {}", e)))?
+        };
 
     let wal_threshold = state.config.wallet_balance_low_threshold_wal;
     let sui_threshold = state.config.wallet_balance_low_threshold_sui;

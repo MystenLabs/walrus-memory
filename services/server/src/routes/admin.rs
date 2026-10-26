@@ -384,6 +384,9 @@ fn postgres_can_accept_writes(used_bytes: i64, max_bytes: i64) -> bool {
 /// call in this codebase (`storage/walrus.rs`, `storage/seal.rs`) so the
 /// probe's latency and failure rate are measurable.
 async fn probe_sidecar_write_ready(state: &std::sync::Arc<AppState>) -> bool {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(&state.config.sidecar_url) {
+        return true;
+    }
     let url = format!("{}/health", state.config.sidecar_url.trim_end_matches('/'));
     let started = std::time::Instant::now();
     match state
