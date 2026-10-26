@@ -1256,7 +1256,10 @@ export class MemWal {
             let processed = result;
             if (typeof options.maxDistance === "number") {
                 const filtered = result.results.filter(
-                    (memory) => memory.distance < options.maxDistance!,
+                    (memory) =>
+                        typeof memory.distance === "number" &&
+                        Number.isFinite(memory.distance) &&
+                        Math.max(0, memory.distance) < options.maxDistance!,
                 );
                 // Keep the relayer's matching total so callers can distinguish
                 // "no memories exist" from "matches exist but were outside maxDistance" (#1066).
