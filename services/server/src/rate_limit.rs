@@ -19,7 +19,7 @@ use crate::{
 // Sponsor Rate Limit Result
 // ============================================================
 
-/// Result of a per-sender (or per-IP) sponsor rate limit check.
+/// Result of a per-sender (or per-IP / global) sponsor rate limit check.
 #[derive(Debug, PartialEq)]
 pub enum SponsorRlResult {
     /// Request is within limits — proceed.
@@ -28,6 +28,8 @@ pub enum SponsorRlResult {
     MinuteLimitExceeded,
     /// Per-hour bucket exhausted.
     HourLimitExceeded,
+    /// Per-day cumulative bucket exhausted.
+    DayLimitExceeded,
 }
 
 // ============================================================
@@ -969,14 +971,33 @@ pub(crate) async fn check_restore_call_rate_limit(
 // Sponsor — deployment-wide budget limit
 // ============================================================
 
+pub const SPONSOR_GLOBAL_MIN_KEY: &str = "rate:sponsor:global:min";
+pub const SPONSOR_GLOBAL_HR_KEY: &str = "rate:sponsor:global:hr";
+pub const SPONSOR_GLOBAL_DAY_KEY: &str = "rate:sponsor:global:day";
+
+pub const SPONSOR_MIN_WINDOW_MS: f64 = 60_000.0;
+pub const SPONSOR_HR_WINDOW_MS: f64 = 3_600_000.0;
+pub const SPONSOR_DAY_WINDOW_MS: f64 = 86_400_000.0;
+
+pub const SPONSOR_MIN_TTL_SECS: i64 = 120;
+pub const SPONSOR_HR_TTL_SECS: i64 = 3_700;
+pub const SPONSOR_DAY_TTL_SECS: i64 = 86_500;
+
 /// Check whether the deployment has exceeded its sponsor budget limits.
 ///
 /// Uses a sliding-window counter in Redis just like the authenticated route
 /// middleware, but keyed by fixed server-controlled identifiers. Unlike a
 /// caller-supplied sender address, these keys cannot be rotated by an attacker.
 ///
+/// Enforces three global tiers:
+/// - `rate:sponsor:global:min` (60s rolling window)
+/// - `rate:sponsor:global:hr` (3,600s rolling window)
+/// - `rate:sponsor:global:day` (86,400s rolling window) — prevents multi-IP
+///   rotation from sustaining the hourly ceiling across consecutive hours.
+///
 /// Returns `SponsorRlResult::Allowed` when the request can proceed, or the
-/// appropriate `MinuteLimitExceeded` / `HourLimitExceeded` variant otherwise.
+/// appropriate `MinuteLimitExceeded` / `HourLimitExceeded` / `DayLimitExceeded`
+/// variant otherwise.
 ///
 /// Returns `Err(())` on Redis failure so callers can fail closed. A per-process
 /// fallback would not enforce a deployment-wide cap across replicas.
@@ -984,24 +1005,24 @@ pub async fn check_global_sponsor_rate_limit(
     state: &crate::types::AppState,
     per_minute: i64,
     per_hour: i64,
+    per_day: i64,
 ) -> Result<SponsorRlResult, ()> {
     let now = chrono::Utc::now().timestamp_millis() as f64;
     let mut redis = state.redis.clone();
 
-    let min_key = "rate:sponsor:global:min";
-    let hr_key = "rate:sponsor:global:hr";
-    let min_window_start = now - 60_000.0;
-    let hr_window_start = now - 3_600_000.0;
+    let min_window_start = now - SPONSOR_MIN_WINDOW_MS;
+    let hr_window_start = now - SPONSOR_HR_WINDOW_MS;
+    let day_window_start = now - SPONSOR_DAY_WINDOW_MS;
 
     // --- Atomic check-and-record for minute bucket ---
     match check_and_record_window(
         &mut redis,
-        &min_key,
+        SPONSOR_GLOBAL_MIN_KEY,
         min_window_start,
         now,
         per_minute,
         1, // weight = 1 per sponsor request
-        120,
+        SPONSOR_MIN_TTL_SECS,
     )
     .await
     {
@@ -1022,12 +1043,12 @@ pub async fn check_global_sponsor_rate_limit(
     // --- Atomic check-and-record for hour bucket ---
     match check_and_record_window(
         &mut redis,
-        &hr_key,
+        SPONSOR_GLOBAL_HR_KEY,
         hr_window_start,
         now + 0.1,
         per_hour,
         1, // weight = 1 per sponsor request
-        3700,
+        SPONSOR_HR_TTL_SECS,
     )
     .await
     {
@@ -1037,6 +1058,29 @@ pub async fn check_global_sponsor_rate_limit(
         }
         Err(e) => {
             tracing::error!("check_global_sponsor_rate_limit: Redis error (hour): {}", e);
+            return Err(());
+        }
+        Ok(WindowCheckResult::Allowed) => {}
+    }
+
+    // --- Atomic check-and-record for rolling 24-hour bucket ---
+    match check_and_record_window(
+        &mut redis,
+        SPONSOR_GLOBAL_DAY_KEY,
+        day_window_start,
+        now + 0.2,
+        per_day,
+        1, // weight = 1 per sponsor request
+        SPONSOR_DAY_TTL_SECS,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => {
+            crate::observability::record_rate_limit_denial("sponsor_global_daily");
+            return Ok(SponsorRlResult::DayLimitExceeded);
+        }
+        Err(e) => {
+            tracing::error!("check_global_sponsor_rate_limit: Redis error (day): {}", e);
             return Err(());
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -1156,7 +1200,8 @@ fn rate_limit_peer_addr(request: &Request, trusted_proxy_hops: usize) -> std::ne
 /// Pre-authentication rate limiting middleware for the public `/sponsor` routes.
 ///
 /// Enforces a per-IP sliding-window limit using the same Redis counters as
-/// the authenticated middleware. Defaults: 10 req/min, 30 req/hr per IP.
+/// the authenticated middleware. Defaults: 10 req/min, 30 req/hr per IP, plus
+/// deployment-wide caps of 100/min, 1000/hr, and 2000/day.
 ///
 /// Redis errors return 503. A local fallback cannot provide consistent abuse
 /// protection across replicas, so the sponsor path intentionally fails closed.
@@ -1182,8 +1227,8 @@ pub async fn sponsor_rate_limit_middleware(
 
     let min_key = format!("rate:sponsor:ip:min:{}", ip);
     let hr_key = format!("rate:sponsor:ip:hr:{}", ip);
-    let min_window_start = now - 60_000.0;
-    let hr_window_start = now - 3_600_000.0;
+    let min_window_start = now - SPONSOR_MIN_WINDOW_MS;
+    let hr_window_start = now - SPONSOR_HR_WINDOW_MS;
 
     // --- Atomic check-and-record for minute bucket (IP-based) ---
     match check_and_record_window(
@@ -1193,7 +1238,7 @@ pub async fn sponsor_rate_limit_middleware(
         now,
         config.per_minute,
         1,
-        120,
+        SPONSOR_MIN_TTL_SECS,
     )
     .await
     {
@@ -1223,7 +1268,7 @@ pub async fn sponsor_rate_limit_middleware(
         now + 0.1,
         config.per_hour,
         1,
-        3700,
+        SPONSOR_HR_TTL_SECS,
     )
     .await
     {
@@ -1245,8 +1290,13 @@ pub async fn sponsor_rate_limit_middleware(
         Ok(WindowCheckResult::Allowed) => {}
     }
 
-    match check_global_sponsor_rate_limit(&state, config.global_per_minute, config.global_per_hour)
-        .await
+    match check_global_sponsor_rate_limit(
+        &state,
+        config.global_per_minute,
+        config.global_per_hour,
+        config.global_per_day,
+    )
+    .await
     {
         Ok(SponsorRlResult::MinuteLimitExceeded) => {
             return rate_limit_response(
@@ -1263,6 +1313,14 @@ pub async fn sponsor_rate_limit_middleware(
                 "hour",
                 300,
             );
+        }
+        Ok(SponsorRlResult::DayLimitExceeded) => {
+            tracing::warn!(
+                "sponsor rate limit [global/day]: ip={} denied (limit={})",
+                ip,
+                config.global_per_day
+            );
+            return rate_limit_response("sponsor_global_daily", config.global_per_day, "day", 3600);
         }
         Ok(SponsorRlResult::Allowed) => {}
         Err(()) => return rate_limiter_unavailable_response(),
@@ -1474,7 +1532,7 @@ pub async fn accounts_rate_limit_middleware(
                 60,
             );
         }
-        Ok(SponsorRlResult::HourLimitExceeded) => {
+        Ok(SponsorRlResult::HourLimitExceeded) | Ok(SponsorRlResult::DayLimitExceeded) => {
             return rate_limit_response(
                 "accounts_global_sustained",
                 config.global_per_hour,
@@ -1653,7 +1711,7 @@ pub async fn mcp_rate_limit_middleware(
         Ok(SponsorRlResult::MinuteLimitExceeded) => {
             return rate_limit_response("mcp_global_burst", config.global_per_minute, "min", 60);
         }
-        Ok(SponsorRlResult::HourLimitExceeded) => {
+        Ok(SponsorRlResult::HourLimitExceeded) | Ok(SponsorRlResult::DayLimitExceeded) => {
             return rate_limit_response(
                 "mcp_global_sustained",
                 config.global_per_hour,
@@ -2583,7 +2641,7 @@ mod tests {
         assert!(!config.bench_bypass_enabled);
     }
 
-    // ---- SponsorRlResult variants ----
+    // ---- SponsorRlResult variants & daily global cap (WALM-713 / GH #1031) ----
 
     #[test]
     fn test_sponsor_rl_result_variants() {
@@ -2596,6 +2654,10 @@ mod tests {
             SponsorRlResult::HourLimitExceeded,
             SponsorRlResult::HourLimitExceeded
         );
+        assert_eq!(
+            SponsorRlResult::DayLimitExceeded,
+            SponsorRlResult::DayLimitExceeded
+        );
         assert_ne!(
             SponsorRlResult::Allowed,
             SponsorRlResult::MinuteLimitExceeded
@@ -2604,5 +2666,252 @@ mod tests {
             SponsorRlResult::MinuteLimitExceeded,
             SponsorRlResult::HourLimitExceeded
         );
+        assert_ne!(
+            SponsorRlResult::HourLimitExceeded,
+            SponsorRlResult::DayLimitExceeded
+        );
+    }
+
+    /// In-memory sliding-window simulator matching `SLIDING_WINDOW_LUA`
+    /// (`ZREMRANGEBYSCORE key -inf window_start`, `ZCARD`, `count + weight > limit`, `ZADD`)
+    /// and the exact 5-bucket `/sponsor` rate-limit sequence in
+    /// `sponsor_rate_limit_middleware` + `check_global_sponsor_rate_limit`.
+    #[derive(Default)]
+    struct SponsorSlidingWindowSim {
+        windows: std::collections::HashMap<String, Vec<f64>>,
+    }
+
+    impl SponsorSlidingWindowSim {
+        fn check_and_record(
+            &mut self,
+            key: &str,
+            window_start: f64,
+            now: f64,
+            limit: i64,
+            weight: i64,
+        ) -> WindowCheckResult {
+            let entries = self.windows.entry(key.to_string()).or_default();
+            entries.retain(|score| *score > window_start);
+            if (entries.len() as i64) + weight > limit {
+                return WindowCheckResult::Denied;
+            }
+            for _ in 0..weight {
+                entries.push(now);
+            }
+            WindowCheckResult::Allowed
+        }
+
+        fn check_sponsor_request(
+            &mut self,
+            ip: &str,
+            now: f64,
+            config: &crate::types::SponsorRateLimitConfig,
+        ) -> Option<Response> {
+            let min_key = format!("rate:sponsor:ip:min:{ip}");
+            let hr_key = format!("rate:sponsor:ip:hr:{ip}");
+            if self.check_and_record(
+                &min_key,
+                now - SPONSOR_MIN_WINDOW_MS,
+                now,
+                config.per_minute,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_ip_burst",
+                    config.per_minute,
+                    "min",
+                    60,
+                ));
+            }
+            if self.check_and_record(
+                &hr_key,
+                now - SPONSOR_HR_WINDOW_MS,
+                now + 0.1,
+                config.per_hour,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_ip_sustained",
+                    config.per_hour,
+                    "hour",
+                    300,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_MIN_KEY,
+                now - SPONSOR_MIN_WINDOW_MS,
+                now,
+                config.global_per_minute,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_burst",
+                    config.global_per_minute,
+                    "min",
+                    60,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_HR_KEY,
+                now - SPONSOR_HR_WINDOW_MS,
+                now + 0.1,
+                config.global_per_hour,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_sustained",
+                    config.global_per_hour,
+                    "hour",
+                    300,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_DAY_KEY,
+                now - SPONSOR_DAY_WINDOW_MS,
+                now + 0.2,
+                config.global_per_day,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_daily",
+                    config.global_per_day,
+                    "day",
+                    3600,
+                ));
+            }
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn sponsor_daily_global_cap_blocks_multi_ip_sustained_drain_across_hours() {
+        // Reproduces GH #1031 / WALM-713: 34 source IPs each stay inside
+        // 10/min and 30/hr per IP, pacing 1,000 requests/hour across Hour 0
+        // and Hour 1 (2,000 total). In Hour 2, even though every per-IP bucket
+        // and the rolling 1-hour global bucket have expired, the 24-hour global
+        // cap (`rate:sponsor:global:day`, default 2000) rejects request #2,001
+        // with 429 (`layer: "sponsor_global_daily"`).
+        let config = crate::types::SponsorRateLimitConfig::default();
+        assert_eq!(config.per_minute, 10);
+        assert_eq!(config.per_hour, 30);
+        assert_eq!(config.global_per_minute, 100);
+        assert_eq!(config.global_per_hour, 1000);
+        assert_eq!(config.global_per_day, 2000);
+
+        let mut sim = SponsorSlidingWindowSim::default();
+        let t0 = 1_700_000_000_000.0;
+
+        for hour in 0..2 {
+            let hour_base = t0 + (hour as f64) * (SPONSOR_HR_WINDOW_MS + 1_000.0);
+            let mut sent_in_hour = 0;
+
+            // 30 waves separated by 61s so neither per-IP minute (10/min),
+            // per-IP hour (30/hr), nor global minute (100/min) trips, while
+            // 34 IPs × <=30/hr reaches the 1000/hr global ceiling.
+            for wave in 0..30 {
+                let wave_ts = hour_base + (wave as f64) * 61_000.0;
+                for ip_idx in 0..34 {
+                    if sent_in_hour >= 1000 {
+                        break;
+                    }
+                    let ip = format!("203.0.113.{}", ip_idx + 1);
+                    let denied = sim.check_sponsor_request(&ip, wave_ts + (ip_idx as f64), &config);
+                    assert!(
+                        denied.is_none(),
+                        "request {} in hour {} from {} should be allowed",
+                        sent_in_hour + 1,
+                        hour,
+                        ip
+                    );
+                    sent_in_hour += 1;
+                }
+            }
+            assert_eq!(sent_in_hour, 1000);
+        }
+
+        // Hour 2: all per-IP buckets and `rate:sponsor:global:hr` are now empty,
+        // and the attacker rotates to a brand-new 35th IP.
+        let hour_2_ts = t0 + 2.0 * (SPONSOR_HR_WINDOW_MS + 1_000.0);
+        let denied_resp = sim
+            .check_sponsor_request("198.51.100.250", hour_2_ts, &config)
+            .expect("2001st request within 24h must be rejected by daily global cap");
+
+        assert_eq!(denied_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(denied_resp.headers().get("retry-after").unwrap(), "3600");
+        let body_bytes = axum::body::to_bytes(denied_resp.into_body(), 4096)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error"], "Rate limit exceeded");
+        assert_eq!(body_json["layer"], "sponsor_global_daily");
+        assert_eq!(body_json["limit"], "2000 weighted-requests/day");
+        assert_eq!(body_json["retry_after_seconds"], 3600);
+
+        // After the full 24h rolling window slides past Hour 0, sponsorship recovers.
+        let next_day_ts = t0 + SPONSOR_DAY_WINDOW_MS + 1_000.0;
+        assert!(
+            sim.check_sponsor_request("198.51.100.250", next_day_ts, &config)
+                .is_none(),
+            "requests must be allowed again once the 24h sliding window advances past Hour 0"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL pointing to a real Redis instance"]
+    async fn sponsor_global_daily_cap_denies_past_window_redis() {
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must be set when running Redis integration tests");
+        let client = redis::Client::open(redis_url).expect("valid TEST_REDIS_URL");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect to test Redis");
+
+        const DAILY_LIMIT: i64 = 15;
+        let key = format!("{}:test:{}", SPONSOR_GLOBAL_DAY_KEY, Uuid::new_v4());
+        let t0 = chrono::Utc::now().timestamp_millis() as f64;
+
+        // Spread requests across 3 simulated hours within the same 24h window.
+        for i in 0..DAILY_LIMIT {
+            let now = t0 + (i / 5) as f64 * SPONSOR_HR_WINDOW_MS + (i as f64);
+            let window_start = now - SPONSOR_DAY_WINDOW_MS;
+            let res = check_and_record_window(
+                &mut connection,
+                &key,
+                window_start,
+                now,
+                DAILY_LIMIT,
+                1,
+                SPONSOR_DAY_TTL_SECS,
+            )
+            .await
+            .expect("Redis script failed");
+            assert_eq!(res, WindowCheckResult::Allowed);
+        }
+
+        let hour_3_now = t0 + 3.0 * SPONSOR_HR_WINDOW_MS;
+        let denied = check_and_record_window(
+            &mut connection,
+            &key,
+            hour_3_now - SPONSOR_DAY_WINDOW_MS,
+            hour_3_now,
+            DAILY_LIMIT,
+            1,
+            SPONSOR_DAY_TTL_SECS,
+        )
+        .await
+        .expect("Redis script failed");
+        assert_eq!(denied, WindowCheckResult::Denied);
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("clean test key");
     }
 }

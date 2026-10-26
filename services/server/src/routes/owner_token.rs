@@ -184,7 +184,9 @@ pub async fn issue_token(
     .await
     {
         Ok(SponsorRlResult::Allowed) => {}
-        Ok(SponsorRlResult::MinuteLimitExceeded) | Ok(SponsorRlResult::HourLimitExceeded) => {
+        Ok(SponsorRlResult::MinuteLimitExceeded)
+        | Ok(SponsorRlResult::HourLimitExceeded)
+        | Ok(SponsorRlResult::DayLimitExceeded) => {
             return Err(AppError::RateLimited(
                 "too many owner-token requests for this owner; retry later".into(),
             ));
