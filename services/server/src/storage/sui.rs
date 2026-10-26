@@ -548,12 +548,17 @@ async fn verify_delegate_key_cached_inner(
     // A pair we refused moments ago is refused again without a chain read.
     // Checked after the positive lookup so a key that has since been
     // registered and verified is never held back by an older rejection.
-    if reject_cache
-        .read()
-        .await
-        .get(probe)
-        .copied()
-        .is_some_and(reject_entry_is_fresh)
+    // Refresh never consumes this map: it records only that signed auth
+    // refused the pair, not why, so a `WrongObjectType` recorded there would
+    // come back as a synthetic `KeyNotFound` and revoke the grant refresh is
+    // supposed to hold. Refresh re-reads the chain instead.
+    if !for_refresh
+        && reject_cache
+            .read()
+            .await
+            .get(probe)
+            .copied()
+            .is_some_and(reject_entry_is_fresh)
     {
         return Err(OnchainVerifyError::KeyNotFound(format!(
             "delegate key not registered on account {account_object_id} (cached)"
@@ -2779,6 +2784,41 @@ mod tests {
         assert!(
             !err.is_unavailable(),
             "served from the reject cache, so it must not look like an RPC failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_ignores_a_rejection_recorded_by_signed_auth() {
+        // Signed auth records a refusal without its cause, so replaying it to
+        // refresh turns a held `WrongObjectType` into a `KeyNotFound` and
+        // revokes the grant. Refresh must consult the chain instead.
+        let cache = new_delegate_verify_cache();
+        let rejects = new_delegate_reject_cache();
+        let account_id = "0xaccount-refresh-ignores-reject";
+        let pk = sample_pk();
+        seed_reject_cache(&rejects, account_id, &pk, std::time::Duration::ZERO).await;
+
+        let client = reqwest::Client::new();
+        let err = verify_delegate_key_cached_for_refresh(
+            &cache,
+            &rejects,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            &pk,
+            "0xpkg",
+        )
+        .await
+        .expect_err("the unreachable RPC still fails");
+
+        assert!(
+            err.is_unavailable(),
+            "refresh must re-read the chain, not reuse signed auth's rejection: {err}"
+        );
+        assert!(
+            !err.revokes_oauth_refresh(),
+            "a held refresh must keep the grant: {err}"
         );
     }
 

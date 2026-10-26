@@ -756,7 +756,9 @@ fn classify_pending_key_preflight(
 /// The token handler acts only on this value, so the unit tests lock the
 /// policy without a database or a live chain. A positive inside
 /// `DELEGATE_VERIFY_CACHE_TTL` (30s) may still mint. Refresh does not use
-/// the 600s stale grace. A cached rejection (10s) revokes (GH #1141).
+/// the 600s stale grace, and it does not consume the signed-auth rejection
+/// cache: that map records only that a pair was refused, so replaying it
+/// would turn a held `WrongObjectType` into a revoke (GH #1141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshDelegateDecision {
     /// Key is still registered to the grant's owner. Rotate and mint.
@@ -1327,19 +1329,22 @@ pub async fn token(
 
             // GH #1141: refresh must not outlive `remove_delegate_key`.
             // Revoke when the key is gone, the account is deactivated, the
-            // owner does not match, gRPC NotFound or JSON-RPC notExists/
-            // deleted hits the object, or the object is a present foreign
-            // type. A partial RPC read is `temporarily_unavailable` and does
-            // not revoke. A definitive miss retires the grant *and* the
-            // delegate atomically, so reconnect cannot reuse the dead key.
-            // Do not log `encrypted_private_key` or the key bytes.
+            // owner does not match, or gRPC NotFound / JSON-RPC notExists /
+            // deleted hits the object. A partial RPC read and a present
+            // foreign type are both `temporarily_unavailable` and do not
+            // revoke; a foreign type means package or RPC config changed, and
+            // revoking every grant for that is worse than holding. A
+            // definitive miss retires the grant *and* the delegate atomically,
+            // so reconnect cannot reuse the dead key. Do not log
+            // `encrypted_private_key` or the key bytes.
             //
             // Window on this path: a positive inside `DELEGATE_VERIFY_CACHE_TTL`
             // (30s) may still mint. `DELEGATE_VERIFY_STALE_GRACE` (600s) is
             // not used — past 30s an unreachable chain is
-            // `temporarily_unavailable`, not a mint and not a revoke. A
-            // rejection cached for `DELEGATE_REJECT_CACHE_TTL` (10s) is a
-            // miss and revokes.
+            // `temporarily_unavailable`, not a mint and not a revoke. The
+            // signed-auth rejection cache (10s) is not consulted: it records
+            // only the refusal, not the error class, so replaying it would
+            // revoke on a held foreign type.
             let Some(public_key_bytes) =
                 decode_refresh_delegate_public_key(&preview.delegate_public_key)
             else {
