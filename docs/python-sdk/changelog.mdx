@@ -29,16 +29,28 @@ questions:
   - What changes were made in memwal 0.1.4?
   - Where can I find the release history for the Walrus Memory Python SDK?
 answer: >-
-  Version 0.2.0 requires Python 3.11+ and updates the certificate and TLS dependency minimums. `remember` derives a 30-minute idempotency key, `get_remember_status` reads one job, recall results include `created_at` and `score`, and remember-job polls back off toward 5 seconds. 0.1.11 adds `list_namespaces()` so an agent can discover which namespaces hold memories instead of guessing. 0.1.10 adds `failed` to `restore()` results for permanent decrypt/UTF-8 failures instead of folding them into `skipped`. 0.1.9 reports HTTP 503 as a retryable upstream outage instead of a credential failure, rejects empty `remember_bulk_async` batches and misaligned relayer `job_ids`, aligns restore `truncated` docs with WALM-431 retryable semantics, and warns when `server_url` uses plaintext HTTP on a non-localhost host without logging URL credentials.
+  Version 0.2.1 adds verbatim auto-save and save confirmation, preserves pending jobs on cancellation, validates vectors and limits before signing, and rejects empty namespaces. Version 0.2.0 requires Python 3.11+ and updates the certificate and TLS dependency minimums. `remember` derives a 30-minute idempotency key, `get_remember_status` reads one job, recall results include `created_at` and `score`, and remember-job polls back off toward 5 seconds. 0.1.11 adds `list_namespaces()` so an agent can discover which namespaces hold memories instead of guessing. 0.1.10 adds `failed` to `restore()` results for permanent decrypt/UTF-8 failures instead of folding them into `skipped`. 0.1.9 reports HTTP 503 as a retryable upstream outage instead of a credential failure, rejects empty `remember_bulk_async` batches and misaligned relayer `job_ids`, aligns restore `truncated` docs with WALM-431 retryable semantics, and warns when `server_url` uses plaintext HTTP on a non-localhost host without logging URL credentials.
 ---
 
 Track what's new, changed, and fixed in `memwal` (Python).
 
 For the latest version, see the [PyPI project page](https://pypi.org/project/memwal/).
 
-## 0.2.0
+## 0.2.1
 
 Unreleased.
+
+### Fixed
+
+- `with_memwal_*` gains `save_mode` and confirmable saves: `memwal_wait_for_saves` (async and sync) polls every job the middleware enqueued, and restores the job ids if that poll raises so a retry can still confirm them. (#410, #411, #412)
+- `wait_for_remember_jobs` chunks its status reads to the relayer's 20-id `MAX_BULK_ITEMS` cap. Above it the relayer answers a non-transient 400, so a wait over 21+ jobs raised on every attempt and could never confirm — reachable from `save_mode="remember"` after 21 turns, or from two fat `analyze` extracts.
+
+- Save confirmation preserves unconfirmed job IDs when an async wait is cancelled or a synchronous wait is interrupted, then propagates the cancellation or interrupt. (#1303)
+- Reject explicitly empty namespaces instead of silently writing to the default namespace. (#1265)
+- Reject non-finite vectors and invalid limits before signing requests. (#1264)
+
+## 0.2.0
+
 
 ### Changed
 
