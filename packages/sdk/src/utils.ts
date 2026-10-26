@@ -107,6 +107,20 @@ export function u64ToLeHex(value: bigint): string {
     return hex;
 }
 
+/**
+ * Reject a non-finite scoring weight before it is signed. `JSON.stringify`
+ * rewrites NaN/Infinity to `null`, so an unchecked weight reaches the relayer
+ * as `{"semantic": null}` instead of what the caller passed (#1215, #1246).
+ */
+export function assertFiniteScoringWeights(weights?: ScoringWeights): void {
+    if (!weights) return;
+    for (const [name, value] of Object.entries(weights)) {
+        if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+            throw new Error(`scoringWeights.${name} must be a finite number`);
+        }
+    }
+}
+
 export function scoringWeightsToWire(weights?: ScoringWeights): object | undefined {
     if (!weights) return undefined;
 
