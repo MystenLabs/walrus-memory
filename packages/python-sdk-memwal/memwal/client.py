@@ -381,7 +381,7 @@ def _occurred_at_to_wire(
     Aware ``datetime`` objects are converted to UTC. **Naïve datetimes
     are rejected** with ``ValueError``: silently assuming UTC would
     produce timezone-off-by-N anchors for callers outside UTC and
-    undermine WALM-55's "honest temporal anchoring" guarantee. Callers
+    undermine 's "honest temporal anchoring" guarantee. Callers
     should pass ``datetime.now(timezone.utc)`` or attach a ``tzinfo``
     explicitly.
 
@@ -1452,7 +1452,7 @@ class MemWal:
         * ``truncated`` — True when this restore is known-incomplete (limit
           truncation or an upstream on-chain candidate-fetch cap; see
           :class:`~memwal.types.RestoreResult`). Defaults to ``False`` when
-          talking to a relayer older than WALM-319 that omits the field.
+          talking to a relayer older than  that omits the field.
 
         Args:
             namespace: Namespace to restore. Exact match — no prefix or

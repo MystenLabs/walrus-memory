@@ -1,5 +1,15 @@
 # memwal
 
+## 0.3.0
+
+### Added
+
+- `forget(namespace=None)` on `MemWal` and `MemWalSync` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It deletes the owner's index rows for the namespace; the Walrus blobs stay in place. (#1061)
+
+### Changed
+
+- **Breaking (mock):** `MemWalMock.forget(blob_id)` is renamed to `forget_blob(blob_id)`. `MemWalMock.forget` now matches the client: it is async, clears a namespace, and returns `ForgetResult`. An un-awaited `assert mock.forget(blob_id)` in an existing test gets a truthy coroutine and passes without deleting anything, so move those calls to `forget_blob`. (#1061)
+
 ## 0.2.2
 
 Unreleased.
@@ -21,8 +31,8 @@ Unreleased.
 
 ### Fixed
 
-- `with_memwal_*` gains `save_mode` and confirmable saves: `memwal_wait_for_saves` (async and sync) polls every job the middleware enqueued, and restores the job ids if that poll raises so a retry can still confirm them. (WALM-307, #410, #411, #412)
-- `wait_for_remember_jobs` chunks its status reads to the relayer's 20-id `MAX_BULK_ITEMS` cap. Above it the relayer answers a non-transient 400, so a wait over 21+ jobs raised on every attempt and could never confirm — reachable from `save_mode="remember"` after 21 turns, or from two fat `analyze` extracts. (WALM-307)
+- `with_memwal_*` gains `save_mode` and confirmable saves: `memwal_wait_for_saves` (async and sync) polls every job the middleware enqueued, and restores the job ids if that poll raises so a retry can still confirm them. (#410, #411, #412)
+- `wait_for_remember_jobs` chunks its status reads to the relayer's 20-id `MAX_BULK_ITEMS` cap. Above it the relayer answers a non-transient 400, so a wait over 21+ jobs raised on every attempt and could never confirm — reachable from `save_mode="remember"` after 21 turns, or from two fat `analyze` extracts.
 
 - Save confirmation preserves unconfirmed job IDs when an async wait is cancelled or a synchronous wait is interrupted, then propagates the cancellation or interrupt. (#1303)
 - Reject explicitly empty namespaces instead of silently writing to the default namespace. (#1265)
@@ -43,30 +53,26 @@ Unreleased.
 
 ### Added
 
-- `get_remember_status(job_id)` on `MemWal` and `MemWalSync` returns `RememberJobStatus` from `GET /api/remember/{job_id}`, accepting 200 and 404 like the TypeScript SDK. (WALM-832, #1096)
+- `get_remember_status(job_id)` on `MemWal` and `MemWalSync` returns `RememberJobStatus` from `GET /api/remember/{job_id}`, accepting 200 and 404 like the TypeScript SDK. (#1096)
 - `RecallMemory` and `RecallManualHit` include `created_at` and `score`. (#1178)
 - `RecallParams` accepts `scoring_weights` and `sort`. `recall()` forwards them on `POST /api/recall`. (#1062)
-
-### Changed
-
-- **Breaking (mock):** `MemWalMock.forget(blob_id)` is renamed to `forget_blob(blob_id)`. `MemWalMock.forget` now matches the client: it is async, clears a namespace, and returns `ForgetResult`. An un-awaited `assert mock.forget(blob_id)` in an existing test gets a truthy coroutine and passes without deleting anything, so move those calls to `forget_blob`. (#1061)
 
 ### Fixed
 
 - The default `server_url` is `https://relayer.memory.walrus.xyz`, matching the TypeScript SDK. `env="local"` still selects `http://127.0.0.1:8000`. (#1064)
 - `remember` derives an idempotency key from the namespace and text inside a 30-minute bucket, matching the TypeScript SDK. A retry inside that window reuses the job. An explicit `idempotency_key` still wins. `remember_bulk_async` still sends no key. (#1094)
-- `get_remember_status` and `wait_for_remember_job` reject a job id outside `[A-Za-z0-9_-]+` before the request. `.`, `..`, a backslash, and encoded dot-dot used to pass a denylist and be rewritten after signing. An empty id used to call `GET /api/remember/` and raise `json.JSONDecodeError`. An unparseable 404 is `not_found` / `MemWalRememberJobNotFound`, not a JSON error. `uuid.UUID` is coerced with `str()`. Valid UUID job ids are unchanged. (WALM-833, #1100, #1216)
+- `get_remember_status` and `wait_for_remember_job` reject a job id outside `[A-Za-z0-9_-]+` before the request. `.`, `..`, a backslash, and encoded dot-dot used to pass a denylist and be rewritten after signing. An empty id used to call `GET /api/remember/` and raise `json.JSONDecodeError`. An unparseable 404 is `not_found` / `MemWalRememberJobNotFound`, not a JSON error. `uuid.UUID` is coerced with `str()`. Valid UUID job ids are unchanged. (#1100, #1216)
 - `remember`, `remember_bulk`, `analyze`, and `embed` reject whitespace-only text before the request. A blank body used to be accepted and then sit until the caller timed out. (#1129)
 - A 401 `AUTH_REJECTED` now says a wallet address is not a MemWal account ID. (#1132)
-- `wait_for_remember_jobs` / `remember_bulk_and_wait` no longer return a batch they could not read as if it were still uploading. When every status poll is rate-limited, the wait makes one confirming read and raises `MemWalRateLimited` (`status` 429, `job_ids`, `retry_after`) if that is refused too. An item still unsettled at the deadline names its last known status, or says no read got through. (WALM-671, #967)
-- A job the bulk status response omits stays pending and is asked about again. It used to drop out and settle as `timeout`. (WALM-660)
+- `wait_for_remember_jobs` / `remember_bulk_and_wait` no longer return a batch they could not read as if it were still uploading. When every status poll is rate-limited, the wait makes one confirming read and raises `MemWalRateLimited` (`status` 429, `job_ids`, `retry_after`) if that is refused too. An item still unsettled at the deadline names its last known status, or says no read got through. (#967)
+- A job the bulk status response omits stays pending and is asked about again. It used to drop out and settle as `timeout`.
 - `wait_for_remember_job` retries a transport error and stops at the caller's deadline. `Retry-After` may be a number of seconds or an HTTP date. (#1000, #1151)
-- `MemWalRememberJobTimeout` carries `last_status`, `server_error` and `last_refusal`, and its message names the relayer's last reported state. Under upload congestion a job stays `running` for up to ~25 minutes while the relayer retries, and the timeout used to hide that, so a job that was still retrying looked dead. (WALM-670, #966)
-- A `max_distance` filter keeps the relayer's matching `total` instead of replacing it with the number of rows left. (WALM-840)
+- `MemWalRememberJobTimeout` carries `last_status`, `server_error` and `last_refusal`, and its message names the relayer's last reported state. Under upload congestion a job stays `running` for up to ~25 minutes while the relayer retries, and the timeout used to hide that, so a job that was still retrying looked dead. (#966)
+- A `max_distance` filter keeps the relayer's matching `total` instead of replacing it with the number of rows left.
 - Middleware does not recall or auto-save on a tool-execution step. A later tool step reuses the cached recall. `flush()` raises when a background save failed, and `on_save_error` runs. The memory instruction is anchored at the start of the prompt. (#1107, #1117, #1159)
 - `normalize_private_key` accepts an uppercase `0X` prefix. Error text redacts IPv6, `0.0.0.0`, and `localhost` subdomains. (#1172, #1161)
-- Grow `wait_for_remember_job` / `wait_for_remember_jobs` poll delay 1.5× from the caller interval (floor 100ms) toward a 5s cap, with an immediate first poll. Backoff is disabled above the cap. (WALM-623)
-- A 429 during a remember-job wait is reported on the timeout. Retry-After is still clamped to the caller's remaining budget, and that remainder still buys one status read. (WALM-623)
+- Grow `wait_for_remember_job` / `wait_for_remember_jobs` poll delay 1.5× from the caller interval (floor 100ms) toward a 5s cap, with an immediate first poll. Backoff is disabled above the cap.
+- A 429 during a remember-job wait is reported on the timeout. Retry-After is still clamped to the caller's remaining budget, and that remainder still buys one status read.
 
 ## 0.1.11
 
