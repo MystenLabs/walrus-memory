@@ -614,6 +614,7 @@ mod mcp_rate_limit_tests {
         let db = Arc::new(VectorDb::from_pool(pool.clone()));
         let http_client = reqwest::Client::new();
         let config = Arc::new(rate_limit_test_config());
+        let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
         Arc::new(AppState {
             db: Arc::clone(&db),
             wallet_lock_pool: pool.clone(),
@@ -635,14 +636,14 @@ mod mcp_rate_limit_tests {
             delegate_verify_cache: storage::sui::new_delegate_verify_cache(),
             delegate_reject_cache: storage::sui::new_delegate_reject_cache(),
             mcp_connect_episodes: observability::new_mcp_connect_episodes(),
-            alerts: Arc::new(AlertManager::from_env(http_client.clone())),
+            alerts: Arc::clone(&alerts),
             key_pool: Arc::new(KeyPool::new(Vec::new())),
             engine: Arc::new(PlaintextEngine::new(db)),
-            embedder: Arc::new(OpenAiEmbedder::new(
-                http_client.clone(),
-                Arc::clone(&config),
-            )),
-            extractor: Arc::new(LlmExtractor::new(http_client, config)),
+            embedder: Arc::new(
+                OpenAiEmbedder::new(http_client.clone(), Arc::clone(&config))
+                    .with_alerts(Arc::clone(&alerts)),
+            ),
+            extractor: Arc::new(LlmExtractor::new(http_client, config).with_alerts(alerts)),
             ranker: Arc::new(CompositeRanker),
             redis,
             fallback_rate_limit: tokio::sync::Mutex::new(rate_limit::InMemoryFallback::default()),
@@ -1695,12 +1696,14 @@ async fn main() {
     // implementations can be swapped at startup. Both wrap the same
     // http_client + config; behaviour is identical to the inline
     // generate_embedding / extract_facts_llm they replace.
-    let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::new(
-        http_client.clone(),
-        Arc::clone(&config),
-    ));
-    let extractor: Arc<dyn Extractor> =
-        Arc::new(LlmExtractor::new(http_client.clone(), Arc::clone(&config)));
+    let embedder: Arc<dyn Embedder> = Arc::new(
+        OpenAiEmbedder::new(http_client.clone(), Arc::clone(&config))
+            .with_alerts(Arc::clone(&alerts)),
+    );
+    let extractor: Arc<dyn Extractor> = Arc::new(
+        LlmExtractor::new(http_client.clone(), Arc::clone(&config))
+            .with_alerts(Arc::clone(&alerts)),
+    );
     // CompositeRanker is stateless — one shared instance is fine.
     let ranker: Arc<dyn Ranker> = Arc::new(CompositeRanker);
 

@@ -696,7 +696,7 @@ pub async fn ask(
             "transport_error",
             started.elapsed(),
         );
-        AppError::Internal(format!("LLM request failed: {}", e))
+        AppError::UpstreamUnavailable(format!("LLM request failed: {}", e))
     })?;
     let status_label = resp.status().as_u16().to_string();
     crate::observability::observe_external(
@@ -709,16 +709,41 @@ pub async fn ask(
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::PAYMENT_REQUIRED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            state.alerts.notify_embedding_provider_auth_failed(
+                crate::alerts::EmbeddingProviderAuthAlert {
+                    sui_network: state.config.sui_network.clone(),
+                    status: status.as_u16(),
+                    api_base: state.config.openai_api_base.clone(),
+                    error: body_text.clone(),
+                },
+            );
+            return Err(AppError::UpstreamUnavailable(format!(
+                "LLM upstream error ({}): {}",
+                status, body_text
+            )));
+        }
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            return Err(AppError::UpstreamUnavailable(format!(
+                "LLM upstream error ({}): {}",
+                status, body_text
+            )));
+        }
         return Err(AppError::Internal(format!(
             "LLM error ({}): {}",
             status, body_text
         )));
     }
 
-    let api_resp: ChatCompletionResponse = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
+    let api_resp: ChatCompletionResponse = resp.json().await.map_err(|e| {
+        AppError::UpstreamUnavailable(format!("Failed to parse LLM response: {}", e))
+    })?;
 
     // `content` is `Option<String>` — `None` on upstream null-content
     // returns. For the ask path, fall back to the existing

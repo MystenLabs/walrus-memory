@@ -70,6 +70,7 @@ pub trait Embedder: Send + Sync {
 pub struct OpenAiEmbedder {
     http_client: reqwest::Client,
     config: Arc<Config>,
+    alerts: Option<Arc<crate::alerts::AlertManager>>,
 }
 
 impl OpenAiEmbedder {
@@ -77,7 +78,13 @@ impl OpenAiEmbedder {
         Self {
             http_client,
             config,
+            alerts: None,
         }
+    }
+
+    pub fn with_alerts(mut self, alerts: Arc<crate::alerts::AlertManager>) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 }
 
@@ -85,11 +92,16 @@ impl OpenAiEmbedder {
 impl Embedder for OpenAiEmbedder {
     #[tracing::instrument(name = "embedder.embed", skip_all, fields(text_len = text.len()))]
     async fn embed(&self, text: &str) -> Result<Vec<f32>, AppError> {
-        embed_text(
+        let alert_ctx = self
+            .alerts
+            .as_deref()
+            .map(|alerts| (alerts, self.config.sui_network.as_str()));
+        embed_text_with_alerts(
             &self.http_client,
             self.config.openai_api_key.as_deref(),
             &self.config.openai_api_base,
             text,
+            alert_ctx,
         )
         .await
     }
@@ -97,11 +109,22 @@ impl Embedder for OpenAiEmbedder {
 
 /// The embedding call itself, taking only what it reads from `Config` so the
 /// tests can drive it against a local stand-in provider.
+#[cfg(test)]
 async fn embed_text(
     http_client: &reqwest::Client,
     api_key: Option<&str>,
     api_base: &str,
     text: &str,
+) -> Result<Vec<f32>, AppError> {
+    embed_text_with_alerts(http_client, api_key, api_base, text, None).await
+}
+
+pub(crate) async fn embed_text_with_alerts(
+    http_client: &reqwest::Client,
+    api_key: Option<&str>,
+    api_base: &str,
+    text: &str,
+    alert_ctx: Option<(&crate::alerts::AlertManager, &str)>,
 ) -> Result<Vec<f32>, AppError> {
     match api_key {
         Some(api_key) => {
@@ -127,7 +150,7 @@ async fn embed_text(
                         "transport_error",
                         started.elapsed(),
                     );
-                    AppError::Internal(format!("Embedding API request failed: {}", e))
+                    AppError::UpstreamUnavailable(format!("Embedding API request failed: {}", e))
                 })?;
             let status_label = resp.status().as_u16().to_string();
             crate::observability::observe_external(
@@ -140,7 +163,27 @@ async fn embed_text(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                if crate::services::extractor::is_upstream_status_transient(status) {
+                if crate::services::extractor::is_upstream_provider_auth_or_quota_status(status) {
+                    if let Some((alerts, sui_network)) = alert_ctx {
+                        let _ = alerts
+                            .notify_embedding_provider_auth_failed(
+                                crate::alerts::EmbeddingProviderAuthAlert {
+                                    sui_network: sui_network.to_string(),
+                                    status: status.as_u16(),
+                                    api_base: api_base.to_string(),
+                                    error: body.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    return Err(AppError::UpstreamUnavailable(format!(
+                        "Embedding API upstream error ({}): {}",
+                        status, body
+                    )));
+                }
+                if crate::services::extractor::is_upstream_status_transient(status)
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                {
                     return Err(AppError::UpstreamUnavailable(format!(
                         "Embedding API upstream error ({}): {}",
                         status, body
@@ -175,6 +218,20 @@ async fn embed_text(
             if let Some(envelope) =
                 crate::services::extractor::parse_openrouter_error_envelope(&body)
             {
+                if matches!(envelope.code, 401 | 402 | 403) {
+                    if let Some((alerts, sui_network)) = alert_ctx {
+                        let _ = alerts
+                            .notify_embedding_provider_auth_failed(
+                                crate::alerts::EmbeddingProviderAuthAlert {
+                                    sui_network: sui_network.to_string(),
+                                    status: envelope.code as u16,
+                                    api_base: api_base.to_string(),
+                                    error: body.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                }
                 return Err(AppError::UpstreamUnavailable(format!(
                     "OpenRouter upstream error (code={}): {}",
                     envelope.code, envelope.message
@@ -182,14 +239,16 @@ async fn embed_text(
             }
 
             let api_resp: EmbeddingApiResponse = serde_json::from_str(&body).map_err(|e| {
-                AppError::Internal(format!("Failed to parse embedding response: {}", e))
+                AppError::UpstreamUnavailable(format!("Failed to parse embedding response: {}", e))
             })?;
 
             let vector = api_resp
                 .data
                 .into_iter()
                 .next()
-                .ok_or_else(|| AppError::Internal("Embedding API returned no data".into()))?
+                .ok_or_else(|| {
+                    AppError::UpstreamUnavailable("Embedding API returned no data".into())
+                })?
                 .embedding;
             Ok(vector)
         }
@@ -372,5 +431,200 @@ mod tests {
                 "{body} → {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn provider_401_unauthorized_returns_upstream_unavailable() {
+        let (base, _) =
+            stub_provider(401, r#"{"error":{"message":"User not found.","code":401}}"#).await;
+        let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
+        assert!(
+            matches!(result, Err(crate::types::AppError::UpstreamUnavailable(_))),
+            "401 must map to UpstreamUnavailable, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_402_payment_required_returns_upstream_unavailable() {
+        let (base, _) = stub_provider(
+            402,
+            r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+        )
+        .await;
+        let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
+        assert!(
+            matches!(result, Err(crate::types::AppError::UpstreamUnavailable(_))),
+            "402 must map to UpstreamUnavailable, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_403_forbidden_returns_upstream_unavailable() {
+        let (base, _) =
+            stub_provider(403, r#"{"error":{"message":"Key disabled","code":403}}"#).await;
+        let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
+        assert!(
+            matches!(result, Err(crate::types::AppError::UpstreamUnavailable(_))),
+            "403 must map to UpstreamUnavailable, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_connection_refused_and_timeout_return_upstream_unavailable() {
+        // 1. Connection refused (bind and immediately drop listener).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = super::embed_text(
+            &reqwest::Client::new(),
+            Some("key"),
+            &format!("http://{closed_addr}"),
+            "q",
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(crate::types::AppError::UpstreamUnavailable(_))),
+            "connection refused must map to UpstreamUnavailable, got {refused:?}"
+        );
+
+        // 2. Request timeout against a stalled provider.
+        let app = axum::Router::new().route(
+            "/embeddings",
+            axum::routing::post(|| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                (
+                    axum::http::StatusCode::OK,
+                    r#"{"data":[{"embedding":[0.0]}]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let short_timeout_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let timed_out = super::embed_text(
+            &short_timeout_client,
+            Some("key"),
+            &format!("http://{slow_addr}"),
+            "q",
+        )
+        .await;
+        assert!(
+            matches!(
+                timed_out,
+                Err(crate::types::AppError::UpstreamUnavailable(_))
+            ),
+            "timeout must map to UpstreamUnavailable, got {timed_out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_200_with_non_json_or_empty_data_returns_upstream_unavailable() {
+        for body in [
+            "<html><body>502 Bad Gateway</body></html>",
+            "not json",
+            r#"{"data":[]}"#,
+        ] {
+            let (base, _) = stub_provider(200, body).await;
+            let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
+            assert!(
+                matches!(result, Err(crate::types::AppError::UpstreamUnavailable(_))),
+                "200 body {body:?} must map to UpstreamUnavailable, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_401_402_403_emits_one_slack_alert_per_dedup_window() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let slack_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&slack_hits);
+        let slack_app = axum::Router::new().route(
+            "/slack",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let slack_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slack_addr = slack_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(slack_listener, slack_app).await.unwrap() });
+
+        let webhook_url = format!("http://{slack_addr}/slack");
+        let alerts = crate::alerts::AlertManager::from_webhook_value(
+            reqwest::Client::new(),
+            Some(&webhook_url),
+        );
+
+        for (status, body) in [
+            (401, r#"{"error":{"message":"User not found.","code":401}}"#),
+            (
+                402,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+            ),
+            (403, r#"{"error":{"message":"Key disabled","code":403}}"#),
+        ] {
+            let (base, _) = stub_provider(status, body).await;
+            let result = super::embed_text_with_alerts(
+                &reqwest::Client::new(),
+                Some("key"),
+                &base,
+                "q",
+                Some((&alerts, "mainnet")),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(crate::types::AppError::UpstreamUnavailable(_))),
+                "status {status} → {result:?}"
+            );
+        }
+
+        assert_eq!(
+            slack_hits.load(Ordering::SeqCst),
+            1,
+            "401/402/403 burst must emit exactly one Slack alert within the dedup window"
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_provider_401_end_to_end_returns_503_code_without_leaking_body() {
+        use axum::response::IntoResponse;
+
+        let (base, _) =
+            stub_provider(401, r#"{"error":{"message":"User not found.","code":401}}"#).await;
+        let err = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "hello")
+            .await
+            .expect_err("401 provider must fail");
+
+        let resp = err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["code"].as_str(),
+            Some(crate::types::EMBEDDING_PROVIDER_UNAVAILABLE_CODE)
+        );
+        assert!(
+            json["traceId"].as_str().is_some_and(|t| !t.is_empty()),
+            "expected non-empty traceId in 503 body: {json}"
+        );
+        assert!(
+            !text.contains("User not found"),
+            "503 response body must not leak upstream provider error message: {text}"
+        );
     }
 }

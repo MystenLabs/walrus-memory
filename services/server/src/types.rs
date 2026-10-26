@@ -2860,22 +2860,29 @@ impl axum::response::IntoResponse for AppError {
                 return (axum::http::StatusCode::GATEWAY_TIMEOUT, axum::Json(body)).into_response();
             }
             AppError::UpstreamUnavailable(msg) => {
-                // log the upstream details server-side, return
-                // 503 so the SDK / harness will retry per their
-                // transient-error policy. Body is a generic message —
-                // we don't leak internal upstream-provider names to
-                // clients.
+                // log the upstream details server-side (scrubbing raw response
+                // bodies so credentials or billing payloads are not emitted to
+                // log sinks), return 503 so the SDK / harness will retry per
+                // their transient-error policy.
                 let trace_id = crate::observability::current_request_id()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let sanitized_msg = sanitize_upstream_error_for_logging(&msg);
                 tracing::warn!(
                     request_id = %trace_id,
                     "Upstream unavailable: {}",
-                    msg,
+                    sanitized_msg,
                 );
-                (
+                let message = format!("Upstream temporarily unavailable (traceId: {})", trace_id);
+                let body = serde_json::json!({
+                    "error": message,
+                    "code": EMBEDDING_PROVIDER_UNAVAILABLE_CODE,
+                    "traceId": trace_id,
+                });
+                return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Upstream temporarily unavailable (traceId: {})", trace_id),
+                    axum::Json(body),
                 )
+                    .into_response();
             }
         };
 
@@ -2883,6 +2890,46 @@ impl axum::response::IntoResponse for AppError {
         (status, axum::Json(body)).into_response()
     }
 }
+
+/// Sanitizes upstream provider error strings for server logging telemetry.
+/// Preserves the provider prefix and HTTP status code, while stripping
+/// untrusted raw body payloads that could leak API keys, tokens, or paths.
+pub(crate) fn sanitize_upstream_error_for_logging(msg: &str) -> String {
+    if let Some(pos) = msg.find("): ") {
+        format!("{} [body scrubbed]", &msg[..=pos])
+    } else if let Some(code_pos) = msg.find("(code=") {
+        if let Some(end_paren) = msg[code_pos..].find(')') {
+            let end = code_pos + end_paren;
+            format!("{} [body scrubbed]", &msg[..=end])
+        } else {
+            "OpenRouter upstream error [body scrubbed]".to_string()
+        }
+    } else if msg.starts_with("Failed to read ") {
+        if let Some(colon_pos) = msg.find(':') {
+            format!("{} [transport error]", &msg[..colon_pos])
+        } else {
+            msg.to_string()
+        }
+    } else if msg.starts_with("Embedding API returned no data")
+        || msg.starts_with("Summarization returned empty result")
+        || msg.starts_with("Memory encryption backend is unavailable")
+        || msg.starts_with("Sponsor auth Redis unavailable")
+        || msg.starts_with("security-delete Sui RPC")
+        || msg.starts_with("Embedding API upstream error (")
+        || msg.starts_with("LLM API upstream error (")
+        || msg.starts_with("Summarization API upstream error (")
+        || msg.starts_with("Embedding request failed:")
+        || msg.starts_with("LLM request failed:")
+        || msg.starts_with("Summarization request failed:")
+        || msg.starts_with("Failed to parse ")
+    {
+        msg.to_string()
+    } else {
+        "Upstream provider temporarily unavailable [body scrubbed]".to_string()
+    }
+}
+
+pub const EMBEDDING_PROVIDER_UNAVAILABLE_CODE: &str = "EMBEDDING_PROVIDER_UNAVAILABLE";
 
 impl AppError {
     pub fn kind(&self) -> &'static str {
@@ -3627,6 +3674,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn app_error_upstream_unavailable_body_carries_code_and_trace_id_without_leaking_provider_body(
+    ) {
+        let err = AppError::UpstreamUnavailable(
+            r#"Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#.into(),
+        );
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["code"], EMBEDDING_PROVIDER_UNAVAILABLE_CODE);
+        let trace_id = json["traceId"].as_str().expect("traceId string");
+        assert!(!trace_id.is_empty());
+        let error_text = json["error"].as_str().expect("error string");
+        assert!(error_text.contains(trace_id));
+        assert!(!error_text.contains("User not found"));
+    }
+
     #[test]
     fn app_error_upstream_unavailable_kind_label() {
         let err = AppError::UpstreamUnavailable("test".into());
@@ -4262,5 +4327,35 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], WRITES_PAUSED_ERROR);
+    }
+
+    #[test]
+    fn sanitize_upstream_error_for_logging_scrubs_bodies() {
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                r#"Embedding API upstream error (401 Unauthorized): {"error":"secret"}"#
+            ),
+            "Embedding API upstream error (401 Unauthorized) [body scrubbed]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                "OpenRouter upstream error (code=504): timeout occurred"
+            ),
+            "OpenRouter upstream error (code=504) [body scrubbed]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                "Failed to read LLM response body: stream closed"
+            ),
+            "Failed to read LLM response body [transport error]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging("Embedding API upstream error (401)"),
+            "Embedding API upstream error (401)"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging("some untrusted error with secret sk-live-12345"),
+            "Upstream provider temporarily unavailable [body scrubbed]"
+        );
     }
 }
