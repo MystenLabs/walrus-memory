@@ -135,6 +135,7 @@ Public deployment parameters that the SDK reads to build a Seal SessionKey clien
 ```json
 {
   "packageId": "0x...",
+  "registryId": "0x...",
   "network": "testnet",
   "suiRpcUrl": "https://fullnode.testnet.sui.io",
   "suiGrpcUrl": "https://fullnode.testnet.sui.io",
@@ -144,6 +145,8 @@ Public deployment parameters that the SDK reads to build a Seal SessionKey clien
 ```
 
 This example shows the fields a client needs to select a transport and build a session key. A deployment can return more, so read fields by name rather than assuming the shape is exhaustive.
+
+`registryId` is the `AccountRegistry` shared object for `packageId`, the first argument to `account::create_account`.
 
 `suiGrpcUrl` is the preferred gRPC endpoint, and `suiTransport` names the transport the relayer prefers for Sui reads. Newer SDKs read both; a client might fall back to `suiRpcUrl` while a deployment migrates. `rateLimitDisabled` mirrors the server's benchmark-bypass setting so benchmark scripts can pre-flight the configuration.
 
