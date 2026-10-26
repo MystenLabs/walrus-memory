@@ -299,12 +299,19 @@ function parsePreparedRegisterTransaction(raw: unknown): PreparedRegisterTransac
  * hands `maxEpoch` back as the journal's expiry guard, so a window outliving
  * the reservation would keep replaying an entry Sui has already retired.
  *
- * The nonce is derived from the transaction kind rather than drawn at random,
- * so re-preparing the same register — same blob, same epochs, same attributes —
- * rebuilds byte-identical and the journal stays idempotent, while two different
- * registers still reserve under different nonces.
+ * The nonce is a hash of the transaction kind, not a random draw, so the
+ * first prepare of a register repeats byte-identical and a replay does not
+ * pay for a second blob. A rebuild passes the cancelled digest as `rebuild`:
+ * the same kind alone would sign that cancelled transaction again. Gas price
+ * is not an input here; within an epoch it does not change the bytes.
  */
-export function addressBalanceExpiration(epoch: bigint, transactionKind: Uint8Array) {
+export function addressBalanceExpiration(
+    epoch: bigint,
+    transactionKind: Uint8Array,
+    rebuild = "",
+) {
+    const hash = createHash("sha256").update(transactionKind);
+    if (rebuild) hash.update(rebuild);
     const bounded = String(epoch);
     return {
         ValidDuring: {
@@ -313,18 +320,21 @@ export function addressBalanceExpiration(epoch: bigint, transactionKind: Uint8Ar
             minTimestamp: null,
             maxTimestamp: null,
             chain: SUI_CHAIN_IDENTIFIER,
-            nonce: createHash("sha256").update(transactionKind).digest().readUInt32BE(0),
+            nonce: hash.digest().readUInt32BE(0),
         },
     } as const;
 }
 
-async function bindAddressBalanceExpiration(transaction: Transaction): Promise<void> {
+async function bindAddressBalanceExpiration(
+    transaction: Transaction,
+    rebuild = "",
+): Promise<void> {
     const transactionKind = await transaction.build({
         client: suiClient as any,
         onlyTransactionKind: true,
     });
     transaction.setExpiration(
-        addressBalanceExpiration(await currentSuiEpoch(), transactionKind),
+        addressBalanceExpiration(await currentSuiEpoch(), transactionKind, rebuild),
     );
 }
 
@@ -332,6 +342,7 @@ export async function prepareRegisterTransaction(
     transaction: Transaction,
     signer: Ed25519Keypair,
     allowedAddresses: string[] = [signer.toSuiAddress()],
+    rebuild = "",
 ): Promise<PreparedRegisterTransaction> {
     const signerAddress = signer.toSuiAddress();
     transaction.setSenderIfNotSet(signerAddress);
@@ -373,7 +384,7 @@ export async function prepareRegisterTransaction(
     // Fail-closed sponsorship already returned above. Remaining path is the
     // explicit phase-1 / unconfigured-Enoki direct sign.
     transaction.setGasPayment([]);
-    await bindAddressBalanceExpiration(transaction);
+    await bindAddressBalanceExpiration(transaction, rebuild);
     const bytes = await transaction.build({ client: suiClient });
     assertAddressBalanceRegisterTransaction(TransactionDataBuilder.fromBytes(bytes));
     const signed = await signer.signTransaction(bytes);
@@ -729,7 +740,9 @@ export function settleUploadStepFlight(
     flight.resolve(result);
     const code = (result.body as { code?: unknown } | null)?.code;
     if (rejectedPreparation && result.status >= 400
-        && (code === "NO_SIDE_EFFECT" || code === "INVALID_PREPARED_REGISTER_TRANSACTION")) {
+        && (code === "NO_SIDE_EFFECT"
+            || code === "INVALID_PREPARED_REGISTER_TRANSACTION"
+            || code === "CONGESTION_CANCELLED_TRANSACTION")) {
         // Rust clears the rejected transaction and asks to prepare again. A
         // cached prepare would otherwise hand it the same unusable sponsorship
         // for another minute. Evict only that exact prepared digest; completed
@@ -850,6 +863,14 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                 // so it never surfaces as a protocol-ambiguous 500.
                 let resume: WriteBlobStep | null;
                 let preparedRegisterTransaction: PreparedRegisterTransaction | null;
+                // A cancelled register names its digest here. Strip it before
+                // the Walrus SDK sees the checkpoint; it is only a nonce salt.
+                const registerRebuild = typeof rawResumeStep?.registerRebuild === "string"
+                    ? rawResumeStep.registerRebuild
+                    : "";
+                if (rawResumeStep && typeof rawResumeStep === "object") {
+                    delete rawResumeStep.registerRebuild;
+                }
                 try {
                     resume = parseResumeStep(rawResumeStep);
                     preparedRegisterTransaction = parsePreparedRegisterTransaction(rawRegisterTransaction);
@@ -1012,6 +1033,7 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                             registerTx,
                             signer,
                             allowedAddresses,
+                            registerRebuild,
                         );
                         console.log(`[walrus/upload-step-v3] [${traceId}] prepared ${JSON.stringify({
                             jobId,

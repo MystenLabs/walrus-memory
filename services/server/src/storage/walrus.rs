@@ -561,11 +561,41 @@ fn should_reset_prepared_register(
 ) -> bool {
     // NO_SIDE_EFFECT: sidecar proved the digest absent. INVALID_PREPARED:
     // this replica refused the journaled bytes before execute (mixed-version
-    // or incompatible sponsorship). Both are safe to rebuild.
+    // or incompatible sponsorship). CONGESTION_CANCELLED_TRANSACTION: the
+    // digest finalized as cancelled by shared-object congestion and can never
+    // land. All three are safe to rebuild. Only the last one gets a new
+    // nonce; the other two re-prepare byte-identical so a register that did
+    // land is still found by its digest.
     matches!(
         error_code,
-        Some("NO_SIDE_EFFECT") | Some("INVALID_PREPARED_REGISTER_TRANSACTION")
+        Some("NO_SIDE_EFFECT")
+            | Some("INVALID_PREPARED_REGISTER_TRANSACTION")
+            | Some("CONGESTION_CANCELLED_TRANSACTION")
     ) && prepared.is_some()
+}
+
+/// Drop a prepared register that must not be executed again, and name its
+/// digest on the encoded checkpoint. The sidecar mixes that digest into the
+/// direct-signed nonce, so the rebuild is not the cancelled bytes.
+fn discard_cancelled_register(journal: &mut UploadJournal) {
+    if let Some(digest) = journal
+        .register_transaction
+        .as_ref()
+        .map(|prepared| prepared.digest.clone())
+        .filter(|digest| !digest.is_empty())
+    {
+        if let Some(step) = journal
+            .resume_step
+            .as_mut()
+            .and_then(|step| step.as_object_mut())
+        {
+            step.insert(
+                "registerRebuild".to_string(),
+                serde_json::Value::String(digest),
+            );
+        }
+    }
+    journal.register_transaction = None;
 }
 
 /// An `encoded` checkpoint is a local hash of the bytes from that attempt.
@@ -670,7 +700,18 @@ pub async fn advance_durable_upload(
             // bytes. NO_SIDE_EFFECT proved the digest absent. INVALID_PREPARED
             // means this replica refused the bytes before execute (mixed-version
             // or incompatible sponsorship) and can rebuild compatible ones.
-            journal.register_transaction = None;
+            // A congestion cancel is the only code that proves the digest dead;
+            // naming it on the checkpoint makes the rebuild a new transaction.
+            // The other two re-prepare byte-identical so a register that did
+            // land is still found by its digest lookup.
+            if matches!(
+                error_code.as_deref(),
+                Some("CONGESTION_CANCELLED_TRANSACTION")
+            ) {
+                discard_cancelled_register(&mut journal);
+            } else {
+                journal.register_transaction = None;
+            }
             return Ok(DurableUploadAdvance::Reset {
                 journal,
                 reason: format!("durable Walrus upload reset ({}): {}", status, body),
@@ -1310,9 +1351,10 @@ fn aggregate_download_errors(blob_id: &str, errors: &[(String, AppError)]) -> Ap
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_download_errors, error_chain, is_valid_blob_id, register_transaction_for_resume,
-        should_drop_stale_encoded_resume, should_reset_prepared_register,
-        PreparedRegisterTransaction, QueryBlobsResponse, WalrusUploadErrorResponse,
+        aggregate_download_errors, discard_cancelled_register, error_chain, is_valid_blob_id,
+        register_transaction_for_resume, should_drop_stale_encoded_resume,
+        should_reset_prepared_register, PreparedRegisterTransaction, QueryBlobsResponse,
+        UploadJournal, WalrusUploadErrorResponse,
     };
     use crate::types::AppError;
 
@@ -1424,6 +1466,32 @@ mod tests {
             Some("DURABLE_SIDE_EFFECT_VERIFY_FAILED"),
             Some(&sponsored),
         ));
+    }
+
+    #[test]
+    fn a_cancelled_register_rebuild_names_the_discarded_digest() {
+        let mut journal = UploadJournal {
+            wallet_index: 0,
+            wallet_address: None,
+            execution_identity: None,
+            resume_step: Some(serde_json::json!({
+                "step": "encoded",
+                "blobId": "blob",
+            })),
+            register_transaction: Some(PreparedRegisterTransaction {
+                transaction_bytes: "bytes".into(),
+                signature: "signature".into(),
+                digest: "cancelled-digest".into(),
+                sponsor_digest: None,
+            }),
+        };
+        discard_cancelled_register(&mut journal);
+        assert!(journal.register_transaction.is_none());
+        assert_eq!(
+            journal.resume_step.as_ref().unwrap()["registerRebuild"],
+            "cancelled-digest"
+        );
+        assert_eq!(journal.resume_step.as_ref().unwrap()["blobId"], "blob");
     }
 
     #[test]
@@ -1640,6 +1708,7 @@ mod tests {
         for code in [
             "NO_SIDE_EFFECT",
             "INVALID_PREPARED_REGISTER_TRANSACTION",
+            "CONGESTION_CANCELLED_TRANSACTION",
             "SHARED_SERVICE_UNAVAILABLE",
             "DURABLE_SIDE_EFFECT_VERIFY_FAILED",
         ] {
@@ -1687,13 +1756,21 @@ mod tests {
             server.abort();
             if matches!(
                 code,
-                "NO_SIDE_EFFECT" | "INVALID_PREPARED_REGISTER_TRANSACTION"
+                "NO_SIDE_EFFECT"
+                    | "INVALID_PREPARED_REGISTER_TRANSACTION"
+                    | "CONGESTION_CANCELLED_TRANSACTION"
             ) {
                 let super::DurableUploadAdvance::Reset { journal, reason } = result.unwrap() else {
                     panic!("a proven reset must report its own budget event");
                 };
                 assert!(journal.register_transaction.is_none());
-                assert_eq!(journal.resume_step, Some(encoded));
+                // Only a finalized congestion cancel names the discarded
+                // digest, so only that rebuild is a different transaction.
+                let mut expected = encoded.clone();
+                if code == "CONGESTION_CANCELLED_TRANSACTION" {
+                    expected["registerRebuild"] = serde_json::json!("digest");
+                }
+                assert_eq!(journal.resume_step, Some(expected));
                 assert_eq!(journal.wallet_index, 3);
                 assert!(reason.contains(code));
                 assert!(reason.contains("Sponsored transaction not found"));
@@ -1704,6 +1781,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_congestion_reset_sends_the_cancelled_digest_on_the_rebuild_request() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/walrus/upload-step-v3",
+            axum::routing::post({
+                let seen = std::sync::Arc::clone(&seen);
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        let first = {
+                            let mut requests = seen.lock().unwrap();
+                            requests.push(request);
+                            requests.len() == 1
+                        };
+                        if first {
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(serde_json::json!({
+                                    "code": "CONGESTION_CANCELLED_TRANSACTION",
+                                    "error": "registration transaction was cancelled by shared-object congestion",
+                                })),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(serde_json::json!({ "error": "stop" })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let journal = super::UploadJournal {
+            wallet_index: 3,
+            wallet_address: Some("0xsigner".into()),
+            execution_identity: None,
+            resume_step: Some(serde_json::json!({ "step": "encoded", "blobId": "blob" })),
+            register_transaction: Some(PreparedRegisterTransaction {
+                transaction_bytes: "bytes".into(),
+                signature: "signature".into(),
+                digest: "cancelled-digest".into(),
+                sponsor_digest: None,
+            }),
+        };
+        let reset = super::advance_durable_upload(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            b"ciphertext",
+            1,
+            "0xowner",
+            "test",
+            "0xpackage",
+            "job",
+            journal,
+        )
+        .await
+        .expect("a congestion cancel is reset-safe");
+        let super::DurableUploadAdvance::Reset { journal, .. } = reset else {
+            panic!("a congestion cancel must reset the journal");
+        };
+        // The stop response ends the loop; only its request body matters here.
+        assert!(super::advance_durable_upload(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            b"ciphertext",
+            1,
+            "0xowner",
+            "test",
+            "0xpackage",
+            "job",
+            journal,
+        )
+        .await
+        .is_err());
+        server.abort();
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["registerTransaction"]["digest"], "cancelled-digest");
+        assert_eq!(requests[1]["resumeStep"]["registerRebuild"], "cancelled-digest");
+        assert_eq!(requests[1]["resumeStep"]["blobId"], "blob");
+        assert!(requests[1]["registerTransaction"].is_null());
     }
 
     #[tokio::test]
