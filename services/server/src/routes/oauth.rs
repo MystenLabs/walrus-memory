@@ -951,6 +951,15 @@ pub async fn session_complete(
             )));
         }
         DelegateVerifyOutcome::Unregistered { reason } => {
+            // A reused row is still `active`, so session_account would offer
+            // it again and burn a session on every reconnect. Retire it
+            // before failing so the next connect registers a fresh key.
+            if is_reused {
+                state
+                    .db
+                    .revoke_oauth_delegate(&delegate.delegate_ref)
+                    .await?;
+            }
             claim_oauth_session(&state, &session_id).await?;
             return Err(OAuthError::invalid_request(format!(
                 "delegate key is not registered on-chain: {reason}"

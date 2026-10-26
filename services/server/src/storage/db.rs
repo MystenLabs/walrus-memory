@@ -4195,12 +4195,10 @@ impl VectorDb {
         Ok(())
     }
 
-    /// Admin-style operation, not yet called from any route — reserved for
-    /// a future "revoke this delegate everywhere" admin action distinct
-    /// from `revoke_oauth_grant` (a delegate can in principle be shared
-    /// across grants from different clients via the reuse path in
-    /// `routes/oauth.rs::session_account`).
-    #[allow(dead_code)]
+    /// Retire a reusable delegate that can no longer authenticate, so
+    /// `session_account` stops offering it. The refresh path uses
+    /// `revoke_oauth_grant_and_delegate` instead, which retires the delegate
+    /// in the same transaction that revokes its grant.
     pub async fn revoke_oauth_delegate(&self, delegate_ref: &str) -> Result<(), AppError> {
         sqlx::query(
             "UPDATE mcp_oauth_delegates SET status = 'revoked', updated_at = NOW() WHERE delegate_ref = $1",
