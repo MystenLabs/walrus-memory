@@ -1784,6 +1784,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_congestion_reset_sends_the_cancelled_digest_on_the_rebuild_request() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/walrus/upload-step-v3",
+            axum::routing::post({
+                let seen = std::sync::Arc::clone(&seen);
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        let first = {
+                            let mut requests = seen.lock().unwrap();
+                            requests.push(request);
+                            requests.len() == 1
+                        };
+                        if first {
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(serde_json::json!({
+                                    "code": "CONGESTION_CANCELLED_TRANSACTION",
+                                    "error": "registration transaction was cancelled by shared-object congestion",
+                                })),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(serde_json::json!({ "error": "stop" })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let journal = super::UploadJournal {
+            wallet_index: 3,
+            wallet_address: Some("0xsigner".into()),
+            execution_identity: None,
+            resume_step: Some(serde_json::json!({ "step": "encoded", "blobId": "blob" })),
+            register_transaction: Some(PreparedRegisterTransaction {
+                transaction_bytes: "bytes".into(),
+                signature: "signature".into(),
+                digest: "cancelled-digest".into(),
+                sponsor_digest: None,
+            }),
+        };
+        let reset = super::advance_durable_upload(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            b"ciphertext",
+            1,
+            "0xowner",
+            "test",
+            "0xpackage",
+            "job",
+            journal,
+        )
+        .await
+        .expect("a congestion cancel is reset-safe");
+        let super::DurableUploadAdvance::Reset { journal, .. } = reset else {
+            panic!("a congestion cancel must reset the journal");
+        };
+        // The stop response ends the loop; only its request body matters here.
+        assert!(super::advance_durable_upload(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            b"ciphertext",
+            1,
+            "0xowner",
+            "test",
+            "0xpackage",
+            "job",
+            journal,
+        )
+        .await
+        .is_err());
+        server.abort();
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["registerTransaction"]["digest"], "cancelled-digest");
+        assert_eq!(requests[1]["resumeStep"]["registerRebuild"], "cancelled-digest");
+        assert_eq!(requests[1]["resumeStep"]["blobId"], "blob");
+        assert!(requests[1]["registerTransaction"].is_null());
+    }
+
+    #[tokio::test]
     async fn durable_upload_shared_outage_preserves_request_for_retry() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new().route(
