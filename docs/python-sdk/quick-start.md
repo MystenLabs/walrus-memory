@@ -71,7 +71,7 @@ pip install memwal[all]
 
 </CodeGroup>
 
-Requires Python 3.9+. Core dependencies are `httpx` and `PyNaCl` (Ed25519 signing).
+Requires a supported, patched Python 3.11+ runtime: 3.11.17, 3.12.15, 3.13.17, or 3.14.9 and newer patches in those series. Version 0.2.0 drops Python 3.9/3.10 support. The SDK requires patched `certifi` and `anyio` alongside `httpx` and `PyNaCl`. Update pip separately to 26.2.2+ in every venv; see [Security updates](/contributing/security-updates).
 
 ## Configuration
 
@@ -90,7 +90,7 @@ Before wiring the SDK into your app:
 | --- | --- | --- | --- | --- |
 | `key` | `str` | Yes | — | Ed25519 delegate private key in hex |
 | `account_id` | `str` | Yes | — | Walrus Memory account object ID on Sui |
-| `server_url` | `str` | No | `http://localhost:8000` | Explicit relayer URL — wins over `env` |
+| `server_url` | `str` | No | `https://relayer.memory.walrus.xyz` | Explicit relayer URL — wins over `env` |
 | `namespace` | `str` | No | `"default"` | Default namespace for memory isolation |
 | `env` | `str` | No | — | Hosted relayer preset: `staging` for testing or `prod` for production |
 
@@ -103,7 +103,7 @@ Instead of hardcoding a URL, pass `env`. The public docs and Colab example use `
 | `prod` | `https://relayer.memory.walrus.xyz` |
 | `staging` | `https://relayer-staging.memory.walrus.xyz` |
 
-Precedence: an explicit non-default `server_url` > `env` > the default. An unknown preset raises `ValueError`.
+Precedence: any explicit `server_url` wins, including the hosted default. `env` applies only when `server_url` is omitted (`None`). An unknown preset raises `ValueError`.
 
 ## First Memory
 

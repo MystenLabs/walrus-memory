@@ -107,6 +107,18 @@ async function main() {
         "",
     ];
 
+    const sourceVersion = JSON.parse(fs.readFileSync(path.join(process.cwd(), PACKAGE_JSON), "utf8")).version;
+    if (pin !== sourceVersion && versions.includes(sourceVersion)) {
+        annotate(
+            "error",
+            `${PACKAGE}@${sourceVersion} is published, but ${MANIFEST} still installs ${pin}. ` +
+                `Retarget mcpPackageVersion to ${sourceVersion}; the pending-release window has ended.`,
+        );
+        summary.push(`**Stale after publication.** Installs serve \`${pin}\`, but prepared release \`${sourceVersion}\` is available.`);
+        summarise(summary);
+        process.exit(1);
+    }
+
     if (!versions.includes(pin)) {
         // The release being cut is allowed to pin ahead of npm: release-mcp.yml
         // publishes packages/mcp/package.json's version from this very tree a

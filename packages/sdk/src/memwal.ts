@@ -85,6 +85,12 @@ import {
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
 import { pollingDelayMs } from "./polling-delay.js";
 import { resolveRecallCall } from "./recall-args.js";
+import {
+    MemWalRateLimitedError,
+    MemWalRememberJobFailedError,
+    MemWalRememberJobNotFoundError,
+    MemWalRememberJobTimeoutError,
+} from "./errors.js";
 
 // ============================================================
 // Ed25519 Signing (lazy-loaded)
@@ -329,9 +335,13 @@ function rememberJobTimeoutError(
           `Sending the text again under a new idempotency key stores it twice; a key you passed ` +
           `as idempotencyKey is not remembered by the client, so pass it again on any retry.`
         : `no status read got through (last poll: HTTP ${lastRefusal ?? 0}), so the job's state is unknown.`;
-    const err = new Error(`remember job timed out after ${timeoutMs}ms (job_id=${jobId})${rateLimited}; ${detail}`);
-    err.name = "MemWalRememberJobTimeout";
-    return Object.assign(err, { status: 504, jobId, lastStatus: lastSeen?.status, serverError });
+    return new MemWalRememberJobTimeoutError(
+        `remember job timed out after ${timeoutMs}ms (job_id=${jobId})${rateLimited}; ${detail}`,
+        jobId,
+        timeoutMs,
+        lastSeen?.status,
+        serverError,
+    );
 }
 
 function isTransientPollingStatus(status: number): boolean {
@@ -378,13 +388,13 @@ function bulkRateLimitedError(err: unknown, jobIds: string[]): Error {
         (err as { retryAfterSeconds?: number }).retryAfterSeconds
         ?? retryAfterSecondsFromBody((err as { cause?: unknown }).cause);
     const wait = retryAfterSeconds ? ` after ~${Math.ceil(retryAfterSeconds)}s` : "";
-    const e = new Error(
+    return new MemWalRateLimitedError(
         `Walrus Memory rate-limited every status read for this batch, so none of its ${jobIds.length} writes ` +
             `could be confirmed. Do not treat them as stored: check them with getRememberBulkStatus(jobIds)${wait}. ` +
             `Status reads count against the same delegate-key budget as writes.`,
+        jobIds,
+        retryAfterSeconds,
     );
-    e.name = "MemWalRateLimited";
-    return Object.assign(e, { status: 429, jobIds, retryAfterSeconds });
 }
 
 /**
@@ -634,10 +644,7 @@ export class MemWal {
     ): Promise<RememberResult> {
         const path = rememberStatusPath(jobId);
         if (path === undefined) {
-            throw Object.assign(new Error(`remember job not found: ${jobId}`), {
-                status: 404,
-                jobId,
-            });
+            throw new MemWalRememberJobNotFoundError(jobId);
         }
         const { pollIntervalMs = 1500, timeoutMs = 60_000 } = opts;
         const deadline = Date.now() + timeoutMs;
@@ -694,10 +701,7 @@ export class MemWal {
             }
 
             if (!("status" in status) || status.status === "not_found") {
-                throw Object.assign(new Error(`remember job not found: ${jobId}`), {
-                    status: 404,
-                    jobId,
-                });
+                throw new MemWalRememberJobNotFoundError(jobId);
             }
             lastSeen = status;
 
@@ -711,11 +715,9 @@ export class MemWal {
                 };
             }
             if (status.status === "failed") {
-                throw Object.assign(
-                    new Error(
-                        `remember job failed: ${redactInternalUrls(status.error ?? "unknown error")}`,
-                    ),
-                    { status: 500, jobId },
+                throw new MemWalRememberJobFailedError(
+                    jobId,
+                    redactInternalUrls(status.error ?? "unknown error"),
                 );
             }
 

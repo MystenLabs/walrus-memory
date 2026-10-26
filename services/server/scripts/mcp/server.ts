@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { applyAgentClientFromServer } from "./agent-client.js";
 import type { MemWalSession } from "./auth.js";
 import { registerTools } from "./tools/index.js";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "./limits.js";
 import {
     SECRET_EXCLUSION_RULES,
     AUTO_SAVE_OPT_IN_RULE,
@@ -94,7 +95,10 @@ export function createMcpServer(session: MemWalSession): McpServer {
             name: "memwal",
             version: PACKAGE_VERSION,
         },
-        { instructions: INSTRUCTIONS },
+        {
+            instructions: INSTRUCTIONS,
+            maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS,
+        },
     );
 
     registerTools(server, session);

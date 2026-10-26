@@ -5,7 +5,7 @@ package, reviewed manifest digest, imported counts, verification result, and
 approver. Keep the file with the operator record. This is not a full release
 checklist and it is not the in-cluster completion-report consumed as
 `COMPLETION_EVIDENCE_JSON`. Security RC classification and review are in
-`docs/ops/security-rc-workflow.md`.
+`internal/ops/security-rc-workflow.md`.
 
 `scripts/build-finalize-tx.ts` still requires `MANIFEST_SHA256` and a fresh
 completion-report. Ceremony GitHub Environments are checked by

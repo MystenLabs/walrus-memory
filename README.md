@@ -66,9 +66,11 @@ If you spot rough edges or missing guidance, please open an issue or send a PR.
 
 ## Run the Repo Locally
 
-From the repository root:
+Use Node.js 22.23.4 (pinned in `.nvmrc`) for repository development. With nvm, run from the repository root:
 
 ```bash
+nvm install
+nvm use
 pnpm install
 ```
 

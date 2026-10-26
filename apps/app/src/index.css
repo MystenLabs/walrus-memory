@@ -9064,8 +9064,12 @@ h1, h2, h3 {
   box-shadow: none;
 }
 
+.dash-page .dashboard-key-row--affected > td {
+  background: rgba(232, 255, 117, 0.08);
+}
+
 .dash-page .dashboard-key-cell-select {
-  width: 62px;
+  width: 112px;
 }
 
 .dash-page .dashboard-key-name {
@@ -11914,9 +11918,14 @@ h1, h2, h3 {
   }
 
   .dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-refresh,
-  .dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-add {
+  .dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-add,
+  .dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected {
     width: 100%;
     min-width: 0;
+  }
+
+  .dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected {
+    grid-column: 1 / -1;
   }
 }
 
@@ -13535,6 +13544,33 @@ h1, h2, h3 {
   -webkit-text-fill-color: #000000;
 }
 
+.dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected,
+.dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected:focus,
+.dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected:focus-visible {
+  width: auto;
+  height: 52px;
+  min-height: 52px;
+  padding: 10px 26px;
+  border: 1px solid rgba(232, 255, 117, 0.45);
+  border-radius: 26px;
+  background: transparent;
+  color: #e8ff75 !important;
+  -webkit-text-fill-color: #e8ff75;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 400;
+  letter-spacing: 0.64px;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+
+.dash-page .dashboard-keys-card .card-header-actions .dashboard-keys-remove-affected:hover:not(:disabled) {
+  border-color: #e8ff75;
+  background: #e8ff75;
+  color: #000000 !important;
+  -webkit-text-fill-color: #000000;
+}
+
 .dash-page .dashboard-key-table th.dashboard-key-table-actions {
   color: transparent;
   font-size: 0;
@@ -13583,6 +13619,31 @@ h1, h2, h3 {
   padding: 16px 12px 16px 0;
   border-bottom: 1px solid #262b30;
   font-size: 15px;
+}
+
+.dash-page .dashboard-key-table th:first-child,
+.dash-page .dashboard-key-table td.dashboard-key-cell-select {
+  width: 112px;
+  padding-left: 18px;
+}
+
+.dash-page .dashboard-key-table th:first-child {
+  padding-right: 24px;
+}
+
+.dash-page .dashboard-key-row--affected > .dashboard-key-cell-select {
+  position: relative;
+}
+
+.dash-page .dashboard-key-row--affected > .dashboard-key-cell-select::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: 2px;
+  background: #e8ff75;
 }
 
 .dash-page .dashboard-key-name {

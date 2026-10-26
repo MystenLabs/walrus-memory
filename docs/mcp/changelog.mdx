@@ -28,13 +28,30 @@ questions:
   - What changed in the MemWal MCP changelog?
   - When was the automatic memory plugin added to MemWal MCP?
 answer: >-
-  The latest published MCP package on npm `latest` is 0.0.13. This branch's in-tree plugin launcher installs `@mysten-incubation/memwal-mcp@0.0.14-dev.6` because npm has no `0.0.14` yet — pinning the unpublished version would fail to resolve. 0.0.14 (unreleased) stops cold start from advertising tools an older relayer does not serve, bounds stalled relayer calls, honours `retry_after` on 429, and returns `memwal_remember` at accept by default (`MEMWAL_MCP_REMEMBER_WAIT_MS=0`; set `90000` to wait for `blob_id`). 0.0.13 stopped reporting a timed-out write as safe to retry, answers a rejected delegate key with `memwal_login` instead of a dropped-connection story, backs off on handshake 429, and pinned plugin launchers to `@0.0.13` so npx cannot keep a cached 0.0.5.
+  The upcoming 0.0.16 security release updates the transport SDK and refuses authenticated SSE redirects and endpoints on another origin. It is not published yet. The latest MCP package on npm `latest` is 0.0.15, and the plugin launcher installs `@mysten-incubation/memwal-mcp@0.0.15`. 0.0.15 keeps a project-local credentials file inert until `memwal-mcp approve-project`, refuses a `MEMWAL_CREDS_DIR` inside the project, stores the login write-ahead record outside the repository, and closes the previous listener when `memwal_login` uses `freshKey: true`. 0.0.13 stopped reporting a timed-out write as safe to retry, answers a rejected delegate key with `memwal_login` instead of a dropped-connection story, backs off on handshake 429, and pinned plugin launchers to `@0.0.13` so npx cannot keep a cached 0.0.5.
 ---
 
-## Unreleased
+## 0.0.16
+
+Unreleased. Package and plugin manifests are bumped manually to 0.0.16. The launcher still installs the published 0.0.15 through `mcpPackageVersion` until 0.0.16 is available on npm; retarget that pin after publishing.
+
+### Security
+
+- Update `@modelcontextprotocol/sdk` to 1.32.1 for its transport security fixes.
+- Authenticated SSE GET/POST requests refuse redirects, and the server-supplied message endpoint must stay on the configured relayer origin. Custom authentication headers and tool arguments cannot be forwarded to a redirected origin. Deployments that relied on redirects must configure their final relayer URL directly.
+
+## 0.0.15
+
+### Security
+
+- A project-local `.memwal/credentials.json` no longer decides where memory goes on presence alone. That file lives inside the repository, so anyone who could commit to a repo — or get a clone opened — could silently repoint the account and relayer every memory written from that directory went to, including from a subfolder, with nothing said and no delete path once written. A project file is now inert until the user approves that exact project path, account, delegate key and relayer with `memwal-mcp approve-project`; the approval record is kept in `~/.memwal/project-approvals.json`, outside the repository, so a repository cannot carry its own approval, and any later change to the destination requires approving again. Until approved the global credentials are used — an unapproved, altered or malformed project file is a fallback, never a failure — and one stderr line names the file that was skipped, the destination it wanted, and the command that approves it. `MEMWAL_CREDS_DIR` still overrides both files without approval. `memwal_health` now reports `account=` beside `relayer=`, so the active destination is visible where the user is. (WALM-639)
+
+- `MEMWAL_CREDS_DIR` must now be an absolute path outside the current project, and a value that is not is refused with an error naming it rather than followed. The override decides the credentials before any approval is looked up, so it was a way around the gate above rather than through it: an empty value made the approval store the bare relative name `project-approvals.json`, which resolves against the working directory — a repository that committed that one file at its root approved its own credentials — and a relative value such as `.memwal` put both the credentials and the approval record inside the repository. Neither had to be typed by the user: an MCP client reads `.cursor/mcp.json`, `.vscode/mcp.json` or `.claude/settings.json` out of the checkout and passes on the `env` block it finds, and editors expand `${workspaceFolder}` there, so an absolute path inside the project is refused too. An empty value now means unset, matching every other reader of the variable. Tests and CI pointing at an absolute temp directory are unaffected. (WALM-639)
+- The login write-ahead record no longer goes into the repository. It sat beside whichever credentials file resolution chose, so once a project file was approved every sign-in wrote a plaintext 64-hex Ed25519 delegate seed to `<repo>/.memwal/login-pending.json` — in a directory an attacker who planted the credentials file had already created, so tracked rather than ignored, and staged by `git add -A`. It now lives in `~/.memwal/login-pending/`, keyed by project so a sign-in is still reclaimable only by the project that started it. The credentials file itself cannot move — it is the file the user approved — so `approve-project` and the pre-sign-in warning now state plainly that signing in from this project writes a delegate private key inside the repository, and suggest adding `.memwal/` to `.gitignore`. (WALM-639)
 
 ### Fixed
 
+- The plugin launcher installs `@mysten-incubation/memwal-mcp@0.0.15` instead of `0.0.14-dev.6`.
 - `memwal_login` with `freshKey: true` closes the listener already bound. The replaced listener cannot time out into a failure notice, and a late callback cannot save credentials or clear the new write-ahead record. The tool result names the abandoned public key and address so it can be removed from the dashboard. (WALM-645)
 
 ## 0.0.14

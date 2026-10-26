@@ -307,7 +307,7 @@ test("no plugin launch manifest resolves the server through npx", () => {
     assert.match(installer, /launch_mcp\.mjs/);
 });
 
-test("the pinned MCP version is the release this plugin is, or a prerelease of it", () => {
+test("the launcher pin is the release, its prerelease, or a previous stable release", () => {
     const manifest = JSON.parse(readFileSync(join(PLUGIN_DIR, "plugin.json"), "utf8"));
     const pin = manifest.mcpPackageVersion;
 
@@ -318,17 +318,18 @@ test("the pinned MCP version is the release this plugin is, or a prerelease of i
         `mcpPackageVersion is not a semver: ${pin}`,
     );
 
-    // The field exists so `version` can name the release being prepared while the
-    // launcher installs something npm actually carries — installing a version npm
-    // does not have fails the launch outright. That only works while the two stay
-    // tied. Bump `version` for the next release and leave `mcpPackageVersion` on a
-    // prerelease of the previous one and nothing breaks loudly: every install
-    // quietly keeps serving the older client, which is how 0.0.14-dev.0 outlived
-    // the relayer change that made its own instructions wrong. So: either the
-    // release itself, or a prerelease of it. Nothing else.
+    // A manually prepared release can retain the previous stable install until
+    // npm serves the new version. check-mcp-pin.mjs verifies publication and
+    // rejects this lag as soon as the prepared release exists on npm. An old
+    // prerelease remains forbidden because it can outlive its relayer contract.
+    const stablePin = /^\d+\.\d+\.\d+$/.test(pin);
+    const releaseParts = manifest.version.split(".").map(Number);
+    const pinParts = pin.split(".").map(Number);
+    const difference = pinParts.findIndex((part, index) => part !== releaseParts[index]);
+    const previousStable = stablePin && difference >= 0 && pinParts[difference] < releaseParts[difference];
     assert.ok(
-        pin === manifest.version || pin.startsWith(`${manifest.version}-`),
-        `mcpPackageVersion ${pin} is neither ${manifest.version} nor a prerelease of it`,
+        pin === manifest.version || pin.startsWith(`${manifest.version}-`) || previousStable,
+        `mcpPackageVersion ${pin} must be ${manifest.version}, its prerelease, or a previous stable release`,
     );
 
     assert.equal(

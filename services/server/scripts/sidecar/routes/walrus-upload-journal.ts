@@ -687,9 +687,12 @@ type UploadStepFlight = {
     promise: Promise<UploadStepFlightResult>;
     resolve: (result: UploadStepFlightResult) => void;
     settled: boolean;
+    result?: UploadStepFlightResult;
 };
 
 const uploadStepFlights = new Map<string, UploadStepFlight>();
+
+type RejectedRegisterPreparation = { key: string; digest: string; sponsorDigest?: string };
 
 /** Same job and same checkpoint share one sidecar step. A dropped client retries this key instead of starting a second upload. */
 export function uploadStepFlightKey(
@@ -697,8 +700,9 @@ export function uploadStepFlightKey(
     resumeStep: string | undefined,
     blobId: string | undefined,
     preparedDigest: string | undefined,
+    sponsorDigest?: string,
 ): string {
-    return [jobId, resumeStep ?? "start", blobId ?? "", preparedDigest ?? ""].join("|");
+    return [jobId, resumeStep ?? "start", blobId ?? "", preparedDigest ?? "", sponsorDigest ?? ""].join("|");
 }
 
 export function beginOrJoinUploadStepFlight(key: string): { leader: boolean; flight: UploadStepFlight } {
@@ -717,10 +721,28 @@ export function settleUploadStepFlight(
     key: string,
     flight: UploadStepFlight,
     result: UploadStepFlightResult,
+    rejectedPreparation?: RejectedRegisterPreparation,
 ): void {
     if (flight.settled) return;
     flight.settled = true;
+    flight.result = result;
     flight.resolve(result);
+    const code = (result.body as { code?: unknown } | null)?.code;
+    if (rejectedPreparation && result.status >= 400
+        && (code === "NO_SIDE_EFFECT" || code === "INVALID_PREPARED_REGISTER_TRANSACTION")) {
+        // Rust clears the rejected transaction and asks to prepare again. A
+        // cached prepare would otherwise hand it the same unusable sponsorship
+        // for another minute. Evict only that exact prepared digest; completed
+        // side effects and ambiguous submissions must remain replayable.
+        const prepared = uploadStepFlights.get(rejectedPreparation.key);
+        const preparedBody = prepared?.result?.body as { registerTransaction?: { digest?: string; sponsorDigest?: string } } | undefined;
+        if (preparedBody?.registerTransaction?.digest === rejectedPreparation.digest
+            && preparedBody.registerTransaction.sponsorDigest === rejectedPreparation.sponsorDigest) {
+            uploadStepFlights.delete(rejectedPreparation.key);
+        }
+        if (uploadStepFlights.get(key) === flight) uploadStepFlights.delete(key);
+        return;
+    }
     // Keep a success long enough for the relayer to reconnect and persist it.
     // Drop an error quickly so the same journal can try the step again.
     const ttl = result.status >= 400 ? 2_000 : UPLOAD_STEP_FLIGHT_TTL_MS;
@@ -756,9 +778,10 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
             let encodeMs: number | undefined;
             let flightKey: string | undefined;
             let flight: UploadStepFlight | undefined;
+            let rejectedPreparation: RejectedRegisterPreparation | undefined;
             const settleFlight = (status: number, body: unknown) => {
                 if (!flightKey || !flight) return;
-                settleUploadStepFlight(flightKey, flight, { status, body });
+                settleUploadStepFlight(flightKey, flight, { status, body }, rejectedPreparation);
             };
             const deliver = (body: unknown, keep: boolean) => {
                 settleFlight(200, body);
@@ -891,7 +914,15 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     resume?.step,
                     resume && "blobId" in resume ? resume.blobId : undefined,
                     preparedRegisterTransaction?.digest,
+                    preparedRegisterTransaction?.sponsorDigest,
                 );
+                if (preparedRegisterTransaction && resume?.step === "encoded") {
+                    rejectedPreparation = {
+                        key: uploadStepFlightKey(jobId, "encoded", resume.blobId, undefined),
+                        digest: preparedRegisterTransaction.digest,
+                        sponsorDigest: preparedRegisterTransaction.sponsorDigest,
+                    };
+                }
                 const joined = beginOrJoinUploadStepFlight(flightKey);
                 if (!joined.leader) {
                     const outcome = await joined.flight.promise;

@@ -1,0 +1,23 @@
+name: Setup Python
+description: Supported Python runtime and a checksum-pinned pip trust-store bootstrap
+
+inputs:
+  python-version:
+    description: Patched Python version
+    required: false
+    default: "3.13.17"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Bootstrap patched pip and certificates
+      shell: bash
+      run: |
+        python "$GITHUB_ACTION_PATH/../../../scripts/bootstrap-python-security.py"
+        python --version
+        python -m pip --version

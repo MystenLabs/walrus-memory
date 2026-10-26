@@ -3,6 +3,7 @@ import NextAuth, { CredentialsSignin, type DefaultSession } from "next-auth";
 import type { DefaultJWT } from "next-auth/jwt";
 import Credentials from "next-auth/providers/credentials";
 import { headers } from "next/headers";
+import { getAuthSecret } from "@/lib/auth-secret";
 import { DUMMY_PASSWORD } from "@/lib/constants";
 import { createGuestUser, getUser } from "@/lib/db/queries";
 import { checkGuestAuthRateLimit, GuestAuthRateLimitError, guestAuthSignInCode } from "@/lib/ratelimit";
@@ -39,6 +40,7 @@ export const {
   signOut,
 } = NextAuth({
   ...authConfig,
+  secret: getAuthSecret(),
   providers: [
     Credentials({
       credentials: {},

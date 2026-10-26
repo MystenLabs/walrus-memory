@@ -25,6 +25,7 @@ import type {
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
 import { resolveRecallCall } from "./recall-args.js";
 import { derivedBulkIdempotencyKey } from "./utils.js";
+import { MemWalRememberJobNotFoundError } from "./errors.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
 const MAX_BULK_ITEMS = 20;
@@ -269,7 +270,7 @@ export class MemWalMock {
         _opts: { pollIntervalMs?: number; timeoutMs?: number } = {}
     ): Promise<RememberResult> {
         const memory = this.jobs.get(jobId);
-        if (!memory) throw new Error(`Remember job not found: ${jobId}`);
+        if (!memory) throw new MemWalRememberJobNotFoundError(jobId);
         return this.toRememberResult(memory);
     }
 

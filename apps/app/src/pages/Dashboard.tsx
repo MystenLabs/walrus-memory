@@ -125,6 +125,19 @@ function DelegateKeySkeletonList() {
     )
 }
 
+type IncidentStatus = {
+    account_id: string | null
+    affected: boolean
+    quarantined: boolean
+    active: boolean
+    /** Hex delegate public keys to highlight. No `0x` prefix. */
+    affected_public_keys?: string[]
+}
+
+function normalizeKeyHex(hex: string): string {
+    return hex.replace(/^0x/i, '').toLowerCase()
+}
+
 // ============================================================
 // Dashboard Component
 // ============================================================
@@ -224,6 +237,9 @@ export default function Dashboard({
     const [importingExistingKey, setImportingExistingKey] = useState(false)
     const [newPrivateKey, setNewPrivateKey] = useState<string | null>(null)
     const addKeyFormCloseTimerRef = useRef<number | null>(null)
+    const [incident, setIncident] = useState<IncidentStatus | null>(null)
+    const [incidentAction, setIncidentAction] = useState<'reactivate' | null>(null)
+    const [incidentError, setIncidentError] = useState('')
     const [accountReadyDismissed, setAccountReadyDismissed] = useState(false)
     // One-shot signal from SetupWizard's navigate() state — set only when the
     // /setup visit carried Console's "Set up" (COMG-1081) `from` marker.
@@ -264,6 +280,53 @@ export default function Dashboard({
                 signPersonalMsg({ message }),
         }
     }, [currentAccount, signAndExecuteTx, signPersonalMsg])
+
+    const reloadIncident = useCallback(async (owner: string) => {
+        const base = config.memwalServerUrl.replace(/\/+$/, '')
+        const response = await fetch(`${base}/api/accounts/${owner.toLowerCase()}/incident`)
+        if (!response.ok) throw new Error(`incident status ${response.status}`)
+        const body = await response.json() as IncidentStatus
+        setIncident(body)
+    }, [])
+
+    useEffect(() => {
+        if (!address || previewMode) {
+            setIncident(null)
+            return
+        }
+        let cancelled = false
+        reloadIncident(address)
+            .catch((err: unknown) => {
+                if (!cancelled) {
+                    console.error('Failed to load incident status:', err)
+                    setIncident(null)
+                }
+            })
+        return () => { cancelled = true }
+    }, [address, previewMode, reloadIncident])
+
+    const reactivateAccount = useCallback(async () => {
+        if (!incident?.account_id) return
+        setIncidentAction('reactivate')
+        setIncidentError('')
+        try {
+            const tx = new Transaction()
+            tx.moveCall({
+                target: `${config.memwalPackageId}::account::reactivate_account`,
+                arguments: [
+                    tx.object(incident.account_id),
+                    tx.object(config.memwalRegistryId),
+                ],
+            })
+            const result = await signAndExecuteTx({ transaction: tx })
+            await suiClient.waitForTransaction({ digest: result.digest })
+            await reloadIncident(address)
+        } catch (err: unknown) {
+            setIncidentError(err instanceof Error ? err.message : 'failed to reactivate account')
+        } finally {
+            setIncidentAction(null)
+        }
+    }, [address, incident?.account_id, signAndExecuteTx, suiClient, reloadIncident])
 
     const copyToClipboard = useCallback(async (text: string, label: string) => {
         if (!(await copyText(text, label))) return
@@ -385,6 +448,18 @@ export default function Dashboard({
     const browserHasNoKey = !delegateKey && hasResolvedAccount && !previewReady
     const showNoBrowserKeyNotice = browserHasNoKey && !isKeyListLoading
     const selectableKeyPublicKeys = useMemo(() => onChainKeys.map((key) => key.publicKey), [onChainKeys])
+    const affectedKeySet = useMemo(() => {
+        const keys = incident?.affected_public_keys ?? []
+        return new Set(keys.map(normalizeKeyHex).filter(Boolean))
+    }, [incident])
+    const affectedOnChainKeys = useMemo(
+        () => onChainKeys.filter((key) => affectedKeySet.has(normalizeKeyHex(key.publicKey))),
+        [onChainKeys, affectedKeySet],
+    )
+    const incidentOpen = Boolean(incident?.affected && (incident.quarantined || !incident.active))
+    const highlightedKeysRemain = affectedOnChainKeys.length > 0 || (isKeyListLoading && affectedKeySet.size > 0)
+    const showLockedCleanup = incidentOpen && highlightedKeysRemain
+    const visibleKeys = showLockedCleanup && affectedOnChainKeys.length > 0 ? affectedOnChainKeys : onChainKeys
     const selectedKeySet = useMemo(() => new Set(selectedKeyPublicKeys), [selectedKeyPublicKeys])
     const selectedKeyCount = selectedKeyPublicKeys.length
     const keyRemovalBusy = removingSelectedKeys || Boolean(removingKey)
@@ -792,6 +867,7 @@ export default function Dashboard({
                     : prev.filter((key) => key !== publicKeyHexes[0])
             )
             await fetchOnChainKeys()
+            if (address) await reloadIncident(address).catch(() => undefined)
             trackEvent('delegate_key_remove_complete', removeEventPayload)
             // Direct reset, not an effect keyed on justRemovedKeys — the flag
             // can already be true from an earlier dismissed dialog, in which
@@ -823,6 +899,8 @@ export default function Dashboard({
         delegatePublicKey,
         clearDelegateKeys,
         fetchOnChainKeys,
+        address,
+        reloadIncident,
     ])
 
     const handleRemoveKey = useCallback((publicKeyHex: string) => {
@@ -858,6 +936,14 @@ export default function Dashboard({
         selectedKeyPublicKeys,
         selectableKeyPublicKeys,
     ])
+
+    const handleRemoveAffectedKeys = useCallback(() => {
+        if (!walletSigner || !effectiveAccountObjectId || affectedOnChainKeys.length === 0) return
+        setRemoveKeysConfirm({
+            publicKeys: affectedOnChainKeys.map((key) => key.publicKey),
+            source: 'selection',
+        })
+    }, [walletSigner, effectiveAccountObjectId, affectedOnChainKeys])
 
     const confirmRemoveKeys = useCallback(async () => {
         if (!removeKeysConfirm) return
@@ -978,6 +1064,36 @@ asyncio.run(main())`
                     onSdkKindChange={(kind) => setQuickstartLanguage(kind === 'python' ? 'py' : 'ts')}
                     sdkSnippet={sdkSnippet}
                 />
+
+                {incidentOpen && (
+                    <div className="dash-alert dash-alert--info" role="status">
+                        <TriangleAlert className="dash-alert-icon" size={24} strokeWidth={2.3} aria-hidden="true" />
+                        {showLockedCleanup ? (
+                            <p>
+                                Your account has been temporarily locked following a security disclosure by Railway, our third-party hosting provider. To restore your account, delete the highlighted delegate keys below.
+                                {incidentError ? ` ${incidentError}` : null}
+                            </p>
+                        ) : (
+                            <p>
+                                Your account is ready to restore.{' '}
+                                {incident?.account_id ? (
+                                    <button
+                                        type="button"
+                                        className="dash-alert-link"
+                                        onClick={reactivateAccount}
+                                        disabled={incidentAction !== null}
+                                    >
+                                        {incidentAction === 'reactivate' ? 'Reactivating the account' : 'Reactivate the account'}
+                                    </button>
+                                ) : (
+                                    'Reactivate the account'
+                                )}
+                                .
+                                {incidentError ? ` ${incidentError}` : null}
+                            </p>
+                        )}
+                    </div>
+                )}
 
                 {showNoBrowserKeyNotice && (
                     <div className="dash-alert dash-alert--info">
@@ -1259,6 +1375,16 @@ asyncio.run(main())`
                     subtitle="Create and manage keys for apps and clients that access your Walrus Memory account."
                     action={
                         <div className="card-header-actions">
+                            {showLockedCleanup && affectedOnChainKeys.length > 0 && (
+                                <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm dashboard-keys-remove-affected"
+                                    onClick={handleRemoveAffectedKeys}
+                                    disabled={keyRemovalBusy || keyActionBlockedByUncopiedKey || !effectiveAccountObjectId}
+                                >
+                                    Remove highlighted keys
+                                </button>
+                            )}
                             <button
                                 className="btn btn-secondary btn-sm dashboard-keys-refresh"
                                 onClick={fetchOnChainKeys}
@@ -1443,22 +1569,25 @@ asyncio.run(main())`
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {onChainKeys.map((k) => {
+                                    {visibleKeys.map((k) => {
                                         const isCurrentKey = k.publicKey === delegatePublicKey
                                         const isRemoving = removingKey === k.publicKey
                                         const isSelected = selectedKeySet.has(k.publicKey)
+                                        const isAffected = affectedKeySet.has(normalizeKeyHex(k.publicKey))
                                         const copyPublicKeyLabel = `pk-${k.publicKey.slice(0,8)}`
                                         return (
                                             <tr
                                                 key={k.publicKey}
-                                                className={`dashboard-key-row${isSelected ? ' dashboard-key-row--selected' : ''}`}
+                                                className={`dashboard-key-row${isSelected ? ' dashboard-key-row--selected' : ''}${isAffected ? ' dashboard-key-row--affected' : ''}`}
                                             >
                                                 <td data-label="Select" className="dashboard-key-cell-select">
                                                     <label className="dashboard-key-checkbox" aria-label={`Select ${k.label || 'delegate key'}`}>
                                                         <input
                                                             type="checkbox"
-                                                            checked={isSelected}
-                                                            onChange={() => toggleKeySelection(k.publicKey)}
+                                                            checked={isAffected || isSelected}
+                                                            onChange={() => {
+                                                                if (!isAffected) toggleKeySelection(k.publicKey)
+                                                            }}
                                                             disabled={keyRemovalBusy}
                                                         />
                                                         <span className="dashboard-key-checkbox-box" aria-hidden="true" />

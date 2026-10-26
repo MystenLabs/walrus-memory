@@ -4,6 +4,10 @@ Walrus Memory SDK for storing encrypted AI memories on Walrus and retrieving the
 
 > Walrus Memory is currently in beta and actively evolving. While fully usable today, we continue to refine the developer experience and operational guidance. We welcome feedback from early builders as we continue to improve the product.
 
+## Node.js runtime
+
+Use a supported, security-patched Node.js runtime: **22.23.4+ within 22.x**, **24.22.1+ within 24.x**, or **26.12.1+ within 26.x**. The package `engines` field describes API compatibility, not the minimum security patch. See the [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases).
+
 ## Documentation
 
 For full documentation, visit [memory.walrus.xyz](https://memory.walrus.xyz).

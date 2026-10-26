@@ -32,7 +32,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24.22.1"
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
@@ -104,41 +104,9 @@ jobs:
       # ── staging branch → release candidate (rc tag, auto-increment) ──
       - name: Publish staging release candidate
         if: github.ref == 'refs/heads/staging'
-        run: |
-          BASE_VERSION=$(node -p "require('./packages/sdk/package.json').version")
-          LATEST=$(npm view @mysten-incubation/memwal versions --json 2>/dev/null \
-            | node -p "
-                const versions = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
-                const nums = (Array.isArray(versions) ? versions : [versions])
-                  .filter(v => v.startsWith('${BASE_VERSION}-rc.'))
-                  .map(v => +v.split('-rc.')[1])
-                  .sort((a,b) => b - a);
-                nums.length ? nums[0] : -1;
-              " || echo "-1")
-          NEXT=$((LATEST + 1))
-          NEW_VERSION="${BASE_VERSION}-rc.${NEXT}"
-          echo "Publishing @mysten-incubation/memwal@${NEW_VERSION}"
-          cd packages/sdk
-          node -e "const p=require('./package.json');p.version='${NEW_VERSION}';require('fs').writeFileSync('./package.json',JSON.stringify(p,null,4)+'\n')"
-          pnpm publish --tag rc --provenance --access public --no-git-checks
+        run: .github/scripts/publish-prerelease.sh packages/sdk @mysten-incubation/memwal rc
 
       # ── dev branch → prerelease (dev tag, auto-increment) ──
       - name: Publish dev prerelease
         if: github.ref == 'refs/heads/dev'
-        run: |
-          BASE_VERSION=$(node -p "require('./packages/sdk/package.json').version")
-          LATEST=$(npm view @mysten-incubation/memwal versions --json 2>/dev/null \
-            | node -p "
-                const versions = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
-                const nums = (Array.isArray(versions) ? versions : [versions])
-                  .filter(v => v.startsWith('${BASE_VERSION}-dev.'))
-                  .map(v => +v.split('-dev.')[1])
-                  .sort((a,b) => b - a);
-                nums.length ? nums[0] : -1;
-              " || echo "-1")
-          NEXT=$((LATEST + 1))
-          NEW_VERSION="${BASE_VERSION}-dev.${NEXT}"
-          echo "Publishing @mysten-incubation/memwal@${NEW_VERSION}"
-          cd packages/sdk
-          node -e "const p=require('./package.json');p.version='${NEW_VERSION}';require('fs').writeFileSync('./package.json',JSON.stringify(p,null,4)+'\n')"
-          pnpm publish --tag dev --provenance --access public --no-git-checks
+        run: .github/scripts/publish-prerelease.sh packages/sdk @mysten-incubation/memwal dev

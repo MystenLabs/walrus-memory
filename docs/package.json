@@ -6,7 +6,7 @@
     "dev": "mintlify dev"
   },
   "devDependencies": {
-    "mintlify": "^4"
+    "mintlify": "^4.2.1105"
   },
   "engines": {
     "node": ">=20.0"

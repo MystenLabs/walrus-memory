@@ -46,7 +46,7 @@ See also:
 MemWal.create(
     key: str,
     account_id: str,
-    server_url: str = "http://localhost:8000",
+    server_url: str = "https://relayer.memory.walrus.xyz",
     namespace: str = "default",
     env: str | None = None,
 ) -> MemWal
@@ -58,7 +58,7 @@ MemWal.create(
 | --- | --- | --- | --- | --- |
 | `key` | `str` | Yes | — | Ed25519 delegate private key in hex |
 | `account_id` | `str` | Yes | — | Walrus Memory account object ID on Sui |
-| `server_url` | `str` | No | `http://localhost:8000` | Explicit relayer URL — wins over `env` |
+| `server_url` | `str` | No | `https://relayer.memory.walrus.xyz` | Explicit relayer URL — wins over `env` |
 | `namespace` | `str` | No | `"default"` | Default namespace for memory isolation |
 | `env` | `str` | No | — | Hosted preset: `staging` for testing or `prod` for production. Unknown → `ValueError` |
 
@@ -194,7 +194,7 @@ Rebuild missing indexed entries for one namespace from Walrus. Incremental.
 RestoreResult(restored: int, skipped: int, total: int, namespace: str, owner: str, truncated: bool = False, failed: int = 0)
 ```
 
-`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob (WALM-451 `sourceCapped`).
+`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob (a `sourceCapped` field is planned as a follow-up).
 
 ### `list_namespaces(cursor=None, limit=None) -> NamespacesResult`
 

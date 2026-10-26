@@ -183,7 +183,7 @@ const COOKIE_HEADER =
  * `ACCESS_KEY` that does precede the `=`.
  */
 const CREDENTIAL_ASSIGNMENT =
-    /(?:\b|(?<=[a-z0-9_-]))(passwords?|passwd|pwd|passphrases?|api[_-]?keys?|apikeys?|secret[_-]?keys?|access[_-]?keys?|client[_-]?secrets?|secrets?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|bearer[_-]?tokens?|tokens?|private[_-]?keys?|credentials?)(["'`]?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|`[^`\n]*`|[^\s,;]+)/gi;
+    /(?:\b|(?<=[a-z0-9_-]))(passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-]?keys?|apikeys?|secret[_-]?keys?|access[_-]?keys?|encryption[_-]?keys?|enc[_-]?keys?|client[_-]?secrets?|secrets?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|bearer[_-]?tokens?|tokens?|priv(?:ate)?[_-]?keys?|credentials?)(["'`]?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|`[^`\n]*`|[^\s,;]+)/gi;
 
 /**
  * Vendor-prefixed keys. Each prefix is issued by exactly one service and never
@@ -264,7 +264,7 @@ const HEX_LABEL_WINDOW = 48;
  * next to a commit SHA would lose the SHA.
  */
 const HEX_CREDENTIAL_LABEL =
-    /private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*key|delegate[\s_-]*private|signing[\s_-]*key|priv[\s_-]*key|api[\s_-]*key|access[\s_-]*key|auth[\s_-]*key|secret|seed|mnemonic|passphrase/i;
+    /private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*key|delegate[\s_-]*private|signing[\s_-]*key|priv[\s_-]*key|encryption[\s_-]*keys?(?![A-Za-z0-9])|enc[\s_-]*keys?(?![A-Za-z0-9])|api[\s_-]*key|access[\s_-]*key|auth[\s_-]*key|db[\s_-]*pass(?:word)?s?(?![A-Za-z0-9])|secret|seed|mnemonic|passphrase/i;
 
 /**
  * The same, for a label that FOLLOWS the value ("4f3c... is my private key").
@@ -273,7 +273,7 @@ const HEX_CREDENTIAL_LABEL =
  * in whatever sentence happens to come next.
  */
 const HEX_LABEL_AFTER =
-    /^[^A-Za-z0-9]{0,4}(?:is|was)?[^A-Za-z0-9]{0,4}(?:my|the|our|his|her|their)?[^A-Za-z0-9]{0,4}(?:delegate[\s_-]*)?(?:private[\s_-]*key|secret[\s_-]*key|seed|mnemonic|passphrase|api[\s_-]*key)/i;
+    /^[^A-Za-z0-9]{0,4}(?:is|was)?[^A-Za-z0-9]{0,4}(?:my|the|our|his|her|their)?[^A-Za-z0-9]{0,4}(?:delegate[\s_-]*)?(?:private[\s_-]*key|secret[\s_-]*key|priv[\s_-]*key|encryption[\s_-]*keys?(?![A-Za-z0-9])|enc[\s_-]*keys?(?![A-Za-z0-9])|seed|mnemonic|passphrase|api[\s_-]*key|db[\s_-]*pass(?:word)?s?(?![A-Za-z0-9]))/i;
 
 /** Placeholders this module writes, for stripping out of a context window. */
 const PLACEHOLDER_RUN = /\[redacted:[a-z-]+\]/g;

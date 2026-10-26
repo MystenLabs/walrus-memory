@@ -121,7 +121,7 @@ Both wrappers accept the same keyword arguments:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `server_url` | `http://localhost:8000` | Explicit relayer URL (wins over `env`) |
+| `server_url` | `https://relayer.memory.walrus.xyz` | Explicit relayer URL (wins over `env`) |
 | `env` | — | Hosted relayer preset: `staging` for testing or `prod` for production |
 | `namespace` | `"default"` | Memory namespace |
 | `max_memories` | `5` | Max memories injected per request |

@@ -440,7 +440,7 @@ class MemWal:
         cls,
         key: str,
         account_id: str,
-        server_url: str = "http://localhost:8000",
+        server_url: Optional[str] = None,
         namespace: str = "default",
         env: Optional[str] = None,
     ) -> "MemWal":
@@ -449,11 +449,11 @@ class MemWal:
         Args:
             key: Ed25519 private key hex string (the delegate key).
             account_id: Walrus Memory account object ID on Sui.
-            server_url: Server URL (default: ``http://localhost:8000``).
+            server_url: Server URL (default: ``https://relayer.memory.walrus.xyz``).
             namespace: Default namespace for memory isolation (default: ``"default"``).
             env: Optional relayer preset — ``"prod"``, ``"dev"``, ``"staging"``,
                 or ``"local"``. Resolves ``server_url`` to the matching hosted
-                relayer unless an explicit non-default ``server_url`` is given.
+                relayer unless an explicit ``server_url`` is given.
                 Precedence: explicit ``server_url`` > ``env`` > default.
 
         Returns:
@@ -1037,19 +1037,28 @@ class MemWal:
         Returns:
             :class:`RecallResult` with decrypted text results.
         """
+        scoring_weights = None
+        sort = None
         if isinstance(query, RecallParams):
             params = query
             query_text = params.query
             limit = params.limit
             namespace = params.namespace
             max_distance = params.max_distance
+            scoring_weights = params.scoring_weights
+            sort = params.sort
         else:
             query_text = query
-        data = await self._signed_request("POST", "/api/recall", {
+        body = {
             "query": query_text,
             "limit": limit,
             "namespace": namespace or self._namespace,
-        })
+        }
+        if scoring_weights is not None:
+            body["scoring_weights"] = scoring_weights.to_wire()
+        if sort is not None:
+            body["sort"] = sort
+        data = await self._signed_request("POST", "/api/recall", body)
         memories = [
             RecallMemory(
                 blob_id=m["blob_id"],
@@ -1999,7 +2008,7 @@ class MemWalSync:
         cls,
         key: str,
         account_id: str,
-        server_url: str = "http://localhost:8000",
+        server_url: Optional[str] = None,
         namespace: str = "default",
         env: Optional[str] = None,
     ) -> "MemWalSync":

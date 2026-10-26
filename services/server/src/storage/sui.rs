@@ -773,6 +773,176 @@ pub fn parse_delegate_keys(
     Ok(out)
 }
 
+/// A delegate key as stored on `MemWalAccount`, including the public key
+/// `DelegateKeyInfo` leaves out. Hex is 64 lowercase chars, no `0x`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnchainDelegateKeyPublic {
+    pub public_key_hex: String,
+    pub sui_address: String,
+    pub label: String,
+    pub created_at: u64,
+}
+
+/// Account object read straight from RPC for the revocation notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAccountOnchain {
+    pub account_id: String,
+    pub active: bool,
+    pub admin_quarantined: bool,
+    pub keys: Vec<OnchainDelegateKeyPublic>,
+}
+
+/// `0xf0` is `HashingIntentScope::ChildObjectId`. The rest matches
+/// `sui_types::dynamic_field::derive_dynamic_field_id` for an `address` key:
+/// blake2b-256 of `0xf0 || parent || len(key) || key || TypeTag::Address`.
+pub fn derive_address_dynamic_field_id(parent: &Address, key: &Address) -> Address {
+    let mut hasher = sui_sdk_types::hash::Hasher::new();
+    hasher.update([0xf0]);
+    hasher.update(parent.as_bytes());
+    hasher.update(32u64.to_le_bytes());
+    hasher.update(key.as_bytes());
+    hasher.update([0x04]);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    Address::new(bytes)
+}
+
+fn address_hex(address: &Address) -> String {
+    format!("0x{}", hex::encode(address.inner()))
+}
+
+fn normalize_object_id(value: &str) -> Option<String> {
+    let bare = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if bare.len() != 64 || !bare.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("0x{}", bare.to_ascii_lowercase()))
+}
+
+fn json_object_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => normalize_object_id(text),
+        serde_json::Value::Array(items) if items.len() == 32 => {
+            let bytes: Option<Vec<u8>> = items
+                .iter()
+                .map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect();
+            bytes.map(|bytes| format!("0x{}", hex::encode(bytes)))
+        }
+        serde_json::Value::Object(map) => map
+            .get("id")
+            .and_then(json_object_id)
+            .or_else(|| map.get("bytes").and_then(json_object_id)),
+        _ => None,
+    }
+}
+
+fn json_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for key in path {
+        current = current.as_object()?.get(*key)?;
+    }
+    Some(current)
+}
+
+/// Table UID inside `AccountRegistry.accounts`. Accepts the flat gRPC json
+/// shape and the JSON-RPC `{fields: ...}` wrapper.
+pub fn registry_table_id(fields: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let accounts = serde_json::Value::Object(fields.clone());
+    let accounts = accounts.get("accounts")?;
+    json_at(accounts, &["id"])
+        .and_then(json_object_id)
+        .or_else(|| json_at(accounts, &["fields", "id"]).and_then(json_object_id))
+}
+
+/// `value` of a `dynamic_field::Field<address, ID>`.
+pub fn dynamic_field_account_id(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let root = serde_json::Value::Object(fields.clone());
+    root.get("value")
+        .and_then(json_object_id)
+        .or_else(|| json_at(&root, &["fields", "value"]).and_then(json_object_id))
+}
+
+fn public_key_hex(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => {
+            let bytes: Option<Vec<u8>> = items
+                .iter()
+                .map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect();
+            let bytes = bytes?;
+            (bytes.len() == 32).then(|| hex::encode(bytes))
+        }
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if let Some(id) = normalize_object_id(trimmed) {
+                return Some(id.trim_start_matches("0x").to_string());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(trimmed)
+                .ok()?;
+            (bytes.len() == 32).then(|| hex::encode(bytes))
+        }
+        _ => None,
+    }
+}
+
+fn created_at_u64(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// `active`, `admin_quarantined`, and delegate keys from one account object.
+/// A missing quarantine flag means the object is not quarantined. `active`
+/// is required.
+pub fn parse_owner_account_fields(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(bool, bool, Vec<OnchainDelegateKeyPublic>), OnchainVerifyError> {
+    let active = json_account_active(fields)?;
+    let admin_quarantined = fields
+        .get("admin_quarantined")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let delegate_keys = fields
+        .get("delegate_keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing 'delegate_keys' field".into()))?;
+    let mut keys = Vec::with_capacity(delegate_keys.len());
+    for entry in delegate_keys {
+        let node = entry.get("fields").unwrap_or(entry);
+        let public_key_hex = node
+            .get("public_key")
+            .and_then(public_key_hex)
+            .ok_or_else(|| OnchainVerifyError::RpcError("delegate key missing public_key".into()))?;
+        let sui_address = node
+            .get("sui_address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OnchainVerifyError::RpcError("delegate key missing sui_address".into()))?
+            .to_ascii_lowercase();
+        let label = node
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let created_at = node
+            .get("created_at")
+            .map(created_at_u64)
+            .unwrap_or(0);
+        keys.push(OnchainDelegateKeyPublic {
+            public_key_hex,
+            sui_address,
+            label,
+            created_at,
+        });
+    }
+    Ok((active, admin_quarantined, keys))
+}
+
 /// List all delegate keys on a MemWalAccount object. JSON-RPC only (mirrors
 /// verify_delegate_key_onchain's non-gRPC path) — the initial phase did not
 /// need the gRPC variant since this endpoint is not on the hot signature-
@@ -1025,6 +1195,194 @@ async fn grpc_get_object(
     .ok_or_else(|| partial_get_object(PARTIAL_GRPC_OBJECT_ABSENT))
 }
 
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    match &value.kind {
+        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(prost_types::value::Kind::NumberValue(number)) => serde_json::Number::from_f64(*number)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(prost_types::value::Kind::StringValue(text)) => serde_json::Value::String(text.clone()),
+        Some(prost_types::value::Kind::BoolValue(flag)) => serde_json::Value::Bool(*flag),
+        Some(prost_types::value::Kind::StructValue(fields)) => {
+            let mut map = serde_json::Map::new();
+            for (key, child) in &fields.fields {
+                map.insert(key.clone(), prost_value_to_json(child));
+            }
+            serde_json::Value::Object(map)
+        }
+        Some(prost_types::value::Kind::ListValue(list)) => {
+            serde_json::Value::Array(list.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+async fn json_rpc_get_move_fields(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    object_id: &str,
+) -> Result<Option<(Option<String>, serde_json::Map<String, serde_json::Value>)>, OnchainVerifyError>
+{
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sui_getObject",
+        "params": [object_id, { "showContent": true }]
+    });
+    let started = std::time::Instant::now();
+    let response = http_client
+        .post(rpc_url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            crate::observability::observe_external(
+                "sui_rpc",
+                "sui_getObject",
+                "transport_error",
+                started.elapsed(),
+            );
+            OnchainVerifyError::RpcError(format!("HTTP request failed: {error}"))
+        })?;
+    let status_label = response.status().as_u16().to_string();
+    crate::observability::observe_external(
+        "sui_rpc",
+        "sui_getObject",
+        &status_label,
+        started.elapsed(),
+    );
+    let rpc_response: OwnerObjectRpcResponse =
+        parse_json_rpc_response(response, "sui_getObject").await?;
+    if let Some(error) = &rpc_response.error {
+        let message = error.message.to_ascii_lowercase();
+        if message.contains("not exists") || message.contains("not found") {
+            return Ok(None);
+        }
+        return Err(OnchainVerifyError::RpcError(format!(
+            "RPC error {}: {}",
+            error.code, error.message
+        )));
+    }
+    if rpc_response
+        .result
+        .as_ref()
+        .and_then(|result| result.error.as_ref())
+        .is_some_and(|error| error.code.eq_ignore_ascii_case("notExists"))
+    {
+        return Ok(None);
+    }
+    let Some(content) = rpc_response
+        .result
+        .and_then(|result| result.data)
+        .and_then(|data| data.content)
+    else {
+        return Ok(None);
+    };
+    let fields = content
+        .fields
+        .ok_or_else(|| OnchainVerifyError::RpcError("Object has no fields".into()))?;
+    Ok(Some((content.object_type, fields)))
+}
+
+async fn get_move_fields(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    object_id: &str,
+) -> Result<Option<(Option<String>, serde_json::Map<String, serde_json::Value>)>, OnchainVerifyError>
+{
+    let Some(grpc_client) = grpc_client else {
+        return json_rpc_get_move_fields(http_client, rpc_url, object_id).await;
+    };
+    match grpc_get_object(grpc_client.clone(), object_id, GET_OBJECT_ATTEMPTS).await {
+        Ok(object) => {
+            let json = object
+                .json
+                .ok_or_else(|| OnchainVerifyError::RpcError("Object has no json content".into()))?;
+            let value = prost_value_to_json(&json);
+            let fields = value.as_object().cloned().ok_or_else(|| {
+                OnchainVerifyError::RpcError("Object json is not an object".into())
+            })?;
+            Ok(Some((object.object_type, fields)))
+        }
+        Err(OnchainVerifyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+static REGISTRY_TABLE_IDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Resolve `owner` through `AccountRegistry`'s `Table<address, ID>` and read
+/// that `MemWalAccount` from RPC. `Ok(None)` means the owner has no account.
+/// The registry object itself missing is an error, not an empty account.
+pub async fn load_owner_account_onchain(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    registry_id: &str,
+    expected_type_origin_package_id: &str,
+    owner: &str,
+) -> Result<Option<OwnerAccountOnchain>, OnchainVerifyError> {
+    let table_id = {
+        let cached = REGISTRY_TABLE_IDS
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(registry_id).cloned());
+        if let Some(table_id) = cached {
+            table_id
+        } else {
+            let Some((_, registry_fields)) =
+                get_move_fields(http_client, rpc_url, grpc_client, registry_id).await?
+            else {
+                return Err(OnchainVerifyError::NotFound(
+                    "AccountRegistry object not found".into(),
+                ));
+            };
+            let table_id = registry_table_id(&registry_fields).ok_or_else(|| {
+                OnchainVerifyError::RpcError("AccountRegistry has no accounts table id".into())
+            })?;
+            if let Ok(mut guard) = REGISTRY_TABLE_IDS.lock() {
+                guard.insert(registry_id.to_string(), table_id.clone());
+            }
+            table_id
+        }
+    };
+
+    let parent = parse_object_id(&table_id)?;
+    let key = parse_object_id(owner)?;
+    let field_id = address_hex(&derive_address_dynamic_field_id(&parent, &key));
+    let Some((_, field_fields)) =
+        get_move_fields(http_client, rpc_url, grpc_client, &field_id).await?
+    else {
+        return Ok(None);
+    };
+    let account_id = dynamic_field_account_id(&field_fields).ok_or_else(|| {
+        OnchainVerifyError::RpcError("registry dynamic field has no account id".into())
+    })?;
+
+    let Some((object_type, account_fields)) =
+        get_move_fields(http_client, rpc_url, grpc_client, &account_id).await?
+    else {
+        return Err(OnchainVerifyError::NotFound(format!(
+            "MemWalAccount {account_id} not found"
+        )));
+    };
+    ensure_memwal_account_type(
+        object_type.as_deref(),
+        expected_type_origin_package_id,
+        &account_id,
+    )?;
+    let (active, admin_quarantined, keys) = parse_owner_account_fields(&account_fields)?;
+    Ok(Some(OwnerAccountOnchain {
+        account_id,
+        active,
+        admin_quarantined,
+        keys,
+    }))
+}
+
 /// gRPC counterpart of `verify_delegate_key_onchain` above — same checks
 /// (owner, active, delegate_keys membership), fetched via
 /// LedgerService.GetObject instead of JSON-RPC's `sui_getObject`.
@@ -1229,6 +1587,25 @@ fn body_snippet(bytes: &[u8]) -> String {
 struct RpcResponse {
     result: Option<RpcResult>,
     error: Option<RpcError>,
+}
+
+/// `sui_getObject` for an owner lookup. A missing object is `result.error.code
+/// = notExists` (or no content), which is not the same as a JSON-RPC error.
+#[derive(Debug, Deserialize)]
+struct OwnerObjectRpcResponse {
+    result: Option<OwnerObjectRpcResult>,
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnerObjectRpcResult {
+    data: Option<ObjectData>,
+    error: Option<OwnerObjectRpcObjectError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnerObjectRpcObjectError {
+    code: String,
 }
 
 #[derive(Debug, Deserialize)]

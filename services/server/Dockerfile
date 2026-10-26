@@ -26,9 +26,9 @@ RUN cargo build --release
 
 # ── Stage 2: Runtime (Node.js slim) ─────────────────────────
 # pinned by digest for reproducible, supply-chain-safe builds.
-# Tag: node:22-bookworm-slim  |  arch: linux/amd64  |  pinned: 2026-04-16
-# To refresh: docker inspect --format='{{index .RepoDigests 0}}' node:22-bookworm-slim
-FROM node:22-bookworm-slim@sha256:db9a3a15e8e8e2adbaf1e1c3d93dfb04c2e294bdd027490addb2391b8e61cc6a AS runtime
+# Tag: node:22.23.4-bookworm-slim  |  multi-platform index  |  pinned: 2026-10-22
+# To refresh: docker buildx imagetools inspect node:22.23.4-bookworm-slim
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS runtime
 
 # Install Rust runtime deps (ca-certificates and libssl3)
 RUN apt-get update && apt-get install -y --no-install-recommends \

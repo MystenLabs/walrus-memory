@@ -28,6 +28,8 @@ Memories are **encrypted** and stored on **Walrus Memory**, a privacy-preserving
 
 ## Prerequisites
 
+Use a supported, security-patched Node.js runtime: **22.23.4+ within 22.x**, **24.22.1+ within 24.x**, or **26.12.1+ within 26.x**. The package `engines` field describes API compatibility, not the minimum security patch. See the [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases).
+
 ### OpenClaw
 
 You need [OpenClaw](https://openclaw.ai) `>=2026.3.11` installed and running, and a package manager ([bun](https://bun.sh), pnpm, or npm).

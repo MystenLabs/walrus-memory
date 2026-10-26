@@ -70,6 +70,9 @@ export async function POST(request: Request) {
     try {
       const data = await put(blobKey, fileBuffer, {
         access: "public",
+        // Preserve the configured read/write token when ambient OIDC is present.
+        token: process.env.BLOB_READ_WRITE_TOKEN,
+        addRandomSuffix: true,
       });
 
       return NextResponse.json(data);

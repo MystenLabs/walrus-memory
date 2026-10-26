@@ -16,7 +16,7 @@
  *   X-MemWal-Namespace: <optional namespace default>
  * =============================================================================
  */
-import type { Request, Response, Router } from "express";
+import { json, type Request, type Response, type Router } from "express";
 import { randomUUID } from "node:crypto";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -31,10 +31,12 @@ import {
 } from "./agent-client.js";
 import { createLogger } from "./logger.js";
 import { createMcpServer } from "./server.js";
+import { MCP_MAX_REQUEST_BODY_BYTES } from "./limits.js";
 import { McpRateLimiter, clientIpFromRequest } from "./rateLimit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 const log = createLogger("mcp");
+const parseSseBody = json({ limit: MCP_MAX_REQUEST_BODY_BYTES, strict: false });
 
 // Global limiter — caps concurrent MCP sessions per source IP and total. The
 // limiter MUST run BEFORE resolveAuth() so a flood of forged bearers cannot
@@ -330,14 +332,31 @@ async function handlePostMessage(
         );
     }
 
-    // SSEServerTransport.handlePostMessage expects the raw IncomingMessage.
-    // Express `req` is an IncomingMessage subtype; passing it through works.
+    // Parse only after authentication and session ownership have succeeded.
+    // The legacy SSE transport has no configurable body cap; pass a bounded
+    // parsed body instead of letting it read the stream a second time.
+    if (!req.is("application/json")) {
+        return rpcError(res, 400, "Expected application/json");
+    }
+    const parsed = await new Promise<boolean>((resolve) => {
+        parseSseBody(req, res, (err?: { status?: number }) => {
+            if (err) {
+                const status = err.status === 413 ? 413 : 400;
+                rpcError(res, status, status === 413 ? "MCP request body too large" : "Invalid JSON body");
+                resolve(false);
+                return;
+            }
+            resolve(true);
+        });
+    });
+    if (!parsed) return;
+
     applyAgentClient(conn.session, agentClientFromHeaders(req), {
         transport: "sse",
         transportId: sessionId,
         sessionKey: conn.sessionKey,
     });
-    await conn.transport.handlePostMessage(req, res);
+    await conn.transport.handlePostMessage(req, res, req.body);
     identifyConnection(conn.server, conn.session, req, {
         transport: "sse",
         transportId: sessionId,
@@ -465,6 +484,7 @@ async function handleStreamableHttp(
     let initialized = false;
     const holder: { server: McpServer | null } = { server: null };
     const transport = new StreamableHTTPServerTransport({
+        maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES,
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (newId: string) => {
             const server = holder.server;
@@ -600,9 +620,7 @@ export function mountMcpRoutes(
 
     app.post(
         "/mcp/messages",
-        // Body parsing — SSEServerTransport reads the raw body itself, so we
-        // do NOT mount express.json() here. Keep the body intact for the
-        // transport's internal raw-body parser.
+        // Body parsing runs inside handlePostMessage, after session auth.
         async (req, res) => {
             try {
                 await handlePostMessage(req, res, relayerUrl, publicRelayerUrl);

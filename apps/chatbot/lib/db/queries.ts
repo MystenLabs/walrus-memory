@@ -252,13 +252,18 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
 
 export async function updateMessage({
   id,
+  chatId,
   parts,
 }: {
   id: string;
+  chatId: string;
   parts: DBMessage["parts"];
 }) {
   try {
-    return await db.update(message).set({ parts }).where(eq(message.id, id));
+    return await db
+      .update(message)
+      .set({ parts })
+      .where(and(eq(message.id, id), eq(message.chatId, chatId)));
   } catch (_error) {
     throw new ChatbotError("bad_request:database", "Failed to update message");
   }

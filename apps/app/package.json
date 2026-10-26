@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-	"prebuild": "node scripts/verify-walrus-wasm-version.mjs",
+    "prebuild": "node scripts/verify-walrus-wasm-version.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "postbuild": "node scripts/verify-dist-assets.mjs",
@@ -23,7 +23,7 @@
     "@mysten/seal": "^1.1.0",
     "@mysten/sui": "^2.6.0",
     "@mysten/walrus": "^1.0.3",
-		"@mysten/walrus-wasm": "0.2.0",
+    "@mysten/walrus-wasm": "0.2.0",
     "@noble/ed25519": "^3.0.0",
     "@noble/hashes": "^2.0.1",
     "@radix-ui/react-slot": "^1.2.4",
@@ -36,7 +36,7 @@
     "lucide-react": "^0.577.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-router-dom": "^7.13.1",
+    "react-router-dom": "^7.18.4",
     "react-syntax-highlighter": "^15.6.6",
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.1",
@@ -63,10 +63,9 @@
     "jsdom": "^29.1.1",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.48.0",
-    "vite": "^7.3.1",
+    "vite": "^7.3.7",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0",
-    "vitepress": "^1.6.4",
     "vitest": "^4.1.10"
   }
 }

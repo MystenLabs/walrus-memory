@@ -7,7 +7,7 @@ OpenRouter.
 
 ## Prerequisites
 
-- Node 22 (or 20) + pnpm 9.
+- Node 22.23.4+ (or 24.22.1+ / 26.12.1+) + pnpm 9.
 - PostgreSQL with the schema migrations applied. The simplest way is to run
   the repo's Postgres container:
   ```bash
@@ -22,7 +22,7 @@ pnpm --filter @memwal/chatbot playwright:install
 
 # run the E2E suite
 POSTGRES_URL=postgresql://memwal:memwal_secret@localhost:5432/memwal \
-AUTH_SECRET=local-dev-secret-not-for-prod \
+AUTH_SECRET=local-dev-secret-not-for-production \
   pnpm --filter @memwal/chatbot test:e2e
 
 # same commands, interactive UI

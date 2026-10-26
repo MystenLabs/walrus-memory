@@ -28,7 +28,7 @@ Add MemWal to Codex so it recalls context and saves durable facts as you work. I
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x)
 - A Codex CLI build with `codex plugin` support (shipped since ~April 2026; check with `codex plugin --help`) if you want the plugin install. MCP-only works on any version.
 - A Walrus Memory account. The first memory tool call opens a browser sign-in (`memwal_login`).
 

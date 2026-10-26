@@ -1,7 +1,7 @@
 """Tests for the relayer environment presets (prod/dev/staging/local).
 
-Pure config resolution — no network. Mirrors the precedence rule documented
-in the README: explicit non-default ``server_url`` > ``env`` > default.
+Pure config resolution — no network. Any explicit ``server_url`` wins,
+including the hosted default. ``env`` applies only when ``server_url`` is ``None``.
 """
 
 import pytest
@@ -41,6 +41,7 @@ def test_explicit_server_url_overrides_env():
 
 def test_no_env_keeps_default():
     cfg = MemWalConfig(key=KEY, account_id=ACCOUNT)
+    assert cfg.server_url == "https://relayer.memory.walrus.xyz"
     assert cfg.server_url == DEFAULT_SERVER_URL
 
 
@@ -59,13 +60,11 @@ def test_sync_create_threads_env_through():
     assert client._inner._server_url == "https://relayer.memory.walrus.xyz"
 
 
-def test_explicit_default_url_with_env_still_takes_preset():
-    # Passing the default URL explicitly is indistinguishable from not
-    # passing it — documented edge: the preset still applies.
+def test_explicit_hosted_url_wins_over_env():
     cfg = MemWalConfig(
         key=KEY,
         account_id=ACCOUNT,
         server_url=DEFAULT_SERVER_URL,
-        env="prod",
+        env="local",
     )
     assert cfg.server_url == "https://relayer.memory.walrus.xyz"

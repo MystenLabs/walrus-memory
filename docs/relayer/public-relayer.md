@@ -58,6 +58,11 @@ const memwal = MemWal.create({
 - **Shared App ID** - all users of the managed relayer share the same Walrus Memory package ID. Your own `owner + namespace` (Memory Space) isolates your data, but the underlying deployment is shared.
 - **Trust assumption** - the relayer sees plaintext during encryption and embedding. By using the managed relayer, you're trusting the Walrus Foundation-hosted instance with that data. See [Trust and Security Model](/fundamentals/architecture/data-flow-security-model) for details.
 - **Availability** - the Walrus Foundation provides the managed relayer as a public good without SLA guarantees.
-- **Storage costs** - the server wallet covers Walrus storage fees. The service can apply usage limits.
+
+## Storage costs
+
+The managed relayer covers WAL storage fees and SUI gas through its server wallets and configured gas sponsor. Account holders do not pay gas or WAL for these relayed writes. Account ownership does not determine which wallet pays for an upload. The shared service applies usage limits.
+
+With a [self-hosted relayer](/relayer/self-hosting), you fund the relayer deployment.
 
 If you need full control over the trust boundary or your own dedicated instance, see [Self-Hosting](/relayer/self-hosting).

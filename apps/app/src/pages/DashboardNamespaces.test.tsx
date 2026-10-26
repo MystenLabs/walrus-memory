@@ -71,6 +71,7 @@ vi.mock('../utils/analytics', () => ({
 vi.mock('../components/SecurityDeleteSection', () => ({ default: () => null }))
 
 import Dashboard from './Dashboard'
+import { fetchObjectJson } from '../utils/suiClientCompat'
 
 /** One relayer page of `count` namespaces, named `<prefix>-<n>`. */
 function page(prefix: string, count: number, hasMore: boolean, nextCursor: string | null = null) {
@@ -115,6 +116,19 @@ beforeEach(() => {
     mocks.apiGet.mockReset()
     // Non-namespace calls (delegate keys etc.) get a harmless empty payload.
     mocks.apiGet.mockResolvedValue({})
+    vi.mocked(fetchObjectJson).mockReset()
+    vi.mocked(fetchObjectJson).mockResolvedValue(null)
+    // Incident status uses global fetch. A clean miss keeps the banner off
+    // and never dials the relayer.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+            account_id: null,
+            affected: false,
+            quarantined: false,
+            active: false,
+        }),
+    }))
 })
 
 describe('Dashboard namespaces pagination', () => {
@@ -287,5 +301,101 @@ describe('Dashboard namespaces pagination', () => {
         const card = await namespacesCard()
         const link = await within(card).findByTitle('Open this namespace in the playground')
         expect(link.getAttribute('href')).toBe('/playground?namespace=my%20ns')
+    })
+})
+
+describe('Dashboard incident banner', () => {
+    it('asks a locked account with no highlighted keys to reactivate', async () => {
+        mocks.apiGet.mockResolvedValue({})
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: true,
+                quarantined: true,
+                active: false,
+                affected_public_keys: [],
+            }),
+        }))
+        const { findByRole, queryByRole } = renderDashboard()
+        const button = await findByRole('button', { name: 'Reactivate the account' })
+        expect(button.closest('p')?.textContent).toContain('Your account is ready to restore.')
+        expect(queryByRole('button', { name: 'Remove highlighted keys' })).toBeNull()
+        expect(document.body.textContent).not.toContain('delete the highlighted delegate keys below')
+    })
+
+    it('highlights affected keys and removes them in one confirmation', async () => {
+        const user = userEvent.setup()
+        const leaked = 'ab'.repeat(32)
+        const other = 'cd'.repeat(32)
+        vi.mocked(fetchObjectJson).mockResolvedValue({
+            delegate_keys: [
+                { public_key: `0x${leaked.toUpperCase()}`, label: 'Leaked', created_at: '1' },
+                { public_key: other, label: 'Safe', created_at: '2' },
+            ],
+        })
+        mocks.apiGet.mockResolvedValue({})
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: true,
+                quarantined: true,
+                active: false,
+                affected_public_keys: [leaked],
+            }),
+        }))
+        const { findByRole, findByText, queryByText } = renderDashboard()
+        const leakedRow = (await findByText('Leaked')).closest('tr')
+        expect(queryByText('Safe')).toBeNull()
+        expect(leakedRow?.classList.contains('dashboard-key-row--affected')).toBe(true)
+        expect(leakedRow?.querySelector('input[type="checkbox"]')).toBeChecked()
+        expect(leakedRow?.textContent).not.toContain('Affected')
+        const banner = await findByRole('button', { name: 'Remove highlighted keys' })
+        expect(banner.closest('p')).toBeNull()
+        const status = document.querySelector('.dash-alert--info p')
+        expect(status?.textContent).toBe('Your account has been temporarily locked following a security disclosure by Railway, our third-party hosting provider. To restore your account, delete the highlighted delegate keys below.')
+        expect(document.body.textContent).not.toContain('request an unblock')
+        await user.click(banner)
+        expect(await findByRole('heading', { name: 'Remove delegate key?' })).toBeTruthy()
+    })
+
+    it('keeps the locked banner until the highlighted keys are gone', async () => {
+        const leaked = 'ab'.repeat(32)
+        vi.mocked(fetchObjectJson).mockResolvedValue({
+            delegate_keys: [{ public_key: leaked, label: 'Leaked', created_at: '1' }],
+        })
+        mocks.apiGet.mockResolvedValue({})
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: true,
+                quarantined: false,
+                active: false,
+                affected_public_keys: [leaked],
+            }),
+        }))
+        const { findByRole, findByText, queryByRole } = renderDashboard()
+        expect((await findByText('Leaked')).closest('tr')?.querySelector('input[type="checkbox"]')).toBeChecked()
+        expect(await findByRole('button', { name: 'Remove highlighted keys' })).toBeTruthy()
+        expect(queryByRole('button', { name: 'Reactivate the account' })).toBeNull()
+        expect(document.body.textContent).toContain('delete the highlighted delegate keys below')
+    })
+
+    it('asks a cleared account to reactivate', async () => {
+        mocks.apiGet.mockResolvedValue({})
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: true,
+                quarantined: false,
+                active: false,
+            }),
+        }))
+        const { findByRole } = renderDashboard()
+        const button = await findByRole('button', { name: 'Reactivate the account' })
+        expect(button.closest('p')?.textContent).toContain('Your account is ready to restore.')
     })
 })

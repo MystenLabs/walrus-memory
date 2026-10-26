@@ -9,7 +9,7 @@
 # ============================================================
 
 # ── Stage 1: Install Dependencies ──────────────────────────
-FROM node:22-alpine AS deps
+FROM node:22.23.4-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS deps
 
 RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
 
@@ -69,7 +69,7 @@ RUN node_modules/.bin/esbuild lib/db/migrate.ts \
     --outfile=migrate.mjs
 
 # ── Stage 4: Runtime ───────────────────────────────────────
-FROM node:22-alpine AS runtime
+FROM node:22.23.4-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS runtime
 
 RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
 

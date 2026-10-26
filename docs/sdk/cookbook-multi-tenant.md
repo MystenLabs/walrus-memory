@@ -10,7 +10,7 @@ keywords:
   - Walrus Memory
   - MemWal
 goal:
-  description: "Design a multi-tenant memory architecture: create one MemWalAccount, isolate each end user with a per-wallet namespace, and secure access with scoped delegate keys."
+  description: "Design a multi-tenant memory architecture: use the operator's MemWalAccount, organize each user's memory with a namespace, and enforce access in the authenticated server."
   requires:
     - has_frontmatter:
         - title
@@ -35,12 +35,16 @@ This is the pattern for SaaS-style apps where **one operator** runs a server tha
 
 ## The pattern at a glance
 
-| Layer | What it holds | Why |
+| **Layer** | **What it holds** | **Why** |
 | --- | --- | --- |
-| **Operator** | One `MemWalAccount` + one **delegate key** | Created once on the [dashboard](https://memory.walrus.xyz). Pays for storage, owns all memory. |
+| **Operator** | One `MemWalAccount` + one **delegate key** | Created once on the [dashboard](https://memory.walrus.xyz). Owns all memory stored through this account. |
 | **Server** (API routes) | `MEMWAL_PRIVATE_KEY` + `MEMWAL_ACCOUNT_ID` as env vars | The delegate key authenticates every relayer call. Never sent to the browser. |
 | **End user** | A connected Sui wallet, used for **auth only** | The wallet proves identity. The user does **not** create a MemWalAccount. |
-| **Isolation** | One **namespace per wallet**, for example `myapp-{walletAddress}` | Keeps each user's memories in a separate logical bucket under the shared account. |
+| **Organization** | One **namespace per wallet**, for example `myapp-{walletAddress}` | Groups each user's memories under the shared account. The server enforces who can access each group. |
+
+This pattern uses the operator's account for every end user; signing in with a wallet does not create an account for that user or transfer memory ownership to them. See [Ownership and access](/fundamentals/concepts/ownership-and-access).
+
+The managed relayer sponsors writes; see [Managed relayer costs](/relayer/public-relayer#storage-costs). The managed service applies its usage limits to this pattern like any other.
 
 ```
                   ┌─────────────────────────────────────┐
@@ -64,7 +68,7 @@ Create the account and a delegate key once, on the [Walrus Memory dashboard](htt
 - A **delegate private key** (hex) → your `MEMWAL_PRIVATE_KEY`
 
 <Warning>
-Use a **delegate key**, never the **owner** wallet key. The owner key can transfer the account and manage delegates; a delegate key can only read and write memory. If a delegate key leaks, you revoke it without touching the owner wallet. See [Delegate Key Management](/contract/delegate-key-management).
+Use a **delegate key**, never the **owner** wallet key, in the application server. The owner manages the account and its delegates; a delegate authenticates memory operations across the account's namespaces. Revocation does not cover already-read data; see [Ownership and access](/fundamentals/concepts/ownership-and-access#access-control-enforcement) and [Delegate key management](/contract/delegate-key-management).
 </Warning>
 
 Store both as server-side environment variables:
@@ -88,6 +92,7 @@ await removeDelegateKey({
   accountId: process.env.MEMWAL_ACCOUNT_ID!,
   publicKey: "<delegate-public-key-hex>", // the leaked key's public key
   suiPrivateKey: "suiprivkey1...",        // owner key: kept offline, NOT on the server
+  suiNetwork: "mainnet",                 // use testnet for a testnet account
 });
 ```
 
@@ -111,7 +116,7 @@ Guidelines:
 - **Keep it stable.** Never include a timestamp or session ID, or you lose the user's history on the next request.
 
 <Warning>
-A namespace serves as a **data-organization boundary, not a security boundary between users.** The delegate key can read and write **every** namespace under the account. Cross-user isolation depends entirely on your server mapping each *authenticated* wallet to the correct namespace. Verify the wallet signature **before** choosing the namespace. Never take the namespace (or raw address) from an unauthenticated request body.
+A namespace serves as a **data-organization boundary, not a security boundary between users.** The delegate key can read and write **every** namespace under the account. Cross-user isolation depends entirely on your server mapping each authenticated wallet to the correct namespace. Verify the wallet signature **before** choosing the namespace. Never take the namespace (or raw address) from an unauthenticated request body.
 </Warning>
 
 ## 3. Next.js / serverless example
@@ -156,18 +161,19 @@ export async function POST(req: Request) {
   // 3. Generate a reply with your model, injecting recalled.results as context…
   const reply = await generateReply(message, recalled.results);
 
-  // 4. Persist new memory. Use rememberAndWait when the next read must see it
-  //    immediately (for example, same-session follow-up); use remember
-  //    (fire-and-forget) when eventual indexing is fine and you don't want to
-  //    block the response.
-  await memwal.remember(`User said: ${message}`, ns);
+  // 4. Submit new memory and return after the relayer accepts the job.
+  //    Capture the job ID for a background worker to track completion.
+  //    Use rememberAndWait only when the caller needs completion before proceeding.
+  const accepted = await memwal.remember(`User said: ${message}`, ns);
 
-  return Response.json({ reply, recalled: recalled.results });
+  return Response.json({ reply, recalled: recalled.results, memoryJobId: accepted.job_id });
 }
 ```
 
+`remember` waits for acceptance, not for the upload and indexing to finish. Persist the returned job ID if completion must survive a process restart. For retries, stable operation keys, and checking completion outside the chat turn, see [Production readiness](/sdk/production-readiness).
+
 <Note>
-**Structured agent state (a single profile JSON):** semantic `recall` is built for *fuzzy* retrieval by meaning, so it is not a reliable way to fetch one authoritative "current profile" record. If you need deterministic key-based reads/upserts, follow [issue #247](https://github.com/MystenLabs/MemWal/issues/247). For now, prefer a **dedicated namespace per structured record** and treat free-form semantic lines separately.
+**Structured agent state (a single profile JSON):** semantic `recall` is built for fuzzy retrieval by meaning, so it is not a reliable way to fetch one authoritative "current profile" record. If you need deterministic key-based reads/upserts, follow [issue #247](https://github.com/MystenLabs/MemWal/issues/247). For now, prefer a **dedicated namespace per structured record** and treat free-form semantic lines separately.
 </Note>
 
 ## 4. Security checklist
@@ -177,7 +183,7 @@ export async function POST(req: Request) {
 `MEMWAL_PRIVATE_KEY` must live in server env vars. Never ship it to the browser, a client component, or `NEXT_PUBLIC_*`. Any code path that reaches the client must not import the memory client.
 </Step>
 <Step title="Use the wallet for identity, not authorization">
-The user's wallet signature proves *who they are*. It does not grant memory access; your delegate key does. Verify the signature server-side and derive the namespace from the verified address.
+The user's wallet signature proves who they are. It does not grant memory access; your delegate key does. Verify the signature server-side and derive the namespace from the verified address.
 </Step>
 <Step title="Never trust a client-supplied namespace">
 Compute the namespace on the server from the authenticated address. If a client could send its own namespace, any user could read another user's bucket.

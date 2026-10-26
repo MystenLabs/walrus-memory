@@ -261,16 +261,28 @@ class MemWalMock:
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
     ) -> RecallResult:
+        """Token-overlap recall over the in-memory store.
+
+        ``RecallParams.sort`` is honored: ``"recent"`` keeps the semantic top
+        ``max(min(limit * 5, 50), limit)`` and orders that window newest first,
+        like the relayer. Otherwise results are ordered by token-overlap
+        distance. ``RecallParams.scoring_weights`` is accepted but ignored and
+        does not re-rank; ``distance`` is always token overlap.
+        """
         if isinstance(query, RecallParams):
             limit = query.limit
             namespace = query.namespace
             max_distance = query.max_distance
+            sort = query.sort
             query_text = query.query
         else:
+            sort = None
             query_text = query
         _validate_text(query_text, "query")
         if not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        if sort not in (None, "relevance", "recent"):
+            raise ValueError("sort must be 'relevance' or 'recent'")
         resolved_namespace = namespace or self._namespace
         query_tokens = _tokens(query_text)
         ranked = [
@@ -279,6 +291,11 @@ class MemWalMock:
             if memory.namespace == resolved_namespace
         ]
         ranked.sort(key=lambda item: (item[1], item[0].sequence))
+        if sort == "recent":
+            # Same window as the TypeScript mock and RecallSort::candidate_limit.
+            # A newer memory outside that semantic window must not win.
+            window = max(min(limit * 5, 50), limit)
+            ranked = sorted(ranked[:window], key=lambda item: (-item[0].sequence, item[1]))
         page = ranked[:limit]
         if max_distance is not None:
             page = [item for item in page if item[1] < max_distance]

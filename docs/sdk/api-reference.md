@@ -67,6 +67,8 @@ consume recall's budget.
 
 Submit one memory through the relayer. The method returns after the relayer creates a background job; embedding, SEAL encryption, Walrus upload, and vector indexing continue asynchronously.
 
+HTTP 426 throws `MemWalCompatibilityError`.
+
 **Returns:**
 
 ```ts
@@ -98,7 +100,7 @@ One `GET /api/remember/{jobId}`. Accepts 200 and 404 and returns the job state (
 
 ### `waitForRememberJob(jobId, opts?): Promise<RememberResult>`
 
-Poll a previously accepted remember job until it reaches `done` or `failed`. A job id outside `[A-Za-z0-9_-]+` fails immediately with status 404.
+Poll a previously accepted remember job until it reaches `done` or `failed`. A job id outside `[A-Za-z0-9_-]+`, or one the relayer has no record of, throws `MemWalRememberJobNotFoundError` (`status` 404). A `failed` job throws `MemWalRememberJobFailedError` (`status` 500). HTTP 429/5xx status reads are retried rather than thrown; a deadline with no terminal status, including one where every read was 429, throws `MemWalRememberJobTimeoutError` (`status` 504, default `timeoutMs` 60\_000). These classes, plus `MemWalRateLimitedError` (see `waitForRememberJobs` below), are exported from the SDK entry and `instanceof`-checkable, alongside the existing `MemWalCompatibilityError`.
 
 ### `rememberBulk(items): Promise<RememberBulkAcceptedResult>`
 
@@ -116,7 +118,7 @@ Submit up to 20 memories in one request and return the accepted job IDs immediat
 
 ### `rememberBulkAndWait(items, opts?): Promise<RememberBulkResult>`
 
-Submit a bulk remember request and wait until every job reaches a terminal state.
+Submit a bulk remember request and wait until every job reaches a terminal state. Unlike `waitForRememberJob`, a failed or non-terminal job is reported per-item in the result rather than thrown. The one case this (and `waitForRememberJobs`) still throws is `MemWalRateLimitedError` (`status` 429): every status read was rate-limited, including a final confirming read after the deadline, so none of the batch's writes could be confirmed.
 
 ### `recall(params): Promise<RecallResult>`
 

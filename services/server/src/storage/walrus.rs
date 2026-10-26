@@ -66,14 +66,14 @@ pub struct UploadJournal {
 }
 
 pub enum DurableUploadAdvance {
-    /// Ready for another prepare/execute loop.
-    ///
-    /// Two producers:
-    /// - sidecar returned a prepared register (`register_transaction` is Some)
-    /// - a proven reset cleared the journal (`register_transaction` is None);
-    ///   the next loop iteration re-prepares. That reset consumes one of the
-    ///   six advance-loop slots; overflowing the loop is `WalletJobError::Transient`.
+    /// Exact signed bytes are ready to checkpoint before execution.
     Prepared(UploadJournal),
+    /// A proven-safe reset needs another prepare/execute cycle. Preserve its
+    /// cause so a bounded rebuild failure reports the underlying sidecar error.
+    Reset {
+        journal: UploadJournal,
+        reason: String,
+    },
     Step {
         journal: UploadJournal,
         step: serde_json::Value,
@@ -656,7 +656,10 @@ pub async fn advance_durable_upload(
             // belongs to the old blob id.
             journal.resume_step = None;
             journal.register_transaction = None;
-            return Ok(DurableUploadAdvance::Prepared(journal));
+            return Ok(DurableUploadAdvance::Reset {
+                journal,
+                reason: format!("durable Walrus upload reset ({}): {}", status, body),
+            });
         }
         let reset_safe = should_reset_prepared_register(
             error_code.as_deref(),
@@ -668,7 +671,10 @@ pub async fn advance_durable_upload(
             // means this replica refused the bytes before execute (mixed-version
             // or incompatible sponsorship) and can rebuild compatible ones.
             journal.register_transaction = None;
-            return Ok(DurableUploadAdvance::Prepared(journal));
+            return Ok(DurableUploadAdvance::Reset {
+                journal,
+                reason: format!("durable Walrus upload reset ({}): {}", status, body),
+            });
         }
         return Err(AppError::Internal(format!(
             "durable Walrus upload failed ({}): {}",
@@ -1627,6 +1633,77 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{}", addr), handle, seen)
+    }
+
+    #[tokio::test]
+    async fn durable_upload_resets_only_proven_rejections_and_keeps_the_cause() {
+        for code in [
+            "NO_SIDE_EFFECT",
+            "INVALID_PREPARED_REGISTER_TRANSACTION",
+            "SHARED_SERVICE_UNAVAILABLE",
+            "DURABLE_SIDE_EFFECT_VERIFY_FAILED",
+        ] {
+            let app = axum::Router::new().route(
+                "/walrus/upload-step-v3",
+                axum::routing::post(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "code": code,
+                            "error": "Enoki 404: Sponsored transaction not found",
+                        })),
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let encoded = serde_json::json!({ "step": "encoded", "blobId": "blob" });
+            let journal = super::UploadJournal {
+                wallet_index: 3,
+                wallet_address: Some("0xsigner".into()),
+                execution_identity: None,
+                resume_step: Some(encoded.clone()),
+                register_transaction: Some(PreparedRegisterTransaction {
+                    transaction_bytes: "bytes".into(),
+                    signature: "signature".into(),
+                    digest: "digest".into(),
+                    sponsor_digest: Some("sponsor".into()),
+                }),
+            };
+            let result = super::advance_durable_upload(
+                &reqwest::Client::new(),
+                &url,
+                None,
+                b"ciphertext",
+                1,
+                "0xowner",
+                "test",
+                "0xpackage",
+                "job",
+                journal,
+            )
+            .await;
+            server.abort();
+            if matches!(
+                code,
+                "NO_SIDE_EFFECT" | "INVALID_PREPARED_REGISTER_TRANSACTION"
+            ) {
+                let super::DurableUploadAdvance::Reset { journal, reason } = result.unwrap() else {
+                    panic!("a proven reset must report its own budget event");
+                };
+                assert!(journal.register_transaction.is_none());
+                assert_eq!(journal.resume_step, Some(encoded));
+                assert_eq!(journal.wallet_index, 3);
+                assert!(reason.contains(code));
+                assert!(reason.contains("Sponsored transaction not found"));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "ambiguous effects must not clear the journal"
+                );
+            }
+        }
     }
 
     #[tokio::test]

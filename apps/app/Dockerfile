@@ -5,7 +5,7 @@
 # ============================================================
 
 # ── Stage 1: Build ──────────────────────────────────────────
-FROM node:22-alpine AS builder
+FROM node:22.23.4-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS builder
 
 # Install pnpm (matches packageManager in root package.json)
 RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
@@ -103,7 +103,7 @@ ENV VITE_WALRUS_CONSOLE_ENABLED=$VITE_WALRUS_CONSOLE_ENABLED
 RUN pnpm --filter @memwal/app build
 
 # ── Stage 2: Serve static files ─────────────────────────────
-FROM node:22-alpine AS runtime
+FROM node:22.23.4-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS runtime
 
 WORKDIR /app
 

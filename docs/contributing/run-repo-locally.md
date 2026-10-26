@@ -38,7 +38,7 @@ answer: >-
 
 | Tool | Version | Check |
 |------|---------|-------|
-| **Node.js** | ≥ 20 | `node -v` |
+| **Node.js** | 22.23.4 (see `.nvmrc`) | `node -v` |
 | **pnpm** | ≥ 9.12 | `pnpm -v` |
 | **Rust** | latest stable (only for backend services) | `rustc --version` |
 
@@ -51,8 +51,12 @@ If you only work on TypeScript apps or docs, you don't need Rust.
 ```bash
 git clone https://github.com/MystenLabs/MemWal.git
 cd MemWal
+nvm install
+nvm use
 pnpm install
 ```
+
+If you use a different Node version manager, select the version in `.nvmrc` before installing dependencies.
 
 If `pnpm install` fails while downloading Chrome for Puppeteer (HTTP 403 — common in CI, sandboxes, or corporate networks), skip the browser download:
 
