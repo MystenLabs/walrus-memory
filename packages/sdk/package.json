@@ -82,7 +82,7 @@
     "license": "Apache-2.0",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/MystenLabs/MemWal.git",
+        "url": "git+https://github.com/MystenLabs/walrus-memory.git",
         "directory": "packages/sdk"
     },
     "publishConfig": {
