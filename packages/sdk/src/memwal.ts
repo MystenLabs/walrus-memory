@@ -525,16 +525,19 @@ export class MemWal {
     private pendingRememberKeys = new Map<string, string>();
 
     private constructor(config: MemWalConfig) {
-        this.privateKey =
+        const rawKey =
             typeof config.key === "string"
                 ? hexToBytes(normalizePrivateKey(config.key))
                 : config.key;
-        if (!(this.privateKey instanceof Uint8Array) || this.privateKey.length !== 32) {
-            const got = this.privateKey instanceof Uint8Array
-                ? String(this.privateKey.length)
-                : typeof this.privateKey;
+        if (!(rawKey instanceof Uint8Array) || rawKey.length !== 32) {
+            const got = rawKey instanceof Uint8Array
+                ? String(rawKey.length)
+                : typeof rawKey;
             throw new Error(`Ed25519 seed must be exactly 32 bytes, got ${got}`);
         }
+        // Copy caller-provided Uint8Array so destroy() zeroes only the
+        // client's internal key buffer without mutating the caller's bytes (WALM-676).
+        this.privateKey = typeof config.key === "string" ? rawKey : new Uint8Array(rawKey);
         if (typeof config.accountId !== "string" || config.accountId.trim().length === 0) {
             throw new TypeError(
                 `MemWal.create: "accountId" is required (Walrus Memory object ID, e.g. 0x...); got ${config.accountId}`,
@@ -562,7 +565,11 @@ export class MemWal {
     /**
      * Create a new Walrus Memory client instance.
      *
-     * @param config.key - Ed25519 private key (hex or `suiprivkey1...`) — the delegate key
+     * When `config.key` is passed as a `Uint8Array`, the bytes are copied into an
+     * internal buffer so `destroy()` zeroes only the client's copy and leaves the
+     * caller's `Uint8Array` unchanged.
+     *
+     * @param config.key - Ed25519 private key (hex, `suiprivkey1...`, or 32-byte `Uint8Array`; copied on `create()`) — the delegate key
      * @param config.serverUrl - Server URL (default: https://relayer.memory.walrus.xyz)
      */
     static create(config: MemWalConfig): MemWal {
@@ -570,7 +577,8 @@ export class MemWal {
     }
 
     /**
-     * Securely wipe the private and public keys from memory.
+     * Securely wipe the client's internal private and public key buffers from memory
+     * and invalidate the client so subsequent or in-flight operations reject.
      * Prevents key extraction from V8 heap dumps.
      */
     destroy(): void {
@@ -580,10 +588,12 @@ export class MemWal {
         }
         if (this.publicKey) {
             this.publicKey.fill(0);
+            this.publicKey = null;
         }
         // ENG-1697: drop cached session material too — once destroyed the
         // instance must not leak authorization tokens either.
         this.sessionCache = null;
+        this.sessionBuildPromise = null;
         this.serverConfig = null;
         this.relayerVersionMetadata = null;
         this.compatibilityPromise = null;
@@ -1820,9 +1830,12 @@ export class MemWal {
     }
 
     private async buildSealSessionInner(): Promise<string> {
+        if (this.destroyed) throw destroyedClientError();
         const cfg = await this.fetchServerConfig();
+        if (this.destroyed) throw destroyedClientError();
         const sealMod = (await import("@mysten/seal")) as any;
         const ed25519Mod = (await import("@mysten/sui/keypairs/ed25519")) as any;
+        if (this.destroyed) throw destroyedClientError();
         const SessionKey = sealMod.SessionKey;
         const Ed25519Keypair = ed25519Mod.Ed25519Keypair;
 
@@ -1880,6 +1893,7 @@ export class MemWal {
             );
         }
 
+        if (this.destroyed) throw destroyedClientError();
         const keypair = Ed25519Keypair.fromSecretKey(this.privateKey);
 
         // SessionKey accepts either transport through the shared core client
@@ -1905,6 +1919,7 @@ export class MemWal {
             throw lastClientError;
         }
 
+        if (this.destroyed) throw destroyedClientError();
         // Eagerly sign the personal message so the exported envelope is
         // fully self-contained. `SessionKey.create()` defers this signing
         // until first use, which would break the migration: the sidecar
@@ -1914,7 +1929,9 @@ export class MemWal {
         // `personalMessageSignature` field in the subsequent export().
         const personalMessage = session.getPersonalMessage();
         const signResult = await keypair.signPersonalMessage(personalMessage);
+        if (this.destroyed) throw destroyedClientError();
         await session.setPersonalMessageSignature(signResult.signature);
+        if (this.destroyed) throw destroyedClientError();
 
         const exported = session.export();
         // SEAL intentionally installs a throwing `toJSON` on the
@@ -1937,6 +1954,7 @@ export class MemWal {
                 ? btoa(jsonStr)
                 : Buffer.from(jsonStr, "utf8").toString("base64");
 
+        if (this.destroyed) throw destroyedClientError();
         this.sessionCache = {
             bytes,
             expiresAt:
@@ -1948,6 +1966,7 @@ export class MemWal {
     }
 
     private async buildSealSession(): Promise<string> {
+        if (this.destroyed) throw destroyedClientError();
         // Fast path: cached session still fresh.
         if (this.sessionCache && Date.now() < this.sessionCache.expiresAt) {
             return this.sessionCache.bytes;
@@ -1955,10 +1974,13 @@ export class MemWal {
         // Single-flight: concurrent requests share one build.
         if (this.sessionBuildPromise) return this.sessionBuildPromise;
 
-        this.sessionBuildPromise = this.buildSealSessionInner().finally(() => {
-            this.sessionBuildPromise = null;
+        const buildPromise = this.buildSealSessionInner().finally(() => {
+            if (this.sessionBuildPromise === buildPromise) {
+                this.sessionBuildPromise = null;
+            }
         });
-        return this.sessionBuildPromise;
+        this.sessionBuildPromise = buildPromise;
+        return buildPromise;
     }
 
     /**
