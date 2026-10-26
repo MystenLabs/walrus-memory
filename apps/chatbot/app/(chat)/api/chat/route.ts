@@ -203,7 +203,7 @@ export async function POST(request: Request) {
             ? MAX_REASONING_OUTPUT_TOKENS
             : MAX_OUTPUT_TOKENS,
           stopWhen: stepCountIs(5),
-          experimental_activeTools: isReasoningModel
+          activeTools: isReasoningModel
             ? []
             : [
               "getWeather",
