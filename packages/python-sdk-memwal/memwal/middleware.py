@@ -438,7 +438,9 @@ def _expose_memwal_controls(obj: Any, memwal: MemWal, pending: _PendingSaves) ->
         job_ids = pending.drain_job_ids()
         try:
             return await memwal.wait_for_remember_jobs(job_ids, opts)
-        except Exception:
+        except BaseException:
+            # Cancellation and interrupts must leave unconfirmed jobs available
+            # to the next wait, while still propagating to the caller.
             pending.track_job_ids(job_ids)
             raise
 
@@ -455,7 +457,9 @@ def _expose_memwal_controls(obj: Any, memwal: MemWal, pending: _PendingSaves) ->
                     memwal, memwal.wait_for_remember_jobs(job_ids, opts)
                 )
             )
-        except Exception:
+        except BaseException:
+            # Cancellation and interrupts must leave unconfirmed jobs available
+            # to the next wait, while still propagating to the caller.
             pending.track_job_ids(job_ids)
             raise
 

@@ -18,15 +18,18 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import nacl.signing
+import pytest
 import respx
 
 from memwal.client import MemWal
 from memwal.middleware import (
     _MAX_TRACKED_JOB_IDS,
+    _expose_memwal_controls,
     _find_last_user_message,
     _format_memories,
     _inject_openai_memory,
@@ -1583,6 +1586,45 @@ class TestConfirmableSaves:
         assert result.total == 1
         assert result.succeeded == 1
         assert result.results[0].blob_id == "blob-abc"
+
+    async def test_cancelled_wait_preserves_jobs_and_propagates_cancellation(self) -> None:
+        pending = _PendingSaves()
+        pending.track_job_ids(["job-1"])
+        entered = asyncio.Event()
+
+        async def poll_until_cancelled(job_ids, opts):
+            entered.set()
+            await asyncio.Event().wait()
+
+        memwal = MagicMock()
+        memwal.wait_for_remember_jobs = AsyncMock(side_effect=poll_until_cancelled)
+        wrapper = SimpleNamespace()
+        _expose_memwal_controls(wrapper, memwal, pending)
+        task = asyncio.create_task(wrapper.memwal_wait_for_saves())
+        await entered.wait()
+        # A save accepted while polling must survive alongside the restored batch.
+        pending.track_job_ids(["job-2"])
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        memwal.wait_for_remember_jobs.side_effect = None
+        memwal.wait_for_remember_jobs.return_value = "confirmed"
+        assert await wrapper.memwal_wait_for_saves() == "confirmed"
+        memwal.wait_for_remember_jobs.assert_awaited_with(["job-2", "job-1"], None)
+        assert pending.drain_job_ids() == []
+
+    def test_interrupted_sync_wait_preserves_jobs_and_propagates_interrupt(self) -> None:
+        pending = _PendingSaves()
+        pending.track_job_ids(["job-1"])
+        wrapper = SimpleNamespace()
+        _expose_memwal_controls(wrapper, MagicMock(), pending)
+
+        with patch("memwal.middleware._run_blocking", side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                wrapper.memwal_wait_for_saves_sync()
+
+        assert pending.drain_job_ids() == ["job-1"]
 
     @respx.mock
     async def test_wait_confirms_more_jobs_than_the_relayer_bulk_cap(self) -> None:
