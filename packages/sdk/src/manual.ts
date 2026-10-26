@@ -49,6 +49,7 @@ import {
     assertNonBlankText,
     sanitizeServerError,
     clockDriftErrorFromResponse,
+    assertFiniteScoringWeights,
     scoringWeightsToWire,
     fetchWithDeadline,
     DEFAULT_PREFLIGHT_TIMEOUT_MS,
@@ -472,6 +473,7 @@ export class MemWalManual {
                 `limit must be a positive integer, got ${limit}`,
             );
         }
+        assertFiniteScoringWeights(options.scoringWeights);
         const ns = options.namespace ?? this.namespace;
 
         // Step 1: Embed query

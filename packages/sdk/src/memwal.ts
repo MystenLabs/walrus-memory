@@ -71,6 +71,7 @@ import {
     sanitizeServerError,
     redactInternalUrls,
     clockDriftErrorFromResponse,
+    assertFiniteScoringWeights,
     scoringWeightsToWire,
     derivedIdempotencyKey,
     derivedBulkIdempotencyKey,
@@ -352,6 +353,31 @@ function jsonBodyError(status: number, message: string): Error {
     return Object.assign(new Error(message), { status });
 }
 
+function isJsonObject(value: unknown): boolean {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The parsed 2xx body must carry `field` as an array. #1207 named the error
+ * for a body that is not JSON; this names it for JSON of the wrong shape, so a
+ * drifted relayer or proxy does not surface as a raw `TypeError` (#1247).
+ */
+function requireArrayField<T>(
+    body: unknown,
+    field: string,
+    endpoint: string,
+    httpStatus?: number,
+): T[] {
+    const value = isJsonObject(body) ? (body as Record<string, unknown>)[field] : undefined;
+    if (!Array.isArray(value)) {
+        const err = new Error(`MemWal: ${endpoint} response is missing a ${field} array`);
+        // Polling loops treat a missing `status` as a network error and retry
+        // it; a malformed 2xx body is not transient, so carry the real status.
+        throw httpStatus === undefined ? err : Object.assign(err, { status: httpStatus });
+    }
+    return value as T[];
+}
+
 /**
  * How long a transient polling rejection asked us to wait, in ms.
  *
@@ -624,11 +650,13 @@ export class MemWal {
             { includeDelegateKey: false },
         );
 
-        if (!("status" in status)) {
+        if (!isJsonObject(status) || !("status" in status)) {
+            const raw = isJsonObject(status) ? (status as { error?: unknown }).error : undefined;
+            const error = typeof raw === "string" ? raw : undefined;
             return {
                 job_id: jobId,
                 status: "not_found",
-                error: status.error ?? `remember job not found: ${jobId}`,
+                error: error ?? `remember job not found: ${jobId}`,
             };
         }
 
@@ -700,7 +728,7 @@ export class MemWal {
                 throw err;
             }
 
-            if (!("status" in status) || status.status === "not_found") {
+            if (!isJsonObject(status) || !("status" in status) || status.status === "not_found") {
                 throw new MemWalRememberJobNotFoundError(jobId);
             }
             lastSeen = status;
@@ -848,7 +876,7 @@ export class MemWal {
         if (!Array.isArray(jobIds)) {
             throw new Error("getRememberBulkStatus: jobIds must be an array");
         }
-        return this.signedRequest<RememberBulkStatusResult>(
+        const result = await this.signedRequest<RememberBulkStatusResult>(
             "POST",
             "/api/remember/bulk/status",
             { job_ids: jobIds },
@@ -856,6 +884,9 @@ export class MemWal {
             // Status is metadata. No SEAL decrypt, so no session. (#1135)
             { timeoutMs: opts.timeoutMs, includeDelegateKey: false },
         );
+        // Only a 200 is accepted here.
+        requireArrayField(result, "results", "POST /api/remember/bulk/status", 200);
+        return result;
     }
 
     async waitForRememberJobs(
@@ -1173,14 +1204,7 @@ export class MemWal {
                 `limit must be a positive integer, got ${limit}`,
             );
         }
-        const weights = options.scoringWeights;
-        if (weights) {
-            for (const [name, value] of Object.entries(weights)) {
-                if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
-                    throw new Error(`scoringWeights.${name} must be a finite number`);
-                }
-            }
-        }
+        assertFiniteScoringWeights(options.scoringWeights);
         if (
             options.maxDistance !== undefined
             && (typeof options.maxDistance !== "number"
@@ -1217,6 +1241,7 @@ export class MemWal {
                 sort: options.sort,
                 ...(wireDeadline === undefined ? {} : { deadline_ms: wireDeadline }),
             }, { timeoutMs });
+            requireArrayField(result, "results", "POST /api/recall");
 
             let processed = result;
             if (typeof options.maxDistance === "number") {
@@ -1329,6 +1354,7 @@ export class MemWal {
                 `limit must be a positive integer, got ${limit}`,
             );
         }
+        assertFiniteScoringWeights(opts.scoringWeights);
         return this.signedRequest<RecallManualHitResult>(
             "POST",
             "/api/recall/manual",
@@ -1401,6 +1427,7 @@ export class MemWal {
         const options = normalizeAnalyzeOptions(namespaceOrOptions);
         const namespace = options.namespace ?? this.namespace;
         const accepted = await this.analyze(text, options);
+        requireArrayField(accepted, "job_ids", "POST /api/analyze");
         const namespaces = accepted.job_ids.map(() => namespace);
         const completed = await this.waitForRememberJobs(accepted.job_ids, namespaces, opts);
         return {
@@ -1558,6 +1585,7 @@ export class MemWal {
         const raw = await this.signedRequest<MemoriesResult>("GET", path, {}, [200], {
             includeDelegateKey: false,
         });
+        requireArrayField(raw, "memories", "GET /v1/owners/{owner}/memories");
         // Relayers older than WALM-363 omit the tombstone fields.
         const page: MemoriesResult = {
             ...raw,
