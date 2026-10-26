@@ -508,9 +508,10 @@ class TestBulkWaitUnderRateLimit:
         start = time.monotonic()
 
         async def probe_answers(job_ids: Sequence[str]) -> RememberBulkStatusResult:
-            # Refused for the whole 250ms wait; the read after the deadline is
-            # the probe. Time-based because jitter varies the poll count.
-            if time.monotonic() - start < 0.25:
+            # Refuse during the wait. The confirming read runs after the
+            # 250ms deadline, so the refusal window has to end before that
+            # or a slow CI clock still counts the probe as a refusal.
+            if time.monotonic() - start < 0.20:
                 raise _HttpStatusError(429, "{}")
             return RememberBulkStatusResult(
                 results=[

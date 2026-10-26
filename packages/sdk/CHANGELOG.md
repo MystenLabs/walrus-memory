@@ -1,9 +1,23 @@
 # @mysten-incubation/memwal
 
-## Unreleased
+## 0.1.9
 
 ### Fixed
 
+- `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
+- `rememberBulk` and `rememberBulkAsync` send an idempotency key derived from the batch (a 30-minute bucket plus each item's namespace and text). A retry inside that window returns the same jobs instead of storing the batch again. An explicit `idempotencyKey` still wins. (#1080)
+- `listMemories()` pages every stored memory without a similarity query. It returns metadata only: no blob download and no decrypt. An optional namespace filter runs on the client, so a filtered page can be empty while `has_more` is true. (WALM-388)
+- `withMemWal` does not recall or auto-save on a tool-execution step. A later tool step reuses the recall cached for that user message. Auto-save still runs only on a user turn. (#1079)
+- `flush()` raises when a background auto-save failed, and `onSaveError` runs. The chat turn itself still does not fail. (#1117)
+- `withMemWal` warns when recall fails and accepts `onRecallError`. (WALM-764)
+- `MemWal.create` and `MemWalManual.create` reject a blank `accountId`, an empty namespace string, and a private key that is not a 32-byte Ed25519 seed. An omitted namespace still defaults to `"default"`. (#1155, #1200, #1204)
+- `recall`, `recallManual`, and `restore` reject a `limit` that is not a positive integer before signing. `recall` also rejects a blank query, a non-finite scoring weight, and a non-finite or negative `maxDistance`. A bad `maxDistance` used to drop every hit and look like an empty namespace. `recall` also rejects a `maxTokens` that is not a number (`TypeError`) or is negative (`RangeError`). (#1086, #1068, #1227, #1228)
+- A `maxDistance` filter keeps the relayer's matching `total`. `total` is no longer replaced by the filtered row count, including when every row is dropped. (WALM-840)
+- When a token budget keeps only high-relevance hits, the lowest-distance hits are kept and the caller's sort order is preserved. (WALM-756)
+- `waitForRememberJob` and `waitForRememberJobs` do not sleep past the deadline. If the budget runs out during the sleep, they make one more status read. (#1081)
+- Package `exports` include a `default` condition and list `types` first, so Next.js, Turbopack, and Node `require(esm)` resolve the subpaths. (WALM-721)
+- A success response with an empty or non-JSON body raises an SDK error that names the HTTP status, instead of a raw `SyntaxError`. `MemWalManual.restore` sends the SEAL session and keeps its deadline armed across the body read. (#1201, #1137)
+- `getRememberBulkStatus` rejects a job id list that is not an array before any request. `MemWalMock.analyze` rejects an invalid date, and `MemWalMock.listNamespaces` rejects a cursor that is not `{updated_at, namespace}` instead of ending the page early. (#1226, #1229, #1203)
 - `createAccount`, `addDelegateKey`, `removeDelegateKey`, and `MemWalManual` work again without a caller-supplied `suiClient`. They looked for `SuiClient` in `@mysten/sui/client`, which current `@mysten/sui` no longer exports, and threw `SuiClient not found`. The default is now `SuiGrpcClient` against the public fullnode for `suiNetwork`, because those fullnodes no longer serve JSON-RPC. An explicit `suiClient` still wins. (WALM-164, #300)
 - `remember`, `rememberAsync`, and `rememberAndWait` reject a non-string text argument with `TypeError` before signing. An object used to be sent as `text` and the relayer answered 422. (#1058)
 - `getRememberStatus` and `waitForRememberJob` reject a job id outside `[A-Za-z0-9_-]+` before signing. `.`, `..`, `\`, and `%2e%2e` used to pass a denylist and be rewritten by `fetch` after the path was signed. Valid UUID job ids are unchanged. (#1087, #1216)
@@ -12,6 +26,7 @@
 - `MemWalMock.listNamespaces` rejects a non-positive or non-integer `limit` with `limit must be positive`, matching the relayer. `limit: 0` used to return `has_more: true` and `next_cursor: null`, so the documented pagination loop never finished, and `limit: -1` silently dropped the last namespace. (#1144, #1145)
 - `MemWalMock.rememberBulkAsync` rejects an empty or non-array batch with the same error as `MemWal`. (#1146)
 - `MemWalMock` honors `idempotencyKey`. A retry of the same text and namespace returns the original job, a different payload throws, and `forget` / `clear` release the key so the text can be written again. (#1147)
+- `MemWalMock` scopes an idempotency key to its namespace, like the relayer. (WALM-781)
 - `MemWalMock.recall({ sort: "recent" })` orders a bounded semantic window (5× `limit`, at least `limit`, at most 50) by write time before truncating. Relevance order is unchanged. (#1124)
 - Positional `recall(query, options, namespace)` uses that namespace when `options.namespace` is omitted, on both `MemWal` and `MemWalMock`. An explicit `options.namespace` still wins. (#1038)
 - `remember(text, { idempotencyKey })` and `rememberAndWait(text, { timeoutMs }, { idempotencyKey })` treat a plain object in the namespace slot as options. A third options argument is merged, and its fields win. That call used to send the object as the namespace, or drop the third argument and mint a second blob. An explicit string namespace still wins. (#1142)
@@ -26,11 +41,6 @@
 - A 401 `AUTH_REJECTED` now says a wallet address is not a MemWal account ID. The relayer still returns one 401 for every credential failure, so the message names the mix-up instead of revealing which check failed. (#1132)
 - `rememberBulkAndWait` / `waitForRememberJobs` no longer resolve a batch they could not read as if it were still uploading. The status endpoint counts against the delegate-key budget, and a 429 on every poll used to be retried silently until the wait ran out, leaving each item as `timeout` with "polling timed out", even when nothing had been stored. When no poll got through, the wait now makes one confirming read. If that is rate-limited too, it throws `MemWalRateLimited` (`status: 429`, `jobIds`, `retryAfterSeconds`). An item still unsettled at the deadline names its last known status, or says no read got through. (WALM-671, #967)
 - A `rememberAndWait` / `waitForRememberJob` that runs out of time now raises `MemWalRememberJobTimeout` (still `status: 504`) carrying `lastStatus` and `serverError`, the last state the relayer reported. Under upload congestion the relayer keeps a job `running` for up to ~25 minutes and says so, but the 504 used to drop that, so a job that was still retrying looked dead and callers dropped their idempotency key to force a new paid write. When no poll got through, the message says the state is unknown instead. (WALM-670, #966)
-
-## 0.1.9
-
-### Fixed
-
 - Grow `waitForRememberJob` / `waitForRememberJobs` poll delay 1.5× from the caller interval (floor 100ms) toward a 5s cap, with an immediate first poll. Backoff is disabled above the cap. (WALM-623)
 - A 429 during a remember-job wait is reported on the timeout. Retry-After is still clamped to the caller's remaining budget, and that remainder still buys one status read. (WALM-623)
 

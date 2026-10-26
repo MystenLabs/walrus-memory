@@ -35,7 +35,7 @@ Add MemWal to OpenCode so the agent can save and recall durable facts. OpenCode 
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x)
 - A Walrus Memory account. The first memory tool call opens a browser sign-in (`memwal_login`).
 
 ## Installation

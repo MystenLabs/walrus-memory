@@ -7,7 +7,7 @@ never calls OpenRouter, Sui, or the Walrus relayer.
 
 ## Prerequisites
 
-- Node 22 (or 20) + pnpm 9.
+- Node 22.23.4+ (or 24.22.1+ / 26.12.1+) + pnpm 9.
 - PostgreSQL with the schema migrations applied:
   ```bash
   docker compose -f apps/researcher/docker-compose.yml up -d

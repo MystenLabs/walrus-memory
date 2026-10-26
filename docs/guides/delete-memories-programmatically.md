@@ -60,7 +60,7 @@ The deletion flow uses these endpoints:
 
 You need:
 
-- Node.js 20 or later.
+- Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x).
 - The base URL of a MemWal deployment with the Security Delete API enabled.
 - The Sui private key for the wallet that owns the memories.
 

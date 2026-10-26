@@ -2691,6 +2691,10 @@ async fn main() {
             "/api/admin/activity",
             get(routes::admin_activity::get_admin_activity).layer(DefaultBodyLimit::max(16 * 1024)),
         )
+        .route(
+            "/api/admin/unblock-requests",
+            get(routes::list_unblock_requests).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .layer(middleware::from_fn(auth::verify_admin_key));
 
     // Public routes
@@ -2716,8 +2720,35 @@ async fn main() {
             "/api/accounts/{owner}/exists",
             get(routes::account_exists)
                 .layer(DefaultBodyLimit::max(16 * 1024))
-                // Only route in `public_routes` that hits the DB pool — see
-                // `rate_limit::accounts_rate_limit_middleware` doc comment.
+                // Shares the accounts rate limit with the revocation routes
+                // below. See `rate_limit::accounts_rate_limit_middleware`.
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    rate_limit::accounts_rate_limit_middleware,
+                )),
+        )
+        .route(
+            "/api/accounts/{owner}/delegate-keys",
+            get(routes::delegate_keys)
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    rate_limit::accounts_rate_limit_middleware,
+                )),
+        )
+        .route(
+            "/api/accounts/{owner}/incident",
+            get(routes::incident_status)
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    rate_limit::accounts_rate_limit_middleware,
+                )),
+        )
+        .route(
+            "/api/accounts/{owner}/unblock-requests",
+            post(routes::request_unblock)
+                .layer(DefaultBodyLimit::max(4 * 1024))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     rate_limit::accounts_rate_limit_middleware,

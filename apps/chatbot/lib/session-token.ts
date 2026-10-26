@@ -1,11 +1,12 @@
 import { getToken } from "next-auth/jwt";
+import { getAuthSecret } from "@/lib/auth-secret";
 import { isDevelopmentEnvironment } from "@/lib/constants";
 
 export async function getSessionToken(request: Request) {
   try {
     return await getToken({
       req: request,
-      secret: process.env.AUTH_SECRET,
+      secret: getAuthSecret(),
       secureCookie: !isDevelopmentEnvironment,
     });
   } catch (error) {

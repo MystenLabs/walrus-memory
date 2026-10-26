@@ -2,7 +2,7 @@
 title: "Run Docs Locally"
 description: >-
   Instructions for running the Walrus Memory Mintlify documentation site locally
-  using Node 20 and pnpm, including build commands for verification.
+  using Node 22.23.4 and pnpm, including build commands for verification.
 keywords:
   - Walrus Memory
   - MemWal
@@ -29,21 +29,23 @@ questions:
   - "How do I build the MemWal documentation site?"
 answer: >-
   Run pnpm install and pnpm dev:docs from the repository root to start the Mintlify docs site
-  locally. Use Node 20 LTS because Mintlify fails on Node 25+. Build with pnpm build:docs
+  locally. Use Node 22.23.4 from .nvmrc because Mintlify fails on Node 25+. Build with pnpm build:docs
   to verify the output.
 ---
 
 Run these commands from the repository root:
 
 ```bash
-npx -p node@20 -c 'node -v'
+nvm install
+nvm use
 pnpm install
 pnpm dev:docs
 ```
 
 This starts the Mintlify site using the docs in this repository.
 
-Use Node 20 LTS for Mintlify local preview. Mintlify fails on Node 25+.
+Use Node 22.23.4 from `.nvmrc` for Mintlify local preview. If you use another
+version manager, select that version before running pnpm. Mintlify fails on Node 25+.
 
 ## Build the Docs
 

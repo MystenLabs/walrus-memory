@@ -37,7 +37,9 @@ pub(crate) fn next_search_fetch_limit(
     if dropped == 0 {
         return None;
     }
-    let cap = limit.saturating_mul(SEARCH_SIMILAR_OVERFETCH_FACTOR).max(limit);
+    let cap = limit
+        .saturating_mul(SEARCH_SIMILAR_OVERFETCH_FACTOR)
+        .max(limit);
     if fetch_limit >= cap {
         return None;
     }
@@ -160,6 +162,8 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // deleted_at range index for the admin activity delete counts.
     // CONCURRENTLY, own file -- see 024's header.
     migration!("024_memory_tombstones_deleted_at_index.sql"),
+    // Quarantined owners asking for admin_clear_quarantine.
+    migration!("025_account_unblock_requests.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -4030,6 +4034,44 @@ impl VectorDb {
                 .map_err(|e| AppError::Internal(format!("Failed to query accounts: {}", e)))?;
 
         Ok(result.map(|(id,)| id))
+    }
+
+    /// Insert or refresh the single unblock request for an owner.
+    pub async fn upsert_unblock_request(
+        &self,
+        owner: &str,
+        account_id: &str,
+    ) -> Result<chrono::DateTime<chrono::Utc>, AppError> {
+        let requested_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "INSERT INTO account_unblock_requests (owner, account_id)
+             VALUES ($1, $2)
+             ON CONFLICT (owner) DO UPDATE
+             SET account_id = EXCLUDED.account_id,
+                 requested_at = now()
+             RETURNING requested_at",
+        )
+        .bind(owner)
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| AppError::Internal(format!("Failed to store unblock request: {error}")))?;
+        Ok(requested_at)
+    }
+
+    /// Newest first, capped so an admin page cannot pull an unbounded table.
+    pub async fn list_unblock_requests(
+        &self,
+    ) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
+        let rows = sqlx::query_as(
+            "SELECT owner, account_id, requested_at
+             FROM account_unblock_requests
+             ORDER BY requested_at DESC
+             LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| AppError::Internal(format!("Failed to list unblock requests: {error}")))?;
+        Ok(rows)
     }
 
     // ============================================================

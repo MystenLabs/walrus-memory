@@ -68,8 +68,8 @@ mechanisms, dispatched by `auth::verify_read_api_auth`
    headers" and "Canonical signing string" below.
 2. **Owner-scoped bearer token** (`Authorization: Bearer <token>`), the
    mechanism for Console, which structurally never holds a delegate key and
-   so can never produce an Ed25519 signature. See `docs/api/owner-token-auth.md`
-   for how Console obtains a token; once obtained, a request here is just
+   so can never produce an Ed25519 signature. Console mints that token with
+   `POST /v1/owner-tokens`. Once obtained, a request here is just
    `Authorization: Bearer <token>` with no other auth headers. The token's
    `permissions` must include `memories.read` (the only scope currently
    minted) or the request is rejected `403`.

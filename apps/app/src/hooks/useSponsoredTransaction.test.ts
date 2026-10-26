@@ -52,6 +52,35 @@ describe('sponsorFailureMessage', () => {
         expect(sponsorFailureMessage(err)).toContain('max 20')
     })
 
+    it('says the account is already active instead of a generic sponsor rejection', () => {
+        const err = new SponsorHttpError(
+            'sponsor',
+            409,
+            bodyFor({
+                error: 'This account is already active, so it cannot be reactivated.',
+                code: 'account_already_active',
+                traceId: 'req-11',
+            }),
+        )
+        const message = sponsorFailureMessage(err)
+        expect(message).toBe('This account is already active, so it cannot be reactivated. (traceId: req-11)')
+        expect(message).not.toContain('rejected by the sponsor')
+    })
+
+    it('says the account is still locked when reactivation is quarantined', () => {
+        const err = new SponsorHttpError(
+            'sponsor',
+            409,
+            bodyFor({
+                error: 'This account is still locked, so it cannot be reactivated yet.',
+                code: 'account_quarantined',
+                traceId: 'req-20',
+            }),
+        )
+        expect(sponsorFailureMessage(err)).toContain('still locked')
+        expect(sponsorFailureMessage(err)).toContain('traceId: req-20')
+    })
+
     it('reports a masked upstream rejection with its traceId', () => {
         const err = new SponsorHttpError(
             'sponsor',

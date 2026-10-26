@@ -16,9 +16,9 @@ from typing import Any, Dict, List, Optional
 # ============================================================
 
 #: Default ``server_url`` when neither an explicit URL nor an ``env`` preset
-#: is supplied. Kept as a module constant so ``__post_init__`` can tell an
-#: untouched default apart from an explicitly-passed custom URL.
-DEFAULT_SERVER_URL = "http://localhost:8000"
+#: is supplied. ``None`` means the caller omitted it. An explicit URL, including
+#: this hosted default, wins over ``env``.
+DEFAULT_SERVER_URL = "https://relayer.memory.walrus.xyz"
 
 #: Named relayer environments for the public Walrus Memory deployments.
 ENV_PRESETS = {
@@ -37,18 +37,18 @@ class MemWalConfig:
         key: Ed25519 private key (hex string). This is the delegate key from the
             Walrus Memory dashboard.
         account_id: Walrus Memory account object ID on Sui.
-        server_url: Server URL (default: http://localhost:8000). An explicit
-            non-default value always wins over ``env``.
+        server_url: Server URL. ``None`` means omitted. Any explicit URL,
+            including the hosted default, wins over ``env``.
         namespace: Default namespace for memory isolation (default: "default").
         env: Optional relayer preset — one of ``"prod"``, ``"dev"``,
-            ``"staging"``, ``"local"``. Resolves ``server_url`` to the matching
-            hosted relayer when ``server_url`` is left at its default.
-            Precedence: explicit ``server_url`` > ``env`` > default.
+            ``"staging"``, ``"local"``. Used only when ``server_url`` is
+            omitted (``None``). Precedence: explicit ``server_url`` > ``env``
+            > ``DEFAULT_SERVER_URL``.
     """
 
     key: str
     account_id: str
-    server_url: str = DEFAULT_SERVER_URL
+    server_url: Optional[str] = None
     namespace: str = "default"
     env: Optional[str] = None
 
@@ -60,10 +60,10 @@ class MemWalConfig:
                 raise ValueError(
                     f"Unknown env preset {self.env!r}. Valid presets: {valid}"
                 )
-            # Explicit, non-default server_url takes precedence over the
-            # preset; only fill from the preset when server_url is untouched.
-            if self.server_url == DEFAULT_SERVER_URL:
+            if self.server_url is None:
                 self.server_url = preset
+        if self.server_url is None:
+            self.server_url = DEFAULT_SERVER_URL
 
 
 # ============================================================
@@ -108,6 +108,8 @@ class RecallParams:
     limit: int = 10
     namespace: Optional[str] = None
     max_distance: Optional[float] = None
+    scoring_weights: Optional["ScoringWeights"] = None
+    sort: Optional[str] = None
 
 
 @dataclass

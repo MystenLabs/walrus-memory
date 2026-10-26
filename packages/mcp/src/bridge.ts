@@ -40,6 +40,7 @@ import {
     type LoginSuccessInfo,
 } from "./messages.js";
 import { openStreamableSession, resolveTransport } from "./streamable.js";
+import { fetchMcp, ssePostUrl } from "./http-security.js";
 import { MEMWAL_MCP_VERSION } from "./version.js";
 
 /** Bridge mode runtime config — the URLs / label resolved at boot from
@@ -629,7 +630,7 @@ async function openSseStream(
 
     let resp: Response;
     try {
-        resp = await fetch(url, {
+        resp = await fetchMcp(url, {
             method: "GET",
             headers: {
                 ...mcpAuthHeaders(creds, extraHeaders),
@@ -853,9 +854,13 @@ async function openSseStream(
 
     // `endpointPath` may be relative (`/api/mcp/messages?sessionId=...`) or
     // absolute. Make it absolute for `fetch()`.
-    const postUrl = endpointPath.startsWith("http")
-        ? endpointPath
-        : `${relayerUrl.replace(/\/+$/, "")}${endpointPath}`;
+    let postUrl: string;
+    try {
+        postUrl = ssePostUrl(relayerUrl, endpointPath);
+    } catch (err) {
+        controller.abort();
+        throw err;
+    }
 
     return {
         postUrl,
@@ -874,7 +879,7 @@ async function postMessage(
     creds: MemWalCredentials,
     extraHeaders: Record<string, string> = {},
 ): Promise<number> {
-    const resp = await fetch(postUrl, {
+    const resp = await fetchMcp(postUrl, {
         method: "POST",
         headers: {
             ...mcpAuthHeaders(creds, extraHeaders),

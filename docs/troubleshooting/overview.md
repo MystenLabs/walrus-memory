@@ -5,7 +5,7 @@ keywords: [Walrus Memory, MemWal, troubleshooting, AUTH_REJECTED, delegate key, 
 ---
 
 {/*
-Source: BEDU-612, seeded from a Walrus Memory Discord support thread.
+Seeded from a Walrus Memory Discord support thread.
 The 401 reporter self-resolved without recording the exact fix, so the AUTH_REJECTED
 entry documents all known causes from the authentication model rather than a single
 confirmed one. Confirm the specific fix with the reporter before treating that entry

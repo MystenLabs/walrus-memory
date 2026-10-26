@@ -32,6 +32,10 @@ jobs:
             script: scripts/check-docs-code-sync.mjs
           - name: Docs / Freshness
             script: scripts/check-docs-freshness.mjs
+          - name: Release / Manual versions and changelogs
+            script: scripts/verify-manual-sdk-release.mjs
+          - name: Release / Verifier regressions
+            script: scripts/tests/verify-manual-sdk-release.test.mjs
           - name: SEAL cross-account synthetic parser
             script: scripts/synthetic-seal-cross-account.test.mjs
           - name: Migration / Completion artifact
@@ -42,7 +46,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       - name: Run check
         run: node ${{ matrix.script }}
@@ -68,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["22", "24"]
+        node-version: ["22.23.4", "24.22.1"]
 
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +130,8 @@ jobs:
         run: pnpm build:sdk
 
       - name: Setup Playwright
-        timeout-minutes: 8
+        # Slow package mirrors can spend eight minutes on OS deps alone.
+        timeout-minutes: 12
         uses: ./.github/actions/setup-playwright
         with:
           package: "@memwal/chatbot"
@@ -190,7 +195,7 @@ jobs:
         run: pnpm --filter researcher test:unit
 
       - name: Setup Playwright
-        timeout-minutes: 8
+        timeout-minutes: 12
         uses: ./.github/actions/setup-playwright
         with:
           package: researcher
@@ -247,7 +252,7 @@ jobs:
         run: pnpm build:sdk
 
       - name: Setup Playwright
-        timeout-minutes: 8
+        timeout-minutes: 12
         uses: ./.github/actions/setup-playwright
         with:
           package: "@memwal/noter"
@@ -319,7 +324,7 @@ jobs:
       - name: Setup Node (for TS sidecar auto-spawned by server)
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
 
       - name: Install sidecar deps
         working-directory: services/server/scripts
@@ -331,9 +336,9 @@ jobs:
           fi
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: ./.github/actions/setup-python
         with:
-          python-version: "3.11"
+          python-version: "3.11.17"
 
       - name: Install Python deps
         run: pip install -r services/server/tests/requirements.txt
@@ -412,6 +417,10 @@ jobs:
 
       - name: Build (Next.js, type-check inclusive)
         working-directory: apps/chatbot
+        env:
+          # next build imports auth.ts, which rejects a missing or short secret.
+          AUTH_SECRET: ci-test-secret-not-for-production
+          POSTGRES_URL: postgresql://dummy:dummy@localhost:5432/dummy
         run: pnpm exec next build
 
   noter-checks:

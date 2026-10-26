@@ -5,13 +5,11 @@ import { existsSync, readFileSync } from "node:fs";
 const releases = [
     {
         name: "TypeScript SDK",
-        version: "0.1.8",
         manifests: [["packages/sdk/package.json", "version"]],
         changelogs: ["packages/sdk/CHANGELOG.md", "docs/sdk/changelog.mdx"],
     },
     {
         name: "Python SDK",
-        version: "0.1.11",
         manifests: [
             ["packages/python-sdk-memwal/pyproject.toml", "toml-version"],
             ["packages/python-sdk-memwal/memwal/__init__.py", "python-version"],
@@ -23,7 +21,6 @@ const releases = [
     },
     {
         name: "MCP package",
-        version: "0.0.14",
         manifests: [
             ["packages/mcp/package.json", "version"],
             [".claude-plugin/marketplace.json", "plugin-version"],
@@ -37,7 +34,6 @@ const releases = [
     },
     {
         name: "OpenClaw plugin",
-        version: "0.0.7",
         manifests: [["packages/openclaw-memory-memwal/package.json", "version"]],
         changelogs: [
             "packages/openclaw-memory-memwal/CHANGELOG.md",
@@ -47,20 +43,26 @@ const releases = [
 ];
 
 for (const release of releases) {
+    const [sourcePath, sourceKind] = release.manifests[0];
+    const version = readVersion(readFileSync(sourcePath, "utf8"), sourceKind);
+    if (!/^\d+\.\d+\.\d+$/.test(version)) {
+        throw new Error(`${sourcePath}: expected a stable manual release version, received ${version}`);
+    }
     for (const [path, kind] of release.manifests) {
         const content = readFileSync(path, "utf8");
         const actual = readVersion(content, kind);
-        if (actual !== release.version) {
-            throw new Error(`${path}: expected ${release.version}, received ${actual}`);
+        if (actual !== version) {
+            throw new Error(`${path}: expected ${version}, received ${actual}`);
         }
     }
     for (const path of release.changelogs) {
         const content = readFileSync(path, "utf8");
-        if (!content.includes(`## ${release.version}\n`)) {
-            throw new Error(`${path}: missing release ${release.version}`);
+        const newest = /^## (\d+\.\d+\.\d+)\r?$/m.exec(content)?.[1];
+        if (newest !== version) {
+            throw new Error(`${path}: newest release must be ${version}, received ${newest ?? "none"}`);
         }
     }
-    console.log(`${release.name} ${release.version}: manifests and changelogs synchronized`);
+    console.log(`${release.name} ${version}: manifests and changelogs synchronized`);
 }
 
 // The plugin no longer launches the server through `npx <name>@<pin>`: npx resolves
@@ -71,17 +73,28 @@ for (const release of releases) {
 // checked against packages/mcp/package.json above — or its `mcpPackageVersion`,
 // which names the published prerelease to install while that release version is
 // not yet on npm. A pin the registry cannot serve fails the launch outright, so the
-// override may only name a prerelease of the release it stands in for, and it has
-// to go when that release is published.
+// override may name the current release's prerelease or an earlier stable release
+// while the new version is not published. check-mcp-pin.mjs independently verifies
+// that the registry actually serves the override. Retarget/drop it after publishing.
 const mcpVersion = JSON.parse(readFileSync("packages/mcp/package.json", "utf8")).version;
 const pinOverride = JSON.parse(
     readFileSync("packages/mcp/plugin/plugin.json", "utf8"),
 ).mcpPackageVersion;
-if (pinOverride !== undefined && !pinOverride.startsWith(`${mcpVersion}-`)) {
-    throw new Error(
-        `packages/mcp/plugin/plugin.json: "mcpPackageVersion" is ${pinOverride}, which is not ` +
-            `a prerelease of ${mcpVersion}; drop it once ${mcpVersion} is on npm`,
+if (pinOverride !== undefined) {
+    const stable = /^(\d+)\.(\d+)\.(\d+)$/.exec(pinOverride);
+    const releaseParts = mcpVersion.split(".").map(Number);
+    const pinParts = stable?.slice(1).map(Number);
+    const firstDifference = pinParts?.findIndex((part, index) => part !== releaseParts[index]);
+    const stableAtOrBeforeRelease = stable && (
+        firstDifference === -1 || pinParts[firstDifference] < releaseParts[firstDifference]
     );
+    const currentPrerelease = new RegExp(`^${mcpVersion.replaceAll(".", "\\.")}-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*$`).test(pinOverride);
+    if (!stableAtOrBeforeRelease && !currentPrerelease) {
+        throw new Error(
+            `packages/mcp/plugin/plugin.json: "mcpPackageVersion" is ${pinOverride}; ` +
+                `expected a stable release at or before ${mcpVersion}, or its prerelease`,
+        );
+    }
 }
 const LAUNCHER = "scripts/launch_mcp.mjs";
 for (const [pluginPath, rootPlaceholder] of [

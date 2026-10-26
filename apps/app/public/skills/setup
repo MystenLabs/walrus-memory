@@ -103,8 +103,9 @@ For local MCP clients, check Node.js:
 node -v
 ```
 
-Walrus Memory MCP requires Node.js 20 or newer. If Node is missing or older
-than 20, ask the user to install Node.js 20+ from https://nodejs.org/ and stop.
+Use a supported, patched Node.js runtime: 22.23.4+ within 22.x, 24.22.1+
+within 24.x, or 26.12.1+ within 26.x. If Node is missing or does not meet
+these security minimums, ask the user to update from https://nodejs.org/ and stop.
 The Remote MCP path needs Node.js only once, for the login step on the user's
 computer.
 
@@ -199,7 +200,7 @@ and merge:
 ### Claude Desktop local MCP (optional)
 
 For regular chat, prefer the Claude OAuth Connector section above. Use this
-local alternative only when the user chooses it; it requires Node.js 20+.
+local alternative only when the user chooses it; it requires a patched Node.js runtime as listed above.
 This config does not install the plugin for the Code tab.
 
 Edit:
@@ -495,7 +496,7 @@ this skill for the same client.
 
 | Symptom | Fix |
 | --- | --- |
-| `node: command not found` | Install Node.js 20+ from https://nodejs.org/. |
+| `node: command not found` | Install a supported, patched Node.js release from https://nodejs.org/ (see Requirements above). |
 | `npx` fails | Confirm Node/npm and internet access. If inside a Node monorepo, run from the home directory or set MCP `cwd` to the home directory. |
 | No Walrus Memory tools after restart | Check the MCP config path and fully restart the client. |
 | Claude Code saves to `MEMORY.md` instead of `memwal_remember` | Run `claude plugin list` first: the plugin is usually missing, and its hook supplies the routing on its own. If the plugin is installed and this still happens, ask the user to disable Claude's built-in / native memory in account settings, then merge the Walrus Memory block into `~/.claude/CLAUDE.md` as a fallback. |

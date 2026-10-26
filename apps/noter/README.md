@@ -24,7 +24,7 @@ AI assistant platform powered by Sui blockchain zkLogin authentication.
 
 ### Prerequisites
 
-- Node.js 18+ and pnpm
+- Node.js 22.23.4+ (or 24.22.1+ / 26.12.1+) and pnpm
 - PostgreSQL database (Neon, Supabase, or local)
 - Google OAuth credentials
 - Environment variables configured

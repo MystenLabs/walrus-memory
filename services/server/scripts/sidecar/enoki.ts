@@ -81,6 +81,27 @@ export function isMoveAbortBalanceSplit(message: string): boolean {
 }
 
 /**
+ * `account::reactivate_account` aborts the sponsor dry-run when the account
+ * is already active (11) or still quarantined (20). Callers map these to a
+ * stable code. Every other MoveAbort stays unclassified.
+ */
+export function reactivateRejectionCode(
+    message: string,
+): "account_already_active" | "account_quarantined" | null {
+    if (!/moveabort/i.test(message)) return null;
+    const namesThisFunction =
+        /::account::reactivate_account\b/.test(message) ||
+        /"functionName"\s*:\s*"reactivate_account"/.test(message);
+    if (!namesThisFunction) return null;
+    const abort =
+        message.match(/abort code:\s*(11|20)\b/i)?.[1] ??
+        message.match(/"abortCode"\s*:\s*"(11|20)"/)?.[1];
+    if (abort === "11") return "account_already_active";
+    if (abort === "20") return "account_quarantined";
+    return null;
+}
+
+/**
  * Detect the `0x2::coin::destroy_zero` abort (ENonZero, abort code 0) that the
  * Walrus register PTB raises when the WAL payment coin still holds a non-zero
  * remainder. The `@mysten/walrus` `#withWal` helper pre-funds an *exact* WAL

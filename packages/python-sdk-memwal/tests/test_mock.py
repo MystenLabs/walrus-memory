@@ -46,6 +46,37 @@ async def test_mock_remember_and_recall_are_deterministic_and_offline(monkeypatc
     assert recalled.results[1].created_at == "2026-01-01T00:00:02.000Z"
 
 
+
+@pytest.mark.asyncio
+async def test_mock_recall_sort_recent_is_not_relevance_order():
+    mock = MemWalMock.create(namespace="user-a")
+    await mock.remember_and_wait("I prefer coffee in the morning")
+    await mock.remember_and_wait("I drink tea at night")
+
+    recent = await mock.recall(RecallParams(query="I", sort="recent"))
+    assert [memory.text for memory in recent.results] == [
+        "I drink tea at night",
+        "I prefer coffee in the morning",
+    ]
+
+    with pytest.raises(ValueError, match="sort"):
+        await mock.recall(RecallParams(query="I", sort="newest"))
+
+
+@pytest.mark.asyncio
+async def test_mock_recall_sort_recent_stays_inside_the_semantic_window():
+    mock = MemWalMock.create(namespace="user-a")
+    for i in range(6):
+        await mock.remember_and_wait(f"same fact {i}")
+    recent = await mock.recall(RecallParams(query="same fact", limit=1, sort="recent"))
+    assert recent.results[0].text == "same fact 4"
+
+    wide = MemWalMock.create(namespace="user-a")
+    for i in range(51):
+        await wide.remember_and_wait(f"same fact {i}")
+    first = await wide.recall(RecallParams(query="same fact", limit=11, sort="recent"))
+    assert first.results[0].text == "same fact 49"
+
 @pytest.mark.asyncio
 async def test_mock_isolates_namespaces_and_honors_max_distance():
     mock = MemWalMock.create()

@@ -49,7 +49,7 @@ The TypeScript SDK (`MemWal.create()` and `withMemWal()`) and the Python SDK tak
 | `MEMWAL_PRIVATE_KEY` | `key` | none | Delegate private key in hex. The fundamentals and Python examples use this name |
 | `MEMWAL_KEY` | `key` | none | The same delegate private key under a shorter name used by the getting-started and SDK quick-starts. Pick one name per project |
 | `MEMWAL_ACCOUNT_ID` | `accountId` | none | `MemWalAccount` object ID on Sui |
-| `MEMWAL_SERVER_URL` | `serverUrl` | SDK-specific | Relayer base URL. The TypeScript SDK defaults to `https://relayer.memory.walrus.xyz`; the Python SDK defaults to `http://localhost:8000` unless `env="prod"` selects the hosted relayer |
+| `MEMWAL_SERVER_URL` | `serverUrl` | SDK-specific | Relayer base URL. Both SDKs default to `https://relayer.memory.walrus.xyz`. Python `env="local"` selects `http://127.0.0.1:8000` |
 | `SUI_PRIVATE_KEY` | `suiPrivateKey` | none | Sui signer key for `MemWalManual` local signing, in `suiprivkey1...` format |
 | `OPENAI_API_KEY` | `embeddingApiKey` (manual client only) | none | Embedding and fact-extraction provider key. Only the `MemWalManual` client takes it as `embeddingApiKey`. The standard `MemWal` and Python SDKs let the relayer handle embeddings, so this is needed only for optional OpenAI middleware or demos |
 | `OPENAI_BASE_URL` | `embeddingApiBase` (manual client only) | `https://api.openai.com/v1` | Base URL for an OpenAI-compatible provider such as OpenRouter, in the same manual-client and optional-middleware contexts as `OPENAI_API_KEY` |
@@ -105,6 +105,8 @@ These are not all enforced at boot, but most real deployments need them.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PORT` | `8000` | Relayer port |
+| `MEMWAL_AFFECTED_OWNERS` | empty | Comma-separated owner addresses. `GET /api/accounts/:owner/incident` marks these owners affected so the dashboard banner stays off for everyone else. `0x` is optional |
+| `MEMWAL_LEAKED_DELEGATE_PUBLIC_KEYS` | empty | Comma-separated delegate public keys (64 hex chars). An owner is affected while one of these keys is still on their account. With both lists empty, the banner follows the on-chain `admin_quarantined` flag |
 | `RUST_LOG` | `memwal_server=info,tower_http=info` | Rust tracing filter for relayer logs |
 | `LOG_FORMAT` | pretty text | Set to `json` for machine-parseable structured logs |
 | `ALERT_TO_SLACK` | none | Slack incoming webhook URL. When set, the relayer posts an alert after a Walrus upload job exhausts all 5 wallet attempts without producing a blob |

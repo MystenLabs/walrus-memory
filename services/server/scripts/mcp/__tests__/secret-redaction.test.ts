@@ -745,3 +745,119 @@ test("a clean passage is forwarded byte-for-byte", () => {
     assert.deepEqual(out.dropped, []);
     assert.equal(droppedSpanNotice(out.dropped, out.segments), "");
 });
+
+test("db_pass, encryption_key, and priv_key assignments are redacted (#1052)", () => {
+    const V = "hunter2-prod-9xQ";
+    const labels = [
+        "db_pass",
+        "dbpass",
+        "DB_PASS",
+        "encryption_key",
+        "enc_key",
+        "ENCRYPTION_KEY",
+        "priv_key",
+        "privkey",
+        "private_key",
+        "db_password",
+    ];
+    for (const label of labels) {
+        const fact = `My local override file has ${label}=${V} and I never commit it`;
+        assertRedacted(fact, V, "credential-assignment", [
+            "local override file",
+            "never commit it",
+            `${label}=`,
+        ]);
+    }
+
+    const batch = sanitizeFactBatch(
+        labels.map((label) => `staging ${label}=${V} stays out of git`),
+    );
+    for (const [i, result] of batch.entries()) {
+        assert.equal(result.refusal, undefined, labels[i]);
+        assert.ok(!result.text.includes(V), `batch kept ${labels[i]}=${V}: ${result.text}`);
+        assert.ok(result.text.includes(`${labels[i]}=`), result.text);
+    }
+
+    const passage = sanitizePassage(
+        [
+            "I always use pnpm",
+            ...labels.map((label) => `staging ${label}=${V} stays out of git`),
+            "I deploy on Thursdays",
+        ].join("\n"),
+    );
+    assert.equal(passage.refusal, undefined);
+    assert.ok(!passage.text.includes(V), passage.text);
+    for (const label of labels) {
+        assert.ok(passage.text.includes(`${label}=`), passage.text);
+    }
+    assert.ok(passage.text.includes("I always use pnpm"));
+    assert.ok(passage.text.includes("I deploy on Thursdays"));
+
+    for (const fact of [
+        "My password manager is 1Password and I rotate keys every quarter.",
+        "The compass=north bearing is what the field notes record.",
+        `My local override file has mypass=${V} and I never commit it`,
+        `My local override file has bypass=${V} and I never commit it`,
+    ]) {
+        const out = sanitizeFact(fact);
+        assert.equal(out.text, fact, `changed a clean fact: ${fact}`);
+        assert.equal(out.changed, false);
+    }
+});
+
+test("hex beside the new credential labels is key material too (#1052)", () => {
+    const HEX = "4f3c2b1a9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b";
+    const labels = [
+        "db_pass",
+        "dbpass",
+        "DB_PASS",
+        "db_password",
+        "encryption_key",
+        "enc_key",
+        "ENCRYPTION_KEY",
+        "priv_key",
+        "privkey",
+    ];
+    for (const label of labels) {
+        for (const fact of [
+            `Notes from setup: ${label} ${HEX} on this laptop`,
+            `Notes from setup: ${HEX} is my ${label} for this laptop`,
+        ]) {
+            const out = sanitizeFact(fact);
+            assert.equal(out.refusal, undefined, fact);
+            assert.ok(!out.text.includes(HEX), `hex survived: ${fact}`);
+            assert.ok(out.text.includes("Notes from setup"), fact);
+        }
+    }
+
+    for (const fact of [
+        `Notes from setup: ${HEX} is mypass for this laptop`,
+        `Pin the build to commit ${HEX.slice(0, 40)} mypass`,
+    ]) {
+        const out = sanitizeFact(fact);
+        assert.equal(out.text, fact, `mypass must not label the preceding id: ${fact}`);
+        assert.equal(out.changed, false);
+    }
+
+    const split = sanitizeFactBatch([
+        "my encryption_key for the staging box",
+        HEX,
+    ]);
+    assert.ok(!split.map((r) => r.text).join("\n").includes(HEX));
+    assert.equal(split[1].refusal, "credential-only");
+    assert.equal(split[0].refusal, undefined);
+});
+
+test("the word pass is ordinary English, not a credential (#1052)", () => {
+    const sha = "4f2b8c1e9d7a3f5b6c0e2d4a8b1f3c5e7d9a0b2c";
+    const hex = "4f3c2b1a9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b";
+    for (const fact of [
+        "Our CI config has pass: true for the smoke suite",
+        `I need to pass this commit sha ${sha} to the team`,
+        `${hex} is my pass`,
+    ]) {
+        const out = sanitizeFact(fact);
+        assert.equal(out.text, fact, `changed a clean fact: ${fact}`);
+        assert.equal(out.changed, false);
+    }
+});

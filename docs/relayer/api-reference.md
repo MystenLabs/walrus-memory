@@ -43,7 +43,7 @@ See also:
 
 The routes below require signed headers, except the [MCP transports](#mcp-transports), which use bearer authentication. The SDK handles the signing automatically.
 
-Not every `/api/*` route works this way. Account existence checks need no authentication, the security-delete families use their own challenge and bearer flows, and `/api/admin/*` requires an `ADMIN_API_KEY`. Those families stay out of scope here.
+Not every `/api/*` route works this way. Account existence checks and the quarantine routes below need no authentication. The security-delete families use their own challenge and bearer flows, and `/api/admin/*` requires an `ADMIN_API_KEY`. Security-delete and the admin dashboard stay out of scope here. `GET /api/admin/unblock-requests` is the one admin route documented with the quarantine routes.
 
 ### Required headers
 
@@ -158,6 +158,72 @@ Proxy to the Seal/Walrus sidecar's `/sponsor` endpoint for sponsored transaction
 ### `POST /sponsor/execute`
 
 Proxy to the sidecar's `/sponsor/execute` endpoint. `sender` must match the short-lived, one-time Redis binding that the authenticated `/sponsor` call creates.
+
+### `GET /api/accounts/:owner/delegate-keys`
+
+Public read of one owner's delegate keys from Sui RPC. The relayer resolves that owner through `AccountRegistry`'s dynamic field, then reads the `MemWalAccount`. It does not use the indexer or the delegate-key cache. The response has no private key.
+
+No authentication. Same per-IP limit as `GET /api/accounts/:owner/exists`: 20 requests per minute and 120 per hour. `owner` is `0x` plus 64 hex characters. A bad address is HTTP 400. An RPC failure is HTTP 503.
+
+An owner with no account returns HTTP 200:
+
+```json
+{ "account_id": null, "keys": [] }
+```
+
+Otherwise each on-chain key is listed. `public_key` is 64 lowercase hex characters and has no `0x` prefix.
+
+```json
+{
+  "account_id": "0x...",
+  "keys": [
+    {
+      "public_key": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "sui_address": "0x...",
+      "label": "Noter",
+      "created_at": 10
+    }
+  ]
+}
+```
+
+### `GET /api/accounts/:owner/incident`
+
+Public answer for the owner in the path. The dashboard uses it to decide whether to show the quarantine banner. The response names no other owner. `affected_public_keys` lists only this account's current delegate public keys that are in `MEMWAL_LEAKED_DELEGATE_PUBLIC_KEYS`. On testnet, one preview owner is reported locked. When that list is empty, the preview response pins one current key whose label contains `migrat` for the life of the process. A non-empty list does not pin a replacement.
+
+```json
+{
+  "account_id": "0x...",
+  "affected": true,
+  "quarantined": true,
+  "active": false,
+  "affected_public_keys": ["00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"]
+}
+```
+
+`affected` is true when the owner is listed in `MEMWAL_AFFECTED_OWNERS`, a current delegate public key is listed in `MEMWAL_LEAKED_DELEGATE_PUBLIC_KEYS`, or the account is `admin_quarantined`. With both lists empty, `affected` follows the on-chain flag. An owner with no account still returns HTTP 200: `account_id` is null, `quarantined` and `active` are false, and `affected` is true only when that owner is in `MEMWAL_AFFECTED_OWNERS`.
+
+### `POST /api/accounts/:owner/unblock-requests`
+
+The owner signs a Sui personal message. The relayer stores one request. Clearing quarantine stays an `AdminCap` transaction. After an operator clears it, the owner calls `reactivate_account`. One `reactivate_account` call is on the sponsored-transaction allowlist.
+
+The signed text uses the lowercased owner and the account id read from chain, not a value from the body:
+
+```text
+Walrus Memory unblock request
+owner:0x...
+account:0x...
+```
+
+```json
+{ "signature": "<base64 personal-message signature>" }
+```
+
+HTTP 200 returns `{ "status": "requested", "requested_at": "<RFC3339>" }`. A second request from the same owner refreshes `requested_at`. HTTP 409 when the account is not quarantined. HTTP 401 when the signature is not the owner's. HTTP 400 when the owner has no account, or the signature is empty or longer than 4096 characters. HTTP 503 when the signature check cannot reach RPC.
+
+### `GET /api/admin/unblock-requests`
+
+Requires `ADMIN_API_KEY`, the same gate as the other admin routes. Returns the newest 200 requests, each with `owner`, `account_id`, and `requested_at`. The dashboard does not call the POST route. Operators clear quarantine with `admin_clear_quarantine` after the highlighted keys are gone, and the owner reactivates from the dashboard.
 
 ## Protected routes
 
@@ -516,7 +582,7 @@ Rebuild missing vector entries for one namespace. Queries onchain blobs by owner
 
 `skipped` is onchain blobs already in the local success index. `failed` is permanent decrypt/UTF-8 failures on this onchain page (negative-cache hits plus new permanent failures this call), so it never exceeds `total`. Transient download, decrypt, or embed errors are not counted in `failed`; when a page yields only those, `truncated` is true so the caller retries.
 
-`truncated=true` means this restore is **known-retryable-incomplete**: more missing blobs than `limit` allowed this call to restore, **or** the sidecar's owner-wide candidate fetch hit its cap **and** raising `limit` can still expand that fetch (`limit < 20`). Once the sidecar cap is saturated (`limit >= 20`, cap pinned at 100), truncation follows this call's missing-blob page length, not onchain `total`. A fully restored namespace does not loop. `truncated=false` is **not** proof the sidecar saw every onchain blob; blobs beyond the owner-wide sidecar candidate cap can still be missing. WALM-451 tracks a `sourceCapped` field for that case ([WALM-451](https://linear.app/mysten-labs/issue/WALM-451)). Relayers older than WALM-319 omit `truncated`; SDKs default it to `false`.
+`truncated=true` means this restore is **known-retryable-incomplete**: more missing blobs than `limit` allowed this call to restore, **or** the sidecar's owner-wide candidate fetch hit its cap **and** raising `limit` can still expand that fetch (`limit < 20`). Once the sidecar cap is saturated (`limit >= 20`, cap pinned at 100), truncation follows this call's missing-blob page length, not onchain `total`. A fully restored namespace does not loop. `truncated=false` is **not** proof the sidecar saw every onchain blob; blobs beyond the owner-wide sidecar candidate cap can still be missing. A `sourceCapped` field for that case is planned as a follow-up. Relayers that predate the `truncated` field omit it; SDKs default it to `false`.
 
 ### `POST /api/forget`
 

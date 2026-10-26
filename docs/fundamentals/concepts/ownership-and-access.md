@@ -31,17 +31,19 @@ questions:
   - What are delegates in MemWal and how do they get access?
   - How is access control enforced in Walrus Memory?
 answer: >-
-  In Walrus Memory, memory is cryptographically owned by a Sui wallet address derived from the
-  user's private key. Owners can grant delegate access to other users, agents, or services,
-  enabling shared access and service delegation. All access control is enforced onchain by Sui
-  smart contracts, making it tamper-proof and verifiable.
+  Memory belongs to the owner recorded in a MemWalAccount. The SDK's accountId selects that
+  account, while key authenticates an authorized delegate; passing a delegate key does not
+  change ownership. Delegates access memory across all namespaces in the account. The relayer
+  verifies account authorization, and the Seal contract policy controls decryption-key access.
 ---
 
-Walrus Memory puts you in full control of your memory. Programmable permissions and explicit ownership define how memory is shared, accessed, and updated — with delegate access for agents and workflows.
+Walrus Memory puts you in full control of your memory. Programmable permissions and explicit ownership define how memory is shared, accessed, and updated, with delegate access for agents and workflows.
 
 ## Ownership
 
-Memory content in Walrus Memory is stored on Walrus and cryptographically owned by a user identified by their private key. When you pass a `key` to the SDK, it is translated into a Sui wallet address — this address is the owner.
+Memory content is stored on Walrus under the owner address recorded in a `MemWalAccount`. The account registry permits one account per owner address. The SDK's `accountId` is the account object ID, not the wallet address.
+
+For the relayer-backed client, `key` is a registered delegate private key used to authenticate requests. Its derived wallet address identifies the delegate, not the account owner. The relayer resolves the owner from the selected account.
 
 ```ts
 const memwal = MemWal.create({
@@ -52,41 +54,43 @@ const memwal = MemWal.create({
 });
 ```
 
-Only the owner (and their authorized delegates) can access their encrypted content or perform privileged actions over their memories. This isn't a policy promise — it's cryptographically enforced onchain.
+In a [multi-tenant server app](/sdk/cookbook-multi-tenant), the operator owns the account and the memories stored through it. An end user signs in with a wallet to prove identity to that application. Signing in does not create an account for the user or give the user ownership of those memories.
 
-This strong ownership model opens the door to future capabilities like a memory marketplace, where users could transfer memories or grant specific permissions for others to use their data.
+Ownership is separate from payment; see [Managed relayer costs](/relayer/public-relayer#storage-costs).
 
 ## Delegates
 
-A delegate is simply a keypair (private key) that gets translated into a Sui wallet address — just like the owner. The difference is that a delegate's access is **granted by the owner** rather than being inherent.
+A delegate is a keypair registered on the account by its owner. The delegate signs requests, and its authority comes from that registration. The owner can add and remove delegates without giving them the owner wallet key.
 
-This enables two key use cases:
+This enables 2 use cases:
 
-- **Shared access** — users (human or AI agents) can grant other users access to their memories. An agent could share its knowledge base with another agent, or a user could give a service read access to specific data.
-- **Service delegation** — users can delegate privileges to services that act on their behalf, such as paying for transaction fees or storage costs, without handing over ownership.
+- **Agent access:** give each agent a separate key so you can label and revoke it individually.
+- **Service access:** authorize a backend to read and write memory under the owner's account without handing over account-management credentials.
+
+<Warning>
+Delegate keys are not scoped to a namespace or a read-only subset of memory. An authorized delegate can access memories across every namespace in the account. Namespaces organize data and scope queries; a multi-tenant application must authenticate users and choose the allowed namespace on its server.
+</Warning>
 
 ```mermaid
 flowchart TD
     Owner[Owner Wallet]
-    D1[Delegate A<br/>AI Agent]
-    D2[Delegate B<br/>Backend Service]
-    D3[Delegate C<br/>Shared User]
-    Memory[Owner's Memories]
+    D1[Delegate A<br/>AI agent]
+    D2[Delegate B<br/>Backend service]
+    Memory[Owner's memories<br/>All account namespaces]
 
-    Owner -->|grants access| D1
-    Owner -->|grants access| D2
-    Owner -->|grants access| D3
+    Owner -->|grants and revokes access| D1
+    Owner -->|grants and revokes access| D2
     D1 -->|reads/writes| Memory
-    D2 -->|pays fees| Memory
-    D3 -->|reads| Memory
+    D2 -->|reads/writes| Memory
 ```
 
-## Access Control Enforcement
+## Access control enforcement
 
-The relationship between owners and delegates is enforced on chain by the Sui smart contract system — not by application logic or database permissions.
+Account authorization and application-user authorization operate at different levels:
 
-- The owner's wallet address is the root authority over a Walrus Memory account
-- Delegate keys are registered onchain and verified on every request
-- The relayer checks delegate authorization against the contract before executing any operation
+- The owner's wallet address controls the account and delegate registrations onchain.
+- The relayer verifies that the signing delegate is authorized for the selected account before serving memory requests.
+- The [Seal](/fundamentals/architecture/data-flow-security-model) contract policy checks the owner or registered delegate before releasing decryption keys.
+- An application using one account for many users enforces each user's namespace access in its own server. The account contract does not distinguish those application users.
 
-This means access control is tamper-proof and verifiable — no one can bypass it without the owner's explicit onchain approval.
+Removing a delegate rotates the account's encryption identity for future writes. It does not take back plaintext the delegate already read, or decryption keys it already obtained. Keep the owner key secure so you can manage and replace delegate keys. See [Delegate key management](/contract/delegate-key-management) for revocation steps.

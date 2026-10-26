@@ -44,7 +44,7 @@ pub const MAX_WALRUS_STORAGE_EPOCHS: u32 = 15;
 /// Hard ceiling for `OWNER_TOKEN_TTL_SECS` — 24 hours. Without a
 /// bound, `env_positive_u64` accepts any positive u64, and a very large TTL
 /// both defeats the "short-lived" security property the token scheme's
-/// whole threat model rests on (see docs/api/owner-token-auth.md's
+/// whole threat model rests on (see internal/api/owner-token-auth.md's
 /// trust-boundary note) and can push `now + ttl` outside chrono's
 /// representable range in `routes::owner_token::issue_token`'s `expires_at`
 /// computation.

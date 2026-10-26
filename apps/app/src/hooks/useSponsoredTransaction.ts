@@ -100,6 +100,12 @@ export function sponsorFailureMessage(err: unknown): string {
     }
     if (err instanceof SponsorHttpError) {
         if (err.status === 429) return 'Too many requests — please wait a moment and try again.'
+        if (err.code === 'account_already_active') {
+            return withTrace('This account is already active, so it cannot be reactivated.', err.traceId)
+        }
+        if (err.code === 'account_quarantined') {
+            return withTrace('This account is still locked, so it cannot be reactivated yet.', err.traceId)
+        }
         if (err.code === 'sponsor_misconfigured') {
             return withTrace('The sponsor service is misconfigured, so this transaction could not be sponsored. Please report this.', err.traceId)
         }

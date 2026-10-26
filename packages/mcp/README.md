@@ -10,6 +10,8 @@ This directory is the canonical source for the MCP runtime, tests, versioning, a
 
 ## Quick Start
 
+Use a supported, security-patched Node.js runtime: **22.23.4+ within 22.x**, **24.22.1+ within 24.x**, or **26.12.1+ within 26.x**. The package `engines` field describes API compatibility, not the minimum security patch. See the [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases).
+
 Add Walrus Memory MCP to your MCP client config:
 
 ```json

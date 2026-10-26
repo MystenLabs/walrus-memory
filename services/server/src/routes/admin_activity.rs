@@ -22,7 +22,12 @@ use crate::types::{AppError, AppState};
 const SAMPLE_RETENTION: Duration = Duration::hours(24 * 61);
 const MAX_WINDOW_HOURS: i64 = 24 * 30;
 const MAX_SERIES_POINTS: usize = 48;
-const SPONSOR_KINDS: [&str; 3] = ["create_account", "add_delegate_key", "remove_delegate_key"];
+const SPONSOR_KINDS: [&str; 4] = [
+    "create_account",
+    "add_delegate_key",
+    "remove_delegate_key",
+    "reactivate_account",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalancePoint {
@@ -204,6 +209,7 @@ pub fn normalize_sponsor_kind(kind: &str) -> &'static str {
         "create_account" => "create_account",
         "add_delegate_key" => "add_delegate_key",
         "remove_delegate_key" => "remove_delegate_key",
+        "reactivate_account" => "reactivate_account",
         _ => "unknown",
     }
 }

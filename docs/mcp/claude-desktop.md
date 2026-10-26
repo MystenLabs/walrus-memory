@@ -31,7 +31,7 @@ answer: >-
   For regular Claude Desktop chat, add the Walrus Memory OAuth custom connector
   using https://relayer.memory.walrus.xyz/api/mcp and complete browser consent;
   no local Node.js or CLI is required. Alternatively, run the local MCP server
-  with Node.js 20+ and sign in with memwal_login after restarting Desktop.
+  with Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) and sign in with memwal_login after restarting Desktop.
   The Code tab uses the separate Claude Code plugin setup.
 ---
 
@@ -53,7 +53,7 @@ Desktop chat, for users who prefer local credentials.
 
 ## Local MCP prerequisites
 
-- Node.js 20+
+- Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x)
 - A Walrus Memory account. The first memory tool call opens a browser sign-in (`memwal_login`).
 
 ## Local MCP installation

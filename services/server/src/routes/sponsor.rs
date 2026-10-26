@@ -15,8 +15,8 @@
 //!
 //! `validate_sponsor_transaction_kind` is the sponsorship allowlist: a
 //! sponsored transaction may only call `account::create_account`,
-//! `account::add_delegate_key`, or `account::remove_delegate_key` on the
-//! configured MemWal package. Batching is allowed for delegate-key **removal**
+//! `account::add_delegate_key`, `account::remove_delegate_key`, or
+//! `account::reactivate_account` on the configured MemWal package. Batching is allowed for delegate-key **removal**
 //! only, up to `MAX_SPONSORED_DELEGATE_REMOVALS` — the dashboard removes a
 //! multi-key selection in one transaction, so a one-command-only rule would
 //! reject every bulk revoke. Every other shape stays single-command.
@@ -81,6 +81,33 @@ fn mask_upstream(status: u16) -> (axum::http::StatusCode, &'static str, &'static
             "Sponsor request rejected",
         ),
     }
+}
+
+/// A known `reactivate_account` abort. The sidecar names it with a stable
+/// code; the raw upstream body stays in the log and never reaches the client.
+fn reactivate_rejection(
+    body: &[u8],
+) -> Option<(axum::http::StatusCode, &'static str, &'static str)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match value.get("code").and_then(serde_json::Value::as_str)? {
+        "account_already_active" => Some((
+            axum::http::StatusCode::CONFLICT,
+            "account_already_active",
+            "This account is already active, so it cannot be reactivated.",
+        )),
+        "account_quarantined" => Some((
+            axum::http::StatusCode::CONFLICT,
+            "account_quarantined",
+            "This account is still locked, so it cannot be reactivated yet.",
+        )),
+        _ => None,
+    }
+}
+
+fn sponsor_error_response(status: reqwest::StatusCode, body: &[u8]) -> Response<Body> {
+    let (masked_status, masked_code, masked_msg) =
+        reactivate_rejection(body).unwrap_or_else(|| mask_upstream(status.as_u16()));
+    json_error_response(masked_status, masked_code, masked_msg)
 }
 
 /// Error body for the sponsor proxies: a generic message, a stable `code`, and
@@ -250,7 +277,10 @@ fn validate_sponsor_transaction_kind(
                     && call.type_arguments.is_empty()
                     && matches!(
                         call.function.as_str(),
-                        "create_account" | "add_delegate_key" | "remove_delegate_key"
+                        "create_account"
+                            | "add_delegate_key"
+                            | "remove_delegate_key"
+                            | "reactivate_account"
                     ) =>
             {
                 Some(call.function.as_str())
@@ -276,6 +306,7 @@ fn validate_sponsor_transaction_kind(
             "create_account" => Ok("create_account"),
             "add_delegate_key" => Ok("add_delegate_key"),
             "remove_delegate_key" => Ok("remove_delegate_key"),
+            "reactivate_account" => Ok("reactivate_account"),
             _ => Err(AppError::BadRequest(
                 "Transaction kind is not permitted for sponsorship".into(),
             )),
@@ -514,8 +545,7 @@ async fn forward_sponsor(
             upstream_status,
             String::from_utf8_lossy(&resp_body)
         );
-        let (masked_status, masked_code, masked_msg) = mask_upstream(upstream_status.as_u16());
-        Ok(json_error_response(masked_status, masked_code, masked_msg))
+        Ok(sponsor_error_response(upstream_status, &resp_body))
     }
 }
 
@@ -622,8 +652,7 @@ pub async fn sponsor_execute_proxy(
             upstream_status,
             String::from_utf8_lossy(&resp_body)
         );
-        let (masked_status, masked_code, masked_msg) = mask_upstream(upstream_status.as_u16());
-        Ok(json_error_response(masked_status, masked_code, masked_msg))
+        Ok(sponsor_error_response(upstream_status, &resp_body))
     }
 }
 
@@ -722,7 +751,12 @@ nonce: 00000000-0000-4000-8000-000000000000"
     #[test]
     fn sponsor_allowlist_accepts_a_single_memwal_account_call() {
         let package = format!("0x{}", "a".repeat(64));
-        for function in ["create_account", "add_delegate_key", "remove_delegate_key"] {
+        for function in [
+            "create_account",
+            "add_delegate_key",
+            "remove_delegate_key",
+            "reactivate_account",
+        ] {
             let bytes = move_call_kind(&package, "account", function);
             assert_eq!(
                 validate_sponsor_transaction_kind(&bytes, &package).unwrap(),
@@ -1073,6 +1107,40 @@ nonce: 00000000-0000-4000-8000-000000000000"
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(code, "sponsor_rejected");
         assert_eq!(msg, "Sponsor request rejected");
+    }
+
+    #[test]
+    fn test_reactivate_already_active_is_its_own_message() {
+        let raw = br#"{"error":"MoveAbort in 1st command, abort code: 11, in '0xabc::account::reactivate_account'","code":"account_already_active"}"#;
+        let (status, code, msg) = reactivate_rejection(raw).unwrap();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(code, "account_already_active");
+        assert_eq!(
+            msg,
+            "This account is already active, so it cannot be reactivated."
+        );
+        assert!(!msg.contains("MoveAbort"));
+        assert!(!msg.contains("0xabc"));
+    }
+
+    #[test]
+    fn test_reactivate_quarantine_is_its_own_message() {
+        let raw = br#"{"code":"account_quarantined","error":"upstream text"}"#;
+        let (status, code, msg) = reactivate_rejection(raw).unwrap();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(code, "account_quarantined");
+        assert_eq!(
+            msg,
+            "This account is still locked, so it cannot be reactivated yet."
+        );
+        assert!(!msg.contains("upstream"));
+    }
+
+    #[test]
+    fn test_reactivate_rejection_ignores_unclassified_bodies() {
+        assert!(reactivate_rejection(br#"{"error":"MoveAbort abort code: 11"}"#).is_none());
+        assert!(reactivate_rejection(br#"{"code":"sponsor_rejected"}"#).is_none());
+        assert!(reactivate_rejection(b"not json").is_none());
     }
 
     #[test]

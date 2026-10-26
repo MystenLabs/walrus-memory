@@ -3,7 +3,7 @@
  * Handles Sui wallet connections using Wallet Standard
  */
 
-import { getWallets, type Wallet } from '@mysten/wallet-standard';
+import { getWallets, type Wallet } from '@wallet-standard/core';
 import { WALLET_TYPES, type WalletType } from "../constant";
 
 export type WalletAccount = {

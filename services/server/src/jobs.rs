@@ -699,12 +699,6 @@ fn congestion_resume_wallet(current: usize, pool: usize, transport: bool) -> usi
 /// parks on the congestion requeue and frees the worker.
 const SAME_JOURNAL_ATTACHES: u32 = 3;
 
-/// Sidecar calls one fresh upload may spend, including a register Sui
-/// cancelled. Encode, prepare, the cancelled execute, the rebuild prepare,
-/// register, upload, certify. Six stops on "exceeded step budget" before
-/// certify.
-const DURABLE_UPLOAD_STEP_BUDGET: usize = 7;
-
 fn wallet_upload_gates(pool_len: usize) -> &'static Vec<tokio::sync::Semaphore> {
     use std::sync::OnceLock;
     static GATES: OnceLock<Vec<tokio::sync::Semaphore>> = OnceLock::new();
@@ -1967,6 +1961,55 @@ fn durable_step_field(step: &serde_json::Value, field: &str) -> Result<String, W
         })
 }
 
+/// Five happy-path boundaries (encode, prepare, register, upload, certify),
+/// plus one spare. Each proven reset gets room for its failed boundary and
+/// replacement preparation, with at most two rebuilds per wallet attempt.
+struct DurableUploadBudget {
+    remaining_steps: u32,
+    rebuilds: u32,
+    last_reset: Option<String>,
+}
+
+impl DurableUploadBudget {
+    fn new() -> Self {
+        Self {
+            remaining_steps: 6,
+            rebuilds: 0,
+            last_reset: None,
+        }
+    }
+
+    fn take_step(&mut self) -> bool {
+        if self.remaining_steps == 0 {
+            return false;
+        }
+        self.remaining_steps -= 1;
+        true
+    }
+
+    fn rebuild(&mut self, reason: String) -> bool {
+        self.last_reset = Some(reason);
+        if self.rebuilds == 2 {
+            return false;
+        }
+        self.rebuilds += 1;
+        self.remaining_steps += 2;
+        true
+    }
+
+    fn exhausted(&self, job_id: &str) -> WalletJobError {
+        WalletJobError::Transient(format!(
+            "durable upload for job {} exceeded step budget after {} rebuild(s){}",
+            job_id,
+            self.rebuilds,
+            self.last_reset
+                .as_ref()
+                .map(|reason| format!("; last reset: {}", reason))
+                .unwrap_or_default(),
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_durable_upload(
     state: &AppState,
@@ -1997,8 +2040,8 @@ async fn execute_durable_upload(
 
     // Each sidecar call advances one checkpointable step. Persist the returned
     // checkpoint before asking the sidecar to perform the next side effect.
-    // The bound includes one cancelled register; see `DURABLE_UPLOAD_STEP_BUDGET`.
-    for _ in 0..DURABLE_UPLOAD_STEP_BUDGET {
+    let mut budget = DurableUploadBudget::new();
+    while budget.take_step() {
         let mut attaches = 0u32;
         let advanced = loop {
             let _ = sqlx::query(
@@ -2045,6 +2088,23 @@ async fn execute_durable_upload(
         };
 
         match advanced {
+            DurableUploadAdvance::Reset {
+                journal: next,
+                reason,
+            } => {
+                // Save the cleared journal even at the rebuild limit, so the
+                // next wallet attempt cannot replay the rejected transaction.
+                persist_upload_journal(state.db.pool(), remember_job_id, &next).await?;
+                journal = next;
+                tracing::warn!(
+                    "[wallet-job:upload] job_id={} resetting durable upload: {}",
+                    remember_job_id,
+                    reason,
+                );
+                if !budget.rebuild(reason) {
+                    return Err(budget.exhausted(remember_job_id));
+                }
+            }
             DurableUploadAdvance::Prepared(next) => {
                 // This is the critical pre-submit barrier: exact signed bytes
                 // and digest are durable before the next request can submit.
@@ -2097,10 +2157,7 @@ async fn execute_durable_upload(
         }
     }
 
-    Err(WalletJobError::Transient(format!(
-        "durable upload for job {} exceeded step budget",
-        remember_job_id
-    )))
+    Err(budget.exhausted(remember_job_id))
 }
 
 enum PreparedUpload {
@@ -3968,14 +4025,61 @@ mod tests {
         touch_uploaded_remember_job, update_remember_job_after_wallet_error,
         upload_journal_signer_committed, upload_lock_retry_delay, upload_lock_retry_wallet,
         upload_resume_disposition, upload_retry_backoff, wallet_index_for_upload_attempt,
-        wallet_job_request, wallet_job_uses_followup_queue, JobUploadLock, LockDeferReason,
-        LockOutcome, UploadResume, WalletJob, WalletJobAttemptInfo, WalletJobError,
-        WalletOperation, CONGESTION_WAIT_ERROR_PREFIX, MAX_ATTEMPTS, MAX_CONGESTION_REQUEUES,
-        WALLET_LOCK_POOL_ACQUIRE_TIMEOUT,
+        wallet_job_request, wallet_job_uses_followup_queue, DurableUploadBudget, JobUploadLock,
+        LockDeferReason, LockOutcome, UploadResume, WalletJob, WalletJobAttemptInfo,
+        WalletJobError, WalletOperation, CONGESTION_WAIT_ERROR_PREFIX, MAX_ATTEMPTS,
+        MAX_CONGESTION_REQUEUES, WALLET_LOCK_POOL_ACQUIRE_TIMEOUT,
     };
     use crate::storage::walrus::{
         PreparedRegisterTransaction, UploadExecutionIdentity, UploadJournal,
     };
+
+    #[test]
+    fn durable_upload_budget_finishes_after_sponsorship_rebuilds() {
+        for rebuilds in 0..=2 {
+            let mut budget = DurableUploadBudget::new();
+            assert!(budget.take_step(), "encode");
+            assert!(budget.take_step(), "prepare");
+            for _ in 0..rebuilds {
+                assert!(budget.take_step(), "rejected register");
+                assert!(budget.rebuild("sponsorship not found; rebuild".into()));
+                assert!(budget.take_step(), "replacement prepare");
+            }
+            assert!(budget.take_step(), "register");
+            assert!(budget.take_step(), "upload");
+            assert!(
+                budget.take_step(),
+                "certify must fit in the same wallet attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_upload_budget_bounds_repeated_resets_and_keeps_last_cause() {
+        let mut budget = DurableUploadBudget::new();
+        for _ in 0..2 {
+            assert!(budget.take_step());
+            assert!(budget.rebuild("previous reset".into()));
+        }
+        assert!(budget.take_step());
+        assert!(!budget.rebuild("Enoki 404: Sponsored transaction not found".into()));
+        let error = budget.exhausted("job-1");
+        assert!(matches!(error, WalletJobError::Transient(_)));
+        assert!(error.message().contains("after 2 rebuild(s)"));
+        assert!(error
+            .message()
+            .contains("Enoki 404: Sponsored transaction not found"));
+
+        let mut no_progress = DurableUploadBudget::new();
+        let mut calls = 0;
+        while no_progress.take_step() {
+            calls += 1;
+        }
+        assert_eq!(
+            calls, 6,
+            "responses that never advance cannot extend the budget"
+        );
+    }
 
     /// The exact production error string from the object-lock incident
     /// (testnet job 3d607892…). Used to pin the classifier against real output.

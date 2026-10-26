@@ -21,6 +21,13 @@ export {
     MemWalCompatibilityError,
     SUPPORTED_RELAYER_API_MAJOR,
 } from "./compatibility.js";
+// Typed failures for remember-job waits, catchable with `instanceof`. (WALM-615)
+export {
+    MemWalRateLimitedError,
+    MemWalRememberJobFailedError,
+    MemWalRememberJobNotFoundError,
+    MemWalRememberJobTimeoutError,
+} from "./errors.js";
 
 // Delegate key utilities (no @mysten/sui dependency)
 export { delegateKeyToSuiAddress, delegateKeyToPublicKey } from "./utils.js";

@@ -29,7 +29,8 @@ cd services/server && cargo run
 # 4. Harness setup (one-time)
 cd services/server/benchmarks
 python3 -m venv .venv && source .venv/bin/activate
-pip install datasets huggingface_hub openai httpx pynacl numpy pyyaml tabulate tqdm pytest
+python ../../../scripts/bootstrap-python-security.py
+python -m pip install --require-hashes -r requirements.lock
 cp config.example.yaml config.yaml
 #   edit config.yaml: delegate_key, account_id, judge.api_key (OpenRouter/OpenAI)
 
@@ -96,7 +97,7 @@ Don't confuse the two. The benchmark harness does **not** read the server's `.en
 
 1. **Walrus Memory server running locally with `BENCHMARK_MODE=true`.** This is critical — see [Server setup for benchmarks](#server-setup-for-benchmarks) below.
 2. **Postgres + Redis.** Start via `docker compose -f services/server/docker-compose.yml up -d`.
-3. **Python 3.9+** (tested on 3.9).
+3. **A supported patched Python 3.11+** (3.11.17, 3.12.15, 3.13.17, or 3.14.9 and newer patches in those series).
 4. **A registered Walrus Memory account** with a delegate key. Get one from the Walrus Memory app or via the SDK.
 5. **An OpenRouter or OpenAI API key** with GPT-4o access.
 
@@ -170,12 +171,13 @@ WARN ⚠️  This is a benchmark-only mode. UNSAFE for production.
 ```bash
 cd services/server/benchmarks
 
-# Create venv (Python 3.9+)
+# Create a venv with a supported patched Python 3.11+
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install deps directly (don't use pip install -e on Python 3.9)
-pip install datasets huggingface_hub openai httpx pynacl numpy pyyaml tabulate tqdm pytest
+# Bootstrap pip from the checksum-pinned wheel, then install the locked dependencies
+python ../../../scripts/bootstrap-python-security.py
+python -m pip install --require-hashes -r requirements.lock
 
 # Configure
 cp config.example.yaml config.yaml
@@ -351,9 +353,9 @@ Variance across runs is ~±2-3 points due to judge non-determinism. Retrieval it
 - `.env` didn't load — check you're in `services/server/` when running `cargo run`
 - Typo — it's `BENCHMARK_MODE=true`, case-sensitive
 
-### Python 3.9 install errors
-- `pip install -e .` fails — don't use editable install on 3.9
-- Use the direct install in the setup section
+### Unsupported Python or old certificates
+- Recreate the venv with a patched Python 3.11+ interpreter. Python 3.9/3.10 are no longer supported.
+- Run the checksum-verified pip bootstrap and install `requirements.lock` as shown above. Updating system Python does not change existing venvs.
 
 ---
 
