@@ -410,6 +410,29 @@ def _occurred_at_to_wire(
     )
 
 
+
+def _check_limit(limit: Any) -> None:
+    """Reject a limit that is not a positive integer before it is signed (#1218)."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
+
+def _check_vector(vector: Any) -> None:
+    """Reject a vector that is not a non-empty list of finite numbers (#1218).
+
+    json.dumps would otherwise emit bare NaN/Infinity tokens, which are not
+    JSON, and the relayer would answer with an opaque parse error.
+    """
+    if (
+        not isinstance(vector, (list, tuple))
+        or len(vector) == 0
+        or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            for v in vector
+        )
+    ):
+        raise ValueError("vector must be a non-empty list of finite numbers")
+
 class MemWal:
     """Async-native Walrus Memory client.
 
@@ -1057,6 +1080,7 @@ class MemWal:
             sort = params.sort
         else:
             query_text = query
+        _check_limit(limit)
         body = {
             "query": query_text,
             "limit": limit,
@@ -1299,6 +1323,7 @@ class MemWal:
               downloads in parallel, then 3 SEAL decrypts in parallel, then
               embeddings. Expect seconds-per-blob on cold caches.
         """
+        _check_limit(limit)
         data = await self._signed_request("POST", "/api/restore", {
             "namespace": namespace,
             "limit": limit,
@@ -1354,6 +1379,10 @@ class MemWal:
         Returns:
             :class:`NamespacesResult`.
         """
+        # Validate before resolving the owner: on a fresh client that lookup is
+        # a signed POST /api/stats, so a bad limit must not reach it (#1218).
+        if limit is not None:
+            _check_limit(limit)
         owner = await self._resolve_owner()
 
         params: Dict[str, str] = {}
@@ -1428,6 +1457,7 @@ class MemWal:
         Returns:
             :class:`RememberManualResult` with id, blob_id, owner, namespace.
         """
+        _check_vector(opts.vector)
         data = await self._signed_request(
             "POST",
             "/api/remember/manual",
@@ -1457,6 +1487,8 @@ class MemWal:
         Returns:
             :class:`RecallManualResult` with blob_id + distance pairs.
         """
+        _check_vector(opts.vector)
+        _check_limit(opts.limit)
         body: Dict[str, Any] = {
             "vector": opts.vector,
             "limit": opts.limit,
@@ -1751,7 +1783,9 @@ class MemWal:
 
         method_upper = method.upper()
         timestamp = str(int(time.time()))
-        body_str = "" if method_upper == "GET" else json.dumps(body, separators=(",", ":"))
+        body_str = "" if method_upper == "GET" else json.dumps(
+            body, separators=(",", ":"), allow_nan=False
+        )
         body_hash = sha256_hex(body_str)
         # MED-1 / LOW-23: nonce + account_id are part of the canonical signed
         # message. Server rejects the request as "unsupported legacy SDK"

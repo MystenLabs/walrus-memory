@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from .client import _check_limit
 from .types import (
     AnalyzedFact,
     AnalyzeResult,
@@ -279,8 +280,7 @@ class MemWalMock:
             sort = None
             query_text = query
         _validate_text(query_text, "query")
-        if not isinstance(limit, int) or limit < 0:
-            raise ValueError("limit must be a non-negative integer")
+        _check_limit(limit)
         if sort not in (None, "relevance", "recent"):
             raise ValueError("sort must be 'relevance' or 'recent'")
         resolved_namespace = self._namespace if namespace is None else namespace
@@ -383,7 +383,7 @@ class MemWalMock:
         )
 
     async def restore(self, namespace: str, limit: int = 10) -> RestoreResult:
-        del limit
+        _check_limit(limit)
         return RestoreResult(
             restored=0,
             skipped=0,
@@ -399,6 +399,8 @@ class MemWalMock:
         cursor: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> NamespacesResult:
+        if limit is not None:
+            _check_limit(limit)
         grouped: Dict[str, List[_Memory]] = {}
         for memory in self._memories:
             grouped.setdefault(memory.namespace, []).append(memory)
