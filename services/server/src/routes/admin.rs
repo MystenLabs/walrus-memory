@@ -653,15 +653,48 @@ pub async fn ask(
         .map_err(|_| AppError::Internal("Failed to encode recalled memory".into()))?;
 
     // Step 3: Call LLM
-    let api_key = state
-        .config
-        .openai_api_key
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("OPENAI_API_KEY required for /api/ask".into()))?;
-    let url = format!("{}/chat/completions", state.config.openai_api_base);
+    let answer = call_ask_llm(&state, &memory_context, &body.question).await?;
 
-    let req = state
-        .http_client
+    tracing::info!("ask complete: answer length={} chars", answer.len());
+
+    Ok(Json(AskResponse {
+        answer,
+        memories_used,
+        memories,
+    }))
+}
+
+async fn call_ask_llm(
+    state: &AppState,
+    memory_context: &str,
+    question: &str,
+) -> Result<String, AppError> {
+    call_ask_llm_inner(
+        &state.http_client,
+        state.config.openai_api_key.as_deref(),
+        &state.config.openai_api_base,
+        &state.config.sui_network,
+        &state.alerts,
+        memory_context,
+        question,
+    )
+    .await
+}
+
+async fn call_ask_llm_inner(
+    http_client: &reqwest::Client,
+    openai_api_key: Option<&str>,
+    openai_api_base: &str,
+    sui_network: &str,
+    alerts: &crate::alerts::AlertManager,
+    memory_context: &str,
+    question: &str,
+) -> Result<String, AppError> {
+    let api_key = openai_api_key
+        .ok_or_else(|| AppError::Internal("OPENAI_API_KEY required for /api/ask".into()))?;
+    let url = format!("{}/chat/completions", openai_api_base);
+
+    let req = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
@@ -681,7 +714,7 @@ pub async fn ask(
                 },
                 ChatMessage {
                     role: "user".to_string(),
-                    content: body.question.clone(),
+                    content: question.to_string(),
                 },
             ],
             temperature: 0.7,
@@ -696,7 +729,7 @@ pub async fn ask(
             "transport_error",
             started.elapsed(),
         );
-        AppError::Internal(format!("LLM request failed: {}", e))
+        AppError::EmbeddingProviderUnavailable(format!("LLM request failed: {}", e))
     })?;
     let status_label = resp.status().as_u16().to_string();
     crate::observability::observe_external(
@@ -709,35 +742,54 @@ pub async fn ask(
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::PAYMENT_REQUIRED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            let _ = alerts
+                .notify_embedding_provider_auth_failed(
+                    crate::alerts::EmbeddingProviderAuthAlert {
+                        sui_network: sui_network.to_string(),
+                        status: status.as_u16(),
+                        api_base: openai_api_base.to_string(),
+                        error: body_text.clone(),
+                    },
+                )
+                .await;
+            return Err(AppError::EmbeddingProviderUnavailable(format!(
+                "LLM API upstream error ({}): {}",
+                status, body_text
+            )));
+        }
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            return Err(AppError::EmbeddingProviderUnavailable(format!(
+                "LLM API upstream error ({}): {}",
+                status, body_text
+            )));
+        }
         return Err(AppError::Internal(format!(
             "LLM error ({}): {}",
             status, body_text
         )));
     }
 
-    let api_resp: ChatCompletionResponse = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
+    let api_resp: ChatCompletionResponse = resp.json().await.map_err(|e| {
+        AppError::EmbeddingProviderUnavailable(format!("Failed to parse LLM response: {}", e))
+    })?;
 
     // `content` is `Option<String>` — `None` on upstream null-content
     // returns. For the ask path, fall back to the existing
     // "No response from LLM" message so the user sees a useful signal.
-    let answer = api_resp
+    Ok(api_resp
         .choices
         .first()
         .and_then(|c| c.message.content.as_deref())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "No response from LLM".to_string());
-
-    tracing::info!("ask complete: answer length={} chars", answer.len());
-
-    Ok(Json(AskResponse {
-        answer,
-        memories_used,
-        memories,
-    }))
+        .unwrap_or_else(|| "No response from LLM".to_string()))
 }
 
 // ============================================================
@@ -1925,5 +1977,73 @@ mod tests {
                 "cache must still memoize after a panicking probe"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ask_llm_401_402_403_awaits_alert_and_returns_embedding_provider_unavailable() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let slack_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&slack_hits);
+        let slack_app = axum::Router::new().route(
+            "/slack",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let slack_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slack_addr = slack_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(slack_listener, slack_app).await.unwrap() });
+
+        let webhook_url = format!("http://{slack_addr}/slack");
+        let alerts = crate::alerts::AlertManager::from_webhook_value(
+            reqwest::Client::new(),
+            Some(&webhook_url),
+        );
+
+        for (status, body) in [
+            (401u16, r#"{"error":{"message":"User not found.","code":401}}"#),
+            (402u16, r#"{"error":{"message":"Insufficient credits","code":402}}"#),
+            (403u16, r#"{"error":{"message":"Key disabled","code":403}}"#),
+        ] {
+            let app = axum::Router::new().route(
+                "/chat/completions",
+                axum::routing::post(move || async move {
+                    (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let err = super::call_ask_llm_inner(
+                &reqwest::Client::new(),
+                Some("key"),
+                &format!("http://{addr}"),
+                "mainnet",
+                &alerts,
+                "[]",
+                "what happened?",
+            )
+            .await
+            .expect_err("401/402/403 must return error");
+            assert!(
+                matches!(err, crate::types::AppError::EmbeddingProviderUnavailable(_)),
+                "status {status} must map to EmbeddingProviderUnavailable, got {err:?}"
+            );
+        }
+
+        assert_eq!(
+            slack_hits.load(Ordering::SeqCst),
+            1,
+            "/api/ask must await notify_embedding_provider_auth_failed on 401/402/403 (deduped to 1 within window)"
+        );
     }
 }

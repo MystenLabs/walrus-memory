@@ -225,6 +225,7 @@ fn importance_for_bucket(bucket: &str) -> f32 {
 pub struct LlmExtractor {
     http_client: reqwest::Client,
     config: Arc<Config>,
+    alerts: Option<Arc<crate::alerts::AlertManager>>,
 }
 
 impl LlmExtractor {
@@ -232,7 +233,13 @@ impl LlmExtractor {
         Self {
             http_client,
             config,
+            alerts: None,
         }
+    }
+
+    pub fn with_alerts(mut self, alerts: Arc<crate::alerts::AlertManager>) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 }
 
@@ -272,7 +279,7 @@ impl LlmExtractor {
                     "transport_error",
                     started.elapsed(),
                 );
-                AppError::Internal(format!("LLM API request failed: {}", e))
+                AppError::EmbeddingProviderUnavailable(format!("LLM API request failed: {}", e))
             })?;
         let status_label = resp.status().as_u16().to_string();
         crate::observability::observe_external(
@@ -285,15 +292,28 @@ impl LlmExtractor {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // Transient upstream statuses (429 + 5xx) route to 503 so
-            // the SDK/harness retry policy can recover. Non-transient
-            // (4xx other than 429) stays as 500 — that's a real bug
-            // (bad auth, malformed request, etc.) that retrying won't
-            // fix. Mirrors the 200-wrapped envelope handling below
-            // for the case where the upstream returns the same 5xx
-            // condition as a raw HTTP status instead of wrapping it.
-            if is_upstream_status_transient(status) {
-                return Err(AppError::UpstreamUnavailable(format!(
+            if is_upstream_provider_auth_or_quota_status(status) {
+                if let Some(alerts) = &self.alerts {
+                    let _ = alerts
+                        .notify_embedding_provider_auth_failed(
+                            crate::alerts::EmbeddingProviderAuthAlert {
+                                sui_network: self.config.sui_network.clone(),
+                                status: status.as_u16(),
+                                api_base: self.config.openai_api_base.clone(),
+                                error: body.clone(),
+                            },
+                        )
+                        .await;
+                }
+                return Err(AppError::EmbeddingProviderUnavailable(format!(
+                    "LLM API upstream error ({}): {}",
+                    status, body
+                )));
+            }
+            if is_upstream_status_transient(status)
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            {
+                return Err(AppError::EmbeddingProviderUnavailable(format!(
                     "LLM API upstream error ({}): {}",
                     status, body
                 )));
@@ -306,7 +326,7 @@ impl LlmExtractor {
 
         // read body as text first (was `resp.json()` directly).
         // This enables three transient-failure detections that route to
-        // `AppError::UpstreamUnavailable` (HTTP 503, retried by the
+        // `AppError::EmbeddingProviderUnavailable` (HTTP 503, retried by the
         // SDK + benchmark harness) instead of `AppError::Internal`
         // (HTTP 500, dropped):
         //
@@ -328,18 +348,33 @@ impl LlmExtractor {
         // Cost: holding the body as a String uses ~response-size extra
         // memory (a few KB per chat completion — trivial).
         let body = resp.text().await.map_err(|e| {
-            AppError::UpstreamUnavailable(format!("Failed to read LLM response body: {}", e))
+            AppError::EmbeddingProviderUnavailable(format!("Failed to read LLM response body: {}", e))
         })?;
 
         if let Some(envelope) = parse_openrouter_error_envelope(&body) {
-            return Err(AppError::UpstreamUnavailable(format!(
+            if matches!(envelope.code, 401..=403) {
+                if let Some(alerts) = &self.alerts {
+                    let _ = alerts
+                        .notify_embedding_provider_auth_failed(
+                            crate::alerts::EmbeddingProviderAuthAlert {
+                                sui_network: self.config.sui_network.clone(),
+                                status: envelope.code as u16,
+                                api_base: self.config.openai_api_base.clone(),
+                                error: body.clone(),
+                            },
+                        )
+                        .await;
+                }
+            }
+            return Err(AppError::EmbeddingProviderUnavailable(format!(
                 "OpenRouter upstream error (code={}): {}",
                 envelope.code, envelope.message
             )));
         }
 
-        let api_resp: ChatCompletionResponse = serde_json::from_str(&body)
-            .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
+        let api_resp: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
+            AppError::EmbeddingProviderUnavailable(format!("Failed to parse LLM response: {}", e))
+        })?;
 
         // `content` is `Option<String>` to deserialise cleanly when the
         // upstream returns HTTP 200 with `content: null` (observed from
@@ -358,7 +393,7 @@ impl LlmExtractor {
         let content = match raw_content {
             Some(s) => s.trim().to_string(),
             None => {
-                return Err(AppError::UpstreamUnavailable(
+                return Err(AppError::EmbeddingProviderUnavailable(
                     "LLM upstream returned content=null — treating as transient \
                      failure (retryable). Explicit NONE replies are the valid \
                      no-facts path and are handled separately."
@@ -623,6 +658,19 @@ pub(crate) fn parse_openrouter_error_envelope(body: &str) -> Option<OpenRouterEr
 /// retry budget against an unrecoverable error.
 pub(crate) fn is_upstream_status_transient(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// True when the upstream embedding/LLM provider rejected the relayer's global
+/// API key or billing account (HTTP 401, 402, or 403). These are relayer-side
+/// provider outages rather than caller errors, so they route to HTTP 503
+/// (`EMBEDDING_PROVIDER_UNAVAILABLE`) and trigger a deduplicated Slack alert.
+pub(crate) fn is_upstream_provider_auth_or_quota_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::PAYMENT_REQUIRED
+            | reqwest::StatusCode::FORBIDDEN
+    )
 }
 
 /// Escape characters with structural meaning in the
@@ -1531,5 +1579,30 @@ mod tests {
         // pin the helper's behaviour for defensive callers).
         assert!(!is_upstream_status_transient(StatusCode::OK));
         assert!(!is_upstream_status_transient(StatusCode::ACCEPTED));
+    }
+
+    #[test]
+    fn upstream_provider_auth_or_quota_status_recognises_401_402_403() {
+        use super::is_upstream_provider_auth_or_quota_status;
+        use reqwest::StatusCode;
+
+        assert!(is_upstream_provider_auth_or_quota_status(
+            StatusCode::UNAUTHORIZED
+        ));
+        assert!(is_upstream_provider_auth_or_quota_status(
+            StatusCode::PAYMENT_REQUIRED
+        ));
+        assert!(is_upstream_provider_auth_or_quota_status(
+            StatusCode::FORBIDDEN
+        ));
+        assert!(!is_upstream_provider_auth_or_quota_status(
+            StatusCode::BAD_REQUEST
+        ));
+        assert!(!is_upstream_provider_auth_or_quota_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!is_upstream_provider_auth_or_quota_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 }
