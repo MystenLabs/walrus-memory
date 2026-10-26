@@ -3,7 +3,7 @@
 The public Walrus Memory documentation is published at
 [docs.wal.app/walrus-memory](https://docs.wal.app/walrus-memory). Its source lives in
 [MystenLabs/walrus-documentation](https://github.com/MystenLabs/walrus-documentation) under
-`walrus-memory-content/`; open documentation pull requests there.
+`content/walrus-memory/`; open documentation pull requests there.
 
 This directory keeps the engineering documentation that is not published: contributor guides,
 runbooks, migration and operations notes, internal API notes, and the per-package changelogs that

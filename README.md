@@ -48,7 +48,7 @@ await memwal.restore("demo");
 
 - Full docs at [docs.wal.app/walrus-memory](https://docs.wal.app/walrus-memory)
 - Docs source of truth: [MystenLabs/walrus-documentation](https://github.com/MystenLabs/walrus-documentation),
-  under `walrus-memory-content/`. Open documentation pull requests there. The engineering docs
+  under `content/walrus-memory/`. Open documentation pull requests there. The engineering docs
   that are not published stay in [`docs/`](docs/README.md).
 - Docs site entry points:
   - [What is Walrus Memory?](https://docs.wal.app/walrus-memory)
