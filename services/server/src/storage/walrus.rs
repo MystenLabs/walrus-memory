@@ -418,6 +418,23 @@ async fn upload_blob_inner(
     defer_transfer: bool,
     seal_persistence: SealPersistence<'_>,
 ) -> Result<UploadResult, UploadBlobError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::upload_blob_in_process(
+            client,
+            data,
+            epochs,
+            owner_address,
+            key_index,
+            namespace,
+            package_id,
+            agent_id,
+            job_id,
+            defer_transfer,
+            seal_persistence,
+        )
+        .await;
+    }
+
     let url = format!("{}/walrus/upload", sidecar_url);
     let data_b64 = BASE64.encode(data);
 
@@ -630,6 +647,20 @@ pub async fn advance_durable_upload(
     job_id: &str,
     mut journal: UploadJournal,
 ) -> Result<DurableUploadAdvance, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::advance_durable_upload_in_process(
+            client,
+            data,
+            epochs,
+            owner,
+            namespace,
+            package_id,
+            job_id,
+            journal,
+        )
+        .await;
+    }
+
     let url = format!("{}/walrus/upload-step-v3", sidecar_url);
     let mut req = client.post(&url).json(&DurableUploadRequest {
         data: BASE64.encode(data),
@@ -769,6 +800,19 @@ pub async fn set_metadata_batch(
     blobs: Vec<SetMetadataBatchEntry>,
     seal_persistence: SealPersistence<'_>,
 ) -> Result<usize, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::set_metadata_batch_in_process(
+            client,
+            key_index,
+            owner_address,
+            package_id,
+            agent_id,
+            blobs,
+            seal_persistence,
+        )
+        .await;
+    }
+
     let url = format!("{}/walrus/set-metadata-batch", sidecar_url);
     let (seal_abi, account_id, registry_id, policy_package_id) =
         seal_persistence_fields(seal_persistence);
@@ -858,6 +902,10 @@ pub async fn find_blob_by_job(
     owner: &str,
     job_id: &str,
 ) -> Result<Option<FoundBlobByJob>, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::find_blob_by_job_in_process(owner, job_id).await;
+    }
+
     let url = format!("{}/walrus/find-blob-by-job", sidecar_url);
     let mut req = client.post(&url).json(&serde_json::json!({
         "owner": owner,
@@ -937,6 +985,16 @@ pub async fn query_blobs_by_owner(
     package_id: Option<&str>,
     limit: Option<usize>,
 ) -> Result<(Vec<OnChainBlob>, bool), AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::query_blobs_by_owner_in_process(
+            owner_address,
+            namespace,
+            package_id,
+            limit,
+        )
+        .await;
+    }
+
     let url = format!("{}/walrus/query-blobs", sidecar_url);
 
     let mut body = serde_json::json!({ "owner": owner_address });
@@ -1012,6 +1070,14 @@ pub async fn query_blob_storage_leases(
     owner_address: &str,
     blob_ids: &[String],
 ) -> Result<BlobStorageLeases, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::walrus_native::query_blob_storage_leases_in_process(
+            owner_address,
+            blob_ids,
+        )
+        .await;
+    }
+
     let url = format!("{}/walrus/query-blobs", sidecar_url);
 
     // NOTE: `limit` does NOT currently bound this call's cost. The

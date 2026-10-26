@@ -607,6 +607,9 @@ pub async fn sse_proxy(
     ) {
         return (code, "internal error").into_response();
     }
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(&state.config.sidecar_url) {
+        return crate::mcp_native::handle_sse_in_process(state, forwarded).await;
+    }
     let req = state
         .http_client
         .get(&url)
@@ -732,6 +735,10 @@ pub async fn messages_proxy(
         identity.as_deref(),
     ) {
         return (code, "internal error").into_response();
+    }
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(&state.config.sidecar_url) {
+        return crate::mcp_native::handle_messages_in_process(state, session_id, forwarded, body)
+            .await;
     }
     let upstream = state
         .http_client
@@ -872,6 +879,10 @@ pub async fn streamable_proxy(
         identity.as_deref(),
     ) {
         return (code, "internal error").into_response();
+    }
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(&state.config.sidecar_url) {
+        return crate::mcp_native::handle_streamable_in_process(state, method, forwarded, body)
+            .await;
     }
     req = req.headers(forwarded);
 

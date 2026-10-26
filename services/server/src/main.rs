@@ -5,6 +5,7 @@ mod compatibility;
 mod engine;
 mod jobs;
 mod jobs_security_delete;
+mod mcp_native;
 mod mcp_proxy;
 mod oauth;
 mod observability;
@@ -1581,18 +1582,43 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
         };
         let mut sponsor_sui_mist: Option<i64> = None;
 
-        // Fetch uploader pool balance from sidecar
+        // Fetch uploader pool balance from sidecar (or in-process Rust Walrus runtime)
         let sidecar_url = &state.config.sidecar_url;
-        let wallet_metrics_url = format!("{}/internal/wallet-balances", sidecar_url);
+        let wallet_metrics_resp =
+            if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+                None
+            } else {
+                let wallet_metrics_url = format!("{}/internal/wallet-balances", sidecar_url);
+                let mut sidecar_request = state.http_client.get(&wallet_metrics_url);
+                if let Some(secret) = state.config.sidecar_secret.as_deref() {
+                    sidecar_request =
+                        sidecar_request.header("authorization", format!("Bearer {}", secret));
+                }
+                Some(sidecar_request.send().await)
+            };
 
-        let mut sidecar_request = state.http_client.get(&wallet_metrics_url);
-        if let Some(secret) = state.config.sidecar_secret.as_deref() {
-            sidecar_request = sidecar_request.header("authorization", format!("Bearer {}", secret));
-        }
-
-        match sidecar_request.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
+        match wallet_metrics_resp {
+            None | Some(Ok(_)) => {
+                let parsed_data: Result<serde_json::Value, String> = match wallet_metrics_resp {
+                    None => Ok(
+                        crate::storage::walrus_native::fetch_wallet_balances_in_process().await,
+                    ),
+                    Some(Ok(resp)) if resp.status().is_success() => resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "balance_monitor: failed to parse sidecar wallet metrics: {}",
+                                e
+                            )
+                        }),
+                    Some(Ok(resp)) => Err(format!(
+                        "balance_monitor: sidecar wallet metrics returned status {}",
+                        resp.status()
+                    )),
+                    Some(Err(_)) => unreachable!(),
+                };
+                match parsed_data {
                     Ok(data) => {
                         if let Some(wallets) =
                             data.get("perWallet").and_then(|value| value.as_array())
@@ -1718,24 +1744,15 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
                         }
                         uploader_totals = routes::admin_activity::uploader_spendable_totals(&data);
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "balance_monitor: failed to parse sidecar wallet metrics: {}",
-                            e
-                        );
+                    Err(msg) => {
+                        tracing::warn!("{}", msg);
                     }
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!(
                     "balance_monitor: failed to fetch sidecar wallet metrics: {}",
                     e
-                );
-            }
-            Ok(resp) => {
-                tracing::warn!(
-                    "balance_monitor: sidecar wallet metrics returned status {}",
-                    resp.status()
                 );
             }
         }
@@ -2179,143 +2196,157 @@ async fn main() {
         tracing::warn!("⚠️  Unset RATE_LIMIT_DISABLED to restore protection.");
     }
 
-    // Start TS sidecar HTTP server (SEAL + Walrus operations)
+    // Start TS sidecar HTTP server (SEAL + Walrus operations) unless in-process Rust mode is enabled
     let sidecar_url = config.sidecar_url.clone();
-    tracing::info!("  sidecar: starting at {}", sidecar_url);
-    // Use SIDECAR_SCRIPTS_DIR if set (Docker), otherwise derive from CARGO_MANIFEST_DIR (local dev)
-    let scripts_dir = std::env::var("SIDECAR_SCRIPTS_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts"));
-    // `MEMWAL_RELAYER_URL` is this deployment's public identity — the OAuth
-    // issuer and the network `memwal_health` names — and stays that. What the
-    // sidecar DIALS is now loopback unless `MEMWAL_SIDECAR_RELAYER_URL` says
-    // otherwise, so no deployment pays a public round trip per tool call and
-    // none has to change an env var to stop.
-    let relayer_urls = resolve_sidecar_relayer_urls(
-        std::env::var("MEMWAL_SIDECAR_RELAYER_URL").ok(),
-        std::env::var("MEMWAL_PUBLIC_RELAYER_URL").ok(),
-        std::env::var("MEMWAL_RELAYER_URL").ok(),
-        config.port,
-    );
-    for line in &relayer_urls.warnings {
-        tracing::warn!("{}", line);
-    }
-    tracing::info!(
-        "  sidecar: dialling relayer at {}",
-        redact_url_userinfo(&relayer_urls.dial)
-    );
-    let mut sidecar_command = tokio::process::Command::new("npx");
-    sidecar_command
-        .args(["tsx", "sidecar-server.ts"])
-        .current_dir(&scripts_dir)
-        .env("MEMWAL_RELAYER_URL", &relayer_urls.dial)
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    // One group for npx, tsx, the sidecar, and the forked seal worker.
-    // Signaling the group does not depend on /bin/kill or on Node's handler.
-    #[cfg(unix)]
-    sidecar_command.process_group(0);
-    if let Some(public_relayer_url) = &relayer_urls.public {
-        sidecar_command.env("MEMWAL_PUBLIC_RELAYER_URL", public_relayer_url);
-    }
-    let seal_url = config.seal_sidecar_url.clone();
-    let seal_plan = crate::types::plan_seal_deployment_from_env(&config.sidecar_url);
-    if let Some((seal_host, seal_port)) = seal_plan.bind {
-        sidecar_command.env("SIDECAR_SEAL_HOST", &seal_host);
-        sidecar_command.env("SIDECAR_SEAL_PORT", seal_port.to_string());
-        sidecar_command.env("SIDECAR_SEAL_LISTENER", "1");
-        tracing::info!("  seal listener: {}", seal_url);
-    } else {
-        sidecar_command.env("SIDECAR_SEAL_LISTENER", "0");
-    }
-    let mut sidecar_child = sidecar_command
-        .spawn()
-        .expect("Failed to start TS sidecar. Is Node.js installed?");
-    let sidecar_group = sidecar_child.id();
-
-    // Wait for sidecar to be ready (health check with retry)
-    // Set 30s timeout on HTTP client to prevent hanging LLM/Walrus requests
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
-    let health_url = format!("{}/health", sidecar_url);
-    if !wait_for_local_health(&http_client, &health_url, "sidecar").await {
-        stop_sidecar_child(&mut sidecar_child).await;
-        panic!("TS sidecar failed to start after 15s. Check scripts/sidecar-server.ts");
-    }
-    let seal_health_url = if seal_url.trim_end_matches('/') != sidecar_url.trim_end_matches('/') {
-        Some(format!("{}/health", seal_url.trim_end_matches('/')))
-    } else {
+    let sidecar_child = if crate::storage::walrus_native::is_in_process_sidecar_enabled(&sidecar_url)
+    {
+        tracing::info!(
+            "  sidecar: in-process Rust Walrus + SEAL + Enoki engine enabled (Node.js sidecar disabled)"
+        );
         None
-    };
-    if let Some(seal_health) = &seal_health_url {
-        if !wait_for_local_health(&http_client, seal_health, "seal listener").await {
-            stop_sidecar_child(&mut sidecar_child).await;
-            panic!("Seal listener failed to start after 15s. Recall would block behind uploads.");
+    } else {
+        tracing::info!("  sidecar: starting at {}", sidecar_url);
+        // Use SIDECAR_SCRIPTS_DIR if set (Docker), otherwise derive from CARGO_MANIFEST_DIR (local dev)
+        let scripts_dir = std::env::var("SIDECAR_SCRIPTS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts"));
+        // `MEMWAL_RELAYER_URL` is this deployment's public identity — the OAuth
+        // issuer and the network `memwal_health` names — and stays that. What the
+        // sidecar DIALS is now loopback unless `MEMWAL_SIDECAR_RELAYER_URL` says
+        // otherwise, so no deployment pays a public round trip per tool call and
+        // none has to change an env var to stop.
+        let relayer_urls = resolve_sidecar_relayer_urls(
+            std::env::var("MEMWAL_SIDECAR_RELAYER_URL").ok(),
+            std::env::var("MEMWAL_PUBLIC_RELAYER_URL").ok(),
+            std::env::var("MEMWAL_RELAYER_URL").ok(),
+            config.port,
+        );
+        for line in &relayer_urls.warnings {
+            tracing::warn!("{}", line);
         }
-    }
+        tracing::info!(
+            "  sidecar: dialling relayer at {}",
+            redact_url_userinfo(&relayer_urls.dial)
+        );
+        let mut sidecar_command = tokio::process::Command::new("npx");
+        sidecar_command
+            .args(["tsx", "sidecar-server.ts"])
+            .current_dir(&scripts_dir)
+            .env("MEMWAL_RELAYER_URL", &relayer_urls.dial)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        // One group for npx, tsx, the sidecar, and the forked seal worker.
+        // Signaling the group does not depend on /bin/kill or on Node's handler.
+        #[cfg(unix)]
+        sidecar_command.process_group(0);
+        if let Some(public_relayer_url) = &relayer_urls.public {
+            sidecar_command.env("MEMWAL_PUBLIC_RELAYER_URL", public_relayer_url);
+        }
+        let seal_url = config.seal_sidecar_url.clone();
+        let seal_plan = crate::types::plan_seal_deployment_from_env(&config.sidecar_url);
+        if let Some((seal_host, seal_port)) = seal_plan.bind {
+            sidecar_command.env("SIDECAR_SEAL_HOST", &seal_host);
+            sidecar_command.env("SIDECAR_SEAL_PORT", seal_port.to_string());
+            sidecar_command.env("SIDECAR_SEAL_LISTENER", "1");
+            tracing::info!("  seal listener: {}", seal_url);
+        } else {
+            sidecar_command.env("SIDECAR_SEAL_LISTENER", "0");
+        }
+        let mut sidecar_child = sidecar_command
+            .spawn()
+            .expect("Failed to start TS sidecar. Is Node.js installed?");
+        let sidecar_group = sidecar_child.id();
 
-    // Keep a cheap heartbeat in the Rust logs so operators can distinguish
-    // Enoki/Walrus failures from the sidecar process becoming unavailable.
-    // If the sidecar remains unhealthy, exit the relayer so Railway restarts
-    // the whole container and brings up a fresh sidecar process.
-    let sidecar_watch_interval_secs = parse_env_u64("SIDECAR_WATCHDOG_INTERVAL_SECS", 30, 5, 300);
-    let sidecar_watch_timeout_secs = parse_env_u64("SIDECAR_WATCHDOG_TIMEOUT_SECS", 2, 1, 30);
-    let sidecar_watch_max_failures = parse_env_u32("SIDECAR_WATCHDOG_MAX_FAILURES", 6, 1, 100);
-    tracing::info!(
-        "  sidecar watchdog: interval={}s timeout={}s max_failures={}",
-        sidecar_watch_interval_secs,
-        sidecar_watch_timeout_secs,
-        sidecar_watch_max_failures
-    );
-    let sidecar_watch_client = http_client.clone();
-    let sidecar_watch_url = health_url.clone();
-    let seal_watch_url = seal_health_url.clone();
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(sidecar_watch_interval_secs));
-        let mut consecutive_failures = 0u32;
-        let timeout = std::time::Duration::from_secs(sidecar_watch_timeout_secs);
-        loop {
-            interval.tick().await;
-            let upload_ok = health_ok(&sidecar_watch_client, &sidecar_watch_url, timeout).await;
-            let seal_ok = match &seal_watch_url {
-                Some(url) => health_ok(&sidecar_watch_client, url, timeout).await,
-                None => true,
+        // Wait for sidecar to be ready (health check with retry)
+        let health_url = format!("{}/health", sidecar_url);
+        if !wait_for_local_health(&http_client, &health_url, "sidecar").await {
+            stop_sidecar_child(&mut sidecar_child).await;
+            panic!("TS sidecar failed to start after 15s. Check scripts/sidecar-server.ts");
+        }
+        let seal_health_url =
+            if seal_url.trim_end_matches('/') != sidecar_url.trim_end_matches('/') {
+                Some(format!("{}/health", seal_url.trim_end_matches('/')))
+            } else {
+                None
             };
-            if upload_ok && seal_ok {
-                if consecutive_failures > 0 {
-                    tracing::info!(
-                        "  sidecar: health recovered after {} failed check(s)",
+        if let Some(seal_health) = &seal_health_url {
+            if !wait_for_local_health(&http_client, seal_health, "seal listener").await {
+                stop_sidecar_child(&mut sidecar_child).await;
+                panic!(
+                    "Seal listener failed to start after 15s. Recall would block behind uploads."
+                );
+            }
+        }
+
+        // Keep a cheap heartbeat in the Rust logs so operators can distinguish
+        // Enoki/Walrus failures from the sidecar process becoming unavailable.
+        // If the sidecar remains unhealthy, exit the relayer so Railway restarts
+        // the whole container and brings up a fresh sidecar process.
+        let sidecar_watch_interval_secs =
+            parse_env_u64("SIDECAR_WATCHDOG_INTERVAL_SECS", 30, 5, 300);
+        let sidecar_watch_timeout_secs = parse_env_u64("SIDECAR_WATCHDOG_TIMEOUT_SECS", 2, 1, 30);
+        let sidecar_watch_max_failures = parse_env_u32("SIDECAR_WATCHDOG_MAX_FAILURES", 6, 1, 100);
+        tracing::info!(
+            "  sidecar watchdog: interval={}s timeout={}s max_failures={}",
+            sidecar_watch_interval_secs,
+            sidecar_watch_timeout_secs,
+            sidecar_watch_max_failures
+        );
+        let sidecar_watch_client = http_client.clone();
+        let sidecar_watch_url = health_url.clone();
+        let seal_watch_url = seal_health_url.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                sidecar_watch_interval_secs,
+            ));
+            let mut consecutive_failures = 0u32;
+            let timeout = std::time::Duration::from_secs(sidecar_watch_timeout_secs);
+            loop {
+                interval.tick().await;
+                let upload_ok =
+                    health_ok(&sidecar_watch_client, &sidecar_watch_url, timeout).await;
+                let seal_ok = match &seal_watch_url {
+                    Some(url) => health_ok(&sidecar_watch_client, url, timeout).await,
+                    None => true,
+                };
+                if upload_ok && seal_ok {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            "  sidecar: health recovered after {} failed check(s)",
+                            consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        "  sidecar: health check failed upload_ok={} seal_ok={} consecutive_failures={}",
+                        upload_ok,
+                        seal_ok,
                         consecutive_failures
                     );
                 }
-                consecutive_failures = 0;
-            } else {
-                consecutive_failures += 1;
-                tracing::error!(
-                    "  sidecar: health check failed upload_ok={} seal_ok={} consecutive_failures={}",
-                    upload_ok,
-                    seal_ok,
-                    consecutive_failures
-                );
-            }
-            if consecutive_failures >= sidecar_watch_max_failures {
-                tracing::error!(
-                    "  sidecar: unhealthy for {} consecutive check(s); exiting relayer for supervisor restart",
-                    consecutive_failures
-                );
-                if let Some(pid) = sidecar_group {
-                    #[cfg(unix)]
-                    terminate_sidecar_group(pid);
-                    #[cfg(not(unix))]
-                    let _ = pid;
+                if consecutive_failures >= sidecar_watch_max_failures {
+                    tracing::error!(
+                        "  sidecar: unhealthy for {} consecutive check(s); exiting relayer for supervisor restart",
+                        consecutive_failures
+                    );
+                    if let Some(pid) = sidecar_group {
+                        #[cfg(unix)]
+                        terminate_sidecar_group(pid);
+                        #[cfg(not(unix))]
+                        let _ = pid;
+                    }
+                    std::process::exit(1);
                 }
-                std::process::exit(1);
             }
-        }
-    });
+        });
+        Some(sidecar_child)
+    };
 
     let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
 
@@ -2375,18 +2406,28 @@ async fn main() {
     // Uploads prefetch a batch and will not notice a metadata job until that
     // batch drains. Metadata and finalize use a second queue whose workers
     // are idle until one of those jobs appears.
+    let wallet_upload_queue_name = std::env::var("WALLET_JOB_QUEUE_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| WALLET_UPLOAD_QUEUE.to_string());
+    let wallet_followup_queue_name = if wallet_upload_queue_name == WALLET_UPLOAD_QUEUE {
+        WALLET_FOLLOWUP_QUEUE.to_string()
+    } else {
+        format!("{}_followup", wallet_upload_queue_name)
+    };
     let wallet_storage: WalletJobStorage = PostgresStorage::new_with_config(
         apalis_pool.clone(),
-        apalis_sql::Config::new(WALLET_UPLOAD_QUEUE),
+        apalis_sql::Config::new(&wallet_upload_queue_name),
     );
     let wallet_followup_storage: WalletJobStorage = PostgresStorage::new_with_config(
         apalis_pool.clone(),
-        apalis_sql::Config::new(WALLET_FOLLOWUP_QUEUE).set_buffer_size(1),
+        apalis_sql::Config::new(&wallet_followup_queue_name).set_buffer_size(1),
     );
     tracing::info!(
         "  Apalis: job queues ready (table=apalis_jobs, upload={}, followup={})",
-        WALLET_UPLOAD_QUEUE,
-        WALLET_FOLLOWUP_QUEUE
+        wallet_upload_queue_name,
+        wallet_followup_queue_name
     );
 
     reqwest::Url::parse(&config.walrus_publisher_url)
@@ -2744,6 +2785,7 @@ async fn main() {
     );
     {
         let monitor_client = state.http_client.clone();
+        let monitor_sidecar_url = sidecar_url.clone();
         let monitor_url = format!("{}{}", sidecar_url, sidecar_saturation::UPLOAD_METRICS_PATH);
         let monitor_alerts = Arc::clone(&state.alerts);
         let monitor_network = config.sui_network.clone();
@@ -2756,36 +2798,42 @@ async fn main() {
             );
             loop {
                 interval.tick().await;
-                let body = match monitor_client
-                    .get(&monitor_url)
-                    .timeout(std::time::Duration::from_secs(2))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.json::<serde_json::Value>().await {
-                            Ok(v) => v,
-                            Err(err) => {
-                                tracing::error!(
-                                    "  sidecar: upload metrics body is not JSON, saturation alert is blind: {}",
-                                    err
-                                );
-                                continue;
+                let body = if crate::storage::walrus_native::is_in_process_sidecar_enabled(
+                    &monitor_sidecar_url,
+                ) {
+                    crate::storage::walrus_native::in_process_upload_metrics_snapshot()
+                } else {
+                    match monitor_client
+                        .get(&monitor_url)
+                        .timeout(std::time::Duration::from_secs(2))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    tracing::error!(
+                                        "  sidecar: upload metrics body is not JSON, saturation alert is blind: {}",
+                                        err
+                                    );
+                                    continue;
+                                }
                             }
                         }
+                        // The sidecar answered, so the watchdog stays green; a
+                        // non-2xx here means the metrics route itself is broken.
+                        Ok(resp) => {
+                            tracing::error!(
+                                "  sidecar: {} returned status={}, saturation alert is blind",
+                                sidecar_saturation::UPLOAD_METRICS_PATH,
+                                resp.status()
+                            );
+                            continue;
+                        }
+                        // An unreachable sidecar is the watchdog's job.
+                        Err(_) => continue,
                     }
-                    // The sidecar answered, so the watchdog stays green; a
-                    // non-2xx here means the metrics route itself is broken.
-                    Ok(resp) => {
-                        tracing::error!(
-                            "  sidecar: {} returned status={}, saturation alert is blind",
-                            sidecar_saturation::UPLOAD_METRICS_PATH,
-                            resp.status()
-                        );
-                        continue;
-                    }
-                    // An unreachable sidecar is the watchdog's job.
-                    Err(_) => continue,
                 };
 
                 let sample = match sidecar_saturation::parse_upload_metrics(&body) {
@@ -2919,9 +2967,10 @@ async fn main() {
     {
         let worker_state = state.clone();
         let storage = wallet_storage.clone();
+        let queue_name_for_log = wallet_upload_queue_name.clone();
         tokio::spawn(async move {
             loop {
-                let worker = WorkerBuilder::new(WALLET_UPLOAD_QUEUE)
+                let worker = WorkerBuilder::new(&wallet_upload_queue_name)
                     .data(worker_state.clone())
                     .backend(storage.clone())
                     .build_fn(execute_wallet_job);
@@ -2939,16 +2988,17 @@ async fn main() {
         });
         tracing::info!(
             "  Apalis: worker '{}' spawned (concurrency={})",
-            WALLET_UPLOAD_QUEUE,
+            queue_name_for_log,
             wallet_concurrency
         );
     }
     {
         let worker_state = state.clone();
         let storage = wallet_followup_storage.clone();
+        let queue_name_for_log = wallet_followup_queue_name.clone();
         tokio::spawn(async move {
             loop {
-                let worker = WorkerBuilder::new(WALLET_FOLLOWUP_QUEUE)
+                let worker = WorkerBuilder::new(&wallet_followup_queue_name)
                     .data(worker_state.clone())
                     .backend(storage.clone())
                     .build_fn(execute_wallet_job);
@@ -2966,7 +3016,7 @@ async fn main() {
         });
         tracing::info!(
             "  Apalis: worker '{}' spawned (concurrency={})",
-            WALLET_FOLLOWUP_QUEUE,
+            queue_name_for_log,
             wallet_concurrency
         );
     }
@@ -3724,7 +3774,9 @@ async fn main() {
 
     // Cleanup sidecar after shutdown. SIGTERM lets it stop the seal child;
     // SIGKILL would leave that child listening.
-    stop_sidecar_child(&mut sidecar_child).await;
-    tracing::info!("sidecar stopped");
+    if let Some(mut sidecar_child) = sidecar_child {
+        stop_sidecar_child(&mut sidecar_child).await;
+        tracing::info!("sidecar stopped");
+    }
     telemetry.shutdown();
 }

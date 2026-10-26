@@ -141,6 +141,17 @@ pub async fn seal_encrypt(
     package_id: &str,
     expected_seal_committee_identity: Option<&serde_json::Value>,
 ) -> Result<Vec<u8>, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::seal_native::seal_encrypt_in_process(
+            data,
+            owner_address,
+            account_id,
+            package_id,
+            expected_seal_committee_identity,
+        )
+        .await;
+    }
+
     let url = format!("{}/seal/encrypt", sidecar_url);
     let data_b64 = BASE64.encode(data);
 
@@ -225,6 +236,19 @@ pub async fn seal_decrypt(
     registry_id: &str,
     account_id: &str,
 ) -> Result<Vec<u8>, AppError> {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::seal_native::seal_decrypt_in_process(
+            client,
+            encrypted_data,
+            credential,
+            package_id,
+            policy_package_id,
+            registry_id,
+            account_id,
+        )
+        .await;
+    }
+
     let url = format!("{}/seal/decrypt", sidecar_url);
     let data_b64 = BASE64.encode(encrypted_data);
 
@@ -362,6 +386,19 @@ pub async fn seal_decrypt_batch(
 ) -> Result<Vec<DecryptOutcome>, AppError> {
     if encrypted_blobs.is_empty() {
         return Ok(vec![]);
+    }
+
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
+        return crate::storage::seal_native::seal_decrypt_batch_in_process(
+            client,
+            encrypted_blobs,
+            credential,
+            package_id,
+            policy_package_id,
+            registry_id,
+            account_id,
+        )
+        .await;
     }
 
     let url = format!("{}/seal/decrypt-batch", sidecar_url);
