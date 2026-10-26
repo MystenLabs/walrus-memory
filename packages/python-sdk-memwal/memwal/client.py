@@ -98,6 +98,10 @@ PUBLIC_SUI_GRAPHQL_NETWORKS = ("mainnet", "testnet", "devnet")
 # Sui read endpoint is unresponsive.
 PACKAGE_VERSION_CHECK_TIMEOUT_S = 10.0
 SEAL_SESSION_SAFETY_MARGIN_MS = 30_000
+
+# The relayer's `MAX_BULK_ITEMS` (services/server/src/types.rs). A bulk read
+# above it is rejected with a non-transient 400, so callers must chunk.
+MAX_BULK_STATUS_IDS = 20
 AUTH_REJECTED_MESSAGE = (
     "401 from relayer: typically wrong private key, key not registered on this "
     "account, account ID mismatch (a wallet address is not a MemWal account ID), "
@@ -410,6 +414,29 @@ def _occurred_at_to_wire(
     )
 
 
+
+def _check_limit(limit: Any) -> None:
+    """Reject a limit that is not a positive integer before it is signed (#1218)."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
+
+def _check_vector(vector: Any) -> None:
+    """Reject a vector that is not a non-empty list of finite numbers (#1218).
+
+    json.dumps would otherwise emit bare NaN/Infinity tokens, which are not
+    JSON, and the relayer would answer with an opaque parse error.
+    """
+    if (
+        not isinstance(vector, (list, tuple))
+        or len(vector) == 0
+        or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            for v in vector
+        )
+    ):
+        raise ValueError("vector must be a non-empty list of finite numbers")
+
 class MemWal:
     """Async-native Walrus Memory client.
 
@@ -434,6 +461,14 @@ class MemWal:
         # Preserve a generated key across an ambiguous transport failure. A
         # subsequent identical call then collapses onto the accepted paid job.
         self._pending_remember_keys: Dict[str, str] = {}
+
+    def _resolve_namespace(self, namespace: Optional[str]) -> str:
+        """``None`` uses the client default; do not treat ``""`` as missing."""
+        if namespace is None:
+            return self._namespace
+        if not namespace:
+            raise ValueError("namespace cannot be empty")
+        return namespace
 
     @classmethod
     def create(
@@ -514,7 +549,7 @@ class MemWal:
             status (``"pending"``).
         """
         _reject_blank_text(text)
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._resolve_namespace(namespace)
         request_identity = f"{resolved_namespace}\0{text}"
         generated_key = idempotency_key is None
         resolved_key = (
@@ -727,7 +762,7 @@ class MemWal:
         """
 
         _reject_blank_text(text)
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._resolve_namespace(namespace)
         request_identity = f"{resolved_namespace}\0{text}"
         generated_key = idempotency_key is None
         resolved_key = (
@@ -773,7 +808,7 @@ class MemWal:
         payload_items: List[Dict[str, Any]] = [
             {
                 "text": item.text,
-                "namespace": item.namespace or self._namespace,
+                "namespace": self._resolve_namespace(item.namespace),
             }
             for item in items
         ]
@@ -899,60 +934,81 @@ class MemWal:
                 attempt += 1
             retry_after_ms = 0
 
-            try:
-                poll_timeout = self._poll_deadline_s(deadline_ms)
+            # The relayer rejects a bulk-status read of more than
+            # MAX_BULK_STATUS_IDS ids with a 400, which is NOT transient: an
+            # unchunked poll of 21+ jobs raises out of the whole wait and
+            # every retry hits the same 400. Chunk here so `memwal_wait_for_saves`
+            # and `remember_bulk_and_wait` are both fixed.
+            terminal_ids: Set[str] = set()
+            refused_ids: List[str] = []
+            for start in range(0, len(pending), MAX_BULK_STATUS_IDS):
+                chunk = pending[start : start + MAX_BULK_STATUS_IDS]
                 try:
-                    batch = await self.get_remember_bulk_status(pending, timeout=poll_timeout)
-                except TypeError as err:
-                    if "unexpected keyword argument" in str(err) and "timeout" in str(err):
-                        batch = await self.get_remember_bulk_status(pending)
-                    else:
-                        raise
-            except _HttpStatusError as err:
-                if _is_transient_polling_status(err.status):
-                    last_refusal = err.status
-                    if err.status == 429:
-                        saw_rate_limit = True
-                        retry_after_ms = _clamped_retry_after_ms(err, deadline_ms)
+                    poll_timeout = self._poll_deadline_s(deadline_ms)
+                    try:
+                        batch = await self.get_remember_bulk_status(chunk, timeout=poll_timeout)
+                    except TypeError as err:
+                        if "unexpected keyword argument" in str(err) and "timeout" in str(err):
+                            batch = await self.get_remember_bulk_status(chunk)
+                        else:
+                            raise
+                except _HttpStatusError as err:
+                    if _is_transient_polling_status(err.status):
+                        last_refusal = err.status
+                        if err.status == 429:
+                            saw_rate_limit = True
+                            retry_after_ms = _clamped_retry_after_ms(err, deadline_ms)
+                        # Refused, not answered: keep this chunk pending.
+                        refused_ids.extend(chunk)
+                        continue
+                    raise
+                except httpx.TransportError:
+                    # Network drops retry as status 0; continuing next loop iteration
+                    # increments `attempt` so exponential backoff delay continues to grow.
+                    last_refusal = 0
+                    refused_ids.extend(chunk)
                     continue
-                raise
-            except httpx.TransportError:
-                # Network drops retry as status 0; continuing next loop iteration
-                # increments `attempt` so exponential backoff delay continues to grow.
-                last_refusal = 0
-                continue
-            answered = True
+                answered = True
+                chunk_pending = set(chunk)
+                terminal_ids |= {
+                    item.job_id
+                    for item in batch.results
+                    if item.job_id in chunk_pending and settle(item)
+                }
 
-            terminal_ids: Set[str] = {
-                item.job_id
-                for item in batch.results
-                if item.job_id in pending and settle(item)
-            }
+            if not answered and refused_ids:
+                # Nothing got through this tick; back off and retry.
+                continue
             pending = [jid for jid in pending if jid not in terminal_ids]
 
         if opts.timeout_ms > 0 and len(pending) == len(job_ids) and not last_seen:
             # Nothing settled and nothing was seen: the polls may all have been
             # refused. Confirm with one direct read before reporting anything.
-            try:
-                probed = await self.get_remember_bulk_status(list(job_ids))
-            except _HttpStatusError as err:
-                if err.status == 429:
-                    # Header first, else the body's retry_after_seconds, so a
-                    # proxy that strips Retry-After does not lose the hint.
-                    wait_ms = _retry_after_ms(err)
-                    retry_after = f"{wait_ms / 1000:g}" if wait_ms else None
-                    raise MemWalRateLimited(job_ids, retry_after) from err
-                # Any other probe failure is not evidence about the jobs.
-            except httpx.TransportError:
-                pass
-            else:
+            settled: Set[str] = set()
+            all_ids = list(job_ids)
+            for start in range(0, len(all_ids), MAX_BULK_STATUS_IDS):
+                chunk = all_ids[start : start + MAX_BULK_STATUS_IDS]
+                try:
+                    probed = await self.get_remember_bulk_status(chunk)
+                except _HttpStatusError as err:
+                    if err.status == 429:
+                        # Header first, else the body's retry_after_seconds, so a
+                        # proxy that strips Retry-After does not lose the hint.
+                        wait_ms = _retry_after_ms(err)
+                        retry_after = f"{wait_ms / 1000:g}" if wait_ms else None
+                        raise MemWalRateLimited(job_ids, retry_after) from err
+                    # Any other probe failure is not evidence about the jobs.
+                    continue
+                except httpx.TransportError:
+                    continue
                 answered = True
-                settled = {
+                pending_now = set(pending)
+                settled |= {
                     item.job_id
                     for item in probed.results
-                    if item.job_id in pending and settle(item)
+                    if item.job_id in pending_now and settle(item)
                 }
-                pending = [jid for jid in pending if jid not in settled]
+            pending = [jid for jid in pending if jid not in settled]
 
         for job_id in pending:
             seen = last_seen.get(job_id)
@@ -1049,10 +1105,11 @@ class MemWal:
             sort = params.sort
         else:
             query_text = query
+        _check_limit(limit)
         body = {
             "query": query_text,
             "limit": limit,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         }
         if scoring_weights is not None:
             body["scoring_weights"] = scoring_weights.to_wire()
@@ -1127,7 +1184,7 @@ class MemWal:
         _reject_blank_text(text)
         body: Dict[str, Any] = {
             "text": text,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         }
         wire_occurred_at = _occurred_at_to_wire(occurred_at)
         if wire_occurred_at is not None:
@@ -1228,7 +1285,7 @@ class MemWal:
         data = await self._signed_request("POST", "/api/ask", {
             "question": question,
             "limit": limit,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         })
         memories = [
             AskMemory(blob_id=m["blob_id"], text=m["text"], distance=m["distance"])
@@ -1291,6 +1348,7 @@ class MemWal:
               downloads in parallel, then 3 SEAL decrypts in parallel, then
               embeddings. Expect seconds-per-blob on cold caches.
         """
+        _check_limit(limit)
         data = await self._signed_request("POST", "/api/restore", {
             "namespace": namespace,
             "limit": limit,
@@ -1346,6 +1404,10 @@ class MemWal:
         Returns:
             :class:`NamespacesResult`.
         """
+        # Validate before resolving the owner: on a fresh client that lookup is
+        # a signed POST /api/stats, so a bad limit must not reach it (#1218).
+        if limit is not None:
+            _check_limit(limit)
         owner = await self._resolve_owner()
 
         params: Dict[str, str] = {}
@@ -1420,13 +1482,14 @@ class MemWal:
         Returns:
             :class:`RememberManualResult` with id, blob_id, owner, namespace.
         """
+        _check_vector(opts.vector)
         data = await self._signed_request(
             "POST",
             "/api/remember/manual",
             {
                 "encrypted_data": opts.encrypted_data,
                 "vector": opts.vector,
-                "namespace": opts.namespace or self._namespace,
+                "namespace": self._resolve_namespace(opts.namespace),
             },
             include_seal_session=False,
         )
@@ -1449,10 +1512,12 @@ class MemWal:
         Returns:
             :class:`RecallManualResult` with blob_id + distance pairs.
         """
+        _check_vector(opts.vector)
+        _check_limit(opts.limit)
         body: Dict[str, Any] = {
             "vector": opts.vector,
             "limit": opts.limit,
-            "namespace": opts.namespace or self._namespace,
+            "namespace": self._resolve_namespace(opts.namespace),
         }
         if opts.scoring_weights is not None:
             body["scoring_weights"] = opts.scoring_weights.to_wire()
@@ -1743,7 +1808,9 @@ class MemWal:
 
         method_upper = method.upper()
         timestamp = str(int(time.time()))
-        body_str = "" if method_upper == "GET" else json.dumps(body, separators=(",", ":"))
+        body_str = "" if method_upper == "GET" else json.dumps(
+            body, separators=(",", ":"), allow_nan=False
+        )
         body_hash = sha256_hex(body_str)
         # MED-1 / LOW-23: nonce + account_id are part of the canonical signed
         # message. Server rejects the request as "unsupported legacy SDK"

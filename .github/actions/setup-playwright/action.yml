@@ -23,4 +23,12 @@ runs:
 
     - name: Install Playwright (Chromium + OS deps)
       shell: bash
-      run: pnpm --filter ${{ inputs.package }} playwright:install
+      run: |
+        # The hosted runner's Azure Ubuntu mirror can stall on font downloads
+        # until the whole E2E job times out. Use the upstream Ubuntu mirror.
+        for source in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+          if [ -f "$source" ]; then
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$source"
+          fi
+        done
+        pnpm --filter ${{ inputs.package }} playwright:install

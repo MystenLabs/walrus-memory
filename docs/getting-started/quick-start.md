@@ -49,22 +49,22 @@ The fastest way to get Walrus Memory running is through the TypeScript SDK.
     <Tabs>
       <Tab title="pnpm">
         ```bash
-        pnpm add @mysten-incubation/memwal
+        pnpm add @mysten-incubation/memwal @mysten/sui @mysten/seal
         ```
       </Tab>
       <Tab title="npm">
         ```bash
-        npm install @mysten-incubation/memwal
+        npm install @mysten-incubation/memwal @mysten/sui @mysten/seal
         ```
       </Tab>
       <Tab title="yarn">
         ```bash
-        yarn add @mysten-incubation/memwal
+        yarn add @mysten-incubation/memwal @mysten/sui @mysten/seal
         ```
       </Tab>
       <Tab title="bun">
         ```bash
-        bun add @mysten-incubation/memwal
+        bun add @mysten-incubation/memwal @mysten/sui @mysten/seal
         ```
       </Tab>
     </Tabs>
@@ -96,27 +96,29 @@ The fastest way to get Walrus Memory running is through the TypeScript SDK.
       </Tab>
     </Tabs>
 
-    For the [manual client flow](/getting-started/choose-your-path) (`@mysten-incubation/memwal/manual`):
+    `@mysten/sui` and `@mysten/seal` are required peers: the default client imports them on `recall()` to build the Seal session, and pnpm and yarn do not install peers for you.
+
+    For the [manual client flow](/getting-started/choose-your-path) (`@mysten-incubation/memwal/manual`), also add:
 
     <Tabs>
       <Tab title="pnpm">
         ```bash
-        pnpm add @mysten/sui @mysten/seal @mysten/walrus
+        pnpm add @mysten/walrus
         ```
       </Tab>
       <Tab title="npm">
         ```bash
-        npm install @mysten/sui @mysten/seal @mysten/walrus
+        npm install @mysten/walrus
         ```
       </Tab>
       <Tab title="yarn">
         ```bash
-        yarn add @mysten/sui @mysten/seal @mysten/walrus
+        yarn add @mysten/walrus
         ```
       </Tab>
       <Tab title="bun">
         ```bash
-        bun add @mysten/sui @mysten/seal @mysten/walrus
+        bun add @mysten/walrus
         ```
       </Tab>
     </Tabs>

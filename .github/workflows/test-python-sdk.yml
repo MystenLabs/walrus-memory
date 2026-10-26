@@ -135,7 +135,7 @@ jobs:
       # which test_integration.py reads as MEMWAL_PRIVATE_KEY.
       MEMWAL_PRIVATE_KEY: ${{ secrets.BENCH_DELEGATE_KEY }}
       MEMWAL_ACCOUNT_ID: ${{ secrets.BENCH_ACCOUNT_ID }}
-      # Public URL (docs/relayer/benchmark-ci-setup.md), defaulted so a missing
+      # Public URL (internal/relayer/benchmark-ci-setup.md), defaulted so a missing
       # variable cannot silently point the run at the wrong relayer.
       MEMWAL_SERVER_URL: ${{ vars.BENCH_SERVER_URL || 'https://relayer.dev.memwal.ai' }}
 

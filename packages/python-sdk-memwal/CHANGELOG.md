@@ -1,8 +1,20 @@
 # memwal
 
-## 0.2.0
+## 0.2.1
 
 Unreleased.
+
+### Fixed
+
+- `with_memwal_*` gains `save_mode` and confirmable saves: `memwal_wait_for_saves` (async and sync) polls every job the middleware enqueued, and restores the job ids if that poll raises so a retry can still confirm them. (WALM-307, #410, #411, #412)
+- `wait_for_remember_jobs` chunks its status reads to the relayer's 20-id `MAX_BULK_ITEMS` cap. Above it the relayer answers a non-transient 400, so a wait over 21+ jobs raised on every attempt and could never confirm — reachable from `save_mode="remember"` after 21 turns, or from two fat `analyze` extracts. (WALM-307)
+
+- Save confirmation preserves unconfirmed job IDs when an async wait is cancelled or a synchronous wait is interrupted, then propagates the cancellation or interrupt. (#1303)
+- Reject explicitly empty namespaces instead of silently writing to the default namespace. (#1265)
+- Reject non-finite vectors and invalid limits before signing requests. (#1264)
+
+## 0.2.0
+
 
 ### Changed
 

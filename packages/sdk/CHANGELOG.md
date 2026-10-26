@@ -1,5 +1,13 @@
 # @mysten-incubation/memwal
 
+## 0.1.10
+
+### Fixed
+
+- `MemWal.recallManual` and `MemWalManual.recallManual` reject a non-finite `scoringWeights` value (`NaN` or `Infinity`) before signing, with the same `scoringWeights.<name> must be a finite number` error as `recall`. `JSON.stringify` rewrote the weight to `null`, so the relayer received `{"semantic": null}` instead of the caller's value. (WALM-861, #1246)
+- A 2xx response that is valid JSON of the wrong shape raises an SDK error that names the endpoint, instead of a raw `TypeError`. `recall`, `analyzeAndWait`, `listMemories`, and `getRememberBulkStatus` (so `waitForRememberJobs`) name the missing `results`, `job_ids`, or `memories` array, and the bulk status error is not retried. `getRememberStatus` returns `not_found` and `waitForRememberJob` throws `MemWalRememberJobNotFoundError` when the status body is null or not an object. (WALM-860, #1247)
+- `remember`, `rememberBulk`, `analyze`, `embed`, and `recall` reject text made only of whitespace and zero-width format characters (U+200B, U+200C, U+200D, U+2060, U+FEFF) before signing, with the same error as blank text. The relayer still accepts that text, and the call used to sit until the client timed out. `MemWalMock` rejects the same set. (WALM-810, #1156)
+
 ## 0.1.9
 
 ### Fixed

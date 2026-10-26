@@ -116,7 +116,8 @@ export function getMemWalModel(
     namespace,
     maxMemories: 5,
     autoSave: true,
-    minRelevance: 0,
-    debug: true,
+    // No minRelevance override: the SDK default (0.3) drops unrelated hits
+    // instead of injecting all `maxMemories` into every prompt (#1099).
+    debug: process.env.NODE_ENV !== "production",
   });
 }

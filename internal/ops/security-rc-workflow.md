@@ -30,7 +30,7 @@ mix contract, demo, and docs work in an RC.
 
 Request review from Security (or the postmortem Security owners) on that single
 PR. When the change is a security migration, record the approver on the
-migration completion artifact (`docs/ops/migration-completion-artifact.md`).
+migration completion artifact (`internal/ops/migration-completion-artifact.md`).
 
 ## TDD bar
 

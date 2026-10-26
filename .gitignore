@@ -20,14 +20,9 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Environment variables
+# Every env-file variant (.env.staging, .env.dev, .env.ci, ...), at any depth
 .env
-.env*.local
-.env.local.*
-.env*.bak
-.env.production
-.env.test
-*/.env.test
-**/.env.test
+.env.*
 # Keep .env.example for documentation
 !.env.example
 

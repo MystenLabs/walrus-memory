@@ -135,6 +135,7 @@ Public deployment parameters that the SDK reads to build a Seal SessionKey clien
 ```json
 {
   "packageId": "0x...",
+  "registryId": "0x...",
   "network": "testnet",
   "suiRpcUrl": "https://fullnode.testnet.sui.io",
   "suiGrpcUrl": "https://fullnode.testnet.sui.io",
@@ -144,6 +145,8 @@ Public deployment parameters that the SDK reads to build a Seal SessionKey clien
 ```
 
 This example shows the fields a client needs to select a transport and build a session key. A deployment can return more, so read fields by name rather than assuming the shape is exhaustive.
+
+`registryId` is the `AccountRegistry` shared object for `packageId`, the first argument to `account::create_account`.
 
 `suiGrpcUrl` is the preferred gRPC endpoint, and `suiTransport` names the transport the relayer prefers for Sui reads. Newer SDKs read both; a client might fall back to `suiRpcUrl` while a deployment migrates. `rateLimitDisabled` mirrors the server's benchmark-bypass setting so benchmark scripts can pre-flight the configuration.
 
@@ -582,7 +585,7 @@ Rebuild missing vector entries for one namespace. Queries onchain blobs by owner
 
 `skipped` is onchain blobs already in the local success index. `failed` is permanent decrypt/UTF-8 failures on this onchain page (negative-cache hits plus new permanent failures this call), so it never exceeds `total`. Transient download, decrypt, or embed errors are not counted in `failed`; when a page yields only those, `truncated` is true so the caller retries.
 
-`truncated=true` means this restore is **known-retryable-incomplete**: more missing blobs than `limit` allowed this call to restore, **or** the sidecar's owner-wide candidate fetch hit its cap **and** raising `limit` can still expand that fetch (`limit < 20`). Once the sidecar cap is saturated (`limit >= 20`, cap pinned at 100), truncation follows this call's missing-blob page length, not onchain `total`. A fully restored namespace does not loop. `truncated=false` is **not** proof the sidecar saw every onchain blob; blobs beyond the owner-wide sidecar candidate cap can still be missing. WALM-451 tracks a `sourceCapped` field for that case ([WALM-451](https://linear.app/mysten-labs/issue/WALM-451)). Relayers older than WALM-319 omit `truncated`; SDKs default it to `false`.
+`truncated=true` means this restore is **known-retryable-incomplete**: more missing blobs than `limit` allowed this call to restore, **or** the sidecar's owner-wide candidate fetch hit its cap **and** raising `limit` can still expand that fetch (`limit < 20`). Once the sidecar cap is saturated (`limit >= 20`, cap pinned at 100), truncation follows this call's missing-blob page length, not onchain `total`. A fully restored namespace does not loop. `truncated=false` is **not** proof the sidecar saw every onchain blob; blobs beyond the owner-wide sidecar candidate cap can still be missing. A `sourceCapped` field for that case is planned as a follow-up. Relayers that predate the `truncated` field omit it; SDKs default it to `false`.
 
 ### `POST /api/forget`
 

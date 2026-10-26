@@ -44,7 +44,7 @@ pub const MAX_WALRUS_STORAGE_EPOCHS: u32 = 15;
 /// Hard ceiling for `OWNER_TOKEN_TTL_SECS` — 24 hours. Without a
 /// bound, `env_positive_u64` accepts any positive u64, and a very large TTL
 /// both defeats the "short-lived" security property the token scheme's
-/// whole threat model rests on (see docs/api/owner-token-auth.md's
+/// whole threat model rests on (see internal/api/owner-token-auth.md's
 /// trust-boundary note) and can push `now + ttl` outside chrono's
 /// representable range in `routes::owner_token::issue_token`'s `expires_at`
 /// computation.
@@ -2586,6 +2586,10 @@ pub struct PromptVersions {
 pub struct ConfigResponse {
     #[serde(rename = "packageId")]
     pub package_id: String,
+    /// `AccountRegistry` shared object for `packageId`, needed as the first
+    /// argument of `account::create_account`.
+    #[serde(rename = "registryId")]
+    pub registry_id: String,
     pub network: String,
     #[serde(rename = "suiRpcUrl", skip_serializing_if = "Option::is_none")]
     pub sui_rpc_url: Option<String>,
@@ -2630,6 +2634,44 @@ pub struct ConfigResponse {
     pub security_delete_execution_grace_secs: u64,
     #[serde(rename = "securityDeleteExpiryMarginEpochs")]
     pub security_delete_expiry_margin_epochs: u64,
+}
+
+impl ConfigResponse {
+    /// Build the public `/config` response from the relayer config.
+    pub fn from_config(config: &Config) -> Self {
+        ConfigResponse {
+            package_id: config.package_id.clone(),
+            registry_id: config.registry_id.clone(),
+            network: config.sui_network.clone(),
+            // Keep the legacy endpoint in the response while SDK/server versions
+            // roll independently. New SDKs prefer gRPC when advertised and fall
+            // back to this URL; old SDKs still require this field.
+            sui_rpc_url: Some(config.sui_rpc_url.clone()),
+            sui_grpc_url: config.sui_grpc_url.clone(),
+            sui_transport: if config.sui_grpc_url.is_some() {
+                "grpc"
+            } else {
+                "jsonrpc"
+            },
+            rate_limit_disabled: config.rate_limit.bench_bypass_enabled,
+            security_delete_sui_rpc_requests_per_window: config.sui_rpc_requests_per_window,
+            security_delete_sui_rpc_window_secs: config.sui_rpc_window.as_secs(),
+            security_delete_enabled: config.enable_security_delete,
+            security_delete_reconciler_enabled: config.deletion_reconciler_enabled,
+            security_delete_object_resolver_enabled: config.deletion_object_resolver_enabled,
+            security_delete_batch_max: config.delete_batch_max,
+            security_delete_max_active_batches_per_owner: config.max_active_batches_per_owner,
+            security_delete_auth_requests_per_minute: config
+                .security_delete_auth_requests_per_minute,
+            security_delete_prepare_requests_per_minute: config
+                .security_delete_prepare_requests_per_minute,
+            security_delete_execute_max_in_flight: config.security_delete_execute_max_in_flight,
+            security_delete_crash_test_enabled: config.security_delete_crash_test_secret.is_some(),
+            security_delete_claim_ttl_secs: config.claim_ttl_secs,
+            security_delete_execution_grace_secs: config.exec_grace_secs,
+            security_delete_expiry_margin_epochs: config.expiry_margin_epochs,
+        }
+    }
 }
 
 // ============================================================
@@ -3262,10 +3304,24 @@ mod tests {
         assert!(error.contains("unsupported SUI_NETWORK"));
     }
 
+    // #1152: `create_account` needs the AccountRegistry shared object, and
+    // `/config` was the only public deployment metadata without it.
+    #[test]
+    fn config_response_exposes_registry_id_next_to_package_id() {
+        let mut config = security_delete_test_config();
+        config.package_id = "0xe7c1".into();
+        config.registry_id = "0x8bf8".into();
+        let json = serde_json::to_value(ConfigResponse::from_config(&config)).unwrap();
+        assert_eq!(json["packageId"], "0xe7c1");
+        assert_eq!(json["registryId"], "0x8bf8");
+        assert!(json.get("registry_id").is_none());
+    }
+
     #[test]
     fn config_response_advertises_grpc_transport_compatibly() {
         let response = ConfigResponse {
             package_id: "0x1".into(),
+            registry_id: "0x2".into(),
             network: "testnet".into(),
             sui_rpc_url: Some("https://rpc.example".into()),
             sui_grpc_url: Some("https://grpc.example".into()),

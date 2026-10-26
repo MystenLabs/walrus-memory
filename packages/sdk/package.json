@@ -1,6 +1,6 @@
 {
     "name": "@mysten-incubation/memwal",
-    "version": "0.1.9",
+    "version": "0.1.10",
     "description": "Walrus Memory \u2014 Privacy-first AI memory SDK with Ed25519 delegate key auth",
     "type": "module",
     "engines": {
@@ -82,7 +82,7 @@
     "license": "Apache-2.0",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/MystenLabs/MemWal.git",
+        "url": "git+https://github.com/MystenLabs/walrus-memory.git",
         "directory": "packages/sdk"
     },
     "publishConfig": {

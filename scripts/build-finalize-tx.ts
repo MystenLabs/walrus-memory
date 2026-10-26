@@ -14,7 +14,7 @@
  * Burning the spent MigrationCap is a separate tx signed by the wallet that owns
  * the cap (the controller's), not this one.
  * A fresh completion report from the in-cluster one-shot Job is mandatory.
- * After a security migration, write the operator completion artifact with scripts/write-migration-completion-artifact.mjs (docs/ops/migration-completion-artifact.md).
+ * After a security migration, write the operator completion artifact with scripts/write-migration-completion-artifact.mjs (internal/ops/migration-completion-artifact.md).
  *
  * Gas is auto-selected by build(): address balance when available, otherwise an
  * owned SUI coin. The transaction is chain-bound to the current Sui epoch. Sui

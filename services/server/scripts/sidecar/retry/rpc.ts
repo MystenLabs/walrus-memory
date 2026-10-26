@@ -33,11 +33,26 @@ export class NoSideEffectError extends Error {
 }
 
 export class FinalizedTransactionFailure extends NoSideEffectError {
-    readonly code = "FINALIZED_TRANSACTION_FAILURE";
+    readonly code: string = "FINALIZED_TRANSACTION_FAILURE";
 
     constructor(message: string) {
         super(message);
         this.name = "FinalizedTransactionFailure";
+    }
+}
+
+/**
+ * The transaction finalized as failed because shared objects stayed congested.
+ * The digest can never land, so a rebuild may use a new nonce. Every other
+ * finalized failure keeps the old digest: re-preparing byte-identical lets the
+ * digest lookup find it instead of paying for a second register.
+ */
+export class CongestionCancelledTransaction extends FinalizedTransactionFailure {
+    readonly code = "CONGESTION_CANCELLED_TRANSACTION";
+
+    constructor(message: string) {
+        super(message);
+        this.name = "CongestionCancelledTransaction";
     }
 }
 
@@ -102,11 +117,18 @@ export function classifyDurableSideEffectError(
     phaseCanSubmitSideEffect: boolean,
     submissionStarted: boolean,
 ): {
-    code: "NO_SIDE_EFFECT" | "SHARED_SERVICE_UNAVAILABLE" | "DURABLE_SIDE_EFFECT_VERIFY_FAILED";
+    code:
+        | "NO_SIDE_EFFECT"
+        | "CONGESTION_CANCELLED_TRANSACTION"
+        | "SHARED_SERVICE_UNAVAILABLE"
+        | "DURABLE_SIDE_EFFECT_VERIFY_FAILED";
     causeCode?: "SHARED_SERVICE_UNAVAILABLE";
 } | null {
     if (err instanceof DurableSideEffectVerifyError) {
         return { code: "DURABLE_SIDE_EFFECT_VERIFY_FAILED" };
+    }
+    if (err instanceof CongestionCancelledTransaction) {
+        return { code: "CONGESTION_CANCELLED_TRANSACTION" };
     }
     if (err instanceof NoSideEffectError) {
         return { code: "NO_SIDE_EFFECT" };

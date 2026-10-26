@@ -71,7 +71,7 @@ Enoki Connect only works if WM and Console both use Enoki's **default salt** for
 
 No custom salt exists on either side, by code inspection and by the functional precondition that Enoki Connect requires it. The one thing this doesn't cover: an explicit walkthrough of the Enoki Portal's own app configuration to positively confirm there's no server-side custom salt backend registered outside of what the client SDKs above would exercise — if a Portal-level indicator exists, checking it directly remains a stronger source of truth than the client-code inference above.
 
-*(This confirmation was tracked as part of WALM-298's acceptance criteria — see `docs/reference/console-identity-link.md` for the endpoint that ticket covers.)*
+*(This confirmation was tracked as part of WALM-298's acceptance criteria — see `internal/reference/console-identity-link.md` for the endpoint that ticket covers.)*
 
 ## Allowed Origins Requirement (the actual bug found)
 

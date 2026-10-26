@@ -194,7 +194,7 @@ Rebuild missing indexed entries for one namespace from Walrus. Incremental.
 RestoreResult(restored: int, skipped: int, total: int, namespace: str, owner: str, truncated: bool = False, failed: int = 0)
 ```
 
-`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob (WALM-451 `sourceCapped`).
+`truncated=true` is known-retryable-incomplete (this call's `limit`, or a still-expandable sidecar candidate fetch); `truncated=false` is not proof the sidecar saw every onchain blob (a `sourceCapped` field is planned as a follow-up).
 
 ### `list_namespaces(cursor=None, limit=None) -> NamespacesResult`
 
@@ -269,7 +269,7 @@ See [Manual methods](/python-sdk/usage/memwal-manual).
 from memwal import with_memwal_langchain, with_memwal_openai
 ```
 
-Both wrap an existing LLM client with automatic recall + save and accept: `key`, `account_id`, `server_url`, `namespace`, `env`, `max_memories` (5), `auto_save` (True), `min_relevance` (0.3), `debug` (False). The alias `withMemWal` maps to `with_memwal_langchain`. See [with_memwal](/python-sdk/usage/with-memwal).
+Both wrap an existing LLM client with automatic recall + save and accept: `key`, `account_id`, `server_url`, `namespace`, `env`, `max_memories` (5), `auto_save` (True), `save_mode` (`"analyze"` or `"remember"`), `min_relevance` (0.3), `debug` (False). The wrapped client also exposes `memwal`, `memwal_flush()`, and `memwal_wait_for_saves()` for confirming saves. The alias `withMemWal` maps to `with_memwal_langchain`. See [with_memwal](/python-sdk/usage/with-memwal).
 
 ## Exceptions
 

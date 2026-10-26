@@ -456,7 +456,9 @@ export default function Dashboard({
         () => onChainKeys.filter((key) => affectedKeySet.has(normalizeKeyHex(key.publicKey))),
         [onChainKeys, affectedKeySet],
     )
-    const incidentOpen = Boolean(incident?.affected && (incident.quarantined || !incident.active))
+    // Removing the last leaked key can clear `affected` while the account
+    // remains inactive. Recovery must follow account state, not leaked-key membership.
+    const incidentOpen = Boolean(incident?.account_id && (incident.quarantined || !incident.active))
     const highlightedKeysRemain = affectedOnChainKeys.length > 0 || (isKeyListLoading && affectedKeySet.size > 0)
     const showLockedCleanup = incidentOpen && highlightedKeysRemain
     const visibleKeys = showLockedCleanup && affectedOnChainKeys.length > 0 ? affectedOnChainKeys : onChainKeys
@@ -736,6 +738,11 @@ export default function Dashboard({
             return
         }
 
+        if (incidentOpen) {
+            setKeyError('Restore your account before creating a new key.')
+            return
+        }
+
         if (hasMaxDelegateKeys) {
             setKeyError(MAX_DELEGATE_KEYS_MESSAGE)
             trackEvent('delegate_key_add_failed', { error_type: 'max_delegate_keys' })
@@ -805,6 +812,7 @@ export default function Dashboard({
     }, [
         walletSigner,
         signAndExecuteTx,
+        incidentOpen,
         hasMaxDelegateKeys,
         effectiveAccountObjectId,
         newKeyLabel,
@@ -1405,7 +1413,7 @@ asyncio.run(main())`
                                     trackEvent('cta_click', { cta: 'show_add_delegate_key_form', location: 'dashboard' })
                                     openAddKeyForm()
                                 }}
-                                disabled={showAddForm || addingKey || accountLookupPending || !effectiveAccountObjectId || hasMaxDelegateKeys || keyActionBlockedByUncopiedKey}
+                                disabled={showAddForm || addingKey || incidentOpen || accountLookupPending || !effectiveAccountObjectId || hasMaxDelegateKeys || keyActionBlockedByUncopiedKey}
                             >
                                 Add key <Plus size={18} strokeWidth={2.5} aria-hidden="true" />
                             </button>
@@ -1505,7 +1513,7 @@ asyncio.run(main())`
                                 <button
                                     className="btn btn-primary btn-sm dashboard-add-key-create"
                                     onClick={handleAddKey}
-                                    disabled={addingKey || hasMaxDelegateKeys || accountLookupPending || !effectiveAccountObjectId}
+                                    disabled={addingKey || incidentOpen || hasMaxDelegateKeys || accountLookupPending || !effectiveAccountObjectId}
                                     aria-busy={addingKey}
                                 >
                                     {addingKey ? 'Creating...' : 'Create'}
