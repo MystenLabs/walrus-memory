@@ -1723,13 +1723,17 @@ impl OnchainVerifyError {
 
     /// Whether OAuth refresh may revoke the grant on this answer.
     ///
-    /// A removed key, a deactivated account, gRPC `NotFound`, JSON-RPC
-    /// `notExists` / `deleted`, or a present foreign type. A partial body,
-    /// `InvalidArgument`, a missing `object_type`, an unparseable id, and
-    /// any unavailable RPC are not a removal.
+    /// A removed key, a deactivated account, gRPC `NotFound`, and JSON-RPC
+    /// `notExists` / `deleted`. A present foreign type holds instead of
+    /// revoking: a package/type-origin misconfiguration turns every account
+    /// into `WrongObjectType`, and revoking would destroy every grant on a
+    /// config slip. Refresh still refuses to mint, so a real lookalike cannot
+    /// authenticate (#398). A partial body, `InvalidArgument`, a missing
+    /// `object_type`, an unparseable id, and any unavailable RPC are not a
+    /// removal either.
     pub fn revokes_oauth_refresh(&self) -> bool {
         match self {
-            Self::KeyNotFound(_) | Self::AccountDeactivated(_) | Self::WrongObjectType(_) => true,
+            Self::KeyNotFound(_) | Self::AccountDeactivated(_) => true,
             // gRPC `Code::NotFound` uses the prefix. JSON-RPC removal uses
             // the two codes. `invalid object id` is neither.
             Self::NotFound(msg) => {
@@ -1737,7 +1741,7 @@ impl OnchainVerifyError {
                     || msg == "sui_getObject notExists"
                     || msg == "sui_getObject deleted"
             }
-            Self::RpcError(_) | Self::ScanCapExceeded(_) => false,
+            Self::RpcError(_) | Self::ScanCapExceeded(_) | Self::WrongObjectType(_) => false,
         }
     }
 }
@@ -2089,12 +2093,13 @@ mod tests {
         assert!(real.revokes_oauth_refresh(), "{real}");
         assert!(delegate_verify_evicts(&real, true), "{real}");
 
-        // A present foreign type is a finished read. Refresh revokes it.
-        // Missing `object_type` is `RpcError` and is covered above.
+        // A present foreign type is a finished read: signed auth rejects it
+        // and evicts a cached positive, but refresh holds rather than
+        // revoking so a package-id misconfiguration cannot wipe grants.
         let foreign = OnchainVerifyError::WrongObjectType("foreign".into());
-        assert!(foreign.revokes_oauth_refresh());
+        assert!(!foreign.revokes_oauth_refresh());
         assert!(delegate_verify_evicts(&foreign, false));
-        assert!(delegate_verify_evicts(&foreign, true));
+        assert!(!delegate_verify_evicts(&foreign, true));
 
         let invalid_id = parse_object_id("not-a-sui-object-id").unwrap_err();
         assert!(!invalid_id.revokes_oauth_refresh(), "{invalid_id}");

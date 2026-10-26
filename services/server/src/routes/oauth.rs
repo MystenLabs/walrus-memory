@@ -1520,7 +1520,6 @@ mod tests {
             OnchainVerifyError::KeyNotFound("gone".into()),
             OnchainVerifyError::AccountDeactivated("dead".into()),
             map_get_object_status(tonic::Status::not_found("no such object")),
-            OnchainVerifyError::WrongObjectType("foreign".into()),
             OnchainVerifyError::NotFound("sui_getObject notExists".into()),
             OnchainVerifyError::NotFound("sui_getObject deleted".into()),
         ] {
@@ -1543,6 +1542,24 @@ mod tests {
             .expect("owner mismatch is invalid_grant")
             .description
             .contains("no longer registered on-chain"));
+    }
+
+    #[test]
+    fn refresh_holds_a_foreign_object_instead_of_revoking() {
+        // A package/type-origin misconfiguration makes every account look
+        // foreign. Revoking here would destroy every grant on a config slip,
+        // while refusing to mint still blocks a real lookalike (#398).
+        let err = OnchainVerifyError::WrongObjectType("foreign".into());
+        assert!(!err.revokes_oauth_refresh());
+        let decision = refresh_delegate_decision(Err(err), "0xowner");
+        assert_refresh_policy(decision, false, false, Some("temporarily_unavailable"));
+        assert!(!decision.revokes_grant());
+        assert_eq!(
+            decision.failure().expect("a foreign type holds").status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Signed auth still treats a present foreign type as definitive.
+        assert!(!OnchainVerifyError::WrongObjectType("foreign".into()).is_unavailable());
     }
 
     #[test]
