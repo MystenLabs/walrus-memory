@@ -435,6 +435,14 @@ class MemWal:
         # subsequent identical call then collapses onto the accepted paid job.
         self._pending_remember_keys: Dict[str, str] = {}
 
+    def _resolve_namespace(self, namespace: Optional[str]) -> str:
+        """``None`` uses the client default; do not treat ``""`` as missing."""
+        if namespace is None:
+            return self._namespace
+        if not namespace:
+            raise ValueError("namespace cannot be empty")
+        return namespace
+
     @classmethod
     def create(
         cls,
@@ -514,7 +522,7 @@ class MemWal:
             status (``"pending"``).
         """
         _reject_blank_text(text)
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._resolve_namespace(namespace)
         request_identity = f"{resolved_namespace}\0{text}"
         generated_key = idempotency_key is None
         resolved_key = (
@@ -727,7 +735,7 @@ class MemWal:
         """
 
         _reject_blank_text(text)
-        resolved_namespace = namespace or self._namespace
+        resolved_namespace = self._resolve_namespace(namespace)
         request_identity = f"{resolved_namespace}\0{text}"
         generated_key = idempotency_key is None
         resolved_key = (
@@ -773,7 +781,7 @@ class MemWal:
         payload_items: List[Dict[str, Any]] = [
             {
                 "text": item.text,
-                "namespace": item.namespace or self._namespace,
+                "namespace": self._resolve_namespace(item.namespace),
             }
             for item in items
         ]
@@ -1052,7 +1060,7 @@ class MemWal:
         body = {
             "query": query_text,
             "limit": limit,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         }
         if scoring_weights is not None:
             body["scoring_weights"] = scoring_weights.to_wire()
@@ -1127,7 +1135,7 @@ class MemWal:
         _reject_blank_text(text)
         body: Dict[str, Any] = {
             "text": text,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         }
         wire_occurred_at = _occurred_at_to_wire(occurred_at)
         if wire_occurred_at is not None:
@@ -1228,7 +1236,7 @@ class MemWal:
         data = await self._signed_request("POST", "/api/ask", {
             "question": question,
             "limit": limit,
-            "namespace": namespace or self._namespace,
+            "namespace": self._resolve_namespace(namespace),
         })
         memories = [
             AskMemory(blob_id=m["blob_id"], text=m["text"], distance=m["distance"])
@@ -1426,7 +1434,7 @@ class MemWal:
             {
                 "encrypted_data": opts.encrypted_data,
                 "vector": opts.vector,
-                "namespace": opts.namespace or self._namespace,
+                "namespace": self._resolve_namespace(opts.namespace),
             },
             include_seal_session=False,
         )
@@ -1452,7 +1460,7 @@ class MemWal:
         body: Dict[str, Any] = {
             "vector": opts.vector,
             "limit": opts.limit,
-            "namespace": opts.namespace or self._namespace,
+            "namespace": self._resolve_namespace(opts.namespace),
         }
         if opts.scoring_weights is not None:
             body["scoring_weights"] = opts.scoring_weights.to_wire()
