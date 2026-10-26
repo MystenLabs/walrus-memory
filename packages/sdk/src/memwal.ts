@@ -71,6 +71,7 @@ import {
     sanitizeServerError,
     redactInternalUrls,
     clockDriftErrorFromResponse,
+    assertFiniteScoringWeights,
     scoringWeightsToWire,
     derivedIdempotencyKey,
     derivedBulkIdempotencyKey,
@@ -1203,14 +1204,7 @@ export class MemWal {
                 `limit must be a positive integer, got ${limit}`,
             );
         }
-        const weights = options.scoringWeights;
-        if (weights) {
-            for (const [name, value] of Object.entries(weights)) {
-                if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
-                    throw new Error(`scoringWeights.${name} must be a finite number`);
-                }
-            }
-        }
+        assertFiniteScoringWeights(options.scoringWeights);
         if (
             options.maxDistance !== undefined
             && (typeof options.maxDistance !== "number"
@@ -1360,6 +1354,7 @@ export class MemWal {
                 `limit must be a positive integer, got ${limit}`,
             );
         }
+        assertFiniteScoringWeights(opts.scoringWeights);
         return this.signedRequest<RecallManualHitResult>(
             "POST",
             "/api/recall/manual",

@@ -1147,8 +1147,10 @@ test("a rejected register expiration names the bound that broke the guard", () =
  * applies. Every other register fixture in this file hand-sets `ValidDuring`,
  * which is exactly why the direct-signed path could reject every write in
  * production while the suite stayed green. */
-async function directSignedRegister(): Promise<TransactionDataBuilder> {
-    const signer = new Ed25519Keypair();
+async function directSignedRegister(
+    rebuild = "",
+    signer = new Ed25519Keypair(),
+): Promise<TransactionDataBuilder> {
     const transaction = new Transaction();
     transaction.setSender(signer.toSuiAddress());
     transaction.setGasOwner(signer.toSuiAddress());
@@ -1168,7 +1170,11 @@ async function directSignedRegister(): Promise<TransactionDataBuilder> {
         arguments: [wal],
     });
     transaction.setExpiration(
-        addressBalanceExpiration(7n, await transaction.build({ onlyTransactionKind: true })),
+        addressBalanceExpiration(
+            7n,
+            await transaction.build({ onlyTransactionKind: true }),
+            rebuild,
+        ),
     );
     return TransactionDataBuilder.fromBytes(await transaction.build());
 }
@@ -1218,6 +1224,34 @@ test("the address-balance nonce is derived from the transaction, not drawn at ra
     assert.equal(maxEpoch, "9");
     assert.equal(minTimestamp, null);
     assert.equal(maxTimestamp, null);
+});
+
+test("a congestion rebuild is not the same nonce or the same bytes", async () => {
+    const kind = new Uint8Array([1, 2, 3]);
+    const firstNonce = addressBalanceExpiration(9n, kind).ValidDuring.nonce;
+    // An empty salt is the first attempt. It must stay the hash of the kind.
+    assert.equal(firstNonce, addressBalanceExpiration(9n, kind, "").ValidDuring.nonce);
+    assert.notEqual(
+        firstNonce,
+        addressBalanceExpiration(9n, kind, "cancelled-digest").ValidDuring.nonce,
+    );
+
+    const signer = new Ed25519Keypair();
+    const first = await directSignedRegister("", signer);
+    const second = await directSignedRegister("cancelled-digest", signer);
+    const firstKind = first.build({ onlyTransactionKind: true });
+    const secondKind = second.build({ onlyTransactionKind: true });
+    assert.ok(Buffer.from(firstKind).equals(Buffer.from(secondKind)));
+    const nonce = (data: TransactionDataBuilder) => (
+        data.expiration?.$kind === "ValidDuring" ? data.expiration.ValidDuring.nonce : undefined
+    );
+    assert.equal(nonce(first), addressBalanceExpiration(7n, firstKind).ValidDuring.nonce);
+    assert.equal(
+        nonce(second),
+        addressBalanceExpiration(7n, secondKind, "cancelled-digest").ValidDuring.nonce,
+    );
+    assert.notEqual(nonce(first), nonce(second));
+    assert.equal(Buffer.from(first.build()).equals(Buffer.from(second.build())), false);
 });
 
 test("lease and verify reads use the shared Walrus client max age", () => {

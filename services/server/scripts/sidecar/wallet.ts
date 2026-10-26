@@ -24,7 +24,7 @@ import {
     type EnokiFallbackPolicy,
 } from "./enoki.js";
 import { sidecarMetrics } from "./state.js";
-import { FinalizedTransactionFailure } from "./retry/rpc.js";
+import { CongestionCancelledTransaction, FinalizedTransactionFailure } from "./retry/rpc.js";
 import { errorMessage, sleep, truncateForLog } from "./util.js";
 
 export const DURABLE_WALLET_FALLBACK_POLICY: EnokiFallbackPolicy = {
@@ -48,6 +48,14 @@ export function assertFinalizedTransactionSuccess(result: any, label: string): a
         result?.$kind === "FailedTransaction"
         && result.FailedTransaction?.status?.success === false
     ) {
+        // Only a congestion cancel proves the digest can never land. Any other
+        // finalized failure keeps the old digest so a retry re-prepares the
+        // same bytes and the digest lookup finds the transaction.
+        if (result.FailedTransaction.status.error?.$kind === "CongestedObjects") {
+            throw new CongestionCancelledTransaction(
+                `${label} was cancelled by shared-object congestion`,
+            );
+        }
         throw new FinalizedTransactionFailure(`${label} was not successful`);
     }
     if (
