@@ -318,13 +318,23 @@ export function normalizeServerUrl(url: string): string {
 }
 
 /**
- * Reject empty and whitespace-only text before a request is sent.
+ * Zero-width format characters: U+200B (ZWSP), U+200C (ZWNJ), U+200D (ZWJ),
+ * and U+2060 (WJ). These are Cf format characters, so `String.prototype.trim()`
+ * leaves them in place (#1156). U+FEFF is ECMAScript WhiteSpace, so `trim()`
+ * already rejects a lone BOM.
+ */
+const ZERO_WIDTH_PATTERN = /^[\s\u200B-\u200D\u2060\uFEFF]*$/;
+
+/**
+ * Reject empty, whitespace-only, and zero-width text before a request is sent.
  *
- * The relayer does the same. A blank body used to be accepted and then
- * sit until the client timed out (#1129). Non-blank text is not trimmed.
+ * The relayer rejects whitespace-only text. It still accepts U+200B, U+200C,
+ * U+200D, and U+2060, which this client rejects so a format-only body is not
+ * accepted and then left polling until timeout (#1129, #1156). Non-blank text
+ * is not trimmed.
  */
 export function assertNonBlankText(text: string, message = "Text cannot be empty"): void {
-    if (typeof text !== "string" || text.trim().length === 0) {
+    if (typeof text !== "string" || text.trim().length === 0 || ZERO_WIDTH_PATTERN.test(text)) {
         const err = new Error(message) as Error & { status?: number };
         err.status = 400;
         throw err;
