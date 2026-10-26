@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/MystenLabs/MemWal",
+    "url": "https://github.com/MystenLabs/walrus-memory",
     "directory": "packages/openclaw-memory-memwal"
   },
   "main": "./dist/index.js",
