@@ -36,6 +36,18 @@ Track what's new, changed, and fixed in `memwal` (Python).
 
 For the latest version, see the [PyPI project page](https://pypi.org/project/memwal/).
 
+## 0.2.2
+
+Unreleased.
+
+### Added
+
+- `MemWal.destroy()` and `MemWalSync.destroy()` (plus `close(clear_keys=True)`) zero the client's internal `bytearray` seed copy in place, clear `_private_key_hex`, drop `_signing_key` and cached SEAL session credentials, cancel in-flight initialization tasks, and reject any subsequent or in-flight operation with `MemWalError`. `MemWal.create()` and `MemWalSync.create()` also accept 32-byte `bytes` / `bytearray` keys and copy caller `bytearray` buffers so `destroy()` leaves the caller's buffer intact. (#975)
+
+### Fixed
+
+- Shield shared `_build_seal_session` and `_resolve_owner` initialization tasks with `asyncio.shield`, clear the shared task slot via a completion callback that consumes exceptions on orphaned tasks, and cancel/drain in-flight initialization tasks in `close()` so cancelling one concurrent caller does not abort sibling callers or leave unretrieved task exceptions. (#1029)
+
 ## 0.2.1
 
 Unreleased.

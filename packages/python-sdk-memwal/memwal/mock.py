@@ -129,8 +129,12 @@ class MemWalMock:
     ) -> "MemWalMock":
         return cls(namespace, owner, initial_memories)
 
-    async def close(self) -> None:
+    def destroy(self) -> None:
         """No-op for API parity with :class:`MemWal`."""
+
+    async def close(self, clear_keys: bool = False) -> None:
+        """No-op for API parity with :class:`MemWal`."""
+        del clear_keys
 
     async def __aenter__(self) -> "MemWalMock":
         return self
@@ -714,8 +718,11 @@ class MemWalMockSync:
     def clear(self, namespace: Optional[str] = None) -> int:
         return self._inner.clear(namespace)
 
-    def close(self) -> None:
-        self._run(self._inner.close())
+    def destroy(self) -> None:
+        self._inner.destroy()
+
+    def close(self, clear_keys: bool = False) -> None:
+        self._run(self._inner.close(clear_keys=clear_keys))
 
     def __enter__(self) -> "MemWalMockSync":
         return self
