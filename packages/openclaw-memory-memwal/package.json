@@ -33,7 +33,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsc && node --test \"test/**/*.test.mjs\"",
+    "test": "tsc && node --test \"test/*.test.mjs\"",
+    "test:e2e": "tsc && node --test \"test/e2e/*.test.mjs\"",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "prepublishOnly": "npm run clean && npm run build"
   },
