@@ -4390,6 +4390,55 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Revoke a grant (and its tokens) and retire the delegate it custodies,
+    /// in one transaction.
+    ///
+    /// Used only when the delegate key is definitively gone from the chain
+    /// (GH #1141): leaving the row `active` would let
+    /// `find_reusable_oauth_delegate` hand the dead key to the next
+    /// authorize, whose `/complete` rejects it after burning the session, so
+    /// every reconnect retries the same failure. `revoke_oauth_grant` stays
+    /// delegate-agnostic because ordinary disconnect (RFC 7009) must keep
+    /// the delegate reusable across grants.
+    pub async fn revoke_oauth_grant_and_delegate(
+        &self,
+        grant_id: &str,
+        delegate_ref: &str,
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to start tx: {}", e)))?;
+        sqlx::query("UPDATE mcp_oauth_grants SET revoked_at = NOW() WHERE grant_id = $1 AND revoked_at IS NULL")
+            .bind(grant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to revoke oauth grant: {}", e)))?;
+        sqlx::query(
+            "UPDATE mcp_oauth_tokens SET revoked_at = NOW() WHERE grant_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(grant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to revoke oauth grant tokens: {}", e)))?;
+        sqlx::query(
+            "UPDATE mcp_oauth_delegates SET status = 'revoked', updated_at = NOW()
+             WHERE delegate_ref = $1 AND status <> 'revoked'",
+        )
+        .bind(delegate_ref)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to revoke oauth delegate: {}", e)))?;
+        tx.commit().await.map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to commit oauth grant and delegate revocation: {}",
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
     pub async fn insert_oauth_token(
         &self,
         token: &oauth_rows::OAuthTokenRow,
