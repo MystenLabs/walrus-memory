@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Auto-capture tracks a per-session message watermark so already-captured turns are not re-analyzed on every subsequent turn, and anchors `occurredAt` to each message's creation timestamp instead of the hook execution clock.
+- `withTimeout` passes an `AbortSignal` that aborts the underlying HTTP request when `requestTimeoutMs` expires, `withRetry` does not retry timed-out calls, and an in-flight guard prevents overlapping auto-capture requests across turns.
+- `memory_store` no longer reports `"Stored N facts"` when `/api/analyze` has only accepted asynchronous remember jobs (`status: "pending"`). It polls `waitForRememberJobs` when available within `requestTimeoutMs`, surfaces post-acceptance upload failures, and reports `"Accepted N fact(s) (not stored yet; job_ids=...)"` when jobs remain pending.
 - Update MemWal SDK dependency to `0.1.10`.
 - Detect letter-spaced prompt injection before capture and recall by joining punctuation, symbols, or short runs of spaces between single letters (`i-g-n-o-r-e`, `i g n o r e`, `r.e.v.e.a.l`). Ordinary hyphenated words such as `e-mail` and `built-in` stay unchanged.
 

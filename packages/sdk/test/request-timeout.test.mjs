@@ -224,3 +224,30 @@ test("a classified error survives a deadline that expires during its body read",
         },
     );
 });
+
+test("analyze() forwards options.signal and aborts in-flight POST /api/analyze when caller signal fires", async () => {
+    let analyzeSignal = null;
+    stubRelayer((path, init) => {
+        if (path !== "/api/analyze") return Promise.reject(new Error(path));
+        analyzeSignal = init.signal;
+        return hangUntilAborted(init);
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("caller-cancelled-analyze")), 40);
+    const started = Date.now();
+    try {
+        await assert.rejects(
+            clientWith().analyze("I prefer TypeScript for backend services", {
+                namespace: "default",
+                signal: controller.signal,
+            }),
+            /caller-cancelled-analyze|aborted/i,
+        );
+    } finally {
+        clearTimeout(timer);
+    }
+    assert.ok(analyzeSignal?.aborted, "POST /api/analyze fetch signal must be aborted when caller signal fires");
+    assert.ok(Date.now() - started < 2_000, "caller abort must not wait for the 120s analyze deadline");
+});
+
