@@ -324,6 +324,47 @@ describe('Dashboard incident banner', () => {
         expect(document.body.textContent).not.toContain('delete the highlighted delegate keys below')
     })
 
+    it('keeps recovery available after the last leaked key and quarantine are cleared', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: false,
+                quarantined: false,
+                active: false,
+                affected_public_keys: [],
+            }),
+        }))
+        const { findByRole, queryByRole } = renderDashboard()
+        expect(await findByRole('button', { name: 'Reactivate the account' })).toBeEnabled()
+        expect(await findByRole('button', { name: /Add key/ })).toBeDisabled()
+        expect(queryByRole('button', { name: 'Remove highlighted keys' })).toBeNull()
+    })
+
+    it('allows adding keys without a recovery banner once the account is active', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                account_id: '0xaccount',
+                affected: false,
+                quarantined: false,
+                active: true,
+                affected_public_keys: [],
+            }),
+        }))
+        const { findByRole, queryByRole } = renderDashboard()
+        await waitFor(() => expect(fetch).toHaveBeenCalled())
+        await waitFor(async () => expect(await findByRole('button', { name: /Add key/ })).toBeEnabled())
+        expect(queryByRole('button', { name: 'Reactivate the account' })).toBeNull()
+    })
+
+    it('does not offer recovery when no account exists', async () => {
+        const { findByRole, queryByRole } = renderDashboard()
+        await findByRole('button', { name: /Add key/ })
+        await waitFor(() => expect(fetch).toHaveBeenCalled())
+        expect(queryByRole('button', { name: 'Reactivate the account' })).toBeNull()
+    })
+
     it('highlights affected keys and removes them in one confirmation', async () => {
         const user = userEvent.setup()
         const leaked = 'ab'.repeat(32)
