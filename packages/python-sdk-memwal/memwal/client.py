@@ -98,6 +98,10 @@ PUBLIC_SUI_GRAPHQL_NETWORKS = ("mainnet", "testnet", "devnet")
 # Sui read endpoint is unresponsive.
 PACKAGE_VERSION_CHECK_TIMEOUT_S = 10.0
 SEAL_SESSION_SAFETY_MARGIN_MS = 30_000
+
+# The relayer's `MAX_BULK_ITEMS` (services/server/src/types.rs). A bulk read
+# above it is rejected with a non-transient 400, so callers must chunk.
+MAX_BULK_STATUS_IDS = 20
 AUTH_REJECTED_MESSAGE = (
     "401 from relayer: typically wrong private key, key not registered on this "
     "account, account ID mismatch (a wallet address is not a MemWal account ID), "
@@ -930,60 +934,81 @@ class MemWal:
                 attempt += 1
             retry_after_ms = 0
 
-            try:
-                poll_timeout = self._poll_deadline_s(deadline_ms)
+            # The relayer rejects a bulk-status read of more than
+            # MAX_BULK_STATUS_IDS ids with a 400, which is NOT transient: an
+            # unchunked poll of 21+ jobs raises out of the whole wait and
+            # every retry hits the same 400. Chunk here so `memwal_wait_for_saves`
+            # and `remember_bulk_and_wait` are both fixed.
+            terminal_ids: Set[str] = set()
+            refused_ids: List[str] = []
+            for start in range(0, len(pending), MAX_BULK_STATUS_IDS):
+                chunk = pending[start : start + MAX_BULK_STATUS_IDS]
                 try:
-                    batch = await self.get_remember_bulk_status(pending, timeout=poll_timeout)
-                except TypeError as err:
-                    if "unexpected keyword argument" in str(err) and "timeout" in str(err):
-                        batch = await self.get_remember_bulk_status(pending)
-                    else:
-                        raise
-            except _HttpStatusError as err:
-                if _is_transient_polling_status(err.status):
-                    last_refusal = err.status
-                    if err.status == 429:
-                        saw_rate_limit = True
-                        retry_after_ms = _clamped_retry_after_ms(err, deadline_ms)
+                    poll_timeout = self._poll_deadline_s(deadline_ms)
+                    try:
+                        batch = await self.get_remember_bulk_status(chunk, timeout=poll_timeout)
+                    except TypeError as err:
+                        if "unexpected keyword argument" in str(err) and "timeout" in str(err):
+                            batch = await self.get_remember_bulk_status(chunk)
+                        else:
+                            raise
+                except _HttpStatusError as err:
+                    if _is_transient_polling_status(err.status):
+                        last_refusal = err.status
+                        if err.status == 429:
+                            saw_rate_limit = True
+                            retry_after_ms = _clamped_retry_after_ms(err, deadline_ms)
+                        # Refused, not answered: keep this chunk pending.
+                        refused_ids.extend(chunk)
+                        continue
+                    raise
+                except httpx.TransportError:
+                    # Network drops retry as status 0; continuing next loop iteration
+                    # increments `attempt` so exponential backoff delay continues to grow.
+                    last_refusal = 0
+                    refused_ids.extend(chunk)
                     continue
-                raise
-            except httpx.TransportError:
-                # Network drops retry as status 0; continuing next loop iteration
-                # increments `attempt` so exponential backoff delay continues to grow.
-                last_refusal = 0
-                continue
-            answered = True
+                answered = True
+                chunk_pending = set(chunk)
+                terminal_ids |= {
+                    item.job_id
+                    for item in batch.results
+                    if item.job_id in chunk_pending and settle(item)
+                }
 
-            terminal_ids: Set[str] = {
-                item.job_id
-                for item in batch.results
-                if item.job_id in pending and settle(item)
-            }
+            if not answered and refused_ids:
+                # Nothing got through this tick; back off and retry.
+                continue
             pending = [jid for jid in pending if jid not in terminal_ids]
 
         if opts.timeout_ms > 0 and len(pending) == len(job_ids) and not last_seen:
             # Nothing settled and nothing was seen: the polls may all have been
             # refused. Confirm with one direct read before reporting anything.
-            try:
-                probed = await self.get_remember_bulk_status(list(job_ids))
-            except _HttpStatusError as err:
-                if err.status == 429:
-                    # Header first, else the body's retry_after_seconds, so a
-                    # proxy that strips Retry-After does not lose the hint.
-                    wait_ms = _retry_after_ms(err)
-                    retry_after = f"{wait_ms / 1000:g}" if wait_ms else None
-                    raise MemWalRateLimited(job_ids, retry_after) from err
-                # Any other probe failure is not evidence about the jobs.
-            except httpx.TransportError:
-                pass
-            else:
+            settled: Set[str] = set()
+            all_ids = list(job_ids)
+            for start in range(0, len(all_ids), MAX_BULK_STATUS_IDS):
+                chunk = all_ids[start : start + MAX_BULK_STATUS_IDS]
+                try:
+                    probed = await self.get_remember_bulk_status(chunk)
+                except _HttpStatusError as err:
+                    if err.status == 429:
+                        # Header first, else the body's retry_after_seconds, so a
+                        # proxy that strips Retry-After does not lose the hint.
+                        wait_ms = _retry_after_ms(err)
+                        retry_after = f"{wait_ms / 1000:g}" if wait_ms else None
+                        raise MemWalRateLimited(job_ids, retry_after) from err
+                    # Any other probe failure is not evidence about the jobs.
+                    continue
+                except httpx.TransportError:
+                    continue
                 answered = True
-                settled = {
+                pending_now = set(pending)
+                settled |= {
                     item.job_id
                     for item in probed.results
-                    if item.job_id in pending and settle(item)
+                    if item.job_id in pending_now and settle(item)
                 }
-                pending = [jid for jid in pending if jid not in settled]
+            pending = [jid for jid in pending if jid not in settled]
 
         for job_id in pending:
             seen = last_seen.get(job_id)

@@ -55,7 +55,7 @@ from typing import (
 )
 
 from .client import MemWal, _with_fresh_http_client
-from .types import RecallMemory
+from .types import RecallMemory, RememberBulkOptions, RememberBulkResult
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -178,6 +178,28 @@ def _format_memories(
     ])
 
 
+SAVE_MODES = ("analyze", "remember")
+"""Valid ``save_mode`` values for the auto-save path.
+
+``"analyze"`` extracts spoken-fact-style statements via the server LLM and
+stores one memory per fact — it is lossy by design, and non-sentence content
+(code snippets, structured data) yields zero facts. ``"remember"`` stores the
+user message verbatim as a single memory, which is what callers saving code or
+other non-conversational content want.
+"""
+
+
+def _validate_save_mode(save_mode: str) -> str:
+    if save_mode not in SAVE_MODES:
+        raise ValueError(
+            f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+        )
+    return save_mode
+
+
+_MAX_TRACKED_JOB_IDS = 1000
+
+
 class _PendingSaves:
     """Tracks in-flight fire-and-forget auto-save work (asyncio Tasks and
     background Threads) so a caller can drain it deterministically via
@@ -197,6 +219,7 @@ class _PendingSaves:
         self._failures: List[tuple[str, str]] = []
         self._dropped = 0
         self._on_save_error = on_save_error
+        self._job_ids: List[str] = []
         self._lock = threading.Lock()
         self._callback_threads: set[int] = set()
 
@@ -249,6 +272,23 @@ class _PendingSaves:
         raise RuntimeError(
             f"Walrus Memory auto-save failed ({total} call(s)): {detail}"
         )
+
+    def track_job_ids(self, job_ids: List[str]) -> None:
+        """Record the background remember jobs an auto-save enqueued, so a
+        caller can later confirm they finished and read their blob IDs."""
+        if not job_ids:
+            return
+        with self._lock:
+            self._job_ids.extend(job_ids)
+            if len(self._job_ids) > _MAX_TRACKED_JOB_IDS:
+                del self._job_ids[:-_MAX_TRACKED_JOB_IDS]
+
+    def drain_job_ids(self) -> List[str]:
+        """Return every job ID recorded so far and forget them, so a second
+        wait does not re-poll jobs that already settled."""
+        with self._lock:
+            job_ids, self._job_ids = self._job_ids, []
+        return job_ids
 
     def track_task(self, task: "asyncio.Task[Any]") -> None:
         self._tasks.add(task)
@@ -333,6 +373,46 @@ class _PendingSaves:
             thread.join()
 
 
+async def _run_auto_save(
+    memwal: MemWal,
+    text: str,
+    namespace: str,
+    save_mode: str,
+    pending: _PendingSaves,
+    log: Callable[..., Any],
+) -> None:
+    """Persist `text` via the configured save mode and record its job IDs.
+
+    ``analyze()`` returns cleanly with zero facts for content it cannot read
+    as spoken facts (code, structured data), so a plain call there looks
+    identical to a successful save. Log in that case and point at
+    ``save_mode="remember"`` rather than dropping the write silently.
+    """
+    try:
+        if save_mode == "remember":
+            accepted = await memwal.remember(text, namespace)
+            if accepted is not None and getattr(accepted, "job_id", None):
+                pending.track_job_ids([accepted.job_id])
+            return
+
+        result = await memwal.analyze(text, namespace)
+        if result is None:
+            return
+        job_ids = list(getattr(result, "job_ids", None) or [])
+        facts = getattr(result, "facts", None)
+        pending.track_job_ids(job_ids)
+        if not facts and not job_ids:
+            log(
+                "[Walrus Memory] Auto-save extracted 0 facts from a "
+                f"{len(text)}-character message and stored nothing. analyze() "
+                "only extracts spoken-fact-style statements — pass "
+                'save_mode="remember" to store the message verbatim instead.'
+            )
+    except Exception as e:  # noqa: BLE001 -- auto-save must never break the LLM call
+        log(f"[Walrus Memory] Auto-save failed: {e}")
+        pending.note_error(e)
+
+
 def _expose_memwal_controls(obj: Any, memwal: MemWal, pending: _PendingSaves) -> None:
     """Attach the underlying client and a way to drain pending auto-saves —
     without this, a short-lived process has no way to avoid silently
@@ -349,9 +429,44 @@ def _expose_memwal_controls(obj: Any, memwal: MemWal, pending: _PendingSaves) ->
     (obj.memwal_flush) still finds it — OpenAI clients aren't Pydantic
     models and work the same way either way.
     """
+    async def memwal_wait_for_saves(
+        opts: Optional[RememberBulkOptions] = None,
+    ) -> RememberBulkResult:
+        """Drain pending auto-saves, then poll their remember jobs to a
+        terminal state and return per-job status + blob IDs."""
+        await pending.flush()
+        job_ids = pending.drain_job_ids()
+        try:
+            return await memwal.wait_for_remember_jobs(job_ids, opts)
+        except Exception:
+            pending.track_job_ids(job_ids)
+            raise
+
+    def memwal_wait_for_saves_sync(
+        opts: Optional[RememberBulkOptions] = None,
+    ) -> RememberBulkResult:
+        """Sync counterpart of ``memwal_wait_for_saves`` for callers on the
+        blocking entry points (``OpenAI``, ``llm.invoke``)."""
+        pending.flush_sync()
+        job_ids = pending.drain_job_ids()
+        try:
+            return _run_blocking(
+                lambda: _with_fresh_http_client(
+                    memwal, memwal.wait_for_remember_jobs(job_ids, opts)
+                )
+            )
+        except Exception:
+            pending.track_job_ids(job_ids)
+            raise
+
     object.__setattr__(obj, "_memwal", memwal)
+    # Public alias: reaching wait_for_remember_jobs() and the rest of the
+    # low-level client shouldn't require touching a private attribute.
+    object.__setattr__(obj, "memwal", memwal)
     object.__setattr__(obj, "memwal_flush", pending.flush)
     object.__setattr__(obj, "memwal_flush_sync", pending.flush_sync)
+    object.__setattr__(obj, "memwal_wait_for_saves", memwal_wait_for_saves)
+    object.__setattr__(obj, "memwal_wait_for_saves_sync", memwal_wait_for_saves_sync)
 
 
 async def _warn_if_cancelled(coro: Any, label: str) -> None:
@@ -416,6 +531,7 @@ def with_memwal_langchain(
     namespace: str = "default",
     max_memories: int = 5,
     auto_save: bool = True,
+    save_mode: str = "analyze",
     min_relevance: float = 0.3,
     debug: bool = False,
     env: Optional[str] = None,
@@ -438,6 +554,11 @@ def with_memwal_langchain(
         namespace: Default namespace.
         max_memories: Max memories to inject per request.
         auto_save: Auto-save new facts from conversation.
+        save_mode: How auto_save persists the user message. ``"analyze"``
+            (default) extracts spoken-fact-style statements and stores one
+            memory per fact — non-sentence content such as code yields zero
+            facts and stores nothing. ``"remember"`` stores the message
+            verbatim as a single memory.
         min_relevance: Minimum similarity score (0-1) to include a memory.
         debug: Enable debug logging.
         env: Optional relayer preset (``"prod"`` / ``"dev"`` / ``"staging"`` /
@@ -457,6 +578,8 @@ def with_memwal_langchain(
             "LangChain integration requires langchain-core. "
             "Install with: pip install memwal[langchain]"
         ) from e
+
+    _validate_save_mode(save_mode)
 
     memwal = MemWal.create(
         key=key,
@@ -552,16 +675,12 @@ def with_memwal_langchain(
             return messages
 
     async def _post_analyze(messages: List[BaseMessage]) -> None:
-        """Analyze user message for new facts."""
+        """Persist the user message via the configured save mode."""
         if not auto_save or not _is_last_message_user(messages):
             return
         user_text = _find_last_user_message(messages)
         if user_text:
-            try:
-                await memwal.analyze(user_text, namespace)
-            except Exception as e:
-                log(f"[Walrus Memory] Auto-save failed: {e}")
-                pending.note_error(e)
+            await _run_auto_save(memwal, user_text, namespace, save_mode, pending, log)
 
     async def patched_agenerate(
         messages: List[BaseMessage], *args: Any, **kwargs: Any
@@ -604,6 +723,7 @@ def with_memwal_openai(
     namespace: str = "default",
     max_memories: int = 5,
     auto_save: bool = True,
+    save_mode: str = "analyze",
     min_relevance: float = 0.3,
     debug: bool = False,
     env: Optional[str] = None,
@@ -628,6 +748,11 @@ def with_memwal_openai(
         namespace: Default namespace.
         max_memories: Max memories to inject per request.
         auto_save: Auto-save new facts from conversation.
+        save_mode: How auto_save persists the user message. ``"analyze"``
+            (default) extracts spoken-fact-style statements and stores one
+            memory per fact — non-sentence content such as code yields zero
+            facts and stores nothing. ``"remember"`` stores the message
+            verbatim as a single memory.
         min_relevance: Minimum similarity score (0-1) to include a memory.
         debug: Enable debug logging.
         env: Optional relayer preset (``"prod"`` / ``"dev"`` / ``"staging"`` /
@@ -639,6 +764,8 @@ def with_memwal_openai(
     Returns:
         The same client, with ``chat.completions.create`` wrapped to use Walrus Memory.
     """
+    _validate_save_mode(save_mode)
+
     memwal = MemWal.create(
         key=key,
         account_id=account_id,
@@ -654,11 +781,13 @@ def with_memwal_openai(
 
     if is_async:
         _wrap_async_openai(
-            client, memwal, namespace, max_memories, auto_save, min_relevance, log, pending
+            client, memwal, namespace, max_memories, auto_save, save_mode,
+            min_relevance, log, pending,
         )
     else:
         _wrap_sync_openai(
-            client, memwal, namespace, max_memories, auto_save, min_relevance, log, pending
+            client, memwal, namespace, max_memories, auto_save, save_mode,
+            min_relevance, log, pending,
         )
 
     _expose_memwal_controls(client, memwal, pending)
@@ -672,6 +801,7 @@ def _wrap_async_openai(
     namespace: str,
     max_memories: int,
     auto_save: bool,
+    save_mode: str,
     min_relevance: float,
     log: Callable[..., Any],
     pending: _PendingSaves,
@@ -725,18 +855,14 @@ def _wrap_async_openai(
 
         result = await original_create(*args, **kwargs)
 
-        # Fire-and-forget analyze
+        # Fire-and-forget auto-save
         if auto_save and _is_last_message_user(messages):
             user_text = _find_last_user_message(messages)
             if user_text:
-                async def _analyze() -> None:
-                    try:
-                        await memwal.analyze(user_text, namespace)
-                    except Exception as e:
-                        log(f"[Walrus Memory] Auto-save failed: {e}")
-                        pending.note_error(e)
-
-                _fire_and_forget(_analyze(), pending)
+                _fire_and_forget(
+                    _run_auto_save(memwal, user_text, namespace, save_mode, pending, log),
+                    pending,
+                )
 
         return result
 
@@ -749,6 +875,7 @@ def _wrap_sync_openai(
     namespace: str,
     max_memories: int,
     auto_save: bool,
+    save_mode: str,
     min_relevance: float,
     log: Callable[..., Any],
     pending: _PendingSaves,
@@ -807,18 +934,25 @@ def _wrap_sync_openai(
 
         result = original_create(*args, **kwargs)
 
-        # Fire-and-forget analyze
+        # Fire-and-forget auto-save
         if auto_save and _is_last_message_user(messages):
             user_text = _find_last_user_message(messages)
             if user_text:
-                def _analyze() -> None:
+                def _save() -> None:
+                    # _run_auto_save swallows request failures itself; this guards
+                    # the loop/http-client plumbing around it so a failure there
+                    # can't take down the background thread.
                     try:
-                        _run_memwal(lambda: memwal.analyze(user_text, namespace))
-                    except Exception as e:
+                        _run_memwal(
+                            lambda: _run_auto_save(
+                                memwal, user_text, namespace, save_mode, pending, log
+                            )
+                        )
+                    except Exception as e:  # noqa: BLE001
                         log(f"[Walrus Memory] Auto-save failed: {e}")
                         pending.note_error(e)
 
-                pending.spawn_thread(_analyze)
+                pending.spawn_thread(_save)
 
         return result
 
