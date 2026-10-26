@@ -112,8 +112,49 @@ response = await smart_client.chat.completions.create(
 
 **After generation:**
 
-- If `auto_save` (default `True`), runs `analyze()` on the user message fire-and-forget
-- Extracted facts are stored asynchronously
+- If `auto_save` (default `True`), saves the user message fire-and-forget using `save_mode`
+- With the default `save_mode="analyze"`, `analyze()` extracts spoken-fact-style statements and stores one memory per fact, asynchronously
+- With `save_mode="remember"`, the message is stored verbatim as a single memory
+
+### Choosing a save mode
+
+`analyze()` is lossy by design: it only extracts facts it can read as spoken statements. Code snippets, JSON, logs, and other non-sentence content produce zero facts, so nothing is stored. That path used to be silent; it now logs a message naming the fix through the `memwal` logger (at debug level, or warning with `debug=True`). When you are saving content like that, ask for verbatim storage:
+
+```python
+smart_client = with_memwal_openai(
+    client,
+    key=os.environ["MEMWAL_PRIVATE_KEY"],
+    account_id=os.environ["MEMWAL_ACCOUNT_ID"],
+    env="prod",
+    save_mode="remember",  # store the message as-is, no fact extraction
+)
+```
+
+## Confirming a Save
+
+Auto-save is fire-and-forget, so the LLM response returns before the memory is durable. The wrapper exposes controls to close that gap:
+
+| Control | Purpose |
+| --- | --- |
+| `await client.memwal_flush()` | Wait for in-flight auto-saves to be submitted |
+| `client.memwal_flush_sync()` | Same, from sync code |
+| `await client.memwal_wait_for_saves(opts)` | Flush, then poll every enqueued remember job to a terminal state |
+| `client.memwal_wait_for_saves_sync(opts)` | Same, from sync code |
+| `client.memwal` | The underlying `MemWal` client, for anything lower-level |
+
+```python
+response = await smart_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "def f(): return 1"}],
+)
+
+result = await smart_client.memwal_wait_for_saves()
+print(result.succeeded, result.failed, result.timed_out)
+for item in result.results:
+    print(item.status, item.blob_id)
+```
+
+`memwal_wait_for_saves()` returns a `RememberBulkResult`, so you get per-job status and blob IDs. Job IDs are drained once waited on: a second call only covers saves made since the first. Pass a `RememberBulkOptions` to tune `poll_interval_ms` and `timeout_ms`. Short-lived scripts should call one of these before exiting, or pending saves are lost when the process ends.
 
 ## Options
 
@@ -126,6 +167,7 @@ Both wrappers accept the same keyword arguments:
 | `namespace` | `"default"` | Memory namespace |
 | `max_memories` | `5` | Max memories injected per request |
 | `auto_save` | `True` | Auto-save new facts from the conversation |
+| `save_mode` | `"analyze"` | How auto-save persists the message: `"analyze"` (extract facts) or `"remember"` (store verbatim) |
 | `min_relevance` | `0.3` | Minimum similarity (0–1) to include a memory |
 | `debug` | `False` | Verbose logging via the `memwal` logger |
 

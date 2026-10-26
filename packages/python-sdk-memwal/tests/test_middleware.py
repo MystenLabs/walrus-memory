@@ -26,14 +26,16 @@ import respx
 
 from memwal.client import MemWal
 from memwal.middleware import (
+    _MAX_TRACKED_JOB_IDS,
     _find_last_user_message,
     _format_memories,
     _inject_openai_memory,
     _PendingSaves,
+    _run_auto_save,
     with_memwal_langchain,
     with_memwal_openai,
 )
-from memwal.types import RecallMemory
+from memwal.types import RecallMemory, RememberBulkOptions
 from memwal.utils import bytes_to_hex
 
 # ============================================================
@@ -129,6 +131,27 @@ def _mock_analyze() -> httpx.Response:
         200,
         json={"facts": [], "total": 0, "owner": "0xowner"},
     )
+
+
+_REMEMBER_URL = f"{_SERVER}/api/remember"
+_BULK_STATUS_URL = f"{_SERVER}/api/remember/bulk/status"
+
+
+def _mock_analyze_with_facts(*job_ids: str) -> httpx.Response:
+    return httpx.Response(
+        202,
+        json={
+            "facts": [{"text": f"fact {i}", "id": job_id} for i, job_id in enumerate(job_ids)],
+            "job_ids": list(job_ids),
+            "fact_count": len(job_ids),
+            "status": "pending",
+            "owner": "0xowner",
+        },
+    )
+
+
+def _mock_remember_accepted(job_id: str = "job-remember") -> httpx.Response:
+    return httpx.Response(202, json={"job_id": job_id, "status": "pending"})
 
 
 # ============================================================
@@ -1363,3 +1386,246 @@ class TestPendingSaves:
         else:
             raise AssertionError("flush_sync did not raise")
 
+
+# ============================================================
+# WALM-307: auto_save save_mode + confirmable saves
+# ============================================================
+
+
+class TestAutoSaveMode:
+    """analyze() silently stores nothing for non-fact content (GH #411);
+    save_mode="remember" must store it verbatim instead."""
+
+    def _memwal(self) -> MemWal:
+        return MemWal.create(
+            key=_KEY_HEX, account_id=_ACCOUNT_ID, server_url=_SERVER, namespace="default"
+        )
+
+    @respx.mock
+    async def test_analyze_mode_reports_zero_facts_through_wrapper_log(self) -> None:
+        _mock_seal_session_prereqs()
+        respx.post(_ANALYZE_URL).mock(return_value=_mock_analyze())
+
+        pending = _PendingSaves()
+        messages: list = []
+        with patch("memwal.middleware.logger") as mock_logger:
+            await _run_auto_save(
+                self._memwal(), "def f():\n    return 1", "default", "analyze",
+                pending, messages.append,
+            )
+
+        assert not mock_logger.warning.called
+        assert len(messages) == 1
+        assert "save_mode" in messages[0]
+        assert pending.drain_job_ids() == []
+
+    @respx.mock
+    async def test_analyze_mode_tracks_job_ids_without_warning(self) -> None:
+        _mock_seal_session_prereqs()
+        respx.post(_ANALYZE_URL).mock(return_value=_mock_analyze_with_facts("j1", "j2"))
+
+        pending = _PendingSaves()
+        with patch("memwal.middleware.logger") as mock_logger:
+            await _run_auto_save(
+                self._memwal(), "I am allergic to peanuts", "default", "analyze",
+                pending, lambda *_: None,
+            )
+
+        assert not mock_logger.warning.called
+        assert pending.drain_job_ids() == ["j1", "j2"]
+
+    @respx.mock
+    async def test_remember_mode_stores_verbatim_and_skips_analyze(self) -> None:
+        _mock_seal_session_prereqs()
+        analyze_route = respx.post(_ANALYZE_URL).mock(return_value=_mock_analyze())
+        remember_route = respx.post(_REMEMBER_URL).mock(
+            return_value=_mock_remember_accepted("job-1")
+        )
+
+        pending = _PendingSaves()
+        await _run_auto_save(
+            self._memwal(), "def f():\n    return 1", "default", "remember",
+            pending, lambda *_: None,
+        )
+
+        assert remember_route.called
+        assert not analyze_route.called
+        assert pending.drain_job_ids() == ["job-1"]
+
+    def test_invalid_save_mode_rejected_at_wrap_time(self) -> None:
+        client = MagicMock()
+        try:
+            with_memwal_openai(
+                client, key=_KEY_HEX, account_id=_ACCOUNT_ID, server_url=_SERVER,
+                save_mode="verbatim",
+            )
+        except ValueError as e:
+            assert "save_mode" in str(e)
+        else:
+            raise AssertionError("expected ValueError for an unknown save_mode")
+
+    def test_drain_job_ids_is_one_shot(self) -> None:
+        pending = _PendingSaves()
+        pending.track_job_ids(["a", "b"])
+        assert pending.drain_job_ids() == ["a", "b"]
+        assert pending.drain_job_ids() == []
+
+    def test_tracked_job_ids_are_capped_keeping_the_newest(self) -> None:
+        pending = _PendingSaves()
+        for i in range(_MAX_TRACKED_JOB_IDS + 5):
+            pending.track_job_ids([f"job-{i}"])
+
+        job_ids = pending.drain_job_ids()
+        assert len(job_ids) == _MAX_TRACKED_JOB_IDS
+        assert job_ids[0] == "job-5"
+        assert job_ids[-1] == f"job-{_MAX_TRACKED_JOB_IDS + 4}"
+
+
+class TestConfirmableSaves:
+    """GH #410/#412: the easy-setup path had no way to confirm a save
+    landed or read its blob ID without dropping to the low-level client."""
+
+    def _make_async_client(self) -> MagicMock:
+        client = MagicMock()
+        client._async_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "answer"
+        client.chat = MagicMock()
+        client.chat.completions = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=mock_response)
+        return client
+
+    @respx.mock
+    async def test_wait_for_saves_returns_blob_ids(self) -> None:
+        _mock_seal_session_prereqs()
+        respx.post(_RECALL_URL).mock(return_value=_mock_recall([]))
+        respx.post(_REMEMBER_URL).mock(return_value=_mock_remember_accepted("job-1"))
+        respx.post(_BULK_STATUS_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"job_id": "job-1", "status": "done", "blob_id": "blob-abc"}
+                    ]
+                },
+            )
+        )
+
+        smart = with_memwal_openai(
+            self._make_async_client(), key=_KEY_HEX, account_id=_ACCOUNT_ID,
+            server_url=_SERVER, auto_save=True, save_mode="remember",
+        )
+        await smart.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "def f(): return 1"}],
+        )
+
+        result = await smart.memwal_wait_for_saves(
+            RememberBulkOptions(poll_interval_ms=1, timeout_ms=5000)
+        )
+
+        assert result.total == 1
+        assert result.succeeded == 1
+        assert result.results[0].blob_id == "blob-abc"
+
+    @respx.mock
+    async def test_wrapper_exposes_low_level_client_publicly(self) -> None:
+        _mock_seal_session_prereqs()
+        smart = with_memwal_openai(
+            self._make_async_client(), key=_KEY_HEX, account_id=_ACCOUNT_ID,
+            server_url=_SERVER, auto_save=False,
+        )
+
+        assert isinstance(smart.memwal, MemWal)
+        assert callable(smart.memwal.wait_for_remember_jobs)
+        assert callable(smart.memwal_wait_for_saves)
+        assert callable(smart.memwal_wait_for_saves_sync)
+
+    @respx.mock
+    async def test_failed_wait_leaves_job_ids_for_the_next_wait(self) -> None:
+        _mock_seal_session_prereqs()
+        respx.post(_RECALL_URL).mock(return_value=_mock_recall([]))
+        respx.post(_REMEMBER_URL).mock(return_value=_mock_remember_accepted("job-1"))
+        status_route = respx.post(_BULK_STATUS_URL).mock(
+            return_value=httpx.Response(403, json={"error": "forbidden"})
+        )
+
+        smart = with_memwal_openai(
+            self._make_async_client(), key=_KEY_HEX, account_id=_ACCOUNT_ID,
+            server_url=_SERVER, auto_save=True, save_mode="remember",
+        )
+        await smart.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "def f(): return 1"}],
+        )
+
+        opts = RememberBulkOptions(poll_interval_ms=1, timeout_ms=5000)
+        try:
+            await smart.memwal_wait_for_saves(opts)
+        except Exception:
+            pass
+        else:
+            raise AssertionError("expected the failing poll to raise")
+
+        status_route.mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"job_id": "job-1", "status": "done", "blob_id": "blob-abc"}
+                    ]
+                },
+            )
+        )
+        result = await smart.memwal_wait_for_saves(opts)
+
+        assert result.total == 1
+        assert result.succeeded == 1
+        assert result.results[0].blob_id == "blob-abc"
+
+    @respx.mock
+    async def test_wait_confirms_more_jobs_than_the_relayer_bulk_cap(self) -> None:
+        """21 tracked jobs must confirm, not 400-loop.
+
+        `/api/remember/bulk/status` rejects more than `MAX_BULK_ITEMS` (20)
+        ids with a 400. 400 is not transient, so an unchunked poll raised,
+        the ids were restored for the retry, and every retry hit the same
+        400 — a wait that could never confirm. `save_mode="remember"` is one
+        job per turn, so 21 turns reach this.
+        """
+        _mock_seal_session_prereqs()
+        job_ids = [f"job-{i}" for i in range(21)]
+        seen_chunk_sizes: list[int] = []
+
+        def _status(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            ids = body["job_ids"]
+            seen_chunk_sizes.append(len(ids))
+            if len(ids) > 20:
+                return httpx.Response(
+                    400, json={"error": "job_ids exceeds MAX_BULK_ITEMS"}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"job_id": jid, "status": "done", "blob_id": f"blob-{jid}"}
+                        for jid in ids
+                    ]
+                },
+            )
+
+        respx.post(_BULK_STATUS_URL).mock(side_effect=_status)
+
+        client = MemWal.create(key=_KEY_HEX, account_id=_ACCOUNT_ID, server_url=_SERVER)
+        result = await client.wait_for_remember_jobs(
+            job_ids, RememberBulkOptions(poll_interval_ms=1, timeout_ms=5000)
+        )
+
+        assert max(seen_chunk_sizes) <= 20, seen_chunk_sizes
+        assert result.total == 21
+        assert result.succeeded == 21
+        assert result.timed_out == 0
+        # Order still follows the caller's input, chunking notwithstanding.
+        assert [r.id for r in result.results] == job_ids
