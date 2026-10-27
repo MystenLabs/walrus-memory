@@ -32,6 +32,8 @@ jobs:
             script: scripts/check-docs-code-sync.mjs
           - name: Docs / Freshness
             script: scripts/check-docs-freshness.mjs
+          - name: Plugin / Claude plugin tree is reproducible
+            script: scripts/build-claude-plugin.test.mjs
           - name: Release / Manual versions and changelogs
             script: scripts/verify-manual-sdk-release.mjs
           - name: Release / Verifier regressions
