@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use pgvector::Vector;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
+use super::postgres_url::{direct_postgres_url, is_transaction_pooler_url, postgres_host};
 use crate::alerts::AlertManager;
 use crate::types::{AppError, SearchHit};
 
@@ -527,6 +528,61 @@ mod tests {
     fn invalid_index_is_not_dropped_while_a_build_is_in_progress() {
         assert!(!super::should_drop_invalid_concurrent_index(true));
         assert!(super::should_drop_invalid_concurrent_index(false));
+    }
+
+    #[test]
+    fn concurrent_index_recovery_rewrites_neon_pooler_url_to_direct_endpoint() {
+        let pooled = "postgresql://memwal:s3cret@ep-odd-cake-aorg5ujz-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+        let (direct, is_pooled) = super::concurrent_index_recovery_url(pooled);
+        assert!(is_pooled);
+        assert_eq!(
+            url::Url::parse(&direct).unwrap().host_str(),
+            Some("ep-odd-cake-aorg5ujz.c-2.ap-southeast-1.aws.neon.tech")
+        );
+        assert!(direct.contains("sslmode=require"));
+        assert!(direct.contains("channel_binding=require"));
+
+        let local = "postgresql://memwal:memwal_secret@localhost:5432/memwal";
+        let (local_direct, local_is_pooled) = super::concurrent_index_recovery_url(local);
+        assert!(!local_is_pooled);
+        assert!(matches!(local_direct, std::borrow::Cow::Borrowed(url) if url == local));
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_recovery_releases_session_lock_on_exit() {
+        use sqlx::Connection as _;
+
+        let Some(database_url) = test_database_url() else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+        let _db = super::test_vector_db(&database_url).await;
+
+        super::recover_and_rebuild_concurrent_indexes(&database_url)
+            .await
+            .expect("concurrent-index recovery should succeed on direct connection");
+
+        let mut probe = sqlx::PgConnection::connect(&database_url)
+            .await
+            .expect("probe connection should succeed");
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut probe)
+            .await
+            .expect("pg_try_advisory_lock should succeed");
+        assert!(
+            acquired,
+            "session advisory lock must not remain held after recover_and_rebuild_concurrent_indexes exits"
+        );
+        let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut probe)
+            .await
+            .expect("pg_advisory_unlock should succeed");
+        assert!(unlocked);
+        let _ = probe.close().await;
     }
 
     fn test_database_url() -> Option<String> {
@@ -2655,7 +2711,8 @@ async fn concurrent_index_build_in_progress(
     }
 }
 
-/// Recover leftover INVALID indexes, then run 016/018/022, on one session.
+/// Recover leftover INVALID indexes, then run 016/018/022/024, on one direct
+/// Postgres session.
 ///
 /// The lock serializes replica boots so a follower cannot mistake the
 /// leader's in-progress CONCURRENTLY build for a crashed leftover. It is
@@ -2664,14 +2721,51 @@ async fn concurrent_index_build_in_progress(
 /// `CREATE INDEX CONCURRENTLY` waits for exactly such snapshots to finish,
 /// so the two deadlock. `statement_timeout = 0` for this session so a large
 /// `remember_jobs` cannot leave 022 INVALID by hitting the server GUC.
-async fn recover_and_rebuild_concurrent_indexes(pool: &PgPool) -> Result<(), AppError> {
-    let mut conn = pool.acquire().await.map_err(|e| {
-        AppError::Internal(format!(
-            "Failed to acquire a connection for concurrent-index rebuild: {}",
-            e
-        ))
-    })?;
+///
+/// Must connect to the direct compute endpoint rather than a transaction-mode
+/// pooler (`*-pooler.*` on Neon / PgBouncer): transaction pooling can route
+/// `SET statement_timeout = 0`, `pg_try_advisory_lock`, `CREATE INDEX
+/// CONCURRENTLY`, and `pg_advisory_unlock` to different backend connections,
+/// or return a backend to the server pool with `(872_122, 22)` still held if a
+/// container restarts mid-build. Closing the dedicated direct connection on
+/// exit guarantees the backend session and its session-scoped state are torn
+/// down.
+fn concurrent_index_recovery_url(database_url: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    (
+        direct_postgres_url(database_url),
+        is_transaction_pooler_url(database_url),
+    )
+}
 
+async fn recover_and_rebuild_concurrent_indexes(database_url: &str) -> Result<(), AppError> {
+    let (direct_url, is_pooled) = concurrent_index_recovery_url(database_url);
+    if is_pooled {
+        let original_host = postgres_host(database_url);
+        let direct_host = postgres_host(direct_url.as_ref());
+        tracing::info!(
+            original_host,
+            direct_host,
+            "vector db: running concurrent-index recovery on the direct Postgres endpoint"
+        );
+    }
+
+    let host = postgres_host(direct_url.as_ref()).unwrap_or_else(|| "unknown".into());
+    let mut conn = PgConnection::connect(direct_url.as_ref())
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to connect for concurrent-index rebuild (host={host}): {e}"
+            ))
+        })?;
+
+    let result = recover_and_rebuild_concurrent_indexes_on(&mut conn).await;
+    let _ = conn.close().await;
+    result
+}
+
+async fn recover_and_rebuild_concurrent_indexes_on(
+    conn: &mut PgConnection,
+) -> Result<(), AppError> {
     let previous: String = sqlx::query_scalar("SHOW statement_timeout")
         .fetch_one(&mut *conn)
         .await
@@ -2687,7 +2781,7 @@ async fn recover_and_rebuild_concurrent_indexes(pool: &PgPool) -> Result<(), App
             ))
         })?;
 
-    let (result, lock_released) = lock_and_rebuild_concurrent_indexes(&mut conn).await;
+    let (result, lock_released) = lock_and_rebuild_concurrent_indexes(conn).await;
 
     let timeout_restored = sqlx::query("SELECT set_config('statement_timeout', $1, false)")
         .bind(&previous)
@@ -2696,16 +2790,11 @@ async fn recover_and_rebuild_concurrent_indexes(pool: &PgPool) -> Result<(), App
         .is_ok();
 
     if !timeout_restored || !lock_released {
-        // Either a leaked `statement_timeout = 0` or a still-held session
-        // advisory lock. Both ride on the connection, so close it instead of
-        // returning it to the pool.
         tracing::warn!(
             timeout_restored,
             lock_released,
-            "concurrent-index rebuild left the session dirty; discarding it \
-             rather than returning it to the pool"
+            "concurrent-index rebuild left the session dirty; closing direct session"
         );
-        let _ = conn.close().await;
     }
 
     result
@@ -2726,7 +2815,9 @@ async fn lock_and_rebuild_concurrent_indexes(
             });
         match acquired {
             Ok(true) => break,
-            Ok(false) => {}
+            Ok(false) => {
+                release_orphaned_concurrent_index_lock(conn).await;
+            }
             Err(e) => return (Err(e), true),
         }
         if waited >= CONCURRENT_INDEX_LOCK_WAIT {
@@ -2749,14 +2840,83 @@ async fn lock_and_rebuild_concurrent_indexes(
     }
     .await;
 
-    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1, $2)")
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1, $2)")
         .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
         .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await
-        .is_ok();
+        .unwrap_or(false);
 
     (result, unlocked)
+}
+
+/// Advisory locks are database-wide. A pooled backend that leaked
+/// `CONCURRENT_INDEX_LOCK_KEYS` before this path moved to the direct endpoint
+/// will block even a direct connection. If that holder is idle (an idle
+/// PgBouncer backend now serving unrelated traffic) and has been in that state
+/// for at least 5s, terminate it so the next poll can proceed. Never kill an
+/// `active` backend — that could be a live replica running `DROP INDEX
+/// CONCURRENTLY` or `CREATE INDEX CONCURRENTLY`.
+async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
+    type AdvisoryLockHolder = (i32, Option<String>, Option<String>, Option<String>);
+
+    let holders: Vec<AdvisoryLockHolder> = match sqlx::query_as(
+        "SELECT a.pid, a.application_name, a.state, left(a.query, 120)
+         FROM pg_locks l
+         JOIN pg_stat_activity a ON a.pid = l.pid
+         WHERE l.locktype = 'advisory'
+           AND l.granted
+           AND l.objsubid = 2
+           AND l.classid::int4 = $1
+           AND l.objid::int4 = $2
+           AND l.pid <> pg_backend_pid()
+           AND a.state_change <= NOW() - INTERVAL '5 seconds'",
+    )
+    .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
+    .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
+    .fetch_all(&mut *conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "concurrent-index recovery: could not inspect pg_locks while waiting on advisory lock"
+            );
+            return;
+        }
+    };
+    for (pid, application_name, state, query) in holders {
+        tracing::warn!(
+            pid,
+            application_name = application_name.as_deref().unwrap_or(""),
+            state = state.as_deref().unwrap_or(""),
+            query = query.as_deref().unwrap_or(""),
+            "concurrent-index recovery: advisory lock is held by another backend"
+        );
+        if !matches!(state.as_deref(), Some("idle") | Some("idle in transaction")) {
+            continue;
+        }
+        match sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&mut *conn)
+            .await
+        {
+            Ok(true) => tracing::warn!(
+                pid,
+                "concurrent-index recovery: terminated idle backend holding leaked advisory lock"
+            ),
+            Ok(false) => tracing::warn!(
+                pid,
+                "concurrent-index recovery: pg_terminate_backend returned false"
+            ),
+            Err(error) => tracing::warn!(
+                pid,
+                %error,
+                "concurrent-index recovery: pg_terminate_backend failed"
+            ),
+        }
+    }
 }
 
 /// Release storage reservations given only a pool handle.
@@ -2848,7 +3008,7 @@ impl VectorDb {
 
         run_migrations(&pool, MIGRATIONS_AFTER_BACKFILL).await?;
 
-        recover_and_rebuild_concurrent_indexes(&pool).await?;
+        recover_and_rebuild_concurrent_indexes(database_url).await?;
 
         tracing::info!("database connected and migrations applied");
 
