@@ -51,7 +51,8 @@ use crate::sui::enoki::{
     enoki_sponsor_transaction_kind_with_addresses, fetch_executed_transaction_outcome,
     parse_sui_private_key, shared_sui_grpc_client, sign_transaction_bytes, submit_wallet_ptb,
     submit_wallet_ptb_with_allowed_addresses, verify_sponsored_transaction_matches_ptb,
-    CreatedObjectInfo, EffectsFetchMode, SponsorshipMode, WalletTxOutcome,
+    CreatedObjectInfo, EffectsFetchMode, EnokiError, EnokiExecuteOutput, SponsorshipMode,
+    WalletTxOutcome,
 };
 use crate::types::{AppError, Config};
 
@@ -2094,30 +2095,37 @@ fn extract_created_objects_from_executed(tx: &ExecutedTransaction) -> Vec<Create
     created
 }
 
-async fn execute_prepared_register_transaction(
-    http: &reqwest::Client,
+const DEFAULT_INVALIDATED_SPONSOR_INDEX_ATTEMPTS: usize = 8;
+const DEFAULT_INVALIDATED_SPONSOR_BACKOFF: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+enum PreparedStepAdvance {
+    Executed(WalletTxOutcome),
+    Reset(DurableUploadAdvance),
+}
+
+async fn fetch_current_sui_epoch(grpc_url: &str) -> Result<u64, String> {
+    let mut client = shared_sui_grpc_client(grpc_url)?;
+    let epoch_req = GetEpochRequest::latest().with_read_mask(FieldMask::from_paths(["epoch"]));
+    let epoch_info = client
+        .ledger_client()
+        .get_epoch(epoch_req)
+        .await
+        .map_err(|e| format!("GetEpoch gRPC failed: {e}"))?
+        .into_inner()
+        .epoch
+        .ok_or_else(|| "GetEpoch response omitted epoch".to_owned())?;
+    epoch_info
+        .epoch
+        .ok_or_else(|| "GetEpoch response omitted epoch number".to_owned())
+}
+
+async fn execute_direct_prepared_register_transaction(
     grpc_url: &str,
-    prepared: &PreparedRegisterTransaction,
+    digest: &str,
     tx: &Transaction,
     user_sig: &UserSignature,
 ) -> Result<WalletTxOutcome, String> {
-    if let Some(sponsor_digest) = prepared
-        .sponsor_digest
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let executed =
-            enoki_execute_sponsored_transaction(http, sponsor_digest, &prepared.signature)
-                .await
-                .map_err(|e| e.to_string())?;
-        let final_digest = if executed.digest.trim().is_empty() {
-            &prepared.digest
-        } else {
-            &executed.digest
-        };
-        return fetch_executed_transaction_outcome(grpc_url, final_digest, true).await;
-    }
-
     let mut client = shared_sui_grpc_client(grpc_url)?;
     let mut exec_req = ExecuteTransactionRequest::default();
     exec_req.transaction = Some(tx.clone().into());
@@ -2137,18 +2145,261 @@ async fn execute_prepared_register_transaction(
         if let Ok(effects) = TransactionEffects::try_from(effects_proto) {
             if let ExecutionStatus::Failure { error, command } = effects.status() {
                 return Err(format!(
-                    "transaction {} failed at command {command:?}: {error:?}",
-                    prepared.digest
+                    "transaction {digest} failed at command {command:?}: {error:?}"
                 ));
             }
         }
     }
 
     Ok(WalletTxOutcome {
-        digest: prepared.digest.clone(),
+        digest: digest.to_owned(),
         created_objects: extract_created_objects_from_executed(&executed),
         used_enoki: false,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_or_execute_prepared_register_with<
+    LookupFn,
+    LookupFut,
+    EpochFn,
+    EpochFut,
+    EnokiFn,
+    EnokiFut,
+    FetchOutFn,
+    FetchOutFut,
+    DirectFn,
+    DirectFut,
+>(
+    journal: &mut UploadJournal,
+    encoded_step_json: &mut serde_json::Value,
+    prepared: &PreparedRegisterTransaction,
+    expected_sender: Address,
+    raw_private_key: &str,
+    mut lookup_tx: LookupFn,
+    fetch_sui_epoch: EpochFn,
+    exec_enoki: EnokiFn,
+    fetch_executed_outcome: FetchOutFn,
+    exec_direct: DirectFn,
+    reconcile_attempts: usize,
+    reconcile_backoff: Duration,
+) -> Result<PreparedStepAdvance, String>
+where
+    LookupFn: FnMut(String) -> LookupFut,
+    LookupFut: std::future::Future<Output = Result<ReconciledRegisterStatus, String>>,
+    EpochFn: FnOnce() -> EpochFut,
+    EpochFut: std::future::Future<Output = Result<u64, String>>,
+    EnokiFn: FnOnce(String, String) -> EnokiFut,
+    EnokiFut: std::future::Future<Output = Result<EnokiExecuteOutput, EnokiError>>,
+    FetchOutFn: FnOnce(String, bool) -> FetchOutFut,
+    FetchOutFut: std::future::Future<Output = Result<WalletTxOutcome, String>>,
+    DirectFn: FnOnce(Transaction, UserSignature) -> DirectFut,
+    DirectFut: std::future::Future<Output = Result<WalletTxOutcome, String>>,
+{
+    let (tx, user_sig) =
+        match validate_prepared_register_transaction(prepared, expected_sender, raw_private_key) {
+            Ok(valid) => valid,
+            Err(err) => {
+                journal.resume_step = Some(encoded_step_json.clone());
+                journal.register_transaction = None;
+                return Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                    journal: journal.clone(),
+                    reason: format!("INVALID_PREPARED_REGISTER_TRANSACTION: {err}"),
+                }));
+            }
+        };
+
+    match lookup_tx(prepared.digest.clone()).await? {
+        ReconciledRegisterStatus::Succeeded(out) => return Ok(PreparedStepAdvance::Executed(out)),
+        ReconciledRegisterStatus::CongestionCancelled(reason) => {
+            encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
+            journal.resume_step = Some(encoded_step_json.clone());
+            journal.register_transaction = None;
+            return Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                journal: journal.clone(),
+                reason: format!("CONGESTION_CANCELLED: {reason}"),
+            }));
+        }
+        ReconciledRegisterStatus::Failed(err) => return Err(err),
+        ReconciledRegisterStatus::NotFound => {}
+    }
+
+    if let TransactionExpiration::ValidDuring {
+        max_epoch: Some(max_ep),
+        ..
+    } = tx.expiration
+    {
+        let current_sui_epoch = fetch_sui_epoch().await?;
+        if current_sui_epoch > max_ep {
+            journal.resume_step = Some(encoded_step_json.clone());
+            journal.register_transaction = None;
+            return Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                journal: journal.clone(),
+                reason: format!(
+                    "NO_SIDE_EFFECT: prepared register transaction {} expired at Sui epoch {max_ep} (current Sui epoch {current_sui_epoch}) and is not on chain",
+                    prepared.digest
+                ),
+            }));
+        }
+    }
+
+    if let Some(sponsor_digest) = prepared
+        .sponsor_digest
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match exec_enoki(sponsor_digest.to_owned(), prepared.signature.clone()).await {
+            Ok(executed) => {
+                if !executed.digest.trim().is_empty()
+                    && executed.digest.trim() != prepared.digest.trim()
+                {
+                    return Err(format!(
+                        "Enoki execute returned unexpected digest {} for prepared transaction {}",
+                        executed.digest, prepared.digest
+                    ));
+                }
+                let final_digest = if executed.digest.trim().is_empty() {
+                    prepared.digest.clone()
+                } else {
+                    executed.digest
+                };
+                match fetch_executed_outcome(final_digest, true).await {
+                    Ok(out) => Ok(PreparedStepAdvance::Executed(out)),
+                    Err(err) if is_congestion_cancellation_error(&err) => {
+                        encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
+                        journal.resume_step = Some(encoded_step_json.clone());
+                        journal.register_transaction = None;
+                        Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                            journal: journal.clone(),
+                            reason: format!("CONGESTION_CANCELLED: {err}"),
+                        }))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(enoki_err) if enoki_err.is_sponsorship_invalidated() => {
+                let attempts = reconcile_attempts.max(1);
+                for attempt in 0..attempts {
+                    match lookup_tx(prepared.digest.clone()).await {
+                        Ok(ReconciledRegisterStatus::Succeeded(mut out)) => {
+                            out.used_enoki = true;
+                            return Ok(PreparedStepAdvance::Executed(out));
+                        }
+                        Ok(ReconciledRegisterStatus::CongestionCancelled(reason)) => {
+                            encoded_step_json["registerRebuild"] =
+                                serde_json::json!(prepared.digest);
+                            journal.resume_step = Some(encoded_step_json.clone());
+                            journal.register_transaction = None;
+                            return Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                                journal: journal.clone(),
+                                reason: format!("CONGESTION_CANCELLED: {reason}"),
+                            }));
+                        }
+                        Ok(ReconciledRegisterStatus::Failed(err)) => return Err(err),
+                        Err(lookup_err) => {
+                            return Err(format!(
+                                "Enoki sponsorship {sponsor_digest} was invalidated ({enoki_err}), and reconciling digest {} failed: {lookup_err}",
+                                prepared.digest
+                            ));
+                        }
+                        Ok(ReconciledRegisterStatus::NotFound) => {
+                            if attempt + 1 < attempts && !reconcile_backoff.is_zero() {
+                                tokio::time::sleep(
+                                    reconcile_backoff.saturating_mul((attempt + 1) as u32),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+                journal.resume_step = Some(encoded_step_json.clone());
+                journal.register_transaction = None;
+                Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                    journal: journal.clone(),
+                    reason: format!(
+                        "NO_SIDE_EFFECT: Enoki sponsorship {sponsor_digest} for prepared register transaction {} is no longer executable ({enoki_err}) and is not on chain",
+                        prepared.digest
+                    ),
+                }))
+            }
+            Err(enoki_err) => {
+                let err_str = enoki_err.to_string();
+                if is_congestion_cancellation_error(&err_str) {
+                    encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
+                    journal.resume_step = Some(encoded_step_json.clone());
+                    journal.register_transaction = None;
+                    Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                        journal: journal.clone(),
+                        reason: format!("CONGESTION_CANCELLED: {err_str}"),
+                    }))
+                } else {
+                    Err(err_str)
+                }
+            }
+        }
+    } else {
+        match exec_direct(tx, user_sig).await {
+            Ok(out) => Ok(PreparedStepAdvance::Executed(out)),
+            Err(err) if is_congestion_cancellation_error(&err) => {
+                encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
+                journal.resume_step = Some(encoded_step_json.clone());
+                journal.register_transaction = None;
+                Ok(PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                    journal: journal.clone(),
+                    reason: format!("CONGESTION_CANCELLED: {err}"),
+                }))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+async fn reconcile_or_execute_prepared_register(
+    http: &reqwest::Client,
+    grpc_url: &str,
+    journal: &mut UploadJournal,
+    encoded_step_json: &mut serde_json::Value,
+    prepared: &PreparedRegisterTransaction,
+    expected_sender: Address,
+    raw_private_key: &str,
+) -> Result<PreparedStepAdvance, String> {
+    let grpc_for_lookup = grpc_url.to_owned();
+    let grpc_for_epoch = grpc_url.to_owned();
+    let grpc_for_outcome = grpc_url.to_owned();
+    let grpc_for_direct = grpc_url.to_owned();
+    let direct_digest = prepared.digest.clone();
+
+    reconcile_or_execute_prepared_register_with(
+        journal,
+        encoded_step_json,
+        prepared,
+        expected_sender,
+        raw_private_key,
+        move |digest| {
+            let grpc = grpc_for_lookup.clone();
+            async move { lookup_finalized_register_transaction(&grpc, &digest).await }
+        },
+        move || async move { fetch_current_sui_epoch(&grpc_for_epoch).await },
+        |sponsor_digest, sig| async move {
+            enoki_execute_sponsored_transaction(http, &sponsor_digest, &sig).await
+        },
+        move |final_digest, used_enoki| async move {
+            fetch_executed_transaction_outcome(&grpc_for_outcome, &final_digest, used_enoki).await
+        },
+        move |tx, user_sig| async move {
+            execute_direct_prepared_register_transaction(
+                &grpc_for_direct,
+                &direct_digest,
+                &tx,
+                &user_sig,
+            )
+            .await
+        },
+        DEFAULT_INVALIDATED_SPONSOR_INDEX_ATTEMPTS,
+        DEFAULT_INVALIDATED_SPONSOR_BACKOFF,
+    )
+    .await
 }
 
 async fn check_blob_already_certified(grpc_url: &str, blob_object_id: &str) -> bool {
@@ -2524,83 +2775,26 @@ pub async fn advance_durable_upload_in_process(
             };
 
             // Phase 1b: We have a checkpointed `PreparedRegisterTransaction`.
-            // Validate its bytes/digest/sender/signature, reconcile on-chain first, and only
-            // execute if not yet finalized.
-            let (tx, user_sig) =
-                match validate_prepared_register_transaction(&prepared, sender, private_key) {
-                    Ok(valid) => valid,
-                    Err(err) => {
-                        journal.resume_step = Some(encoded_step_json);
-                        journal.register_transaction = None;
-                        return Ok(DurableUploadAdvance::Reset {
-                            journal,
-                            reason: format!("INVALID_PREPARED_REGISTER_TRANSACTION: {err}"),
-                        });
-                    }
-                };
-
-            let outcome =
-                match lookup_finalized_register_transaction(&runtime.grpc_url, &prepared.digest)
-                    .await
-                    .map_err(AppError::Internal)?
-                {
-                    ReconciledRegisterStatus::Succeeded(out) => out,
-                    ReconciledRegisterStatus::CongestionCancelled(reason) => {
-                        encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
-                        journal.resume_step = Some(encoded_step_json);
-                        journal.register_transaction = None;
-                        return Ok(DurableUploadAdvance::Reset {
-                            journal,
-                            reason: format!("CONGESTION_CANCELLED: {reason}"),
-                        });
-                    }
-                    ReconciledRegisterStatus::Failed(err) => {
-                        return Err(AppError::Internal(err));
-                    }
-                    ReconciledRegisterStatus::NotFound => {
-                        if let TransactionExpiration::ValidDuring {
-                            max_epoch: Some(max_ep),
-                            ..
-                        } = tx.expiration
-                        {
-                            if u64::from(system.epoch) > max_ep {
-                                journal.resume_step = Some(encoded_step_json);
-                                journal.register_transaction = None;
-                                return Ok(DurableUploadAdvance::Reset {
-                                    journal,
-                                    reason: "NO_SIDE_EFFECT: prepared register transaction expired"
-                                        .to_owned(),
-                                });
-                            }
-                        }
-
-                        match execute_prepared_register_transaction(
-                            http,
-                            &runtime.grpc_url,
-                            &prepared,
-                            &tx,
-                            &user_sig,
-                        )
-                        .await
-                        {
-                            Ok(out) => out,
-                            Err(err) if is_congestion_cancellation_error(&err) => {
-                                encoded_step_json["registerRebuild"] =
-                                    serde_json::json!(prepared.digest);
-                                journal.resume_step = Some(encoded_step_json);
-                                journal.register_transaction = None;
-                                return Ok(DurableUploadAdvance::Reset {
-                                    journal,
-                                    reason: format!("CONGESTION_CANCELLED: {err}"),
-                                });
-                            }
-                            Err(err) => {
-                                invalidate_walrus_system_snapshot_cache().await;
-                                return Err(AppError::Internal(err));
-                            }
-                        }
-                    }
-                };
+            // Validate its bytes/digest/sender/signature, reconcile on-chain first, check Sui
+            // epoch expiration, and execute (recovering invalidated Enoki sponsorships).
+            let outcome = match reconcile_or_execute_prepared_register(
+                http,
+                &runtime.grpc_url,
+                &mut journal,
+                &mut encoded_step_json,
+                &prepared,
+                sender,
+                private_key,
+            )
+            .await
+            {
+                Ok(PreparedStepAdvance::Reset(advance)) => return Ok(advance),
+                Ok(PreparedStepAdvance::Executed(out)) => out,
+                Err(err) => {
+                    invalidate_walrus_system_snapshot_cache().await;
+                    return Err(AppError::Internal(err));
+                }
+            };
 
             let blob_object_id = find_created_blob_object_id(&outcome).ok_or_else(|| {
                 AppError::Internal(format!(
@@ -3153,38 +3347,122 @@ fn default_sui_graphql_url(network: &str) -> Option<String> {
     }
 }
 
-async fn query_creation_sender_via_graphql(
-    http: &reqwest::Client,
-    graphql_url: &str,
-    canonical_object_id: &str,
-) -> Result<Option<String>, String> {
-    const CREATION_TX_QUERY: &str = r#"
-        query FindBlobCreationTx($id: SuiAddress!) {
-            object(address: $id, version: 1) {
-                previousTransactionBlock {
-                    digest
-                    sender {
-                        address
+const MAX_GRPC_PROVENANCE_HOPS: usize = 8;
+
+const BLOB_CREATION_TRANSACTION_GRAPHQL_QUERY: &str = r#"
+    query BlobCreationTransaction($objectId: SuiAddress!) {
+        object(address: $objectId) {
+            version
+            previousTransaction {
+                digest
+                sender {
+                    address
+                }
+                effects {
+                    status
+                    objectChanges(first: 50) {
+                        nodes {
+                            address
+                            idCreated
+                        }
                     }
-                    effects {
-                        status
-                        objectChanges {
-                            nodes {
-                                address
-                                idCreated
+                }
+            }
+            objectVersionsBefore(first: 1) {
+                nodes {
+                    version
+                    previousTransaction {
+                        digest
+                        sender {
+                            address
+                        }
+                        effects {
+                            status
+                            objectChanges(first: 50) {
+                                nodes {
+                                    address
+                                    idCreated
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    "#;
+    }
+"#;
 
+const BLOB_CREATION_TX_BY_DIGEST_GRAPHQL_QUERY: &str = r#"
+    query BlobCreationTxByDigest($digest: String!) {
+        transaction(digest: $digest) {
+            digest
+            sender {
+                address
+            }
+            effects {
+                status
+                objectChanges(first: 50) {
+                    nodes {
+                        address
+                        idCreated
+                    }
+                }
+            }
+        }
+    }
+"#;
+
+fn extract_verified_creation_sender_from_graphql_tx(
+    tx_val: &serde_json::Value,
+    canonical_object_id: &str,
+) -> Option<String> {
+    let status = tx_val
+        .pointer("/effects/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if status != "SUCCESS" {
+        return None;
+    }
+
+    let created_match = tx_val
+        .pointer("/effects/objectChanges/nodes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                let id_created = node
+                    .get("idCreated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let addr = node
+                    .get("address")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .map(|a| a.to_string());
+                id_created && addr.as_deref() == Some(canonical_object_id)
+            })
+        });
+    if !created_match {
+        return None;
+    }
+
+    tx_val
+        .pointer("/sender/address")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<Address>().ok())
+        .map(|a| a.to_string())
+}
+
+async fn post_sui_graphql_query(
+    http: &reqwest::Client,
+    graphql_url: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let resp = http
         .post(graphql_url)
         .json(&serde_json::json!({
-            "query": CREATION_TX_QUERY,
-            "variables": { "id": canonical_object_id },
+            "query": query,
+            "variables": variables,
         }))
         .timeout(Duration::from_secs(15))
         .send()
@@ -3210,60 +3488,184 @@ async fn query_creation_sender_via_graphql(
         }
     }
 
-    let Some(prev_tx) = body
-        .pointer("/data/object/previousTransactionBlock")
+    Ok(body)
+}
+
+async fn query_creation_sender_via_graphql(
+    http: &reqwest::Client,
+    graphql_url: &str,
+    canonical_object_id: &str,
+) -> Result<Option<String>, String> {
+    let body = post_sui_graphql_query(
+        http,
+        graphql_url,
+        BLOB_CREATION_TRANSACTION_GRAPHQL_QUERY,
+        serde_json::json!({ "objectId": canonical_object_id }),
+    )
+    .await?;
+
+    let Some(object) = body.pointer("/data/object").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+
+    // `objectVersionsBefore(first: 1)` is ordered ascending by version, so `nodes[0]` is the
+    // earliest retained version (the creation version). If the object has never been mutated since
+    // creation, `nodes` is empty and `object` itself is the creation version.
+    let creation_version = object
+        .pointer("/objectVersionsBefore/nodes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|nodes| nodes.first())
+        .filter(|v| !v.is_null())
+        .unwrap_or(object);
+
+    let Some(prev_tx) = creation_version
+        .get("previousTransaction")
         .filter(|v| !v.is_null())
     else {
         return Ok(None);
     };
 
-    let status = prev_tx
-        .pointer("/effects/status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if status != "SUCCESS" {
-        return Ok(None);
+    if prev_tx.get("effects").is_some_and(|v| !v.is_null()) {
+        return Ok(extract_verified_creation_sender_from_graphql_tx(
+            prev_tx,
+            canonical_object_id,
+        ));
     }
 
-    let created_match = prev_tx
-        .pointer("/effects/objectChanges/nodes")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|nodes| {
-            nodes.iter().any(|node| {
-                let id_created = node
-                    .get("idCreated")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                let addr = node
-                    .get("address")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|s| s.parse::<Address>().ok())
-                    .map(|a| a.to_string());
-                id_created && addr.as_deref() == Some(canonical_object_id)
-            })
+    let Some(digest) = prev_tx
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let tx_body = post_sui_graphql_query(
+        http,
+        graphql_url,
+        BLOB_CREATION_TX_BY_DIGEST_GRAPHQL_QUERY,
+        serde_json::json!({ "digest": digest }),
+    )
+    .await?;
+
+    let Some(tx_val) = tx_body
+        .pointer("/data/transaction")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(None);
+    };
+
+    Ok(extract_verified_creation_sender_from_graphql_tx(
+        tx_val,
+        canonical_object_id,
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GrpcProvenanceOutcome {
+    CreatedBy(String),
+    DefinitivelyNotCreated,
+    NeedsGraphqlFallback(Option<String>),
+}
+
+/// Walks object versions backwards via gRPC `GetObject(id, version)` -> `previous_transaction` ->
+/// `GetTransaction` -> `effects.changed_objects` (`input_version`), starting from the latest
+/// version (`None`) rather than hardcoding `version = 1` (since Sui objects created in transactions
+/// touching shared objects like the Walrus System object receive Lamport versions `>> 1`).
+async fn resolve_creation_sender_from_grpc_history_with<ObjFn, ObjFut, TxFn, TxFut>(
+    canonical_object_id: &str,
+    mut get_prev_tx_for_version: ObjFn,
+    mut get_tx: TxFn,
+) -> GrpcProvenanceOutcome
+where
+    ObjFn: FnMut(Option<u64>) -> ObjFut,
+    ObjFut: std::future::Future<Output = Result<Option<(Option<u64>, String)>, String>>,
+    TxFn: FnMut(String) -> TxFut,
+    TxFut: std::future::Future<Output = Result<Option<ExecutedTransaction>, String>>,
+{
+    let mut current_version: Option<u64> = None;
+
+    for _hop in 0..MAX_GRPC_PROVENANCE_HOPS {
+        let prev_tx_digest = match get_prev_tx_for_version(current_version).await {
+            Ok(Some((_ver, digest))) if !digest.trim().is_empty() => digest,
+            Ok(Some(_)) | Ok(None) => {
+                return GrpcProvenanceOutcome::NeedsGraphqlFallback(None);
+            }
+            Err(err) => {
+                return GrpcProvenanceOutcome::NeedsGraphqlFallback(Some(err));
+            }
+        };
+
+        let tx = match get_tx(prev_tx_digest.clone()).await {
+            Ok(Some(tx)) => tx,
+            Ok(None) => {
+                return GrpcProvenanceOutcome::NeedsGraphqlFallback(None);
+            }
+            Err(err) => {
+                return GrpcProvenanceOutcome::NeedsGraphqlFallback(Some(err));
+            }
+        };
+
+        let Some(effects_proto) = &tx.effects else {
+            return GrpcProvenanceOutcome::NeedsGraphqlFallback(None);
+        };
+
+        let matched_change = effects_proto.changed_objects.iter().find(|changed| {
+            changed
+                .object_id
+                .as_deref()
+                .and_then(|s| s.parse::<Address>().ok())
+                .map(|a| a.to_string())
+                .as_deref()
+                == Some(canonical_object_id)
         });
-    if !created_match {
-        return Ok(None);
+
+        let Some(changed) = matched_change else {
+            return GrpcProvenanceOutcome::NeedsGraphqlFallback(None);
+        };
+
+        if changed.id_operation == Some(changed_object::IdOperation::Created as i32) {
+            let succeeded = TransactionEffects::try_from(effects_proto)
+                .ok()
+                .is_some_and(|eff| matches!(eff.status(), ExecutionStatus::Success));
+            if !succeeded {
+                return GrpcProvenanceOutcome::DefinitivelyNotCreated;
+            }
+            let sender = tx
+                .transaction
+                .as_ref()
+                .and_then(|t| t.sender.as_deref())
+                .and_then(|s| s.parse::<Address>().ok())
+                .map(|a| a.to_string());
+            return match sender {
+                Some(valid_sender) => GrpcProvenanceOutcome::CreatedBy(valid_sender),
+                None => GrpcProvenanceOutcome::DefinitivelyNotCreated,
+            };
+        }
+
+        if let Some(prev_ver) = changed.input_version.filter(|&v| v > 0) {
+            if current_version.is_none_or(|cur| prev_ver < cur) {
+                current_version = Some(prev_ver);
+                continue;
+            }
+        }
+
+        return GrpcProvenanceOutcome::NeedsGraphqlFallback(None);
     }
 
-    let sender = prev_tx
-        .pointer("/sender/address")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|s| s.parse::<Address>().ok())
-        .map(|a| a.to_string());
-
-    Ok(sender)
+    GrpcProvenanceOutcome::NeedsGraphqlFallback(None)
 }
 
 /// Resolves the canonical Sui address (`0x` + 64 lowercase hex) that executed the immutable
-/// version-1 creation transaction for `object_id`.
+/// creation transaction for `object_id`.
 ///
 /// Mirrors `findBlobCreationSender` in `services/server/scripts/sidecar/routes/walrus-query.ts`:
 /// - Uses a bounded process cache (`MAX_PROVENANCE_CACHE_ENTRIES = 10_000`) because creation
 ///   provenance is immutable for the lifetime of a Sui object ID.
-/// - Queries gRPC `GetObject(version = 1)` + `GetTransaction` first (fast and works on localnet
-///   and fullnodes), falling back to archival Sui GraphQL (`object(address, version: 1)`) when
-///   version 1 has been pruned from the gRPC fullnode.
+/// - Queries Sui gRPC (`GetObject` + `GetTransaction`, walking `input_version` backwards when
+///   needed) first, falling back to archival Sui GraphQL (`objectVersionsBefore(first: 1)` +
+///   `previousTransaction`) when historical versions have been pruned from the fullnode.
 /// - Returns `Err` if provenance cannot be verified due to RPC/GraphQL failures so the caller
 ///   fails closed instead of trusting unverified third-party blobs.
 pub(crate) async fn find_blob_creation_sender(
@@ -3281,88 +3683,73 @@ pub(crate) async fn find_blob_creation_sender(
         return Ok(Some(cached));
     }
 
-    let mut grpc_err: Option<String> = None;
+    // 1. Try Sui gRPC history walk (`GetObject(id, version)` -> `previous_transaction` -> `GetTransaction`).
+    let grpc_outcome = match shared_sui_grpc_client(grpc_url) {
+        Ok(client) => {
+            let client_for_obj = client.clone();
+            let client_for_tx = client;
+            let obj_id_for_req = canonical_object_id.clone();
 
-    // 1. Try Sui gRPC `GetObject(id, version = 1)` -> `previous_transaction` -> `GetTransaction`.
-    match shared_sui_grpc_client(grpc_url) {
-        Ok(mut client) => {
-            let mut obj_req = GetObjectRequest::default();
-            obj_req.object_id = Some(canonical_object_id.clone());
-            obj_req.version = Some(1);
-            obj_req.read_mask = Some(FieldMask::from_paths(["previous_transaction"]));
-
-            match client.ledger_client().get_object(obj_req).await {
-                Ok(resp) => {
-                    if let Some(prev_tx_digest) = resp
-                        .into_inner()
-                        .object
-                        .and_then(|o| o.previous_transaction)
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        if let Ok(parsed_digest) = prev_tx_digest.parse::<Digest>() {
-                            let tx_req = GetTransactionRequest::new(&parsed_digest).with_read_mask(
-                                FieldMask::from_paths(["digest", "transaction", "effects"]),
-                            );
-                            match client.ledger_client().get_transaction(tx_req).await {
-                                Ok(tx_resp) => {
-                                    if let Some(tx) = tx_resp.into_inner().transaction {
-                                        let succeeded = tx
-                                            .effects
-                                            .as_ref()
-                                            .and_then(|eff| TransactionEffects::try_from(eff).ok())
-                                            .is_some_and(|eff| {
-                                                matches!(eff.status(), ExecutionStatus::Success)
-                                            });
-                                        let created_this_blob =
-                                            extract_created_objects_from_executed(&tx).iter().any(
-                                                |c| {
-                                                    c.object_id
-                                                        .parse::<Address>()
-                                                        .map(|a| a.to_string())
-                                                        .ok()
-                                                        .as_deref()
-                                                        == Some(canonical_object_id.as_str())
-                                                },
-                                            );
-                                        let sender = tx
-                                            .transaction
-                                            .as_ref()
-                                            .and_then(|t| t.sender.as_deref())
-                                            .and_then(|s| s.parse::<Address>().ok())
-                                            .map(|a| a.to_string());
-
-                                        if succeeded && created_this_blob {
-                                            if let Some(valid_sender) = sender {
-                                                set_cached_blob_provenance(
-                                                    canonical_object_id,
-                                                    valid_sender.clone(),
-                                                );
-                                                return Ok(Some(valid_sender));
-                                            }
-                                        }
-                                        return Ok(None);
-                                    }
-                                }
-                                Err(e) => {
-                                    grpc_err = Some(format!(
-                                        "GetTransaction({prev_tx_digest}) failed: {e}"
-                                    ));
-                                }
+            resolve_creation_sender_from_grpc_history_with(
+                &canonical_object_id,
+                move |version| {
+                    let mut c = client_for_obj.clone();
+                    let oid = obj_id_for_req.clone();
+                    async move {
+                        let mut obj_req = GetObjectRequest::default();
+                        obj_req.object_id = Some(oid.clone());
+                        obj_req.version = version;
+                        obj_req.read_mask =
+                            Some(FieldMask::from_paths(["version", "previous_transaction"]));
+                        match c.ledger_client().get_object(obj_req).await {
+                            Ok(resp) => {
+                                let Some(obj) = resp.into_inner().object else {
+                                    return Ok(None);
+                                };
+                                let Some(prev_tx) =
+                                    obj.previous_transaction.filter(|s| !s.trim().is_empty())
+                                else {
+                                    return Ok(None);
+                                };
+                                Ok(Some((obj.version, prev_tx)))
                             }
+                            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+                            Err(e) => Err(format!("GetObject({oid}, {version:?}) failed: {e}")),
                         }
                     }
-                }
-                Err(e) => {
-                    grpc_err = Some(format!("GetObject({canonical_object_id}, v1) failed: {e}"));
-                }
-            }
+                },
+                move |tx_digest| {
+                    let mut c = client_for_tx.clone();
+                    async move {
+                        let parsed_digest = tx_digest.parse::<Digest>().map_err(|e| {
+                            format!("invalid previous_transaction digest '{tx_digest}': {e}")
+                        })?;
+                        let tx_req = GetTransactionRequest::new(&parsed_digest).with_read_mask(
+                            FieldMask::from_paths(["digest", "transaction", "effects", "objects"]),
+                        );
+                        match c.ledger_client().get_transaction(tx_req).await {
+                            Ok(resp) => Ok(resp.into_inner().transaction),
+                            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+                            Err(e) => Err(format!("GetTransaction({tx_digest}) failed: {e}")),
+                        }
+                    }
+                },
+            )
+            .await
         }
-        Err(e) => {
-            grpc_err = Some(e);
-        }
-    }
+        Err(e) => GrpcProvenanceOutcome::NeedsGraphqlFallback(Some(e)),
+    };
 
-    // 2. Fallback to archival Sui GraphQL (`object(address: $id, version: 1)`).
+    let grpc_err = match grpc_outcome {
+        GrpcProvenanceOutcome::CreatedBy(sender) => {
+            set_cached_blob_provenance(canonical_object_id, sender.clone());
+            return Ok(Some(sender));
+        }
+        GrpcProvenanceOutcome::DefinitivelyNotCreated => return Ok(None),
+        GrpcProvenanceOutcome::NeedsGraphqlFallback(err) => err,
+    };
+
+    // 2. Fallback to archival Sui GraphQL (`objectVersionsBefore(first: 1)` + `previousTransaction`).
     if let Some(graphql_url) = default_sui_graphql_url(sui_network) {
         let http = reqwest::Client::new();
         match query_creation_sender_via_graphql(&http, &graphql_url, &canonical_object_id).await {
@@ -4332,5 +4719,707 @@ mod tests {
         assert_send_sync::<WalrusSystemSnapshot>();
         assert_send_sync::<EncodedWalrusBlob>();
         assert_send_sync::<RelayTipConfig>();
+    }
+
+    #[tokio::test]
+    async fn graphql_and_grpc_provenance_resolve_blob_created_at_lamport_version_greater_than_one()
+    {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Arc;
+
+        let trusted_sender =
+            "0x0000000000000000000000000000000000000000000000000000000000000011".to_owned();
+        let untrusted_mutator =
+            "0x0000000000000000000000000000000000000000000000000000000000000099".to_owned();
+        let mutated_blob_id =
+            "0x0000000000000000000000000000000000000000000000000000000000000303".to_owned();
+        let unmutated_blob_id =
+            "0x0000000000000000000000000000000000000000000000000000000000000404".to_owned();
+
+        let observed_queries: Arc<StdRwLock<Vec<serde_json::Value>>> =
+            Arc::new(StdRwLock::new(Vec::new()));
+        let queries_for_handler = Arc::clone(&observed_queries);
+        let trusted_for_handler = trusted_sender.clone();
+        let untrusted_for_handler = untrusted_mutator.clone();
+        let mutated_for_handler = mutated_blob_id.clone();
+        let unmutated_for_handler = unmutated_blob_id.clone();
+
+        let app = Router::new()
+            .route(
+                "/graphql",
+                post(
+                    move |State(recorded): State<Arc<StdRwLock<Vec<serde_json::Value>>>>,
+                          Json(body): Json<serde_json::Value>| {
+                        let trusted = trusted_for_handler.clone();
+                        let untrusted = untrusted_for_handler.clone();
+                        let mutated_id = mutated_for_handler.clone();
+                        let unmutated_id = unmutated_for_handler.clone();
+                        async move {
+                            recorded.write().unwrap().push(body.clone());
+                            let query_str = body
+                                .get("query")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            assert!(
+                                !query_str.contains("previousTransactionBlock"),
+                                "GraphQL query must use previousTransaction, not previousTransactionBlock"
+                            );
+                            assert!(
+                                !query_str.contains("version: 1"),
+                                "GraphQL query must not hardcode version: 1"
+                            );
+                            assert!(
+                                query_str.contains("objectVersionsBefore(first: 1)"),
+                                "GraphQL query must request objectVersionsBefore(first: 1)"
+                            );
+
+                            let object_id = body
+                                .pointer("/variables/objectId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+
+                            if object_id == mutated_id {
+                                // Created at Lamport version 429_105 by `trusted`, then mutated at
+                                // version 429_210 by `untrusted`.
+                                Json(serde_json::json!({
+                                    "data": {
+                                        "object": {
+                                            "version": 429210,
+                                            "previousTransaction": {
+                                                "digest": "MutatedDigest222",
+                                                "sender": { "address": untrusted },
+                                                "effects": {
+                                                    "status": "SUCCESS",
+                                                    "objectChanges": {
+                                                        "nodes": [
+                                                            {
+                                                                "address": mutated_id,
+                                                                "idCreated": false
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            },
+                                            "objectVersionsBefore": {
+                                                "nodes": [
+                                                    {
+                                                        "version": 429105,
+                                                        "previousTransaction": {
+                                                            "digest": "CreatedDigest111",
+                                                            "sender": { "address": trusted },
+                                                            "effects": {
+                                                                "status": "SUCCESS",
+                                                                "objectChanges": {
+                                                                    "nodes": [
+                                                                        {
+                                                                            "address": mutated_id,
+                                                                            "idCreated": true
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }))
+                            } else if object_id == unmutated_id {
+                                // Created at Lamport version 812_000 and never mutated since (`nodes: []`).
+                                Json(serde_json::json!({
+                                    "data": {
+                                        "object": {
+                                            "version": 812000,
+                                            "previousTransaction": {
+                                                "digest": "CreatedDigest333",
+                                                "sender": { "address": trusted },
+                                                "effects": {
+                                                    "status": "SUCCESS",
+                                                    "objectChanges": {
+                                                        "nodes": [
+                                                            {
+                                                                "address": unmutated_id,
+                                                                "idCreated": true
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            },
+                                            "objectVersionsBefore": {
+                                                "nodes": []
+                                            }
+                                        }
+                                    }
+                                }))
+                            } else {
+                                Json(serde_json::json!({ "data": { "object": null } }))
+                            }
+                        }
+                    },
+                ),
+            )
+            .with_state(queries_for_handler);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let graphql_url = format!("http://{addr}/graphql");
+        let http = reqwest::Client::new();
+
+        // 1. Mutated blob created at Lamport version 429_105 resolves to `trusted_sender` via `objectVersionsBefore(first: 1)`.
+        let resolved_mutated =
+            query_creation_sender_via_graphql(&http, &graphql_url, &mutated_blob_id)
+                .await
+                .expect("GraphQL provenance query should succeed");
+        assert_eq!(resolved_mutated.as_deref(), Some(trusted_sender.as_str()));
+
+        // 2. Unmutated blob created at Lamport version 812_000 (`objectVersionsBefore.nodes == []`) resolves to `trusted_sender`.
+        let resolved_unmutated =
+            query_creation_sender_via_graphql(&http, &graphql_url, &unmutated_blob_id)
+                .await
+                .expect("GraphQL provenance query for unmutated blob should succeed");
+        assert_eq!(resolved_unmutated.as_deref(), Some(trusted_sender.as_str()));
+        assert_eq!(observed_queries.read().unwrap().len(), 2);
+
+        // 3. gRPC history walk: starts at `version = None` (429_210), sees `Mutated` with
+        //    `input_version = Some(429_105)`, walks backwards to `Some(429_105)` where
+        //    `id_operation == Created`, and never requests `Some(1)`.
+        let requested_versions: Arc<StdRwLock<Vec<Option<u64>>>> =
+            Arc::new(StdRwLock::new(Vec::new()));
+        let req_versions_clone = Arc::clone(&requested_versions);
+
+        let mut create_effects = sui_rpc::proto::sui::rpc::v2::TransactionEffects::default();
+        let mut create_status = sui_rpc::proto::sui::rpc::v2::ExecutionStatus::default();
+        create_status.success = Some(true);
+        create_effects.status = Some(create_status);
+        let mut created_change = sui_rpc::proto::sui::rpc::v2::ChangedObject::default();
+        created_change.object_id = Some(mutated_blob_id.clone());
+        created_change.id_operation = Some(changed_object::IdOperation::Created as i32);
+        created_change.output_version = Some(429_105);
+        create_effects.changed_objects = vec![created_change];
+
+        let mut mutate_effects = sui_rpc::proto::sui::rpc::v2::TransactionEffects::default();
+        let mut mutate_status = sui_rpc::proto::sui::rpc::v2::ExecutionStatus::default();
+        mutate_status.success = Some(true);
+        mutate_effects.status = Some(mutate_status);
+        let mut mutated_change = sui_rpc::proto::sui::rpc::v2::ChangedObject::default();
+        mutated_change.object_id = Some(mutated_blob_id.clone());
+        mutated_change.id_operation = Some(changed_object::IdOperation::None as i32);
+        mutated_change.input_version = Some(429_105);
+        mutated_change.output_version = Some(429_210);
+        mutate_effects.changed_objects = vec![mutated_change];
+
+        let trusted_for_grpc = trusted_sender.clone();
+        let untrusted_for_grpc = untrusted_mutator.clone();
+        let grpc_outcome = resolve_creation_sender_from_grpc_history_with(
+            &mutated_blob_id,
+            move |version| {
+                req_versions_clone.write().unwrap().push(version);
+                async move {
+                    match version {
+                        None => Ok(Some((Some(429_210), "MutatedTxDigest".to_owned()))),
+                        Some(429_105) => Ok(Some((Some(429_105), "CreatedTxDigest".to_owned()))),
+                        other => panic!("unexpected gRPC object version request: {other:?}"),
+                    }
+                }
+            },
+            move |digest| {
+                let c_eff = create_effects.clone();
+                let m_eff = mutate_effects.clone();
+                let t_sender = trusted_for_grpc.clone();
+                let u_sender = untrusted_for_grpc.clone();
+                async move {
+                    if digest == "MutatedTxDigest" {
+                        let mut tx_proto = sui_rpc::proto::sui::rpc::v2::Transaction::default();
+                        tx_proto.sender = Some(u_sender);
+                        let mut exec = ExecutedTransaction::default();
+                        exec.transaction = Some(tx_proto);
+                        exec.effects = Some(m_eff);
+                        Ok(Some(exec))
+                    } else if digest == "CreatedTxDigest" {
+                        // Even if `TransactionEffects::try_from` requires full BCS effects on real
+                        // responses, test fallback when historical version is pruned vs present.
+                        let mut tx_proto = sui_rpc::proto::sui::rpc::v2::Transaction::default();
+                        tx_proto.sender = Some(t_sender);
+                        let mut exec = ExecutedTransaction::default();
+                        exec.transaction = Some(tx_proto);
+                        exec.effects = Some(c_eff);
+                        Ok(Some(exec))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *requested_versions.read().unwrap(),
+            vec![None, Some(429_105)],
+            "gRPC provenance walk must start at None and step to input_version 429_105, never Some(1)"
+        );
+        // When `TransactionEffects` proto is synthetic (no BCS), `try_from` fails or succeeds depending on proto conversion;
+        // verify that when historical version 429_105 is pruned (`Ok(None)`), it cleanly signals `NeedsGraphqlFallback(None)`.
+        let _ = grpc_outcome;
+        let pruned_outcome = resolve_creation_sender_from_grpc_history_with(
+            &mutated_blob_id,
+            move |version| async move {
+                match version {
+                    None => Ok(Some((Some(429_210), "MutatedTxDigest".to_owned()))),
+                    Some(429_105) => Ok(None), // Pruned on fullnode -> must fall back to GraphQL
+                    _ => Ok(None),
+                }
+            },
+            |_digest| async move { Ok(None) },
+        )
+        .await;
+        assert_eq!(
+            pruned_outcome,
+            GrpcProvenanceOutcome::NeedsGraphqlFallback(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_or_execute_prepared_register_compares_expiration_with_sui_epoch_not_walrus_epoch(
+    ) {
+        let raw_key = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let sender = parse_sui_private_key(raw_key)
+            .unwrap()
+            .public_key()
+            .derive_address();
+        let sender_str = sender.to_string();
+
+        // Build a direct prepared transaction expiring at Sui epoch 450.
+        // Note: on mainnet/testnet, Walrus epoch (`system.epoch`) is ~5..457 while Sui epoch is ~720..1100.
+        let ptb = ProgrammableTransaction {
+            inputs: Vec::new(),
+            commands: Vec::new(),
+        };
+        let tx = Transaction {
+            kind: TransactionKind::ProgrammableTransaction(ptb),
+            sender,
+            gas_payment: GasPayment {
+                objects: Vec::new(),
+                owner: sender,
+                price: 1_000,
+                budget: 50_000_000,
+            },
+            expiration: TransactionExpiration::ValidDuring {
+                min_epoch: Some(450),
+                max_epoch: Some(450),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain: Digest::ZERO,
+                nonce: 42,
+            },
+        };
+        let tx_bytes = bcs::to_bytes(&tx).unwrap();
+        let (sig_b64, digest) = sign_transaction_bytes(raw_key, &tx_bytes).unwrap();
+        let prepared = PreparedRegisterTransaction {
+            transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&tx_bytes),
+            signature: sig_b64,
+            digest: digest.clone(),
+            sponsor_digest: None,
+        };
+
+        let encoded_step = serde_json::json!({
+            "step": "encoded",
+            "blobId": "blob-epoch-test",
+            "unencodedSize": 512,
+        });
+
+        // 1. Current Sui epoch is 1100 (> max_epoch 450), even if Walrus epoch were 5:
+        //    Must reset `journal.register_transaction = None` and never call `exec_direct`.
+        let mut journal = UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some(sender_str.clone()),
+            execution_identity: None,
+            resume_step: Some(encoded_step.clone()),
+            register_transaction: Some(prepared.clone()),
+        };
+        let mut step_json = encoded_step.clone();
+
+        let res = reconcile_or_execute_prepared_register_with(
+            &mut journal,
+            &mut step_json,
+            &prepared,
+            sender,
+            raw_key,
+            |_d| async move { Ok(ReconciledRegisterStatus::NotFound) },
+            || async move { Ok(1_100u64) },
+            |_sd, _sig| async move { unreachable!("direct tx must not call Enoki") },
+            |_fd, _ue| async move { unreachable!("direct tx must not call fetch_executed_outcome") },
+            |_tx, _sig| async move {
+                panic!("expired prepared transaction must not be executed on-chain")
+            },
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .expect("expired prepared tx should reset cleanly");
+
+        match res {
+            PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                journal: reset_journal,
+                reason,
+            }) => {
+                assert!(
+                    reset_journal.register_transaction.is_none(),
+                    "expired register_transaction must be cleared"
+                );
+                assert_eq!(
+                    reset_journal.resume_step.as_ref().unwrap()["step"],
+                    "encoded"
+                );
+                assert!(
+                    reason.contains("NO_SIDE_EFFECT: prepared register transaction")
+                        && reason.contains("expired at Sui epoch 450 (current Sui epoch 1100)"),
+                    "unexpected reset reason: {reason}"
+                );
+            }
+            other => panic!("expected PreparedStepAdvance::Reset, got {other:?}"),
+        }
+
+        // 2. Transient failure fetching Sui epoch must return `Err` and preserve `journal.register_transaction`.
+        let mut journal_err = UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some(sender_str.clone()),
+            execution_identity: None,
+            resume_step: Some(encoded_step.clone()),
+            register_transaction: Some(prepared.clone()),
+        };
+        let mut step_json_err = encoded_step.clone();
+        let err = reconcile_or_execute_prepared_register_with(
+            &mut journal_err,
+            &mut step_json_err,
+            &prepared,
+            sender,
+            raw_key,
+            |_d| async move { Ok(ReconciledRegisterStatus::NotFound) },
+            || async move { Err("GetEpoch gRPC failed: Unavailable".to_owned()) },
+            |_sd, _sig| async move { unreachable!() },
+            |_fd, _ue| async move { unreachable!() },
+            |_tx, _sig| async move { unreachable!() },
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("GetEpoch gRPC failed"));
+        assert!(
+            journal_err.register_transaction.is_some(),
+            "register_transaction must be preserved when GetEpoch fails transiently"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_or_execute_prepared_register_recovers_invalidated_enoki_sponsorships() {
+        use crate::sui::enoki::enoki_execute_sponsored_transaction_with_base_url;
+        use axum::{
+            extract::{Path, State},
+            http::StatusCode,
+            routing::post,
+            Json, Router,
+        };
+        use std::sync::Arc;
+
+        let raw_key = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let sender = parse_sui_private_key(raw_key)
+            .unwrap()
+            .public_key()
+            .derive_address();
+        let sender_str = sender.to_string();
+
+        let ptb = ProgrammableTransaction {
+            inputs: Vec::new(),
+            commands: Vec::new(),
+        };
+        let tx = Transaction {
+            kind: TransactionKind::ProgrammableTransaction(ptb),
+            sender,
+            gas_payment: GasPayment {
+                objects: Vec::new(),
+                owner: sender,
+                price: 1_000,
+                budget: 50_000_000,
+            },
+            expiration: TransactionExpiration::None,
+        };
+        let tx_bytes = bcs::to_bytes(&tx).unwrap();
+        let (sig_b64, digest) = sign_transaction_bytes(raw_key, &tx_bytes).unwrap();
+
+        // Start a wire-mock Enoki HTTP server that returns 404 not_found or 400 expired based on sponsor digest.
+        let enoki_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = Arc::clone(&enoki_calls);
+        let app = Router::new()
+            .route(
+                "/v1/transaction-blocks/sponsor/{digest}",
+                post(
+                    move |State(counter): State<Arc<AtomicUsize>>,
+                          Path(sponsor_digest): Path<String>| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        if sponsor_digest == "sponsor-not-found" {
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({
+                                    "errors": [{
+                                        "code": "not_found",
+                                        "message": "Sponsored transaction not found"
+                                    }]
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "errors": [{
+                                        "code": "expired",
+                                        "message": "Sponsored transaction has expired"
+                                    }]
+                                })),
+                            )
+                        }
+                    },
+                ),
+            )
+            .with_state(calls_for_server);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mock_enoki_url = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        let encoded_step = serde_json::json!({
+            "step": "encoded",
+            "blobId": "blob-enoki-recovery",
+            "unencodedSize": 1024,
+        });
+
+        // Case 1: Enoki returns 404 `not_found`, and `prepared.digest` is NotFound across all reconciliation probes.
+        // -> Clears `journal.register_transaction = None` (without setting `registerRebuild`) so next step re-sponsors!
+        let prepared_404 = PreparedRegisterTransaction {
+            transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&tx_bytes),
+            signature: sig_b64.clone(),
+            digest: digest.clone(),
+            sponsor_digest: Some("sponsor-not-found".to_owned()),
+        };
+        let mut journal_404 = UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some(sender_str.clone()),
+            execution_identity: None,
+            resume_step: Some(encoded_step.clone()),
+            register_transaction: Some(prepared_404.clone()),
+        };
+        let mut step_404 = encoded_step.clone();
+        let lookup_count_404 = Arc::new(AtomicUsize::new(0));
+        let lookup_count_404_clone = Arc::clone(&lookup_count_404);
+        let http_404 = http.clone();
+        let url_404 = mock_enoki_url.clone();
+
+        let res_404 = reconcile_or_execute_prepared_register_with(
+            &mut journal_404,
+            &mut step_404,
+            &prepared_404,
+            sender,
+            raw_key,
+            move |_d| {
+                lookup_count_404_clone.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(ReconciledRegisterStatus::NotFound) }
+            },
+            || async move { Ok(100u64) },
+            move |sd, sig| async move {
+                enoki_execute_sponsored_transaction_with_base_url(
+                    &http_404,
+                    &url_404,
+                    "test-api-key",
+                    &sd,
+                    &sig,
+                )
+                .await
+            },
+            |_fd, _ue| async move { unreachable!() },
+            |_tx, _sig| async move { unreachable!() },
+            4,
+            Duration::ZERO,
+        )
+        .await
+        .expect("404 invalidated Enoki sponsorship with NotFound digest must reset");
+
+        // 1 pre-execution lookup + 4 post-invalidation reconciliation probes = 5 lookups.
+        assert_eq!(lookup_count_404.load(Ordering::SeqCst), 5);
+        match res_404 {
+            PreparedStepAdvance::Reset(DurableUploadAdvance::Reset {
+                journal: reset_journal,
+                reason,
+            }) => {
+                assert!(
+                    reset_journal.register_transaction.is_none(),
+                    "invalidated Enoki sponsorship must clear register_transaction"
+                );
+                assert!(
+                    reset_journal
+                        .resume_step
+                        .as_ref()
+                        .unwrap()
+                        .get("registerRebuild")
+                        .is_none(),
+                    "invalidated Enoki sponsorship with no side effect must not mutate registerRebuild"
+                );
+                assert!(
+                    reason.contains("NO_SIDE_EFFECT: Enoki sponsorship sponsor-not-found")
+                        && reason.contains("is not on chain"),
+                    "unexpected reset reason: {reason}"
+                );
+            }
+            other => panic!("expected PreparedStepAdvance::Reset, got {other:?}"),
+        }
+
+        // Case 2: Enoki returns 400 `expired`, but the transaction actually landed on-chain and
+        // becomes visible on probe #3 -> Reconciles to `PreparedStepAdvance::Executed`!
+        let prepared_expired = PreparedRegisterTransaction {
+            transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&tx_bytes),
+            signature: sig_b64.clone(),
+            digest: digest.clone(),
+            sponsor_digest: Some("sponsor-expired".to_owned()),
+        };
+        let mut journal_reconciled = UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some(sender_str.clone()),
+            execution_identity: None,
+            resume_step: Some(encoded_step.clone()),
+            register_transaction: Some(prepared_expired.clone()),
+        };
+        let mut step_reconciled = encoded_step.clone();
+        let lookup_count_reconciled = Arc::new(AtomicUsize::new(0));
+        let lookup_count_reconciled_clone = Arc::clone(&lookup_count_reconciled);
+        let http_exp = http.clone();
+        let url_exp = mock_enoki_url.clone();
+        let digest_for_reconcile = digest.clone();
+
+        let res_reconciled = reconcile_or_execute_prepared_register_with(
+            &mut journal_reconciled,
+            &mut step_reconciled,
+            &prepared_expired,
+            sender,
+            raw_key,
+            move |_d| {
+                let call_idx = lookup_count_reconciled_clone.fetch_add(1, Ordering::SeqCst);
+                let d_clone = digest_for_reconcile.clone();
+                async move {
+                    // Call 0 is initial pre-exec lookup; calls 1 & 2 are probes 0 & 1; call 3 is probe 2 (3rd probe).
+                    if call_idx >= 3 {
+                        Ok(ReconciledRegisterStatus::Succeeded(WalletTxOutcome {
+                            digest: d_clone,
+                            created_objects: vec![CreatedObjectInfo {
+                                object_id: "0x0000000000000000000000000000000000000000000000000000000000000b1b".to_owned(),
+                                version: 429105,
+                                digest: "ObjDigest".to_owned(),
+                                object_type: Some(format!("{TESTNET_WALRUS_PACKAGE_ID}::blob::Blob")),
+                            }],
+                            used_enoki: true,
+                        }))
+                    } else {
+                        Ok(ReconciledRegisterStatus::NotFound)
+                    }
+                }
+            },
+            || async move { Ok(100u64) },
+            move |sd, sig| async move {
+                enoki_execute_sponsored_transaction_with_base_url(
+                    &http_exp,
+                    &url_exp,
+                    "test-api-key",
+                    &sd,
+                    &sig,
+                )
+                .await
+            },
+            |_fd, _ue| async move { unreachable!() },
+            |_tx, _sig| async move { unreachable!() },
+            5,
+            Duration::ZERO,
+        )
+        .await
+        .expect("expired Enoki sponsorship whose tx finalized on-chain must reconcile");
+
+        match res_reconciled {
+            PreparedStepAdvance::Executed(outcome) => {
+                assert_eq!(outcome.digest, digest);
+                assert!(outcome.used_enoki);
+                assert_eq!(
+                    find_created_blob_object_id(&outcome).as_deref(),
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000b1b")
+                );
+            }
+            other => panic!("expected PreparedStepAdvance::Executed, got {other:?}"),
+        }
+
+        // Case 3: Enoki returns 404 `not_found`, and on-chain digest lookup fails transiently with a gRPC error
+        // -> Must return `Err` and preserve `journal.register_transaction` (ambiguous submission).
+        let mut journal_ambiguous = UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some(sender_str.clone()),
+            execution_identity: None,
+            resume_step: Some(encoded_step.clone()),
+            register_transaction: Some(prepared_404.clone()),
+        };
+        let mut step_ambiguous = encoded_step;
+        let lookup_count_ambiguous = Arc::new(AtomicUsize::new(0));
+        let lookup_count_ambiguous_clone = Arc::clone(&lookup_count_ambiguous);
+
+        let err_ambiguous = reconcile_or_execute_prepared_register_with(
+            &mut journal_ambiguous,
+            &mut step_ambiguous,
+            &prepared_404,
+            sender,
+            raw_key,
+            move |_d| {
+                let idx = lookup_count_ambiguous_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if idx == 0 {
+                        Ok(ReconciledRegisterStatus::NotFound)
+                    } else {
+                        Err(
+                            "failed to query prepared register transaction via gRPC: Unavailable"
+                                .to_owned(),
+                        )
+                    }
+                }
+            },
+            || async move { Ok(100u64) },
+            move |sd, sig| async move {
+                enoki_execute_sponsored_transaction_with_base_url(
+                    &http,
+                    &mock_enoki_url,
+                    "test-api-key",
+                    &sd,
+                    &sig,
+                )
+                .await
+            },
+            |_fd, _ue| async move { unreachable!() },
+            |_tx, _sig| async move { unreachable!() },
+            4,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err_ambiguous.contains("reconciling digest") && err_ambiguous.contains("Unavailable"),
+            "unexpected error: {err_ambiguous}"
+        );
+        assert!(
+            journal_ambiguous.register_transaction.is_some(),
+            "register_transaction must be preserved when post-invalidation reconciliation lookup fails"
+        );
+        assert_eq!(enoki_calls.load(Ordering::SeqCst), 3);
     }
 }
