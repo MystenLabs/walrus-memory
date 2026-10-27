@@ -262,11 +262,12 @@ Submit text as an encrypted memory job. The relayer returns after creating a bac
 {
   "text": "User prefers dark mode",
   "namespace": "demo",
-  "idempotency_key": "my-idempotency-key"
+  "idempotency_key": "my-idempotency-key",
+  "dedupe": true
 }
 ```
 
-`namespace` defaults to `"default"` if omitted and is limited to 255 UTF-8 bytes. `idempotency_key` is an optional string (up to 255 UTF-8 bytes); when supplied, repeated calls with the same key collapse onto the existing job row.
+`namespace` defaults to `"default"` if omitted and is limited to 255 UTF-8 bytes. `idempotency_key` is an optional string (up to 255 UTF-8 bytes); when supplied, repeated calls with the same key collapse onto the existing job row. `dedupe` is an optional boolean (default `false`); when `true`, the relayer derives a content-hash key from `(owner, namespace, text)` (overriding `idempotency_key`) and returns the existing job when that memory is still live, or writes a fresh job if the prior memory was deleted or expired.
 
 **Response:** `202 Accepted`
 

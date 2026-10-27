@@ -2,6 +2,10 @@
 
 ## 0.1.11
 
+### Added
+
+- `remember`, `rememberAsync`, and `rememberAndWait` accept `{ dedupe: true }` (`RememberOptions` / `RememberWaitOptions`) for opt-in content-hash deduplication per `(owner, namespace, text)` without a 30-minute time window. When `dedupe: true` is set, the client derives a bucket-less `dedupe:<sha256>` key and sends `dedupe: true` to `POST /api/remember`, collapsing duplicate writes onto the existing live job and `blob_id` while writing fresh if the memory was later forgotten or deleted. `MemWalMock` mirrors the same behavior. (#769)
+
 ### Fixed
 
 - `MemWal.create` and `MemWalManual.create` copy a caller-supplied `Uint8Array` key into an internal buffer so `destroy()` zeroes only the client's copy and leaves the caller's `Uint8Array` intact for reuse. `MemWalManual.destroy()` also drops references to `suiPrivateKey`, `embeddingApiKey`, `sealServerConfigs` API keys, `walletSigner`, and cached Sui/SEAL/keypair instances (zeroing any decoded keypair secret buffer) and rejects subsequent or in-flight calls instead of signing with a zeroed key. (#973, #977)
