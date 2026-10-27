@@ -25,7 +25,6 @@ use crate::types::AppState;
 
 #[derive(Clone)]
 pub struct McpNativeSession {
-    pub session_id: String,
     pub delegate_key_hex: String,
     pub account_id: String,
     pub default_namespace: String,
@@ -49,7 +48,7 @@ use reqwest::header as req_headers;
 fn resolve_session_credentials(
     state: &AppState,
     forwarded: &req_headers::HeaderMap,
-) -> Result<(String, String, String), Response> {
+) -> Result<(String, String, String), (StatusCode, &'static str)> {
     let bearer_key = extract_header_str(forwarded, "authorization")
         .and_then(|auth| {
             auth.strip_prefix("Bearer ")
@@ -73,8 +72,7 @@ fn resolve_session_credentials(
         return Err((
             StatusCode::UNAUTHORIZED,
             "Missing or invalid Ed25519 delegate key bearer",
-        )
-            .into_response());
+        ));
     };
 
     let account_id = extract_header_str(forwarded, "x-memwal-internal-oauth-account-id")
@@ -83,7 +81,7 @@ fn resolve_session_credentials(
         .unwrap_or_default();
 
     if account_id.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "Missing X-MemWal-Account-Id").into_response());
+        return Err((StatusCode::UNAUTHORIZED, "Missing X-MemWal-Account-Id"));
     }
 
     let default_namespace =
@@ -733,7 +731,7 @@ pub async fn handle_sse_in_process(
     let (delegate_key_hex, account_id, default_namespace) =
         match resolve_session_credentials(&state, &forwarded) {
             Ok(creds) => creds,
-            Err(resp) => return resp,
+            Err(err) => return err.into_response(),
         };
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -743,7 +741,6 @@ pub async fn handle_sse_in_process(
     let _ = tx.send(endpoint_event);
 
     let session = McpNativeSession {
-        session_id: session_id.clone(),
         delegate_key_hex,
         account_id,
         default_namespace,
@@ -858,7 +855,7 @@ pub async fn handle_streamable_in_process(
             let (delegate_key_hex, account_id, default_namespace) =
                 match resolve_session_credentials(&state, &forwarded) {
                     Ok(creds) => creds,
-                    Err(resp) => return resp,
+                    Err(err) => return err.into_response(),
                 };
             let parsed: Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,

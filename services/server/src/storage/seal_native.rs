@@ -309,8 +309,7 @@ pub async fn resolve_seal_key_servers(
         }
     }
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
 
     let v1_key_bcs = bcs::to_bytes(&1u64).unwrap();
     let v2_key_bcs = bcs::to_bytes(&2u64).unwrap();
@@ -441,8 +440,7 @@ pub async fn fetch_seal_encrypt_identity(
         .parse()
         .map_err(|e| format!("invalid package_id '{immutable_package_id}': {e}"))?;
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
 
     let mut req = GetObjectRequest::default();
     req.object_id = Some(account_id.to_owned());
@@ -532,8 +530,7 @@ pub async fn fetch_shared_object_versions(
         }
     }
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
 
     let mut batch_req = BatchGetObjectsRequest::default();
     for id in [account_id, registry_id] {

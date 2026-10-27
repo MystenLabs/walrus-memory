@@ -4,6 +4,9 @@
 //! Replaces `services/server/scripts/sidecar/enoki.ts`, `wallet.ts`,
 //! `address-balance.ts`, and `routes/sponsor.ts`.
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock as StdRwLock};
+
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sui_crypto::{ed25519::Ed25519PrivateKey, SuiSigner, SuiVerifier};
@@ -20,6 +23,27 @@ use uuid::Uuid;
 
 const DEFAULT_ENOKI_API_URL: &str = "https://api.enoki.mystenlabs.com";
 const DEFAULT_GAS_BUDGET: u64 = 50_000_000; // 0.05 SUI
+
+static SUI_GRPC_CLIENT_POOL: OnceLock<StdRwLock<HashMap<String, sui_rpc::Client>>> =
+    OnceLock::new();
+
+/// Returns a cloned `sui_rpc::Client` backed by a shared HTTP/2 `tonic::transport::Channel`
+/// for `grpc_url`, avoiding a fresh TCP + TLS 1.3 handshake on every RPC call.
+pub fn shared_sui_grpc_client(grpc_url: &str) -> Result<sui_rpc::Client, String> {
+    let key = grpc_url.trim();
+    let pool = SUI_GRPC_CLIENT_POOL.get_or_init(|| StdRwLock::new(HashMap::new()));
+    if let Ok(guard) = pool.read() {
+        if let Some(client) = guard.get(key) {
+            return Ok(client.clone());
+        }
+    }
+    let client = sui_rpc::Client::new(key)
+        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    if let Ok(mut guard) = pool.write() {
+        guard.insert(key.to_owned(), client.clone());
+    }
+    Ok(client)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnokiSponsorOutput {
@@ -381,8 +405,7 @@ pub async fn enoki_execute_and_verify_sponsored_transaction(
             "missing Sui gRPC URL for verifyEffects".to_owned(),
         ));
     };
-    let mut client = sui_rpc::Client::new(grpc)
-        .map_err(|e| EnokiError::Transport(format!("invalid Sui gRPC URL '{grpc}': {e}")))?;
+    let mut client = shared_sui_grpc_client(grpc).map_err(EnokiError::Transport)?;
     let tx_digest = if executed.digest.is_empty() {
         digest
     } else {
@@ -680,8 +703,7 @@ pub async fn fetch_executed_transaction_outcome(
     digest: &str,
     used_enoki: bool,
 ) -> Result<WalletTxOutcome, String> {
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = shared_sui_grpc_client(grpc_url)?;
     let parsed_digest: Digest = digest
         .parse()
         .map_err(|e| format!("invalid transaction digest '{digest}': {e}"))?;
@@ -740,17 +762,22 @@ pub async fn execute_ptb_with_address_balance(
     let key = parse_sui_private_key(raw_private_key)?;
     let sender: Address = key.public_key().derive_address();
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = shared_sui_grpc_client(grpc_url)?;
+    let mut epoch_client = client.clone();
+    let mut info_client = client.clone();
+    let mut epoch_ledger = epoch_client.ledger_client();
+    let mut info_ledger = info_client.ledger_client();
 
-    // Fetch current epoch + reference gas price from GetEpoch, and chain identifier from GetServiceInfo.
-    let epoch_resp = client
-        .ledger_client()
-        .get_epoch(
+    // Fetch current epoch + reference gas price from GetEpoch and chain identifier from GetServiceInfo concurrently.
+    let (epoch_res, info_res) = tokio::join!(
+        epoch_ledger.get_epoch(
             GetEpochRequest::latest()
                 .with_read_mask(FieldMask::from_paths(["epoch", "reference_gas_price"])),
-        )
-        .await
+        ),
+        info_ledger.get_service_info(GetServiceInfoRequest::default()),
+    );
+
+    let epoch_resp = epoch_res
         .map_err(|e| format!("GetEpoch gRPC failed: {e}"))?
         .into_inner();
     let epoch_info = epoch_resp
@@ -759,10 +786,7 @@ pub async fn execute_ptb_with_address_balance(
     let current_epoch = epoch_info.epoch.unwrap_or(0);
     let gas_price = epoch_info.reference_gas_price.unwrap_or(1_000).max(1);
 
-    let service_info = client
-        .ledger_client()
-        .get_service_info(GetServiceInfoRequest::default())
-        .await
+    let service_info = info_res
         .map_err(|e| format!("GetServiceInfo gRPC failed: {e}"))?
         .into_inner();
     let chain_id_str = service_info

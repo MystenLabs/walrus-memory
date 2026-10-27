@@ -41,7 +41,7 @@ use crate::storage::walrus::{
     UploadJournal, UploadResult,
 };
 use crate::sui::enoki::{
-    derive_sui_address, parse_sui_private_key, submit_wallet_ptb,
+    derive_sui_address, parse_sui_private_key, shared_sui_grpc_client, submit_wallet_ptb,
     submit_wallet_ptb_with_allowed_addresses, WalletTxOutcome,
 };
 use crate::types::{AppError, Config};
@@ -88,6 +88,7 @@ pub struct NativeRuntimeConfig {
 }
 
 impl NativeRuntimeConfig {
+    #[allow(dead_code)]
     pub fn from_config(config: &Config) -> Self {
         let grpc_url = config
             .sui_grpc_url
@@ -481,99 +482,106 @@ pub async fn fetch_wallet_balances_in_process() -> serde_json::Value {
     let runtime = get_native_runtime_config();
     let grpc_url = runtime.grpc_url;
     let expected_wal_type = default_wal_coin_type(&runtime.sui_network);
+    let shared_client_res = shared_sui_grpc_client(&grpc_url);
 
-    let mut entries = Vec::with_capacity(runtime.sui_private_keys.len());
-    for (index, raw_key) in runtime.sui_private_keys.iter().enumerate() {
-        let address = match derive_sui_address(raw_key) {
-            Ok(addr) => addr,
-            Err(err) => {
-                entries.push(NativeWalletBalanceEntry {
-                    wallet_index: index,
-                    address: "invalid-key".to_owned(),
-                    sui_mist: "0".to_owned(),
-                    wal_frost: "0".to_owned(),
-                    sui_coin_balance_mist: "0".to_owned(),
-                    sui_address_balance_mist: "0".to_owned(),
-                    wal_coin_balance_frost: "0".to_owned(),
-                    wal_address_balance_frost: "0".to_owned(),
-                    error: Some(err),
-                });
-                continue;
-            }
-        };
+    let balance_futures =
+        runtime
+            .sui_private_keys
+            .iter()
+            .enumerate()
+            .map(|(index, raw_key)| {
+                let client_res = shared_client_res.clone();
+                let expected_wal = expected_wal_type.clone();
+                async move {
+                    let address = match derive_sui_address(raw_key) {
+                        Ok(addr) => addr,
+                        Err(err) => {
+                            return NativeWalletBalanceEntry {
+                                wallet_index: index,
+                                address: "invalid-key".to_owned(),
+                                sui_mist: "0".to_owned(),
+                                wal_frost: "0".to_owned(),
+                                sui_coin_balance_mist: "0".to_owned(),
+                                sui_address_balance_mist: "0".to_owned(),
+                                wal_coin_balance_frost: "0".to_owned(),
+                                wal_address_balance_frost: "0".to_owned(),
+                                error: Some(err),
+                            };
+                        }
+                    };
 
-        let mut client = match sui_rpc::Client::new(&grpc_url) {
-            Ok(c) => c,
-            Err(err) => {
-                entries.push(NativeWalletBalanceEntry {
-                    wallet_index: index,
-                    address,
-                    sui_mist: "0".to_owned(),
-                    wal_frost: "0".to_owned(),
-                    sui_coin_balance_mist: "0".to_owned(),
-                    sui_address_balance_mist: "0".to_owned(),
-                    wal_coin_balance_frost: "0".to_owned(),
-                    wal_address_balance_frost: "0".to_owned(),
-                    error: Some(err.to_string()),
-                });
-                continue;
-            }
-        };
+                    let mut client = match client_res {
+                        Ok(c) => c,
+                        Err(err) => {
+                            return NativeWalletBalanceEntry {
+                                wallet_index: index,
+                                address,
+                                sui_mist: "0".to_owned(),
+                                wal_frost: "0".to_owned(),
+                                sui_coin_balance_mist: "0".to_owned(),
+                                sui_address_balance_mist: "0".to_owned(),
+                                wal_coin_balance_frost: "0".to_owned(),
+                                wal_address_balance_frost: "0".to_owned(),
+                                error: Some(err),
+                            };
+                        }
+                    };
 
-        let mut req = ListBalancesRequest::default();
-        req.owner = Some(address.clone());
-        match client.state_client().list_balances(req).await {
-            Ok(resp) => {
-                let balances = resp.into_inner().balances;
-                let mut sui_total: u64 = 0;
-                let mut sui_coin: u64 = 0;
-                let mut sui_addr: u64 = 0;
-                let mut wal_total: u64 = 0;
-                let mut wal_coin: u64 = 0;
-                let mut wal_addr: u64 = 0;
+                    let mut req = ListBalancesRequest::default();
+                    req.owner = Some(address.clone());
+                    match client.state_client().list_balances(req).await {
+                        Ok(resp) => {
+                            let balances = resp.into_inner().balances;
+                            let mut sui_total: u64 = 0;
+                            let mut sui_coin: u64 = 0;
+                            let mut sui_addr: u64 = 0;
+                            let mut wal_total: u64 = 0;
+                            let mut wal_coin: u64 = 0;
+                            let mut wal_addr: u64 = 0;
 
-                for bal in balances {
-                    let ct = bal.coin_type.as_deref().unwrap_or_default();
-                    if ct == SUI_COIN_TYPE
-                        || (ct.ends_with("::sui::SUI") && ct.starts_with("0x00000000"))
-                    {
-                        sui_total = bal.balance.unwrap_or(0);
-                        sui_coin = bal.coin_balance.unwrap_or(0);
-                        sui_addr = bal.address_balance.unwrap_or(0);
-                    } else if ct == expected_wal_type || ct.ends_with("::wal::WAL") {
-                        wal_total = bal.balance.unwrap_or(0);
-                        wal_coin = bal.coin_balance.unwrap_or(0);
-                        wal_addr = bal.address_balance.unwrap_or(0);
+                            for bal in balances {
+                                let ct = bal.coin_type.as_deref().unwrap_or_default();
+                                if ct == SUI_COIN_TYPE
+                                    || (ct.ends_with("::sui::SUI") && ct.starts_with("0x00000000"))
+                                {
+                                    sui_total = bal.balance.unwrap_or(0);
+                                    sui_coin = bal.coin_balance.unwrap_or(0);
+                                    sui_addr = bal.address_balance.unwrap_or(0);
+                                } else if ct == expected_wal || ct.ends_with("::wal::WAL") {
+                                    wal_total = bal.balance.unwrap_or(0);
+                                    wal_coin = bal.coin_balance.unwrap_or(0);
+                                    wal_addr = bal.address_balance.unwrap_or(0);
+                                }
+                            }
+
+                            NativeWalletBalanceEntry {
+                                wallet_index: index,
+                                address,
+                                sui_mist: sui_total.to_string(),
+                                wal_frost: wal_total.to_string(),
+                                sui_coin_balance_mist: sui_coin.to_string(),
+                                sui_address_balance_mist: sui_addr.to_string(),
+                                wal_coin_balance_frost: wal_coin.to_string(),
+                                wal_address_balance_frost: wal_addr.to_string(),
+                                error: None,
+                            }
+                        }
+                        Err(err) => NativeWalletBalanceEntry {
+                            wallet_index: index,
+                            address,
+                            sui_mist: "0".to_owned(),
+                            wal_frost: "0".to_owned(),
+                            sui_coin_balance_mist: "0".to_owned(),
+                            sui_address_balance_mist: "0".to_owned(),
+                            wal_coin_balance_frost: "0".to_owned(),
+                            wal_address_balance_frost: "0".to_owned(),
+                            error: Some(err.to_string()),
+                        },
                     }
                 }
+            });
 
-                entries.push(NativeWalletBalanceEntry {
-                    wallet_index: index,
-                    address,
-                    sui_mist: sui_total.to_string(),
-                    wal_frost: wal_total.to_string(),
-                    sui_coin_balance_mist: sui_coin.to_string(),
-                    sui_address_balance_mist: sui_addr.to_string(),
-                    wal_coin_balance_frost: wal_coin.to_string(),
-                    wal_address_balance_frost: wal_addr.to_string(),
-                    error: None,
-                });
-            }
-            Err(err) => {
-                entries.push(NativeWalletBalanceEntry {
-                    wallet_index: index,
-                    address,
-                    sui_mist: "0".to_owned(),
-                    wal_frost: "0".to_owned(),
-                    sui_coin_balance_mist: "0".to_owned(),
-                    sui_address_balance_mist: "0".to_owned(),
-                    wal_coin_balance_frost: "0".to_owned(),
-                    wal_address_balance_frost: "0".to_owned(),
-                    error: Some(err.to_string()),
-                });
-            }
-        }
-    }
+    let entries = futures::future::join_all(balance_futures).await;
 
     serde_json::json!({
         "perWallet": entries,
@@ -680,8 +688,7 @@ pub async fn resolve_walrus_system_snapshot(
         .parse()
         .map_err(|e| format!("invalid Walrus system object ID '{system_id_str}': {e}"))?;
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = shared_sui_grpc_client(grpc_url)?;
 
     let mut sys_req = GetObjectRequest::default();
     sys_req.object_id = Some(system_id_str.clone());
@@ -958,13 +965,27 @@ async fn select_owned_wal_coins(
     owner: &str,
     wal_coin_type: &str,
 ) -> Result<(u64, Vec<(Address, u64, Digest)>), String> {
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut bal_client = shared_sui_grpc_client(grpc_url)?;
+    let mut obj_client = bal_client.clone();
+    let mut bal_state = bal_client.state_client();
+    let mut obj_state = obj_client.state_client();
 
     let mut bal_req = ListBalancesRequest::default();
     bal_req.owner = Some(owner.to_owned());
+
+    let mut req = ListOwnedObjectsRequest::default();
+    req.owner = Some(owner.to_owned());
+    req.page_size = Some(100);
+    req.object_type = Some(format!("0x2::coin::Coin<{wal_coin_type}>"));
+    req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
+
+    let (bal_res, obj_res) = tokio::join!(
+        bal_state.list_balances(bal_req),
+        obj_state.list_owned_objects(req),
+    );
+
     let mut address_wal: u64 = 0;
-    if let Ok(resp) = client.state_client().list_balances(bal_req).await {
+    if let Ok(resp) = bal_res {
         for bal in resp.into_inner().balances {
             let ct = bal.coin_type.as_deref().unwrap_or_default();
             if ct == wal_coin_type || ct.ends_with("::wal::WAL") {
@@ -974,14 +995,8 @@ async fn select_owned_wal_coins(
         }
     }
 
-    let mut req = ListOwnedObjectsRequest::default();
-    req.owner = Some(owner.to_owned());
-    req.page_size = Some(100);
-    req.object_type = Some(format!("0x2::coin::Coin<{wal_coin_type}>"));
-    req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
-
     let mut coins = Vec::new();
-    if let Ok(resp) = client.state_client().list_owned_objects(req).await {
+    if let Ok(resp) = obj_res {
         for obj in resp.into_inner().objects {
             if let (Some(id_str), Some(version), Some(digest_str)) =
                 (obj.object_id, obj.version, obj.digest)
@@ -1216,8 +1231,7 @@ async fn resolve_owned_object_ref(
     let addr: Address = object_id_str
         .parse()
         .map_err(|e| format!("invalid object ID '{object_id_str}': {e}"))?;
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let mut client = shared_sui_grpc_client(grpc_url)?;
     let mut req = GetObjectRequest::default();
     req.object_id = Some(object_id_str.to_owned());
     req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
@@ -1314,35 +1328,10 @@ async fn append_seal_persistence_fence(
         .parse()
         .map_err(|e| format!("invalid account_id '{account_id}': {e}"))?;
 
-    let mut client = sui_rpc::Client::new(grpc_url)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
-    let mut batch_req = BatchGetObjectsRequest::default();
-    for id in [registry_id, account_id] {
-        let mut r = GetObjectRequest::default();
-        r.object_id = Some(id.to_owned());
-        batch_req.requests.push(r);
-    }
-    batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "owner"]));
-    let resp = client
-        .ledger_client()
-        .batch_get_objects(batch_req)
-        .await
-        .map_err(|e| format!("BatchGetObjects for seal_encrypt_fence failed: {e}"))?
-        .into_inner();
-
-    let extract_ver = |idx: usize| -> u64 {
-        resp.objects
-            .get(idx)
-            .and_then(|r| match &r.result {
-                Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(o)) => {
-                    o.owner.as_ref().and_then(|ow| ow.version)
-                }
-                _ => None,
-            })
-            .unwrap_or(1)
-    };
-    let reg_ver = extract_ver(0);
-    let acct_ver = extract_ver(1);
+    let (acct_ver, reg_ver) =
+        crate::storage::seal_native::fetch_shared_object_versions(grpc_url, account_id, registry_id)
+            .await
+            .unwrap_or((1, 1));
 
     let id_arg = builder.pure(&enc_obj.id);
     let reg_arg = builder.object(ObjectInput::shared(reg_addr, reg_ver, false));
@@ -2078,8 +2067,8 @@ pub async fn query_blobs_by_owner_in_process(
     limit: Option<usize>,
 ) -> Result<(Vec<OnChainBlob>, bool), AppError> {
     let runtime = get_native_runtime_config();
-    let mut client = sui_rpc::Client::new(&runtime.grpc_url)
-        .map_err(|e| AppError::UpstreamUnavailable(format!("invalid Sui gRPC URL: {e}")))?;
+    let mut client = shared_sui_grpc_client(&runtime.grpc_url)
+        .map_err(AppError::UpstreamUnavailable)?;
 
     let canonical_owner = owner_address
         .trim()
@@ -2185,7 +2174,7 @@ pub async fn query_blobs_by_owner_in_process(
             if let Ok(batch_resp) = client.ledger_client().batch_get_objects(batch_req).await {
                 for (object_id, obj_res) in chunk_obj_ids
                     .into_iter()
-                    .zip(batch_resp.into_inner().objects.into_iter())
+                    .zip(batch_resp.into_inner().objects)
                 {
                     if let Some(
                         sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(obj),
@@ -2259,8 +2248,7 @@ pub async fn query_blob_storage_leases_in_process(
         });
     }
 
-    let mut client = sui_rpc::Client::new(&runtime.grpc_url)
-        .map_err(|e| AppError::Internal(format!("invalid Sui gRPC URL: {e}")))?;
+    let mut client = shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
 
     let requested: std::collections::HashSet<&str> = blob_ids.iter().map(String::as_str).collect();
     let mut found = Vec::new();
@@ -2333,8 +2321,7 @@ pub async fn find_blob_by_job_in_process(
         .map_err(|e| AppError::BadRequest(format!("invalid owner address '{owner}': {e}")))?;
     let user_owner = user_owner_addr.to_string();
 
-    let mut client = sui_rpc::Client::new(&runtime.grpc_url)
-        .map_err(|e| AppError::Internal(format!("invalid Sui gRPC URL: {e}")))?;
+    let mut client = shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
 
     // Scan server pool wallets first (where a not-yet-transferred blob lives) AND
     // the user (where a transferred-but-unrecorded blob lives), matching `findBlobObjectByJob`
