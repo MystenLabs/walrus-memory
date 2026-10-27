@@ -1,5 +1,39 @@
-import { describe, expect, it } from 'vitest'
-import { SponsorHttpError, sponsorFailureMessage } from './useSponsoredTransaction'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { assertRelayerPackageId, relayerPackageMismatch, SponsorHttpError, sponsorFailureMessage } from './useSponsoredTransaction'
+
+describe('relayerPackageMismatch', () => {
+    it('accepts the same package id ignoring case', () => {
+        expect(relayerPackageMismatch('0xAbC', { packageId: '0xabc' })).toBeNull()
+    })
+
+    it('names both ids when they differ', () => {
+        const message = relayerPackageMismatch('0xlocal', { packageId: '0xremote' })
+        expect(message).toContain('0xlocal')
+        expect(message).toContain('0xremote')
+    })
+
+    it('rejects a config body without packageId', () => {
+        expect(relayerPackageMismatch('0xlocal', {})).toMatch(/packageId/)
+        expect(relayerPackageMismatch('0xlocal', null)).toMatch(/packageId/)
+    })
+})
+
+describe('assertRelayerPackageId', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals()
+    })
+
+    it('throws before a transaction would be built when the package differs', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ packageId: '0xremote' }), { status: 200 })))
+        await expect(assertRelayerPackageId('http://relayer.test/', '0xlocal')).rejects.toThrow(/0xremote/)
+        expect(fetch).toHaveBeenCalledWith('http://relayer.test/config')
+    })
+
+    it('throws when /config is not OK', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 503 })))
+        await expect(assertRelayerPackageId('http://relayer.test', '0xlocal')).rejects.toThrow(/503/)
+    })
+})
 
 describe('SponsorHttpError', () => {
     it('parses the relayer error envelope', () => {

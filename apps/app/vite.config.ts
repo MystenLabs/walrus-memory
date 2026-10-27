@@ -5,6 +5,7 @@ import type { HtmlTagDescriptor, Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import wasm from 'vite-plugin-wasm'
 import topLevelAwait from 'vite-plugin-top-level-await'
+import { requiredMemwalIds } from './src/requiredMemwalIds'
 
 /** Dev-server-only wallet injection used by the manual testnet launcher.
  * The private key is a Node-side variable and this plugin is absent unless
@@ -49,6 +50,8 @@ export function devWalletInjector(env: Record<string, string>): Plugin | null {
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
+  // Dev and production builds must not start when these ids are unset.
+  requiredMemwalIds(env)
 
   const devWalletPlugin = devWalletInjector(env)
 
