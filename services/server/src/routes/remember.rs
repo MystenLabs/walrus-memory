@@ -111,6 +111,47 @@ fn redact_hex_addresses(msg: &str) -> String {
     out
 }
 
+fn is_upstream_inference_job_error(msg: &str) -> bool {
+    msg.starts_with("Embedding Provider Unavailable:")
+        || msg.starts_with("Upstream Unavailable: Embedding API")
+        || msg.starts_with("Internal Error: Embedding API")
+        || msg.starts_with("Upstream Unavailable: Summarization API")
+        || msg.starts_with("Internal Error: Summarization API")
+        || msg.starts_with("Upstream Unavailable: Failed to parse embedding response")
+        || msg.starts_with("Upstream Unavailable: Embedding response contained no vectors")
+        || msg.starts_with("Upstream Unavailable: Failed to parse summarization response")
+        || msg.starts_with("Upstream Unavailable: Summarization returned empty result")
+        || msg.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE)
+}
+
+fn format_embedding_provider_unavailable_job_error() -> String {
+    let trace_id = crate::observability::current_request_id()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    format!(
+        "Embedding provider temporarily unavailable (code={}, traceId={}). The memory was not stored; retry shortly.",
+        EMBEDDING_PROVIDER_UNAVAILABLE_CODE, trace_id
+    )
+}
+
+fn format_remember_preparation_error(err: &AppError) -> String {
+    match err {
+        AppError::EmbeddingProviderUnavailable(_) => {
+            format_embedding_provider_unavailable_job_error()
+        }
+        AppError::UpstreamUnavailable(detail)
+            if detail.starts_with("Embedding API")
+                || detail.starts_with("Summarization API")
+                || detail.starts_with("Failed to parse embedding response")
+                || detail.starts_with("Embedding response contained no vectors")
+                || detail.starts_with("Failed to parse summarization response")
+                || detail.starts_with("Summarization returned empty result") =>
+        {
+            format_embedding_provider_unavailable_job_error()
+        }
+        _ => err.to_string(),
+    }
+}
+
 /// Map a stored `error_msg` to what the caller should see, given the job's
 /// current `status`. Infrastructure failures collapse to fixed copy, chosen by
 /// whether the job has stopped retrying. Everything else keeps its text with
@@ -126,6 +167,15 @@ pub(crate) fn sanitize_job_error_for_client(
         } else {
             INFRA_JOB_RETRYING_MESSAGE.to_string()
         });
+    }
+    if is_upstream_inference_job_error(&msg) {
+        if msg.contains("traceId=")
+            && !msg.contains("Embedding API")
+            && !msg.contains("Summarization API")
+        {
+            return Some(msg);
+        }
+        return Some(format_embedding_provider_unavailable_job_error());
     }
     Some(redact_hex_addresses(&msg))
 }
@@ -296,14 +346,20 @@ fn spawn_prepare_remember_job(
             .await;
 
             if let Err(e) = result {
-                let msg = e.to_string();
-                tracing::error!("remember preparation failed: job_id={} {}", job_id, msg);
+                let raw_msg = e.to_string();
+                let client_msg = format_remember_preparation_error(&e);
+                tracing::error!("remember preparation failed: job_id={} {}", job_id, raw_msg);
                 // The job never reached the queue, so nothing downstream will
                 // release its reservation. No-op when the failure was the
                 // quota rejection itself (nothing was reserved).
                 rate_limit::release_storage_quota_one(&state, &job_id).await;
-                mark_remember_job_failed(&state, &job_id, prepare_claim_token.as_deref(), &msg)
-                    .await;
+                mark_remember_job_failed(
+                    &state,
+                    &job_id,
+                    prepare_claim_token.as_deref(),
+                    &client_msg,
+                )
+                .await;
             }
         };
 
@@ -456,12 +512,13 @@ fn spawn_prepare_bulk_remember_job(
             .await;
 
             if let Err(e) = result {
-                let msg = e.to_string();
-                tracing::error!("remember_bulk preparation failed: {}", msg);
+                let raw_msg = e.to_string();
+                let client_msg = format_remember_preparation_error(&e);
+                tracing::error!("remember_bulk preparation failed: {}", raw_msg);
                 // Same reasoning as the single path: nothing downstream will
                 // release these, because the batch never reached the queue.
                 rate_limit::release_storage_quota(&state, &job_ids).await;
-                mark_remember_jobs_failed(&state, &job_ids, &msg).await;
+                mark_remember_jobs_failed(&state, &job_ids, &client_msg).await;
             }
         };
 
@@ -580,7 +637,7 @@ async fn summarize_with_prompt(
             "transport_error",
             started.elapsed(),
         );
-        AppError::Internal(format!("Summarization API request failed: {}", e))
+        AppError::EmbeddingProviderUnavailable(format!("Summarization API request failed: {}", e))
     })?;
     let status_label = resp.status().as_u16().to_string();
     crate::observability::observe_external(
@@ -593,6 +650,18 @@ async fn summarize_with_prompt(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::PAYMENT_REQUIRED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            return Err(AppError::EmbeddingProviderUnavailable(format!(
+                "Summarization API upstream error ({}): {}",
+                status, body
+            )));
+        }
         return Err(AppError::Internal(format!(
             "Summarization API error ({}): {}",
             status, body
@@ -600,7 +669,7 @@ async fn summarize_with_prompt(
     }
 
     let api_resp: ChatCompletionResponse = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("Failed to parse summarization response: {}", e))
+        AppError::EmbeddingProviderUnavailable(format!("Failed to parse summarization response: {}", e))
     })?;
 
     // `content` is `Option<String>` — `None` on upstream null-content
@@ -614,7 +683,7 @@ async fn summarize_with_prompt(
         .unwrap_or_default();
 
     if summary.is_empty() {
-        return Err(AppError::Internal(
+        return Err(AppError::EmbeddingProviderUnavailable(
             "Summarization returned empty result".into(),
         ));
     }
@@ -1443,7 +1512,9 @@ pub async fn remember_bulk(
 
         if inserted.rows_affected() == 0 {
             let existing = match item_key.as_deref() {
-                Some(key) => find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?,
+                Some(key) => {
+                    find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?
+                }
                 None => None,
             };
             let (existing_id, _, _, existing_fingerprint) = existing.ok_or_else(|| {
@@ -2119,7 +2190,9 @@ mod tests {
         .unwrap();
 
         // Lookup now finds it (this is what a retry hits → collapse, no new write).
-        let found = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let found = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             found,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2143,7 +2216,9 @@ mod tests {
         );
 
         // Original row is still the one that survives.
-        let still = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let still = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             still,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2196,7 +2271,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(insert_b.rows_affected(), 1, "same key in different namespace must succeed");
+        assert_eq!(
+            insert_b.rows_affected(),
+            1,
+            "same key in different namespace must succeed"
+        );
 
         // 3. Retry within ns-a collides and collapses (insert DO NOTHING).
         let retry_a = sqlx::query(
@@ -2210,13 +2289,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(retry_a.rows_affected(), 0, "retry within namespace must collapse");
+        assert_eq!(
+            retry_a.rows_affected(),
+            0,
+            "retry within namespace must collapse"
+        );
 
         // 4. Lookup returns the respective job per namespace.
-        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key).await.unwrap();
+        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key)
+            .await
+            .unwrap();
         assert_eq!(found_a.unwrap().0, job_a);
 
-        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key).await.unwrap();
+        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key)
+            .await
+            .unwrap();
         assert_eq!(found_b.unwrap().0, job_b);
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
@@ -2423,10 +2510,11 @@ mod tests {
 
         // Retry #2 while that restart is in flight: same row, no new claim, and
         // the insert path cannot mint a second job for the key.
-        let (again_id, again_status, again_blob, _) = find_remember_job_by_key(&pool, &owner, "ns", key)
-            .await
-            .unwrap()
-            .unwrap();
+        let (again_id, again_status, again_blob, _) =
+            find_remember_job_by_key(&pool, &owner, "ns", key)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(again_id, job_id);
         assert_eq!(
             existing_job_action(&again_status, again_blob.is_some()),
@@ -2867,5 +2955,53 @@ mod tests {
             sanitize_job_error_for_client("failed", Some(GAS_SELECTION_ERR.to_string())).unwrap(),
             INFRA_JOB_ERROR_MESSAGE
         );
+    }
+
+    #[test]
+    fn remember_job_embedder_failure_sanitizes_provider_response_text() {
+        use super::format_remember_preparation_error;
+        use crate::types::EMBEDDING_PROVIDER_UNAVAILABLE_CODE;
+
+        let err = AppError::EmbeddingProviderUnavailable(
+            r#"Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#
+                .to_string(),
+        );
+        let stored = format_remember_preparation_error(&err);
+        assert!(
+            stored.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE),
+            "stored={}",
+            stored
+        );
+        assert!(stored.contains("traceId="), "stored={}", stored);
+        assert!(!stored.contains("User not found"), "stored={}", stored);
+        assert!(!stored.contains("401 Unauthorized"), "stored={}", stored);
+
+        let sanitized = sanitize_job_error_for_client("failed", Some(stored.clone()))
+            .expect("failed job keeps sanitized error");
+        assert_eq!(sanitized, stored);
+        assert!(!sanitized.contains("User not found"));
+
+        // Also verify pre-existing or raw DB error strings are sanitized on read.
+        for raw in [
+            r#"Upstream Unavailable: Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#,
+            r#"Internal Error: Embedding API error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#,
+            r#"Upstream Unavailable: Summarization API upstream error (402 Payment Required): {"error":{"message":"Insufficient credits","code":402}}"#,
+        ] {
+            let client_out = sanitize_job_error_for_client("failed", Some(raw.to_string()))
+                .expect("failed job keeps sanitized error");
+            assert!(
+                client_out.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE),
+                "raw={raw} -> {client_out}"
+            );
+            assert!(client_out.contains("traceId="), "raw={raw} -> {client_out}");
+            assert!(
+                !client_out.contains("User not found"),
+                "raw={raw} -> {client_out}"
+            );
+            assert!(
+                !client_out.contains("Insufficient credits"),
+                "raw={raw} -> {client_out}"
+            );
+        }
     }
 }
