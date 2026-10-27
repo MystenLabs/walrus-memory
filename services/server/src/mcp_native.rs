@@ -32,6 +32,18 @@ pub struct McpNativeSession {
     pub sse_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
+/// Custom `Debug` implementation that redacts `delegate_key_hex` so session secrets
+/// are never leaked to logs (`M-PUBLIC-DEBUG` / `C-DEBUG`).
+impl std::fmt::Debug for McpNativeSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpNativeSession")
+            .field("delegate_key_hex", &"[REDACTED]")
+            .field("account_id", &self.account_id)
+            .field("default_namespace", &self.default_namespace)
+            .finish_non_exhaustive()
+    }
+}
+
 static MCP_NATIVE_SESSIONS: LazyLock<RwLock<HashMap<String, McpNativeSession>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -1171,5 +1183,30 @@ mod tests {
         );
         assert_eq!(extract_header_str(&headers, "x-empty"), None);
         assert_eq!(extract_header_str(&headers, "x-missing"), None);
+    }
+
+    #[test]
+    fn mcp_native_session_debug_redacts_delegate_key() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = McpNativeSession {
+            delegate_key_hex: "deadbeef0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c"
+                .to_owned(),
+            account_id: "0xabc".to_owned(),
+            default_namespace: "default".to_owned(),
+            oauth_scope: "memwal:read memwal:write".to_owned(),
+            sse_tx: Some(tx),
+        };
+        let dbg = format!("{session:?}");
+        assert!(
+            !dbg.contains("deadbeef"),
+            "Debug output must redact delegate_key_hex: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<McpNativeSession>();
     }
 }
