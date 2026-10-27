@@ -28,7 +28,8 @@ pub struct McpNativeSession {
     pub delegate_key_hex: String,
     pub account_id: String,
     pub default_namespace: String,
-    pub sse_tx: mpsc::UnboundedSender<String>,
+    pub oauth_scope: String,
+    pub sse_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 static MCP_NATIVE_SESSIONS: LazyLock<RwLock<HashMap<String, McpNativeSession>>> =
@@ -45,10 +46,55 @@ fn extract_header_str(headers: &req_headers::HeaderMap, name: &str) -> Option<St
 
 use reqwest::header as req_headers;
 
+/// Fail-closed OAuth scope parser matching `registerTools` in `services/server/scripts/mcp/tools/index.ts`.
+///
+/// The relayer states the granted scope explicitly on every forwarded request via
+/// `x-memwal-internal-oauth-scope` — the resolved grant for OAuth callers, and
+/// `"memwal:read memwal:write"` for legacy delegate-key callers. An absent or empty
+/// scope grants neither read nor write tools.
+pub fn parse_granted_oauth_scopes(oauth_scope: &str) -> (bool, bool) {
+    let mut can_read = false;
+    let mut can_write = false;
+    for token in oauth_scope.split_whitespace() {
+        match token {
+            "memwal:read" => can_read = true,
+            "memwal:write" => can_write = true,
+            _ => {}
+        }
+    }
+    (can_read, can_write)
+}
+
+pub fn is_mcp_tool_permitted(tool_name: &str, oauth_scope: &str) -> bool {
+    let (can_read, can_write) = parse_granted_oauth_scopes(oauth_scope);
+    match tool_name {
+        "memwal_health" | "memwal_recall" => can_read,
+        "memwal_remember"
+        | "memwal_remember_status"
+        | "memwal_remember_bulk"
+        | "memwal_analyze"
+        | "memwal_restore" => can_write,
+        _ => false,
+    }
+}
+
+fn is_known_mcp_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "memwal_health"
+            | "memwal_recall"
+            | "memwal_remember"
+            | "memwal_remember_status"
+            | "memwal_remember_bulk"
+            | "memwal_analyze"
+            | "memwal_restore"
+    )
+}
+
 fn resolve_session_credentials(
     state: &AppState,
     forwarded: &req_headers::HeaderMap,
-) -> Result<(String, String, String), (StatusCode, &'static str)> {
+) -> Result<(String, String, String, String), (StatusCode, &'static str)> {
     let bearer_key = extract_header_str(forwarded, "authorization")
         .and_then(|auth| {
             auth.strip_prefix("Bearer ")
@@ -87,7 +133,12 @@ fn resolve_session_credentials(
     let default_namespace =
         extract_header_str(forwarded, "x-memwal-namespace").unwrap_or_else(|| "default".to_owned());
 
-    Ok((delegate_key_hex, account_id, default_namespace))
+    // Fail closed: only trust the explicit `x-memwal-internal-oauth-scope` header injected
+    // by `mcp_proxy::apply_internal_headers` after stripping any client-supplied copy.
+    let oauth_scope =
+        extract_header_str(forwarded, "x-memwal-internal-oauth-scope").unwrap_or_default();
+
+    Ok((delegate_key_hex, account_id, default_namespace, oauth_scope))
 }
 
 /// Sign and execute a loopback HTTP request against the local `memwal-server` REST API
@@ -120,9 +171,8 @@ async fn call_local_relayer(
     let nonce = uuid::Uuid::new_v4().to_string();
     let method_str = method.as_str();
 
-    let canonical = format!(
-        "{timestamp}.{method_str}.{path_and_query}.{body_sha256}.{nonce}.{account_id}"
-    );
+    let canonical =
+        format!("{timestamp}.{method_str}.{path_and_query}.{body_sha256}.{nonce}.{account_id}");
     let signature = signing_key.sign(canonical.as_bytes());
     let signature_hex = hex::encode(signature.to_bytes());
 
@@ -157,8 +207,8 @@ async fn call_local_relayer(
         .send()
         .await
         .map_err(|e| format!("relayer loopback request failed: {e}"))?;
-    let status = StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let text = resp
         .text()
         .await
@@ -167,99 +217,108 @@ async fn call_local_relayer(
     Ok((status, parsed))
 }
 
-fn mcp_tools_list() -> Value {
-    json!({
-        "tools": [
-            {
-                "name": "memwal_health",
-                "description": "Quick connectivity check for Walrus Memory. Calls the relayer's lightweight health endpoint and returns its status and version.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "memwal_remember",
-                "description": "Save a durable fact about the user or project to their Walrus Memory.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string", "description": "The full, detailed fact to save." },
-                        "namespace": { "type": "string", "description": "Optional namespace bucket." }
-                    },
-                    "required": ["text"]
-                }
-            },
-            {
-                "name": "memwal_remember_status",
-                "description": "Check the status of a background memwal_remember job by job_id.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "job_id": { "type": "string", "description": "Job ID returned by memwal_remember." },
-                        "waitMs": { "type": "number", "description": "Optional poll wait budget in ms." }
-                    },
-                    "required": ["job_id"]
-                }
-            },
-            {
-                "name": "memwal_remember_bulk",
-                "description": "Save multiple durable facts in a single batch.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
+fn mcp_tools_list(oauth_scope: &str) -> Value {
+    let all_tools = vec![
+        json!({
+            "name": "memwal_health",
+            "description": "Quick connectivity check for Walrus Memory. Calls the relayer's lightweight health endpoint and returns its status and version.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "memwal_remember",
+            "description": "Save a durable fact about the user or project to their Walrus Memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The full, detailed fact to save." },
+                    "namespace": { "type": "string", "description": "Optional namespace bucket." }
+                },
+                "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "memwal_remember_status",
+            "description": "Check the status of a background memwal_remember job by job_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job ID returned by memwal_remember." },
+                    "waitMs": { "type": "number", "description": "Optional poll wait budget in ms." }
+                },
+                "required": ["job_id"]
+            }
+        }),
+        json!({
+            "name": "memwal_remember_bulk",
+            "description": "Save multiple durable facts in a single batch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
                         "items": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": { "text": { "type": "string" } },
-                                "required": ["text"]
-                            }
-                        },
-                        "namespace": { "type": "string" }
+                            "type": "object",
+                            "properties": { "text": { "type": "string" } },
+                            "required": ["text"]
+                        }
                     },
-                    "required": ["items"]
-                }
-            },
-            {
-                "name": "memwal_recall",
-                "description": "Search the user's Walrus Memory for relevant facts.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "Natural-language search query." },
-                        "limit": { "type": "number", "description": "Max number of memories to return (1-100)." },
-                        "namespace": { "type": "string", "description": "Optional namespace bucket." },
-                        "maxDistance": { "type": "number", "description": "Optional cosine-distance cutoff." }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "memwal_analyze",
-                "description": "Extract durable facts from conversation text and save them to Walrus Memory.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string", "description": "Conversation text to analyze." },
-                        "namespace": { "type": "string", "description": "Optional namespace bucket." }
-                    },
-                    "required": ["text"]
-                }
-            },
-            {
-                "name": "memwal_restore",
-                "description": "Rebuild the vector search index for a namespace from on-chain Walrus blobs.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "namespace": { "type": "string", "description": "Optional namespace bucket." },
-                        "limit": { "type": "number", "description": "Max blobs to restore." }
-                    }
+                    "namespace": { "type": "string" }
+                },
+                "required": ["items"]
+            }
+        }),
+        json!({
+            "name": "memwal_recall",
+            "description": "Search the user's Walrus Memory for relevant facts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural-language search query." },
+                    "limit": { "type": "number", "description": "Max number of memories to return (1-100)." },
+                    "namespace": { "type": "string", "description": "Optional namespace bucket." },
+                    "maxDistance": { "type": "number", "description": "Optional cosine-distance cutoff." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "memwal_analyze",
+            "description": "Extract durable facts from conversation text and save them to Walrus Memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Conversation text to analyze." },
+                    "namespace": { "type": "string", "description": "Optional namespace bucket." }
+                },
+                "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "memwal_restore",
+            "description": "Rebuild the vector search index for a namespace from on-chain Walrus blobs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "namespace": { "type": "string", "description": "Optional namespace bucket." },
+                    "limit": { "type": "number", "description": "Max blobs to restore." }
                 }
             }
-        ]
-    })
+        }),
+    ];
+
+    let filtered: Vec<Value> = all_tools
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| is_mcp_tool_permitted(name, oauth_scope))
+        })
+        .collect();
+
+    json!({ "tools": filtered })
 }
 
 async fn execute_mcp_tool(
@@ -267,9 +326,19 @@ async fn execute_mcp_tool(
     delegate_key_hex: &str,
     account_id: &str,
     default_namespace: &str,
+    oauth_scope: &str,
     tool_name: &str,
     args: &Value,
 ) -> Value {
+    if is_known_mcp_tool(tool_name) && !is_mcp_tool_permitted(tool_name, oauth_scope) {
+        return json!({
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": format!("Tool {tool_name} is not permitted for the current OAuth scope")
+            }]
+        });
+    }
     match tool_name {
         "memwal_health" => {
             let url = format!("http://127.0.0.1:{}/health", state.config.port);
@@ -651,6 +720,7 @@ async fn handle_jsonrpc_envelope(
     delegate_key_hex: &str,
     account_id: &str,
     default_namespace: &str,
+    oauth_scope: &str,
     envelope: &Value,
 ) -> Option<Value> {
     let id = envelope.get("id").cloned()?;
@@ -682,7 +752,7 @@ async fn handle_jsonrpc_envelope(
             })
         }
         "ping" => json!({}),
-        "tools/list" => mcp_tools_list(),
+        "tools/list" => mcp_tools_list(oauth_scope),
         "tools/call" => {
             let tool_name = params
                 .get("name")
@@ -697,6 +767,7 @@ async fn handle_jsonrpc_envelope(
                 delegate_key_hex,
                 account_id,
                 default_namespace,
+                oauth_scope,
                 tool_name,
                 &args,
             )
@@ -725,7 +796,7 @@ pub async fn handle_sse_in_process(
     state: Arc<AppState>,
     forwarded: req_headers::HeaderMap,
 ) -> Response {
-    let (delegate_key_hex, account_id, default_namespace) =
+    let (delegate_key_hex, account_id, default_namespace, oauth_scope) =
         match resolve_session_credentials(&state, &forwarded) {
             Ok(creds) => creds,
             Err(err) => return err.into_response(),
@@ -734,14 +805,16 @@ pub async fn handle_sse_in_process(
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-    let endpoint_event = format!("event: endpoint\ndata: /api/mcp/messages?sessionId={session_id}\n\n");
+    let endpoint_event =
+        format!("event: endpoint\ndata: /api/mcp/messages?sessionId={session_id}\n\n");
     let _ = tx.send(endpoint_event);
 
     let session = McpNativeSession {
         delegate_key_hex,
         account_id,
         default_namespace,
-        sse_tx: tx.clone(),
+        oauth_scope,
+        sse_tx: Some(tx.clone()),
     };
 
     if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
@@ -786,7 +859,7 @@ pub async fn handle_sse_in_process(
 pub async fn handle_messages_in_process(
     state: Arc<AppState>,
     session_id: String,
-    _forwarded: req_headers::HeaderMap,
+    forwarded: req_headers::HeaderMap,
     body: Bytes,
 ) -> Response {
     let session = MCP_NATIVE_SESSIONS
@@ -798,10 +871,26 @@ pub async fn handle_messages_in_process(
         return (StatusCode::NOT_FOUND, "Unknown or expired MCP session").into_response();
     };
 
+    let (caller_key, caller_account, _, _) = match resolve_session_credentials(&state, &forwarded) {
+        Ok(creds) => creds,
+        Err(err) => return err.into_response(),
+    };
+
+    if caller_key != session.delegate_key_hex || caller_account != session.account_id {
+        return (
+            StatusCode::FORBIDDEN,
+            "sessionId does not match authenticated caller",
+        )
+            .into_response();
+    }
+
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON-RPC body: {e}"))
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON-RPC body: {e}"),
+            )
                 .into_response();
         }
     };
@@ -814,14 +903,15 @@ pub async fn handle_messages_in_process(
                     &session.delegate_key_hex,
                     &session.account_id,
                     &session.default_namespace,
+                    &session.oauth_scope,
                     item,
                 )
                 .await
                 {
-                    if let Ok(serialized) = serde_json::to_string(&resp) {
-                        let _ = session
-                            .sse_tx
-                            .send(format!("event: message\ndata: {serialized}\n\n"));
+                    if let (Some(tx), Ok(serialized)) =
+                        (&session.sse_tx, serde_json::to_string(&resp))
+                    {
+                        let _ = tx.send(format!("event: message\ndata: {serialized}\n\n"));
                     }
                 }
             }
@@ -830,14 +920,13 @@ pub async fn handle_messages_in_process(
             &session.delegate_key_hex,
             &session.account_id,
             &session.default_namespace,
+            &session.oauth_scope,
             &parsed,
         )
         .await
         {
-            if let Ok(serialized) = serde_json::to_string(&resp) {
-                let _ = session
-                    .sse_tx
-                    .send(format!("event: message\ndata: {serialized}\n\n"));
+            if let (Some(tx), Ok(serialized)) = (&session.sse_tx, serde_json::to_string(&resp)) {
+                let _ = tx.send(format!("event: message\ndata: {serialized}\n\n"));
             }
         }
     });
@@ -862,7 +951,7 @@ pub async fn handle_streamable_in_process(
         }
         Method::GET => handle_sse_in_process(state, forwarded).await,
         Method::POST => {
-            let (delegate_key_hex, account_id, default_namespace) =
+            let (delegate_key_hex, account_id, default_namespace, oauth_scope) =
                 match resolve_session_credentials(&state, &forwarded) {
                     Ok(creds) => creds,
                     Err(err) => return err.into_response(),
@@ -870,12 +959,58 @@ pub async fn handle_streamable_in_process(
             let parsed: Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    return (StatusCode::BAD_REQUEST, format!("Invalid JSON-RPC body: {e}"))
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid JSON-RPC body: {e}"),
+                    )
                         .into_response();
                 }
             };
-            let session_id = extract_header_str(&forwarded, "mcp-session-id")
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let existing_session_id = extract_header_str(&forwarded, "mcp-session-id");
+            let mut effective_scope = oauth_scope.clone();
+            if let Some(ref sid) = existing_session_id {
+                if let Some(existing) = MCP_NATIVE_SESSIONS
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.get(sid).cloned())
+                {
+                    if existing.delegate_key_hex != delegate_key_hex
+                        || existing.account_id != account_id
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "mcp-session-id does not match authenticated caller",
+                        )
+                            .into_response();
+                    }
+                    // Preserve the intersection of session scope and current request scope so a
+                    // read-only session cannot escalate to write, nor can a narrowed token use a
+                    // broader cached session scope.
+                    let (sess_read, sess_write) = parse_granted_oauth_scopes(&existing.oauth_scope);
+                    let (req_read, req_write) = parse_granted_oauth_scopes(&oauth_scope);
+                    let mut scopes = Vec::new();
+                    if sess_read && req_read {
+                        scopes.push("memwal:read");
+                    }
+                    if sess_write && req_write {
+                        scopes.push("memwal:write");
+                    }
+                    effective_scope = scopes.join(" ");
+                }
+            }
+            let session_id =
+                existing_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
+                guard
+                    .entry(session_id.clone())
+                    .or_insert_with(|| McpNativeSession {
+                        delegate_key_hex: delegate_key_hex.clone(),
+                        account_id: account_id.clone(),
+                        default_namespace: default_namespace.clone(),
+                        oauth_scope: effective_scope.clone(),
+                        sse_tx: None,
+                    });
+            }
 
             let response_value = if let Some(arr) = parsed.as_array() {
                 if arr.is_empty() {
@@ -892,6 +1027,7 @@ pub async fn handle_streamable_in_process(
                         &delegate_key_hex,
                         &account_id,
                         &default_namespace,
+                        &effective_scope,
                         item,
                     )
                     .await
@@ -910,6 +1046,7 @@ pub async fn handle_streamable_in_process(
                     &delegate_key_hex,
                     &account_id,
                     &default_namespace,
+                    &effective_scope,
                     &parsed,
                 )
                 .await
@@ -946,9 +1083,50 @@ pub async fn handle_streamable_in_process(
 mod tests {
     use super::*;
 
+    fn tool_names_for_scope(scope: &str) -> Vec<String> {
+        let list = mcp_tools_list(scope);
+        let tools = list
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools array must exist");
+        tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
     #[test]
-    fn mcp_tools_list_exposes_all_seven_walrus_memory_tools_with_valid_schemas() {
-        let list = mcp_tools_list();
+    fn mcp_tools_list_fails_closed_when_oauth_scope_is_missing_or_blank() {
+        assert!(tool_names_for_scope("").is_empty());
+        assert!(tool_names_for_scope("   ").is_empty());
+        assert!(tool_names_for_scope("unknown:scope").is_empty());
+    }
+
+    #[test]
+    fn mcp_tools_list_exposes_only_read_tools_for_memwal_read_scope() {
+        assert_eq!(
+            tool_names_for_scope("memwal:read"),
+            vec!["memwal_health", "memwal_recall"]
+        );
+        assert!(is_mcp_tool_permitted("memwal_health", "memwal:read"));
+        assert!(is_mcp_tool_permitted("memwal_recall", "memwal:read"));
+        for write_tool in [
+            "memwal_remember",
+            "memwal_remember_status",
+            "memwal_remember_bulk",
+            "memwal_analyze",
+            "memwal_restore",
+        ] {
+            assert!(
+                !is_mcp_tool_permitted(write_tool, "memwal:read"),
+                "{write_tool} must be rejected under read-only OAuth scope"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tools_list_exposes_all_seven_walrus_memory_tools_for_full_scope() {
+        let list = mcp_tools_list("memwal:read memwal:write");
         let tools = list
             .get("tools")
             .and_then(Value::as_array)
@@ -985,10 +1163,7 @@ mod tests {
             "x-memwal-namespace",
             req_headers::HeaderValue::from_static("  work-ns  "),
         );
-        headers.insert(
-            "x-empty",
-            req_headers::HeaderValue::from_static("   "),
-        );
+        headers.insert("x-empty", req_headers::HeaderValue::from_static("   "));
 
         assert_eq!(
             extract_header_str(&headers, "x-memwal-namespace").as_deref(),
@@ -998,4 +1173,3 @@ mod tests {
         assert_eq!(extract_header_str(&headers, "x-missing"), None);
     }
 }
-

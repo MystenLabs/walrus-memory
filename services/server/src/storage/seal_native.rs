@@ -21,8 +21,7 @@ use seal_crypto::{
     seal_encrypt as crypto_seal_encrypt, EncryptedObject, EncryptionInput, IBEPublicKeys, ObjectID,
 };
 use seal_sdk::{
-    decrypt_seal_responses, genkey, seal_decrypt_object, signed_message,
-    types::FetchKeyResponse,
+    decrypt_seal_responses, genkey, seal_decrypt_object, signed_message, types::FetchKeyResponse,
     IBEPublicKey,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +40,19 @@ use crate::sui::enoki::{
     derive_sui_address, parse_sui_private_key_bytes, sign_personal_message_bytes,
 };
 use crate::types::AppError;
+
+const MAX_SEAL_WEIGHTED_SERVERS: usize = 254;
+
+const MAINNET_DEFAULT_SEAL_SERVERS: &[(&str, u8)] = &[
+    (
+        "0x145540d931f182fef76467dd8074c9839aea126852d90d18e1556fcbbd1208b6",
+        1,
+    ),
+    (
+        "0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10",
+        1,
+    ),
+];
 
 const TESTNET_DEFAULT_SEAL_SERVERS: &[(&str, u8)] = &[
     (
@@ -82,14 +94,18 @@ pub fn derive_seal_id(
 // 2. Committee Configuration, Expected Identity Guard & On-Chain KeyServer Fetch
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredKeyServerSpec {
     #[serde(alias = "objectId", alias = "object_id")]
     pub object_id: String,
     #[serde(default = "default_weight")]
     pub weight: u8,
-    #[serde(default)]
+    #[serde(default, alias = "aggregatorUrl", alias = "aggregator_url")]
     pub url: Option<String>,
+    #[serde(default, alias = "apiKeyName", alias = "api_key_name")]
+    pub api_key_name: Option<String>,
+    #[serde(default, alias = "apiKey", alias = "api_key")]
+    pub api_key: Option<String>,
     #[serde(default, alias = "publicKey", alias = "public_key", alias = "pk")]
     pub public_key_hex: Option<String>,
 }
@@ -104,6 +120,8 @@ pub struct ResolvedKeyServer {
     pub weight: u8,
     pub name: String,
     pub url: String,
+    pub api_key_name: Option<String>,
+    pub api_key: Option<String>,
     pub pk: IBEPublicKey,
 }
 
@@ -147,53 +165,235 @@ struct MoveKeyServerV2 {
     server_type: MoveServerTypeV2,
 }
 
-fn parse_configured_key_servers() -> (Vec<ConfiguredKeyServerSpec>, u8) {
-    let threshold = std::env::var("SEAL_THRESHOLD")
-        .ok()
-        .and_then(|v| v.trim().parse::<u8>().ok())
-        .filter(|&t| t > 0)
-        .unwrap_or(2);
+fn require_non_empty_string_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    alias: Option<&str>,
+    index: usize,
+) -> Result<Option<String>, String> {
+    let val = obj.get(field).or_else(|| alias.and_then(|a| obj.get(a)));
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Err(format!(
+            "SEAL_SERVER_CONFIGS[{index}].{field} must be a non-empty string"
+        ));
+    }
+    let s = val
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!("SEAL_SERVER_CONFIGS[{index}].{field} must be a non-empty string")
+        })?;
+    Ok(Some(s.to_owned()))
+}
 
-    if let Ok(raw) = std::env::var("SEAL_KEY_SERVERS") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            if let Ok(specs) = serde_json::from_str::<Vec<ConfiguredKeyServerSpec>>(trimmed) {
-                if !specs.is_empty() {
-                    return (specs, threshold);
-                }
+fn normalize_seal_server_config_value(
+    value: &serde_json::Value,
+    index: usize,
+) -> Result<ConfiguredKeyServerSpec, String> {
+    let Some(obj) = value.as_object() else {
+        return Err(format!("SEAL_SERVER_CONFIGS[{index}] must be an object"));
+    };
+
+    let raw_object_id = require_non_empty_string_field(obj, "objectId", Some("object_id"), index)?
+        .ok_or_else(|| {
+            format!("SEAL_SERVER_CONFIGS[{index}].objectId must be a non-empty string")
+        })?;
+    let normalized_addr: Address = raw_object_id
+        .parse()
+        .map_err(|_| format!("SEAL_SERVER_CONFIGS[{index}].objectId must be a Sui object ID"))?;
+
+    let weight = match obj.get("weight") {
+        None => 1u8,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                format!(
+                    "SEAL_SERVER_CONFIGS[{index}].weight must be an integer between 1 and {MAX_SEAL_WEIGHTED_SERVERS}"
+                )
+            })?;
+            if n < 1 || n > MAX_SEAL_WEIGHTED_SERVERS as u64 {
+                return Err(format!(
+                    "SEAL_SERVER_CONFIGS[{index}].weight must be an integer between 1 and {MAX_SEAL_WEIGHTED_SERVERS}"
+                ));
             }
-            // Also accept comma-separated object IDs.
-            let specs: Vec<_> = trimmed
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|id| ConfiguredKeyServerSpec {
-                    object_id: id.to_owned(),
-                    weight: 1,
-                    url: None,
-                    public_key_hex: None,
-                })
-                .collect();
-            if !specs.is_empty() {
-                return (specs, threshold);
-            }
+            n as u8
         }
+    };
+
+    let url = require_non_empty_string_field(obj, "aggregatorUrl", Some("url"), index)?;
+    let api_key_name =
+        require_non_empty_string_field(obj, "apiKeyName", Some("api_key_name"), index)?;
+    let api_key = require_non_empty_string_field(obj, "apiKey", Some("api_key"), index)?;
+
+    if api_key_name.is_some() != api_key.is_some() {
+        return Err(format!(
+            "SEAL_SERVER_CONFIGS[{index}] must provide both apiKeyName and apiKey, or neither"
+        ));
     }
 
-    let specs = TESTNET_DEFAULT_SEAL_SERVERS
+    let public_key_hex = obj
+        .get("public_key_hex")
+        .or_else(|| obj.get("publicKey"))
+        .or_else(|| obj.get("public_key"))
+        .or_else(|| obj.get("pk"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    Ok(ConfiguredKeyServerSpec {
+        object_id: normalized_addr.to_string(),
+        weight,
+        url,
+        api_key_name,
+        api_key,
+        public_key_hex,
+    })
+}
+
+fn parse_seal_server_configs_json(raw: &str) -> Result<Vec<ConfiguredKeyServerSpec>, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid SEAL_SERVER_CONFIGS JSON: {e}"))?;
+    let Some(arr) = parsed.as_array() else {
+        return Err("SEAL_SERVER_CONFIGS must be a JSON array".to_owned());
+    };
+    if arr.is_empty() {
+        return Err("SEAL_SERVER_CONFIGS must contain at least one server".to_owned());
+    }
+    arr.iter()
+        .enumerate()
+        .map(|(idx, item)| normalize_seal_server_config_value(item, idx))
+        .collect()
+}
+
+fn parse_legacy_key_servers(raw: Option<&str>) -> Result<Vec<ConfiguredKeyServerSpec>, String> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if trimmed.starts_with('[') {
+        return parse_seal_server_configs_json(trimmed);
+    }
+    let mut specs = Vec::new();
+    for (idx, item) in trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        let val = serde_json::json!({ "objectId": item });
+        specs.push(normalize_seal_server_config_value(&val, idx)?);
+    }
+    Ok(specs)
+}
+
+fn default_seal_server_configs_for_network(network: Option<&str>) -> Vec<ConfiguredKeyServerSpec> {
+    let net = network
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("mainnet");
+    let table: &[(&str, u8)] = match net {
+        "mainnet" => MAINNET_DEFAULT_SEAL_SERVERS,
+        "testnet" => TESTNET_DEFAULT_SEAL_SERVERS,
+        _ => &[],
+    };
+    table
         .iter()
         .map(|&(id, weight)| ConfiguredKeyServerSpec {
             object_id: id.to_owned(),
             weight,
             url: None,
+            api_key_name: None,
+            api_key: None,
             public_key_hex: None,
         })
-        .collect();
-    (specs, threshold)
+        .collect()
+}
+
+/// Parses SEAL committee server configs and threshold using the exact precedence and validation
+/// rules from `services/server/scripts/seal-config.ts`:
+/// `SEAL_SERVER_CONFIGS` (JSON) -> `SEAL_KEY_SERVERS` (CSV) -> network defaults (`mainnet` vs `testnet`).
+pub fn parse_configured_key_servers_from_values(
+    raw_server_configs: Option<&str>,
+    raw_legacy_key_servers: Option<&str>,
+    raw_threshold: Option<&str>,
+    network: Option<&str>,
+) -> Result<(Vec<ConfiguredKeyServerSpec>, u8), String> {
+    let configs =
+        if let Some(raw_json) = raw_server_configs.map(str::trim).filter(|s| !s.is_empty()) {
+            parse_seal_server_configs_json(raw_json)?
+        } else {
+            let legacy = parse_legacy_key_servers(raw_legacy_key_servers)?;
+            if !legacy.is_empty() {
+                legacy
+            } else {
+                default_seal_server_configs_for_network(network)
+            }
+        };
+
+    let mut seen_ids = std::collections::HashSet::with_capacity(configs.len());
+    for cfg in &configs {
+        if !seen_ids.insert(cfg.object_id.as_str()) {
+            return Err("SEAL server object IDs must be unique".to_owned());
+        }
+    }
+
+    let total_weight: usize = configs.iter().map(|c| usize::from(c.weight)).sum();
+    if total_weight > MAX_SEAL_WEIGHTED_SERVERS {
+        return Err(format!(
+            "total configured SEAL server weight must be at most {MAX_SEAL_WEIGHTED_SERVERS}"
+        ));
+    }
+
+    let default_threshold = if total_weight > 0 {
+        2.min(total_weight) as u8
+    } else {
+        2
+    };
+
+    let threshold = match raw_threshold.map(str::trim).filter(|s| !s.is_empty()) {
+        None => default_threshold,
+        Some(raw_t) => {
+            let parsed_t = raw_t
+                .parse::<usize>()
+                .ok()
+                .filter(|&t| (1..=MAX_SEAL_WEIGHTED_SERVERS).contains(&t))
+                .ok_or_else(|| "SEAL_THRESHOLD must be a positive integer".to_owned())?;
+            if total_weight > 0 && parsed_t > total_weight {
+                return Err(
+                    "SEAL_THRESHOLD must be less than or equal to total configured SEAL server weight"
+                        .to_owned(),
+                );
+            }
+            parsed_t as u8
+        }
+    };
+
+    Ok((configs, threshold))
+}
+
+fn parse_configured_key_servers() -> Result<(Vec<ConfiguredKeyServerSpec>, u8), String> {
+    let raw_server_configs = std::env::var("SEAL_SERVER_CONFIGS").ok();
+    let raw_legacy_key_servers = std::env::var("SEAL_KEY_SERVERS").ok();
+    let raw_threshold = std::env::var("SEAL_THRESHOLD").ok();
+    let network = std::env::var("SUI_NETWORK")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(get_native_runtime_config().sui_network));
+
+    parse_configured_key_servers_from_values(
+        raw_server_configs.as_deref(),
+        raw_legacy_key_servers.as_deref(),
+        raw_threshold.as_deref(),
+        network.as_deref(),
+    )
 }
 
 /// Validates `expected_committee_identity` against the configured key servers and threshold,
-/// matching `sealEncryptCommitteeFailure` in `services/server/scripts/sidecar/routes/seal.ts`.
+/// matching `sealEncryptCommitteeFailure` in `services/server/scripts/sidecar/routes/seal.ts`
+/// and `sealCommitteeIdentityMatches` in `services/server/scripts/seal-config.ts`.
 pub fn validate_expected_committee_identity(
     expected: Option<&serde_json::Value>,
     specs: &[ConfiguredKeyServerSpec],
@@ -248,12 +448,21 @@ pub fn validate_expected_committee_identity(
                     "SEAL_COMMITTEE_MISMATCH: expected key server {exp_addr}, configured {act_addr}"
                 ));
             }
+            if let Some(exp_weight) = exp.get("weight").and_then(|v| v.as_u64()) {
+                if exp_weight != u64::from(actual.weight) {
+                    return Err(format!(
+                        "SEAL_COMMITTEE_MISMATCH: expected key server {act_addr} weight {exp_weight}, configured {}",
+                        actual.weight
+                    ));
+                }
+            }
         }
     }
     Ok(())
 }
 
 struct TimedCommittee {
+    specs: Vec<ConfiguredKeyServerSpec>,
     servers: Vec<ResolvedKeyServer>,
     threshold: u8,
     fetched_at: Instant,
@@ -275,8 +484,15 @@ pub async fn resolve_seal_key_servers(
     grpc_url: &str,
     expected_committee_identity: Option<&serde_json::Value>,
 ) -> Result<(Vec<ResolvedKeyServer>, u8), String> {
-    let (specs, threshold) = parse_configured_key_servers();
+    let (specs, threshold) = parse_configured_key_servers()?;
     validate_expected_committee_identity(expected_committee_identity, &specs, threshold)?;
+
+    if specs.is_empty() {
+        return Err(
+            "SEAL_SERVER_CONFIGS/SEAL_KEY_SERVERS env vars are empty and no network default exists"
+                .to_owned(),
+        );
+    }
 
     // Check if all specs already provide inline URL + public_key_hex (e.g. unit tests / offline overrides).
     if specs
@@ -302,6 +518,8 @@ pub async fn resolve_seal_key_servers(
                 weight: s.weight,
                 name: s.object_id.clone(),
                 url: url.clone(),
+                api_key_name: s.api_key_name.clone(),
+                api_key: s.api_key.clone(),
                 pk,
             });
         }
@@ -310,7 +528,10 @@ pub async fn resolve_seal_key_servers(
 
     let cache = SEAL_COMMITTEE_CACHE.get_or_init(|| RwLock::new(None));
     if let Some(cached) = cache.read().await.as_ref() {
-        if cached.fetched_at.elapsed() < Duration::from_secs(300) {
+        if cached.fetched_at.elapsed() < Duration::from_secs(300)
+            && cached.specs == specs
+            && cached.threshold == threshold
+        {
             return Ok((cached.servers.clone(), cached.threshold));
         }
     }
@@ -371,7 +592,13 @@ pub async fn resolve_seal_key_servers(
             if let Ok(field_v2) = bcs::from_bytes::<MoveField<u64, MoveKeyServerV2>>(contents) {
                 let url = match field_v2.value.server_type {
                     MoveServerTypeV2::Independent { url } => url,
-                    MoveServerTypeV2::Committee { .. } => spec.url.clone().unwrap_or_default(),
+                    MoveServerTypeV2::Committee { .. } => {
+                        spec.url.clone().ok_or_else(|| {
+                            format!(
+                                "SEAL Committee KeyServer {ks_addr} requires aggregatorUrl in SEAL_SERVER_CONFIGS"
+                            )
+                        })?
+                    }
                 };
                 extracted = Some((field_v2.value.name, url, field_v2.value.pk));
                 break;
@@ -388,11 +615,14 @@ pub async fn resolve_seal_key_servers(
             weight: spec.weight,
             name,
             url: spec.url.clone().unwrap_or(url),
+            api_key_name: spec.api_key_name.clone(),
+            api_key: spec.api_key.clone(),
             pk,
         });
     }
 
     *cache.write().await = Some(TimedCommittee {
+        specs,
         servers: resolved.clone(),
         threshold,
         fetched_at: Instant::now(),
@@ -514,9 +744,7 @@ pub async fn fetch_seal_encrypt_identity(
             serde_json::Value::String(s) => s.parse().ok(),
             _ => None,
         })
-        .ok_or_else(|| {
-            format!("account {account_id} has no access_counter_version field")
-        })?;
+        .ok_or_else(|| format!("account {account_id} has no access_counter_version field"))?;
 
     Ok(counter)
 }
@@ -529,7 +757,8 @@ pub async fn fetch_shared_object_versions(
     account_id: &str,
     registry_id: &str,
 ) -> Result<(u64, u64), String> {
-    let cache = SHARED_OBJECT_INITIAL_VERSIONS.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    let cache =
+        SHARED_OBJECT_INITIAL_VERSIONS.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
     if let Ok(guard) = cache.read() {
         if let (Some(&acct_ver), Some(&reg_ver)) = (guard.get(account_id), guard.get(registry_id)) {
             return Ok((acct_ver, reg_ver));
@@ -571,16 +800,8 @@ pub async fn fetch_shared_object_versions(
         })
         .ok_or_else(|| format!("AccountRegistry {registry_id} not found on chain"))?;
 
-    let acct_shared_ver = acct_obj
-        .owner
-        .as_ref()
-        .and_then(|o| o.version)
-        .unwrap_or(1);
-    let reg_shared_ver = reg_obj
-        .owner
-        .as_ref()
-        .and_then(|o| o.version)
-        .unwrap_or(1);
+    let acct_shared_ver = acct_obj.owner.as_ref().and_then(|o| o.version).unwrap_or(1);
+    let reg_shared_ver = reg_obj.owner.as_ref().and_then(|o| o.version).unwrap_or(1);
 
     if let Ok(mut guard) = cache.write() {
         guard.insert(account_id.to_owned(), acct_shared_ver);
@@ -767,11 +988,12 @@ fn import_exported_session_key(
     let exported: ExportedSessionKeyJson = serde_json::from_slice(&json_bytes)
         .map_err(|e| format!("invalid x-seal-session JSON: {e}"))?;
 
-    let session_pkg: Address = exported
-        .package_id
-        .trim()
-        .parse()
-        .map_err(|e| format!("invalid SessionKey packageId '{}': {e}", exported.package_id))?;
+    let session_pkg: Address = exported.package_id.trim().parse().map_err(|e| {
+        format!(
+            "invalid SessionKey packageId '{}': {e}",
+            exported.package_id
+        )
+    })?;
     if session_pkg != expected_package_id {
         return Err("SessionKey packageId does not match request packageId".to_owned());
     }
@@ -1059,12 +1281,16 @@ pub async fn seal_decrypt_batch_in_process(
         async move {
             let url = format!("{}/v1/fetch_key", srv.url.trim_end_matches('/'));
             let req_id = Uuid::new_v4().to_string();
-            match http
+            let mut req_builder = http
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .header("Client-Sdk-Type", "typescript")
                 .header("Client-Sdk-Version", "0.9.6")
-                .header("Request-Id", &req_id)
+                .header("Request-Id", &req_id);
+            if let (Some(header_name), Some(header_val)) = (&srv.api_key_name, &srv.api_key) {
+                req_builder = req_builder.header(header_name.as_str(), header_val.as_str());
+            }
+            match req_builder
                 .body(req_json)
                 .timeout(Duration::from_secs(15))
                 .send()
@@ -1072,7 +1298,7 @@ pub async fn seal_decrypt_batch_in_process(
             {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<FetchKeyResponse>().await {
-                        Ok(parsed) => Ok((srv.object_id, parsed)),
+                        Ok(parsed) => Ok((srv.object_id, srv.weight, parsed)),
                         Err(e) => Err(format!("invalid FetchKeyResponse from {}: {e}", srv.name)),
                     }
                 }
@@ -1107,12 +1333,14 @@ pub async fn seal_decrypt_batch_in_process(
     });
 
     let mut seal_responses: Vec<(ObjectID, FetchKeyResponse)> = Vec::new();
+    let mut responded_weight: usize = 0;
     let mut last_err = String::new();
     for res in futures::future::join_all(fetch_futures).await {
         match res {
-            Ok(pair) => {
-                seal_responses.push(pair);
-                if seal_responses.len() >= threshold as usize {
+            Ok((obj_id, weight, parsed)) => {
+                seal_responses.push((obj_id, parsed));
+                responded_weight += usize::from(weight.max(1));
+                if responded_weight >= usize::from(threshold) {
                     break;
                 }
             }
@@ -1122,12 +1350,9 @@ pub async fn seal_decrypt_batch_in_process(
         }
     }
 
-    if seal_responses.len() < threshold as usize {
+    if responded_weight < usize::from(threshold) {
         let error = format!(
-            "fetch_keys failed: Not enough shares ({}/{}): {}",
-            seal_responses.len(),
-            threshold,
-            last_err
+            "fetch_keys failed: Not enough shares ({responded_weight}/{threshold}): {last_err}",
         );
         let permanent = DecryptOutcome::permanent_from_error(&error);
         return Ok(parsed_items
@@ -1199,18 +1424,15 @@ mod tests {
         let pk_0 = ibe::public_key_from_master_key(&msk_0);
         let pk_1 = ibe::public_key_from_master_key(&msk_1);
 
-        let srv_0: ObjectID =
-            "0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75"
-                .parse()
-                .unwrap();
-        let srv_1: ObjectID =
-            "0xf5d14a81a982144ae441cd7d64b09027f116a468bd36e7eca494f750591623c8"
-                .parse()
-                .unwrap();
-        let pkg_id: ObjectID =
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .parse()
-                .unwrap();
+        let srv_0: ObjectID = "0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75"
+            .parse()
+            .unwrap();
+        let srv_1: ObjectID = "0xf5d14a81a982144ae441cd7d64b09027f116a468bd36e7eca494f750591623c8"
+            .parse()
+            .unwrap();
+        let pkg_id: ObjectID = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
 
         let (_, id_bytes) = derive_seal_id(
             "0x0000000000000000000000000000000000000000000000000000000000000099",
@@ -1245,21 +1467,13 @@ mod tests {
         let resp_0 = FetchKeyResponse {
             decryption_keys: vec![DecryptionKey {
                 id: full_id.clone(),
-                encrypted_key: elgamal::encrypt(
-                    &mut rng,
-                    &ibe::extract(&msk_0, &full_id),
-                    &eg_pk,
-                ),
+                encrypted_key: elgamal::encrypt(&mut rng, &ibe::extract(&msk_0, &full_id), &eg_pk),
             }],
         };
         let resp_1 = FetchKeyResponse {
             decryption_keys: vec![DecryptionKey {
                 id: full_id.clone(),
-                encrypted_key: elgamal::encrypt(
-                    &mut rng,
-                    &ibe::extract(&msk_1, &full_id),
-                    &eg_pk,
-                ),
+                encrypted_key: elgamal::encrypt(&mut rng, &ibe::extract(&msk_1, &full_id), &eg_pk),
             }],
         };
 
@@ -1277,18 +1491,15 @@ mod tests {
 
     #[test]
     fn build_seal_approve_ptb_produces_valid_3_arg_move_calls() {
-        let pkg: Address =
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .parse()
-                .unwrap();
-        let reg: Address =
-            "0x3333333333333333333333333333333333333333333333333333333333333333"
-                .parse()
-                .unwrap();
-        let acct: Address =
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-                .parse()
-                .unwrap();
+        let pkg: Address = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let reg: Address = "0x3333333333333333333333333333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let acct: Address = "0x2222222222222222222222222222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
         let (_, id1) = derive_seal_id(&acct.to_string(), 0).unwrap();
         let (_, id2) = derive_seal_id(&acct.to_string(), 1).unwrap();
 
@@ -1316,12 +1527,16 @@ mod tests {
                 object_id: srv_0.to_owned(),
                 weight: 1,
                 url: Some("https://s0.example.com".to_owned()),
+                api_key_name: None,
+                api_key: None,
                 public_key_hex: None,
             },
             ConfiguredKeyServerSpec {
                 object_id: srv_1.to_owned(),
                 weight: 1,
                 url: Some("https://s1.example.com".to_owned()),
+                api_key_name: None,
+                api_key: None,
                 public_key_hex: None,
             },
         ];
@@ -1345,16 +1560,113 @@ mod tests {
         let count_err =
             validate_expected_committee_identity(Some(&expected), &specs[..1], 2).unwrap_err();
         assert!(count_err.contains("SEAL_COMMITTEE_MISMATCH: expected 2 servers, configured 1"));
+
+        // Server weight mismatch must fail closed with SEAL_COMMITTEE_MISMATCH
+        let weight_mismatch = serde_json::json!({
+            "threshold": 2,
+            "servers": [
+                { "objectId": srv_0, "weight": 2 },
+                { "objectId": srv_1, "weight": 1 }
+            ]
+        });
+        let weight_err =
+            validate_expected_committee_identity(Some(&weight_mismatch), &specs, 2).unwrap_err();
+        assert!(weight_err.contains("SEAL_COMMITTEE_MISMATCH"));
+    }
+
+    #[test]
+    fn parse_configured_key_servers_matches_seal_config_ts_precedence_and_defaults() {
+        // 1. Mainnet default when SUI_NETWORK is mainnet or unset
+        let (mainnet_specs, mainnet_thresh) =
+            parse_configured_key_servers_from_values(None, None, None, Some("mainnet")).unwrap();
+        assert_eq!(mainnet_thresh, 2);
+        assert_eq!(mainnet_specs.len(), 2);
+        assert_eq!(
+            mainnet_specs[0].object_id,
+            "0x145540d931f182fef76467dd8074c9839aea126852d90d18e1556fcbbd1208b6"
+        );
+        assert_eq!(
+            mainnet_specs[1].object_id,
+            "0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10"
+        );
+
+        // 2. Testnet default when SUI_NETWORK is testnet
+        let (testnet_specs, testnet_thresh) =
+            parse_configured_key_servers_from_values(None, None, None, Some("testnet")).unwrap();
+        assert_eq!(testnet_thresh, 2);
+        assert_eq!(testnet_specs.len(), 2);
+        assert_eq!(
+            testnet_specs[0].object_id,
+            "0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75"
+        );
+
+        // 3. SEAL_SERVER_CONFIGS JSON takes precedence over SEAL_KEY_SERVERS and supports
+        //    weight, aggregatorUrl, apiKeyName, and apiKey
+        let json_cfg = r#"[
+            {
+                "objectId": "0x1",
+                "weight": 3,
+                "aggregatorUrl": "https://agg.example.com",
+                "apiKeyName": "x-api-key",
+                "apiKey": "secret-token"
+            }
+        ]"#;
+        let (json_specs, json_thresh) = parse_configured_key_servers_from_values(
+            Some(json_cfg),
+            Some("0x2,0x3"),
+            Some("3"),
+            Some("testnet"),
+        )
+        .unwrap();
+        assert_eq!(json_thresh, 3);
+        assert_eq!(json_specs.len(), 1);
+        assert_eq!(
+            json_specs[0].object_id,
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        assert_eq!(json_specs[0].weight, 3);
+        assert_eq!(
+            json_specs[0].url.as_deref(),
+            Some("https://agg.example.com")
+        );
+        assert_eq!(json_specs[0].api_key_name.as_deref(), Some("x-api-key"));
+        assert_eq!(json_specs[0].api_key.as_deref(), Some("secret-token"));
+
+        // 4. Rejects duplicate server object IDs, unmatched apiKeyName/apiKey, and threshold > total weight
+        let dup_err =
+            parse_configured_key_servers_from_values(None, Some("0x1,0x01"), None, Some("testnet"))
+                .unwrap_err();
+        assert_eq!(dup_err, "SEAL server object IDs must be unique");
+
+        let api_err = parse_configured_key_servers_from_values(
+            Some(r#"[{"objectId":"0x1","apiKeyName":"x-key"}]"#),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(api_err.contains("must provide both apiKeyName and apiKey, or neither"));
+
+        let thresh_err = parse_configured_key_servers_from_values(
+            None,
+            Some("0x1,0x2"),
+            Some("3"),
+            Some("testnet"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            thresh_err,
+            "SEAL_THRESHOLD must be less than or equal to total configured SEAL server weight"
+        );
     }
 
     #[test]
     fn session_certificate_from_delegate_key_roundtrips_through_import_validation() {
         let seed = [0x55u8; 32];
         let hex_key = format!("0x{}", hex::encode(seed));
-        let pkg: Address =
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .parse()
-                .unwrap();
+        let pkg: Address = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
         let other_pkg: Address =
             "0x2222222222222222222222222222222222222222222222222222222222222222"
                 .parse()
