@@ -1131,8 +1131,9 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     return;
                 }
                 const message = errorMessage(error);
-                // Sponsor dry-run aborts before a register is journaled. The
-                // next attempt builds a new transaction from this client.
+                // A stale-price abort can occur during sponsorship or after
+                // registration lands. Refresh the client before the rejected
+                // preparation is evicted by settleUploadStepFlight.
                 refreshWalrusClientOnStaleWalPrice(message);
                 sidecarLog("error", "walrus_upload_step_failed", {
                     requestId: traceId,
