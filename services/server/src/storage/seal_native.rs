@@ -541,40 +541,46 @@ pub async fn resolve_seal_key_servers(
     let v1_key_bcs = 1u64.to_le_bytes();
     let v2_key_bcs = 2u64.to_le_bytes();
 
-    let mut resolved = Vec::with_capacity(specs.len());
+    // Batch all KeyServers' V1 + V2 dynamic fields into a single BatchGetObjects gRPC call (M-THROUGHPUT).
+    let mut parsed_ks: Vec<(&ConfiguredKeyServerSpec, Address, ObjectID)> =
+        Vec::with_capacity(specs.len());
+    let mut batch_req = BatchGetObjectsRequest::default();
     for spec in &specs {
         let ks_addr: Address = spec
             .object_id
             .parse()
             .map_err(|e| format!("invalid SEAL key server objectId '{}': {e}", spec.object_id))?;
         let ks_obj_id = ObjectID::new(*ks_addr.inner());
-
         let v1_field_id = ks_addr.derive_dynamic_child_id(&TypeTag::U64, &v1_key_bcs);
         let v2_field_id = ks_addr.derive_dynamic_child_id(&TypeTag::U64, &v2_key_bcs);
-
-        let mut batch_req = BatchGetObjectsRequest::default();
         for id in [v1_field_id, v2_field_id] {
             let mut r = GetObjectRequest::default();
             r.object_id = Some(id.to_string());
             batch_req.requests.push(r);
         }
-        batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "bcs"]));
+        parsed_ks.push((spec, ks_addr, ks_obj_id));
+    }
+    batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "bcs"]));
 
-        let batch_resp = client
-            .ledger_client()
-            .batch_get_objects(batch_req)
-            .await
-            .map_err(|e| format!("BatchGetObjects for SEAL KeyServer {ks_addr} failed: {e}"))?
-            .into_inner();
+    let batch_resp = client
+        .ledger_client()
+        .batch_get_objects(batch_req)
+        .await
+        .map_err(|e| format!("BatchGetObjects for SEAL KeyServers failed: {e}"))?
+        .into_inner();
 
+    let mut resolved = Vec::with_capacity(specs.len());
+    for ((spec, ks_addr, ks_obj_id), pair) in
+        parsed_ks.into_iter().zip(batch_resp.objects.chunks(2))
+    {
         let mut extracted: Option<(String, String, Vec<u8>)> = None;
-        for res in batch_resp.objects {
+        for res in pair {
             let Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(proto_obj)) =
-                res.result
+                &res.result
             else {
                 continue;
             };
-            let Some(bcs_proto) = proto_obj.bcs else {
+            let Some(bcs_proto) = &proto_obj.bcs else {
                 continue;
             };
             let Ok(sdk_obj) = bcs_proto.deserialize::<sui_sdk_types::Object>() else {
@@ -635,29 +641,7 @@ pub async fn resolve_seal_key_servers(
 // 3. On-Chain `MemWalAccount` Reader & `seal_approve` PTB Builder
 // ---------------------------------------------------------------------------
 
-fn prost_to_json(value: &prost_types::Value) -> serde_json::Value {
-    use prost_types::value::Kind;
-    match &value.kind {
-        Some(Kind::NullValue(_)) | None => serde_json::Value::Null,
-        Some(Kind::NumberValue(n))
-            if n.fract() == 0.0 && n.is_finite() && *n >= 0.0 && *n <= 9007199254740992.0 =>
-        {
-            serde_json::json!(*n as i64)
-        }
-        Some(Kind::NumberValue(n)) => serde_json::json!(n),
-        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Kind::StructValue(s)) => serde_json::Value::Object(
-            s.fields
-                .iter()
-                .map(|(k, v)| (k.clone(), prost_to_json(v)))
-                .collect(),
-        ),
-        Some(Kind::ListValue(l)) => {
-            serde_json::Value::Array(l.values.iter().map(prost_to_json).collect())
-        }
-    }
-}
+use crate::storage::walrus_native::prost_to_json;
 
 /// Reads and validates the `MemWalAccount` encryption identity fresh from chain,
 /// matching `fetchSealEncryptIdentity` in `services/server/scripts/sidecar/seal-identity.ts`.
@@ -1692,5 +1676,14 @@ mod tests {
 
         // Package mismatch is rejected
         assert!(import_exported_session_key(&exported_b64, other_pkg).is_err());
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ConfiguredKeyServerSpec>();
+        assert_send_sync::<ResolvedKeyServer>();
+        assert_send_sync::<DecryptOutcome>();
+        assert_send_sync::<SealCredential>();
     }
 }

@@ -37,8 +37,8 @@ pub fn shared_sui_grpc_client(grpc_url: &str) -> Result<sui_rpc::Client, String>
             return Ok(client.clone());
         }
     }
-    let client = sui_rpc::Client::new(key)
-        .map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
+    let client =
+        sui_rpc::Client::new(key).map_err(|e| format!("invalid Sui gRPC URL '{grpc_url}': {e}"))?;
     if let Ok(mut guard) = pool.write() {
         guard.insert(key.to_owned(), client.clone());
     }
@@ -142,10 +142,8 @@ impl EnokiError {
             Self::FallbackEligible { .. } | Self::Transport(_) => {
                 axum::http::StatusCode::BAD_GATEWAY
             }
-            Self::Rejected { status, .. } => {
-                axum::http::StatusCode::from_u16(*status)
-                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST)
-            }
+            Self::Rejected { status, .. } => axum::http::StatusCode::from_u16(*status)
+                .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
         }
     }
 }
@@ -396,10 +394,8 @@ pub async fn enoki_execute_sponsored_transaction(
 ) -> Result<EnokiExecuteOutput, EnokiError> {
     let api_key = enoki_api_key().ok_or(EnokiError::NotConfigured)?;
     let api_url = enoki_api_url();
-    let encoded_digest = percent_encoding::utf8_percent_encode(
-        digest,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
+    let encoded_digest =
+        percent_encoding::utf8_percent_encode(digest, percent_encoding::NON_ALPHANUMERIC);
     let url = format!("{api_url}/v1/transaction-blocks/sponsor/{encoded_digest}");
 
     let payload = serde_json::json!({
@@ -453,18 +449,19 @@ pub async fn enoki_execute_and_verify_sponsored_transaction(
     } else {
         &executed.digest
     };
-    let parsed_digest: Digest = tx_digest
-        .parse()
-        .map_err(|e| EnokiError::BadRequest(format!("invalid executed digest '{tx_digest}': {e}")))?;
+    let parsed_digest: Digest = tx_digest.parse().map_err(|e| {
+        EnokiError::BadRequest(format!("invalid executed digest '{tx_digest}': {e}"))
+    })?;
 
     let mut last_err = String::new();
     for attempt in 0..10u64 {
-        let req = GetTransactionRequest::new(&parsed_digest).with_read_mask(FieldMask::from_paths([
-            "digest",
-            "transaction.sender",
-            "effects.status",
-            "effects.bcs",
-        ]));
+        let req =
+            GetTransactionRequest::new(&parsed_digest).with_read_mask(FieldMask::from_paths([
+                "digest",
+                "transaction.sender",
+                "effects.status",
+                "effects.bcs",
+            ]));
         match client.ledger_client().get_transaction(req).await {
             Ok(resp) => {
                 if let Some(tx) = resp.into_inner().transaction {
@@ -535,7 +532,9 @@ fn decode_bech32_suiprivkey(input: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "invalid Bech32 key: missing separator '1'".to_owned())?;
     let (hrp, data_with_sep) = lower.split_at(sep);
     if hrp != "suiprivkey" {
-        return Err(format!("unexpected Bech32 HRP '{hrp}', expected 'suiprivkey'"));
+        return Err(format!(
+            "unexpected Bech32 HRP '{hrp}', expected 'suiprivkey'"
+        ));
     }
     let data_str = &data_with_sep[1..];
     if data_str.len() < 6 {
@@ -616,8 +615,8 @@ pub fn parse_sui_private_key_bytes(raw: &str) -> Result<[u8; 32], String> {
     } else {
         let hex_candidate = trimmed.strip_prefix("0x").unwrap_or(trimmed);
         if hex_candidate.len() == 64 && hex_candidate.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let bytes = hex::decode(hex_candidate)
-                .map_err(|e| format!("invalid hex private key: {e}"))?;
+            let bytes =
+                hex::decode(hex_candidate).map_err(|e| format!("invalid hex private key: {e}"))?;
             bytes
                 .try_into()
                 .map_err(|_| "hex private key must be 32 bytes".to_owned())?
@@ -679,10 +678,7 @@ pub fn sign_transaction_bytes(raw_key: &str, tx_bytes: &[u8]) -> Result<(String,
 }
 
 /// Signs a Sui personal message and returns the base64-encoded `UserSignature`.
-pub fn sign_personal_message_bytes(
-    raw_key: &str,
-    message: &[u8],
-) -> Result<String, String> {
+pub fn sign_personal_message_bytes(raw_key: &str, message: &[u8]) -> Result<String, String> {
     let key = parse_sui_private_key(raw_key)?;
     let personal = PersonalMessage(message.into());
     let sig: UserSignature = key
@@ -921,9 +917,30 @@ pub fn verify_sponsored_transaction_matches_ptb(
     }
 }
 
+/// Controls whether a wallet transaction should attempt Enoki gas sponsorship first
+/// before falling back to direct address-balance execution (`C-CUSTOM-TYPE` / Effective Rust Item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SponsorshipMode {
+    /// Attempt Enoki gas sponsorship when `ENOKI_API_KEY` is configured, falling back
+    /// to direct address-balance execution on transient / rate-limit / pool errors.
+    EnokiFirst,
+    /// Skip Enoki and execute directly using the wallet's address balance.
+    DirectOnly,
+}
+
+/// Controls whether transaction submission must fetch full created-object effects (`C-CUSTOM-TYPE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectsFetchMode {
+    /// Only the transaction digest is needed.
+    DigestOnly,
+    /// Fetch created object references (ID, version, digest, type) from the executed transaction.
+    WithCreatedObjects,
+}
+
 /// Executes a `ProgrammableTransaction` using Enoki sponsorship first (when `ENOKI_API_KEY`
-/// is set and `force_direct` is false), automatically falling back to direct address-balance
-/// signing on Enoki rate limits (429), 5xx, transport errors, or gas-pool exhaustion.
+/// is set and `sponsorship_mode == SponsorshipMode::EnokiFirst`), automatically falling back
+/// to direct address-balance signing on Enoki rate limits (429), 5xx, transport errors, or
+/// gas-pool exhaustion.
 ///
 /// Mirrors `submitSidecarTransaction` in `services/server/scripts/sidecar/enoki.ts`.
 pub async fn submit_wallet_ptb(
@@ -932,8 +949,8 @@ pub async fn submit_wallet_ptb(
     network: &str,
     raw_private_key: &str,
     ptb: ProgrammableTransaction,
-    force_direct: bool,
-    need_created_objects: bool,
+    sponsorship_mode: SponsorshipMode,
+    effects_mode: EffectsFetchMode,
 ) -> Result<WalletTxOutcome, String> {
     submit_wallet_ptb_with_allowed_addresses(
         http,
@@ -942,8 +959,8 @@ pub async fn submit_wallet_ptb(
         raw_private_key,
         ptb,
         None,
-        force_direct,
-        need_created_objects,
+        sponsorship_mode,
+        effects_mode,
     )
     .await
 }
@@ -956,14 +973,14 @@ pub async fn submit_wallet_ptb_with_allowed_addresses(
     raw_private_key: &str,
     ptb: ProgrammableTransaction,
     allowed_addresses: Option<Vec<String>>,
-    force_direct: bool,
-    need_created_objects: bool,
+    sponsorship_mode: SponsorshipMode,
+    effects_mode: EffectsFetchMode,
 ) -> Result<WalletTxOutcome, String> {
     let key = parse_sui_private_key(raw_private_key)?;
     let sender_addr: Address = key.public_key().derive_address();
     let sender = sender_addr.to_string();
 
-    if !force_direct && enoki_is_enabled() {
+    if sponsorship_mode == SponsorshipMode::EnokiFirst && enoki_is_enabled() {
         let tx_kind = TransactionKind::ProgrammableTransaction(ptb.clone());
         let tx_kind_bytes =
             bcs::to_bytes(&tx_kind).map_err(|e| format!("failed to BCS-encode PTB kind: {e}"))?;
@@ -987,7 +1004,7 @@ pub async fn submit_wallet_ptb_with_allowed_addresses(
                 let (sig_b64, _) = sign_transaction_bytes(raw_private_key, &sponsored_bytes)?;
                 match enoki_execute_sponsored_transaction(http, &sponsored.digest, &sig_b64).await {
                     Ok(executed) => {
-                        if need_created_objects {
+                        if effects_mode == EffectsFetchMode::WithCreatedObjects {
                             return fetch_executed_transaction_outcome(
                                 grpc_url,
                                 &executed.digest,
@@ -1106,10 +1123,9 @@ mod tests {
 
     #[test]
     fn verify_sponsored_transaction_matches_ptb_rejects_sender_or_kind_tampering() {
-        let sender: Address =
-            "0x0000000000000000000000000000000000000000000000000000000000000011"
-                .parse()
-                .unwrap();
+        let sender: Address = "0x0000000000000000000000000000000000000000000000000000000000000011"
+            .parse()
+            .unwrap();
         let attacker: Address =
             "0x0000000000000000000000000000000000000000000000000000000000000099"
                 .parse()
@@ -1147,10 +1163,8 @@ mod tests {
 
     #[test]
     fn classify_enoki_http_error_distinguishes_fallback_eligible_and_permanent_errors() {
-        let rate_limited = classify_enoki_http_error(
-            429,
-            r#"{"errors":[{"message":"Rate limit exceeded"}]}"#,
-        );
+        let rate_limited =
+            classify_enoki_http_error(429, r#"{"errors":[{"message":"Rate limit exceeded"}]}"#);
         assert!(rate_limited.is_fallback_eligible());
         assert_eq!(rate_limited.http_status_code(), 429);
 
@@ -1165,10 +1179,8 @@ mod tests {
         assert!(server_err.is_fallback_eligible());
         assert_eq!(server_err.http_status_code(), 502);
 
-        let rejected = classify_enoki_http_error(
-            403,
-            r#"{"message":"Move call target not allowed"}"#,
-        );
+        let rejected =
+            classify_enoki_http_error(403, r#"{"message":"Move call target not allowed"}"#);
         assert!(!rejected.is_fallback_eligible());
         assert_eq!(rejected.http_status_code(), 403);
 
@@ -1182,7 +1194,8 @@ mod tests {
 
     #[test]
     fn sanitize_upstream_error_redacts_bearer_tokens_and_strips_control_chars() {
-        let raw = "upstream failed:\n\r\tAuthorization: Bearer secret_enoki_token_12345 with \x07bell";
+        let raw =
+            "upstream failed:\n\r\tAuthorization: Bearer secret_enoki_token_12345 with \x07bell";
         let sanitized = sanitize_upstream_error_for_logging(raw);
         assert!(!sanitized.contains("secret_enoki_token_12345"));
         assert!(sanitized.contains("Bearer [REDACTED]"));
@@ -1228,12 +1241,23 @@ mod tests {
     fn sign_personal_message_bytes_produces_97_byte_ed25519_serialized_signature() {
         let seed = [0x24u8; 32];
         let hex_key = format!("0x{}", hex::encode(seed));
-        let sig_b64 =
-            sign_personal_message_bytes(&hex_key, b"MemWal session certificate").unwrap();
+        let sig_b64 = sign_personal_message_bytes(&hex_key, b"MemWal session certificate").unwrap();
         let raw_sig = base64::engine::general_purpose::STANDARD
             .decode(&sig_b64)
             .unwrap();
         assert_eq!(raw_sig.len(), 97);
         assert_eq!(raw_sig[0], 0x00); // Ed25519 scheme flag
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EnokiSponsorOutput>();
+        assert_send_sync::<EnokiExecuteOutput>();
+        assert_send_sync::<CreatedObjectInfo>();
+        assert_send_sync::<WalletTxOutcome>();
+        assert_send_sync::<EnokiError>();
+        assert_send_sync::<SponsorshipMode>();
+        assert_send_sync::<EffectsFetchMode>();
     }
 }

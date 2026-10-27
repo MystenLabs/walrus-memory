@@ -51,7 +51,7 @@ use crate::sui::enoki::{
     enoki_sponsor_transaction_kind_with_addresses, fetch_executed_transaction_outcome,
     parse_sui_private_key, shared_sui_grpc_client, sign_transaction_bytes, submit_wallet_ptb,
     submit_wallet_ptb_with_allowed_addresses, verify_sponsored_transaction_matches_ptb,
-    CreatedObjectInfo, WalletTxOutcome,
+    CreatedObjectInfo, EffectsFetchMode, SponsorshipMode, WalletTxOutcome,
 };
 use crate::types::{AppError, Config};
 
@@ -82,7 +82,7 @@ pub const IN_PROCESS_SIDECAR_URL: &str = "in-process://rust";
 // Runtime Config Snapshot (populated from `Config` at server startup or env)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct NativeRuntimeConfig {
     pub grpc_url: String,
@@ -94,6 +94,27 @@ pub struct NativeRuntimeConfig {
     pub package_id: String,
     pub seal_policy_package_id: String,
     pub registry_id: String,
+}
+
+/// Custom `Debug` implementation that redacts `sui_private_keys` so secret key material
+/// is never leaked to logs or panic messages (`M-PUBLIC-DEBUG` / `C-DEBUG`).
+impl std::fmt::Debug for NativeRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeRuntimeConfig")
+            .field("grpc_url", &self.grpc_url)
+            .field("sui_network", &self.sui_network)
+            .field("walrus_publisher_url", &self.walrus_publisher_url)
+            .field("walrus_package_id", &self.walrus_package_id)
+            .field("walrus_system_object_id", &self.walrus_system_object_id)
+            .field(
+                "sui_private_keys",
+                &format_args!("[REDACTED; {} keys]", self.sui_private_keys.len()),
+            )
+            .field("package_id", &self.package_id)
+            .field("seal_policy_package_id", &self.seal_policy_package_id)
+            .field("registry_id", &self.registry_id)
+            .finish()
+    }
 }
 
 impl NativeRuntimeConfig {
@@ -338,6 +359,7 @@ pub fn effective_grpc_url(config: &Config) -> String {
 // 1. In-Process Upload Concurrency Limiter (replaces `scripts/sidecar/concurrency.ts`)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct InProcessUploadLimiter {
     in_flight: AtomicUsize,
     queued: AtomicUsize,
@@ -348,6 +370,7 @@ pub struct InProcessUploadLimiter {
 }
 
 #[must_use = "if unused, the upload slot is immediately released"]
+#[derive(Debug)]
 pub struct UploadSlotGuard<'a> {
     limiter: &'a InProcessUploadLimiter,
     slots: usize,
@@ -668,8 +691,9 @@ struct TimedValue<T> {
 static SYSTEM_SNAPSHOT_CACHE: OnceLock<RwLock<Option<TimedValue<WalrusSystemSnapshot>>>> =
     OnceLock::new();
 
-fn prost_to_json(value: &prost_types::Value) -> serde_json::Value {
+pub(crate) fn prost_to_json(value: &prost_types::Value) -> serde_json::Value {
     use prost_types::value::Kind;
+
     match &value.kind {
         Some(Kind::NullValue(_)) | None => serde_json::Value::Null,
         Some(Kind::NumberValue(n))
@@ -1310,6 +1334,69 @@ async fn resolve_owned_object_ref(
     Ok((addr, version, digest))
 }
 
+/// Resolves owned object `(Address, version, Digest)` triples for `object_ids` in batches of 50
+/// using `BatchGetObjectsRequest` (`M-THROUGHPUT`).
+async fn resolve_owned_object_refs_batch(
+    grpc_url: &str,
+    object_ids: &[String],
+) -> Result<Vec<(Address, u64, Digest)>, String> {
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut client = shared_sui_grpc_client(grpc_url)?;
+    let mut out = Vec::with_capacity(object_ids.len());
+
+    for chunk in object_ids.chunks(50) {
+        let mut addrs = Vec::with_capacity(chunk.len());
+        let mut reqs = Vec::with_capacity(chunk.len());
+        for id_str in chunk {
+            let addr: Address = id_str
+                .parse()
+                .map_err(|e| format!("invalid object ID '{id_str}': {e}"))?;
+            addrs.push((id_str.as_str(), addr));
+            let mut req = GetObjectRequest::default();
+            req.object_id = Some(id_str.clone());
+            reqs.push(req);
+        }
+        let mut batch_req = BatchGetObjectsRequest::default();
+        batch_req.requests = reqs;
+        batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
+
+        let batch_resp = client
+            .ledger_client()
+            .batch_get_objects(batch_req)
+            .await
+            .map_err(|e| format!("BatchGetObjects failed: {e}"))?
+            .into_inner();
+
+        if batch_resp.objects.len() != addrs.len() {
+            return Err(format!(
+                "BatchGetObjects returned {} entries for {} requested objects",
+                batch_resp.objects.len(),
+                addrs.len()
+            ));
+        }
+
+        for ((id_str, addr), res) in addrs.into_iter().zip(batch_resp.objects) {
+            let obj = match res.result {
+                Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(o)) => o,
+                _ => return Err(format!("object {id_str} not found on chain")),
+            };
+            let version = obj
+                .version
+                .ok_or_else(|| format!("object {id_str} omitted version"))?;
+            let digest_str = obj
+                .digest
+                .ok_or_else(|| format!("object {id_str} omitted digest"))?;
+            let digest: Digest = digest_str
+                .parse()
+                .map_err(|e| format!("invalid digest '{digest_str}' for {id_str}: {e}"))?;
+            out.push((addr, version, digest));
+        }
+    }
+    Ok(out)
+}
+
 /// Validates that `encrypted_bytes` is a valid BCS-serialized `seal_crypto::EncryptedObject`
 /// whose `package_id` matches `immutable_package_id`, has a non-empty `id`, and (when
 /// `configured_policy_pkg` is non-empty) `policy_package_id` matches `configured_policy_pkg`.
@@ -1360,14 +1447,15 @@ pub fn validate_seal_persistence_ciphertext(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn append_seal_persistence_fence(
+fn append_seal_encrypt_fence_move_call(
     builder: &mut TransactionBuilder,
-    grpc_url: &str,
     immutable_package_id: &str,
     policy_package_id: &str,
     configured_policy_pkg: &str,
-    registry_id: &str,
-    account_id: &str,
+    reg_addr: Address,
+    reg_ver: u64,
+    acct_addr: Address,
+    acct_ver: u64,
     encrypted_bytes: &[u8],
 ) -> Result<(), String> {
     let (enc_obj, policy_pkg) = validate_seal_persistence_ciphertext(
@@ -1376,20 +1464,6 @@ async fn append_seal_persistence_fence(
         policy_package_id,
         configured_policy_pkg,
     )?;
-    let reg_addr: Address = registry_id
-        .parse()
-        .map_err(|e| format!("invalid registry_id '{registry_id}': {e}"))?;
-    let acct_addr: Address = account_id
-        .parse()
-        .map_err(|e| format!("invalid account_id '{account_id}': {e}"))?;
-
-    let (acct_ver, reg_ver) = crate::storage::seal_native::fetch_shared_object_versions(
-        grpc_url,
-        account_id,
-        registry_id,
-    )
-    .await
-    .unwrap_or((1, 1));
 
     let id_arg = builder.pure(&enc_obj.id);
     let reg_arg = builder.object(ObjectInput::shared(reg_addr, reg_ver, false));
@@ -2676,8 +2750,8 @@ pub async fn advance_durable_upload_in_process(
                 &runtime.sui_network,
                 private_key,
                 certify_ptb,
-                false,
-                false,
+                SponsorshipMode::EnokiFirst,
+                EffectsFetchMode::DigestOnly,
             )
             .await
             {
@@ -2756,34 +2830,52 @@ pub async fn set_metadata_batch_in_process(
         policy_package_id,
     } = seal_persistence;
 
+    // Resolve shared object versions once before the loop and batch-fetch all owned blob
+    // object refs in a single `BatchGetObjects` gRPC call (`M-THROUGHPUT`).
+    let reg_addr: Address = registry_id
+        .parse()
+        .map_err(|e| AppError::Internal(format!("invalid registry_id '{registry_id}': {e}")))?;
+    let acct_addr: Address = account_id
+        .parse()
+        .map_err(|e| AppError::Internal(format!("invalid account_id '{account_id}': {e}")))?;
+
+    let object_ids: Vec<String> = blobs.iter().map(|b| b.blob_object_id.clone()).collect();
+    let (shared_versions_res, resolved_refs_res) = tokio::join!(
+        crate::storage::seal_native::fetch_shared_object_versions(
+            &runtime.grpc_url,
+            account_id,
+            registry_id,
+        ),
+        resolve_owned_object_refs_batch(&runtime.grpc_url, &object_ids),
+    );
+    let (acct_ver, reg_ver) = shared_versions_res.unwrap_or((1, 1));
+    let resolved_refs = resolved_refs_res.map_err(AppError::Internal)?;
+
     let mut builder = TransactionBuilder::new();
     let mut blob_args = Vec::with_capacity(blobs.len());
+    let canonical_owner_str = owner.to_string();
 
-    for entry in &blobs {
+    for (entry, (blob_addr, blob_ver, blob_digest)) in blobs.iter().zip(resolved_refs) {
         if let Some(enc_b64) = &entry.encrypted_data {
             let enc_bytes = base64::engine::general_purpose::STANDARD
                 .decode(enc_b64)
                 .map_err(|e| {
                     AppError::Internal(format!("invalid encryptedData base64 in batch: {e}"))
                 })?;
-            append_seal_persistence_fence(
+            append_seal_encrypt_fence_move_call(
                 &mut builder,
-                &runtime.grpc_url,
                 package_id,
                 policy_package_id,
                 &runtime.seal_policy_package_id,
-                registry_id,
-                account_id,
+                reg_addr,
+                reg_ver,
+                acct_addr,
+                acct_ver,
                 &enc_bytes,
             )
-            .await
             .map_err(AppError::Internal)?;
         }
 
-        let (blob_addr, blob_ver, blob_digest) =
-            resolve_owned_object_ref(&runtime.grpc_url, &entry.blob_object_id)
-                .await
-                .map_err(AppError::Internal)?;
         let blob_arg = builder.object(ObjectInput::owned(blob_addr, blob_ver, blob_digest));
         blob_args.push(blob_arg);
 
@@ -2792,10 +2884,9 @@ pub async fn set_metadata_batch_in_process(
         } else {
             entry.namespace.as_str()
         };
-        let canonical_owner_str = owner.to_string();
         let mut pairs = vec![
             ("memwal_namespace", ns.to_owned()),
-            ("memwal_owner", canonical_owner_str),
+            ("memwal_owner", canonical_owner_str.clone()),
         ];
         if !package_id.trim().is_empty() {
             pairs.push(("memwal_package_id", package_id.to_owned()));
@@ -2834,8 +2925,8 @@ pub async fn set_metadata_batch_in_process(
         private_key,
         ptb,
         Some(allowed_addrs),
-        false,
-        false,
+        SponsorshipMode::EnokiFirst,
+        EffectsFetchMode::DigestOnly,
     )
     .await
     .map_err(AppError::Internal)?;
@@ -2900,6 +2991,58 @@ fn parse_metadata_from_proto_object(
         let json_val = prost_to_json(json_proto);
         collect_vec_map_entries(&json_val, out);
     }
+}
+
+/// Batch-fetches derived `b"metadata"` dynamic-field objects for `object_ids` via
+/// `BatchGetObjectsRequest` (chunks of 50) instead of issuing N sequential `GetObject`
+/// gRPC calls (`M-THROUGHPUT`).
+async fn batch_read_blob_metadata_maps(
+    client: &mut sui_rpc::Client,
+    object_ids: &[String],
+) -> HashMap<String, HashMap<String, String>> {
+    let mut batch_metadata: HashMap<String, HashMap<String, String>> =
+        HashMap::with_capacity(object_ids.len());
+    let Ok(key_bcs) = bcs::to_bytes(b"metadata".as_slice()) else {
+        return batch_metadata;
+    };
+    let key_type = TypeTag::Vector(Box::new(TypeTag::U8));
+
+    for chunk in object_ids.chunks(50) {
+        let mut reqs = Vec::with_capacity(chunk.len());
+        let mut chunk_obj_ids = Vec::with_capacity(chunk.len());
+        for object_id in chunk {
+            if let Ok(blob_addr) = object_id.parse::<Address>() {
+                let df_id = blob_addr.derive_dynamic_child_id(&key_type, &key_bcs);
+                let mut get_req = GetObjectRequest::default();
+                get_req.object_id = Some(df_id.to_string());
+                reqs.push(get_req);
+                chunk_obj_ids.push(object_id.clone());
+            }
+        }
+        if reqs.is_empty() {
+            continue;
+        }
+        let mut batch_req = BatchGetObjectsRequest::default();
+        batch_req.requests = reqs;
+        batch_req.read_mask = Some(FieldMask::from_paths(["json", "bcs"]));
+        if let Ok(batch_resp) = client.ledger_client().batch_get_objects(batch_req).await {
+            for (object_id, obj_res) in chunk_obj_ids
+                .into_iter()
+                .zip(batch_resp.into_inner().objects)
+            {
+                if let Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(obj)) =
+                    obj_res.result
+                {
+                    let mut map = HashMap::new();
+                    parse_metadata_from_proto_object(&obj, &mut map);
+                    if !map.is_empty() {
+                        batch_metadata.insert(object_id, map);
+                    }
+                }
+            }
+        }
+    }
+    batch_metadata
 }
 
 async fn read_blob_metadata_map(
@@ -3399,49 +3542,8 @@ pub async fn query_blobs_by_owner_in_process(
     )
     .await?;
 
-    // Batch-fetch derived `b"metadata"` dynamic-field objects via `BatchGetObjectsRequest`
-    // (chunks of 50) instead of issuing N sequential `GetObject` gRPC calls.
-    let mut batch_metadata: HashMap<String, HashMap<String, String>> =
-        HashMap::with_capacity(candidates.len());
-    if let Ok(key_bcs) = bcs::to_bytes(b"metadata".as_slice()) {
-        let key_type = TypeTag::Vector(Box::new(TypeTag::U8));
-        for chunk in candidates.chunks(50) {
-            let mut reqs = Vec::with_capacity(chunk.len());
-            let mut chunk_obj_ids = Vec::with_capacity(chunk.len());
-            for (object_id, _) in chunk {
-                if let Ok(blob_addr) = object_id.parse::<Address>() {
-                    let df_id = blob_addr.derive_dynamic_child_id(&key_type, &key_bcs);
-                    let mut get_req = GetObjectRequest::default();
-                    get_req.object_id = Some(df_id.to_string());
-                    reqs.push(get_req);
-                    chunk_obj_ids.push(object_id.clone());
-                }
-            }
-            if reqs.is_empty() {
-                continue;
-            }
-            let mut batch_req = BatchGetObjectsRequest::default();
-            batch_req.requests = reqs;
-            batch_req.read_mask = Some(FieldMask::from_paths(["json", "bcs"]));
-            if let Ok(batch_resp) = client.ledger_client().batch_get_objects(batch_req).await {
-                for (object_id, obj_res) in chunk_obj_ids
-                    .into_iter()
-                    .zip(batch_resp.into_inner().objects)
-                {
-                    if let Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(
-                        obj,
-                    )) = obj_res.result
-                    {
-                        let mut map = HashMap::new();
-                        parse_metadata_from_proto_object(&obj, &mut map);
-                        if !map.is_empty() {
-                            batch_metadata.insert(object_id, map);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+    let mut batch_metadata = batch_read_blob_metadata_maps(&mut client, &candidate_ids).await;
 
     let mut blobs = Vec::new();
     for (object_id, blob_id) in candidates {
@@ -3616,11 +3718,22 @@ pub async fn find_blob_by_job_in_process(
                 })?
                 .into_inner();
 
+            let page_obj_ids: Vec<String> = resp
+                .objects
+                .iter()
+                .filter_map(|o| o.object_id.clone())
+                .collect();
+            let mut batch_metadata =
+                batch_read_blob_metadata_maps(&mut client, &page_obj_ids).await;
+
             for obj in resp.objects {
                 let Some(object_id) = obj.object_id else {
                     continue;
                 };
-                let metadata = read_blob_metadata_map(&mut client, &object_id).await;
+                let metadata = match batch_metadata.remove(&object_id) {
+                    Some(map) => map,
+                    None => read_blob_metadata_map(&mut client, &object_id).await,
+                };
                 let job_matches = metadata.get("memwal_job_id").map(String::as_str) == Some(job_id);
                 let owner_matches = metadata
                     .get("memwal_owner")
@@ -4186,5 +4299,38 @@ mod tests {
         assert!(
             matches!(err, AppError::Internal(ref msg) if msg.contains("unable to verify creation provenance"))
         );
+    }
+
+    #[test]
+    fn native_runtime_config_debug_redacts_sui_private_keys() {
+        let cfg = NativeRuntimeConfig {
+            grpc_url: "https://fullnode.testnet.sui.io:443".to_owned(),
+            sui_network: "testnet".to_owned(),
+            walrus_publisher_url: "https://upload-relay.testnet.walrus.space".to_owned(),
+            walrus_package_id: TESTNET_WALRUS_PACKAGE_ID.to_owned(),
+            walrus_system_object_id: TESTNET_WALRUS_SYSTEM_OBJECT_ID.to_owned(),
+            sui_private_keys: vec!["suiprivkey1_super_secret_key_material_do_not_log".to_owned()],
+            package_id: "0x1".to_owned(),
+            seal_policy_package_id: "0x1".to_owned(),
+            registry_id: "0x2".to_owned(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("suiprivkey1_super_secret_key_material_do_not_log"),
+            "Debug output must never expose raw sui_private_keys: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED; 1 keys]"));
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NativeRuntimeConfig>();
+        assert_send_sync::<InProcessUploadLimiter>();
+        assert_send_sync::<UploadSlotGuard<'_>>();
+        assert_send_sync::<NativeWalletBalanceEntry>();
+        assert_send_sync::<WalrusSystemSnapshot>();
+        assert_send_sync::<EncodedWalrusBlob>();
+        assert_send_sync::<RelayTipConfig>();
     }
 }
