@@ -46,14 +46,16 @@ await memwal.restore("demo");
 
 ## Documentation
 
-- Full docs at [memory.walrus.xyz](https://memory.walrus.xyz)
-- Docs source of truth: `docs/`
+- Full docs at [docs.wal.app/walrus-memory](https://docs.wal.app/walrus-memory)
+- Docs source of truth: [MystenLabs/walrus-documentation](https://github.com/MystenLabs/walrus-documentation),
+  under `content/walrus-memory/`. Open documentation pull requests there. The engineering docs
+  that are not published stay in [`docs/`](docs/README.md).
 - Docs site entry points:
-  - [What is Walrus Memory?](docs/getting-started/what-is-memwal.md)
-  - [Quick Start](docs/getting-started/quick-start.md)
-  - [SDK Quick Start](docs/sdk/quick-start.md)
-  - [Relayer Overview](docs/relayer/overview.md)
-  - [SDK API Reference](docs/sdk/api-reference.md)
+  - [What is Walrus Memory?](https://docs.wal.app/walrus-memory)
+  - [Quick Start](https://docs.wal.app/walrus-memory/getting-started/quick-start)
+  - [SDK Quick Start](https://docs.wal.app/walrus-memory/sdk/quick-start)
+  - [Relayer Overview](https://docs.wal.app/walrus-memory/relayer/overview)
+  - [SDK API Reference](https://docs.wal.app/walrus-memory/sdk/api-reference)
 
 ## Contributing
 
@@ -109,9 +111,9 @@ For the full step-by-step setup guide, see:
 openclaw plugins install @mysten-incubation/oc-memwal
 ```
 
-- [Plugin Quick Start](docs/openclaw/quick-start.md)
-- [How It Works](docs/openclaw/how-it-works.md)
-- [Reference](docs/openclaw/reference.md)
+- [Plugin Quick Start](https://docs.wal.app/walrus-memory/openclaw/quick-start)
+- [How It Works](https://docs.wal.app/walrus-memory/openclaw/how-it-works)
+- [Reference](https://docs.wal.app/walrus-memory/openclaw/reference)
 
 ## How It Works
 
