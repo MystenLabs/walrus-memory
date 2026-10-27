@@ -12,6 +12,7 @@
 - `formatUntrustedMemories` and `withMemWal` validate that each recalled memory's `distance` is a finite number and clamp similarity relevance (`1 - distance`) to `[0, 1]` before filtering and formatting. Records with `undefined`, `NaN`, or `±Infinity` distances are dropped instead of rendering `"relevance":"NaN"`, and negative or greater-than-one distances are clamped to `1.00` / `0.00`. (#976)
 - `MemWal.listNamespaces` and `MemWal.listMemories` reject a `limit` that is not a positive integer before signing the query string, with the same `limit must be a positive integer, got <limit>` `TypeError` as `recall` and `recallManual`. (#1213)
 - `analyze()` accepts an optional `signal` in `AnalyzeOptions` and aborts the in-flight `/api/analyze` HTTP request when the caller's `AbortSignal` fires. (#1095)
+- `MemWal.rememberManual`, `MemWal.recallManual`, `MemWalManual.rememberManual`, and `MemWalManual.recallManual` reject an empty or non-finite `vector` (including `NaN`, `±Infinity`, non-number elements, and sparse arrays) before signing, and `rememberManual` rejects a missing or blank `encryptedData` string with `TypeError`. (#1211)
 
 ## 0.1.10
 

@@ -51,6 +51,8 @@ import {
     clockDriftErrorFromResponse,
     assertFiniteScoringWeights,
     scoringWeightsToWire,
+    assertFiniteVector,
+    assertNonEmptyEncryptedData,
     fetchWithDeadline,
     DEFAULT_PREFLIGHT_TIMEOUT_MS,
     RESTORE_REQUEST_TIMEOUT_MS,
@@ -521,6 +523,8 @@ export class MemWalManual {
         // Step 3: Send encrypted bytes (base64) + vector to server.
         // Server will upload to Walrus via upload-relay and return the blob_id.
         const encryptedBase64 = bytesToBase64(encrypted);
+        assertNonEmptyEncryptedData(encryptedBase64);
+        assertFiniteVector(vector);
         return this.signedRequest<RememberManualResult>("POST", "/api/remember/manual", {
             encrypted_data: encryptedBase64,
             vector,
@@ -564,6 +568,7 @@ export class MemWalManual {
 
         // Step 1: Embed query
         const vector = await this.embed(query);
+        assertFiniteVector(vector);
 
         // Step 2: Search server
         const searchResult = await this.signedRequest<{

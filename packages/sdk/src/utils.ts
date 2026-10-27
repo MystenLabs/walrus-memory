@@ -141,6 +141,29 @@ export function scoringWeightsToWire(weights?: ScoringWeights): object | undefin
     };
 }
 
+/**
+ * Manual-mode vectors are signed as JSON, where NaN/Infinity and sparse-array
+ * holes become null and a missing vector is dropped, so check them before
+ * signing (#1211).
+ */
+export function assertFiniteVector(vector: unknown): void {
+    if (
+        !Array.isArray(vector) ||
+        vector.length === 0 ||
+        !Array.from(vector).every((v) => typeof v === "number" && Number.isFinite(v))
+    ) {
+        throw new TypeError(
+            "vector must be a non-empty array of finite numbers",
+        );
+    }
+}
+
+export function assertNonEmptyEncryptedData(encryptedData: unknown): void {
+    if (typeof encryptedData !== "string" || encryptedData.trim() === "") {
+        throw new TypeError("encryptedData must be a non-empty base64 string");
+    }
+}
+
 // ============================================================
 // Sui Private Key Formats
 // ============================================================
