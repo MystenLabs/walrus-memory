@@ -4,7 +4,7 @@
  * Common crypto and encoding helpers used across the SDK.
  */
 
-import type { ScoringWeights } from "./types.js";
+import type { ForgetResult, ScoringWeights } from "./types.js";
 
 // ============================================================
 // SHA-256 (Isomorphic)
@@ -372,6 +372,53 @@ export function assertNonBlankText(text: string, message = "Text cannot be empty
         throw err;
     }
 }
+
+/**
+ * Resolve the target namespace for `forget()` / `forgetNamespace()`.
+ *
+ * `undefined` uses `defaultNamespace`. Any provided value must be a non-empty,
+ * non-whitespace string — `""` or whitespace-only throws
+ * `Error("namespace cannot be empty")` instead of silently falling back to the
+ * default namespace and wiping it (#1043).
+ */
+export function resolveForgetNamespace(
+    namespace: string | undefined,
+    defaultNamespace: string,
+): string {
+    const resolved = namespace === undefined ? defaultNamespace : namespace;
+    if (typeof resolved !== "string" || resolved.trim().length === 0) {
+        throw new Error("namespace cannot be empty");
+    }
+    return resolved;
+}
+
+/**
+ * Validate and normalize a `POST /api/forget` response body into a
+ * `ForgetResult` (#1043).
+ */
+export function parseForgetResult(body: unknown, endpoint = "POST /api/forget"): ForgetResult {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        throw new Error(`MemWal: ${endpoint} response is missing deleted, namespace, and owner fields`);
+    }
+    const record = body as Record<string, unknown>;
+    const { deleted, namespace, owner } = record;
+    if (
+        typeof deleted !== "number" ||
+        !Number.isFinite(deleted) ||
+        !Number.isInteger(deleted) ||
+        deleted < 0
+    ) {
+        throw new Error(`MemWal: ${endpoint} response is missing a valid deleted count`);
+    }
+    if (typeof namespace !== "string" || namespace.trim().length === 0) {
+        throw new Error(`MemWal: ${endpoint} response is missing a valid namespace`);
+    }
+    if (typeof owner !== "string" || owner.trim().length === 0) {
+        throw new Error(`MemWal: ${endpoint} response is missing a valid owner`);
+    }
+    return { deleted, namespace, owner };
+}
+
 
 // ============================================================
 // Error Sanitization (LOW-26)

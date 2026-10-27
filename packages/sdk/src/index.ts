@@ -78,6 +78,7 @@ export type {
     AnalyzedFact,
     HealthResult,
     RestoreResult,
+    ForgetResult,
     RememberBulkItem,
     RememberBulkOptions,
     RememberBulkAsyncOptions,

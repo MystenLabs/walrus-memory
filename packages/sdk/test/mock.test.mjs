@@ -671,4 +671,59 @@ test("MemWalMock.remember with dedupe: true does not collapse onto a prior norma
     assert.equal(secondDedupe.blob_id, firstDedupe.blob_id);
 });
 
+test("MemWalMock.forgetNamespace clears a namespace and returns ForgetResult while forget(blobId) stays synchronous (#1043)", async () => {
+    const mock = MemWalMock.create({
+        namespace: "default-ns",
+        owner: "0xmockowner",
+    });
 
+    const defOne = await mock.rememberAndWait("default fact one", undefined, {
+        idempotencyKey: "idem-def-1",
+    });
+    await mock.rememberAndWait("default fact two", undefined, {
+        dedupe: true,
+    });
+    const customOne = await mock.rememberAndWait("custom fact one", "custom-ns");
+    await mock.rememberAndWait("custom fact two", "custom-ns");
+    await mock.rememberAndWait("other fact", "other-ns");
+
+    // Per-blob forget(blobId) remains synchronous boolean.
+    const removedBlob = mock.forget(customOne.blob_id);
+    assert.equal(typeof removedBlob, "boolean");
+    assert.equal(removedBlob, true);
+    assert.equal(mock.forget(customOne.blob_id), false);
+
+    // forgetNamespace("custom-ns") deletes the remaining record in custom-ns only.
+    const customForgot = mock.forgetNamespace("custom-ns");
+    assert.deepEqual(customForgot, {
+        deleted: 1,
+        namespace: "custom-ns",
+        owner: "0xmockowner",
+    });
+    assert.equal((await mock.recall({ query: "custom", namespace: "custom-ns" })).total, 0);
+    assert.equal((await mock.recall({ query: "other", namespace: "other-ns" })).total, 1);
+
+    // Empty / whitespace namespace throws and does not touch default-ns.
+    assert.throws(() => mock.forgetNamespace(""), {
+        message: /namespace cannot be empty/,
+    });
+    assert.throws(() => mock.forgetNamespace("   "), {
+        message: /namespace cannot be empty/,
+    });
+    assert.equal((await mock.recall({ query: "default" })).total, 2);
+
+    // Omitting namespace clears the client's default namespace and releases idempotency + dedupe keys.
+    const defaultForgot = mock.forgetNamespace();
+    assert.deepEqual(defaultForgot, {
+        deleted: 2,
+        namespace: "default-ns",
+        owner: "0xmockowner",
+    });
+    assert.equal((await mock.recall({ query: "default" })).total, 0);
+
+    // Re-writing with the same idempotencyKey or dedupe: true creates a new job.
+    const rewrittenIdem = await mock.rememberAndWait("default fact one", undefined, {
+        idempotencyKey: "idem-def-1",
+    });
+    assert.notEqual(rewrittenIdem.job_id, defOne.job_id);
+});

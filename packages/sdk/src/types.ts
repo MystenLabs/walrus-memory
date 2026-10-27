@@ -629,6 +629,16 @@ export interface RestoreResult {
     truncated: boolean;
 }
 
+/** Result from forget() / forgetNamespace() (POST /api/forget). Walrus blobs persist; index rows are removed. */
+export interface ForgetResult {
+    /** Number of memories soft-deleted in the namespace */
+    deleted: number;
+    /** Namespace that was cleared */
+    namespace: string;
+    /** Hex-encoded owner address */
+    owner: string;
+}
+
 // ============================================================
 // Full Client-Side Manual Flow — MemWalManual class
 // ============================================================
