@@ -658,6 +658,12 @@ pub async fn analyze(
         .await
         {
             Ok(result) => result,
+            Err(e) if super::remember::is_idempotency_key_unique_violation(&e) => {
+                rate_limit::release_storage_quota(&state, &all_ids[idx..]).await;
+                return Err(AppError::Conflict(
+                    super::remember::IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into(),
+                ));
+            }
             Err(e) => {
                 rate_limit::release_storage_quota(&state, &all_ids[idx..]).await;
                 return Err(AppError::Internal(format!(
@@ -687,6 +693,17 @@ pub async fn analyze(
                 }
                 Ok(None) => {
                     rate_limit::release_storage_quota(&state, &all_ids[idx + 1..]).await;
+                    if super::remember::has_remember_job_for_owner_key(
+                        state.db.pool(),
+                        owner,
+                        &idem_key,
+                    )
+                    .await?
+                    {
+                        return Err(AppError::Conflict(
+                            super::remember::IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into(),
+                        ));
+                    }
                     return Err(AppError::Internal(
                         "Failed to create analyze job row: insert affected no rows".into(),
                     ));
@@ -788,6 +805,13 @@ pub async fn analyze(
                         .await
                         {
                             Ok(result) => result,
+                            Err(e) if super::remember::is_idempotency_key_unique_violation(&e) => {
+                                rate_limit::release_storage_quota(&state, &all_ids[idx + 1..])
+                                    .await;
+                                return Err(AppError::Conflict(
+                                    super::remember::IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into(),
+                                ));
+                            }
                             Err(e) => {
                                 rate_limit::release_storage_quota(&state, &all_ids[idx + 1..])
                                     .await;

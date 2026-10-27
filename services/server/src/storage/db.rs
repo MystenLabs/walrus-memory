@@ -164,6 +164,8 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     migration!("024_memory_tombstones_deleted_at_index.sql"),
     // Quarantined owners asking for admin_clear_quarantine.
     migration!("025_account_unblock_requests.sql"),
+    // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
+    migration!("026_drop_owner_idempotency_key_index.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -1886,10 +1888,76 @@ mod tests {
             migration_sql("005_remember_jobs.sql"),
             migration_sql("012_remember_write_idempotency.sql"),
             migration_sql("013_remember_write_idempotency_index.sql"),
+            migration_sql("026_drop_owner_idempotency_key_index.sql"),
         ] {
             execute_idempotent_migration(db.pool(), migration).await;
         }
         Some(db)
+    }
+
+    #[tokio::test]
+    async fn migration_026_drops_legacy_owner_idempotency_key_index() {
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgresql://memwal:memwal_secret@localhost:5432/memwal".into());
+        let Ok(pool) = PgPoolOptions::new().max_connections(2).connect(&url).await else {
+            eprintln!("skipping DB integration test: PostgreSQL is not reachable");
+            return;
+        };
+        let _guard = VECTOR_SCHEMA_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        for migration in [
+            migration_sql("005_remember_jobs.sql"),
+            migration_sql("012_remember_write_idempotency.sql"),
+            migration_sql("013_remember_write_idempotency_index.sql"),
+            migration_sql("026_drop_owner_idempotency_key_index.sql"),
+        ] {
+            execute_idempotent_migration(&pool, migration).await;
+        }
+
+        let owner = format!("0xlegacy-idx-owner-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_remember_jobs_owner_idempotency_key
+             ON remember_jobs (owner, idempotency_key)
+             WHERE idempotency_key IS NOT NULL AND owner = '{owner}'"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(migration_sql("026_drop_owner_idempotency_key_index.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let legacy_exists: Option<bool> = sqlx::query_scalar(
+            "SELECT indisvalid FROM pg_index JOIN pg_class ON pg_class.oid = pg_index.indexrelid
+             WHERE relname = 'uq_remember_jobs_owner_idempotency_key'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy_exists, None,
+            "migration 026 must drop uq_remember_jobs_owner_idempotency_key"
+        );
+
+        let scoped_valid: Option<bool> = sqlx::query_scalar(
+            "SELECT indisvalid FROM pg_index JOIN pg_class ON pg_class.oid = pg_index.indexrelid
+             WHERE relname = 'uq_remember_jobs_owner_namespace_idempotency_key'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            scoped_valid,
+            Some(true),
+            "migration 026 must keep uq_remember_jobs_owner_namespace_idempotency_key valid"
+        );
     }
 
     #[tokio::test]
