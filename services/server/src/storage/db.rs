@@ -167,6 +167,7 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
     migration!("026_drop_owner_idempotency_key_index.sql"),
     migration!("027_owner_rate_limits.sql"),
+    migration!("028_forgotten_blob_timestamps.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -263,6 +264,7 @@ pub struct VectorInsert<'a> {
     pub agent_id: Option<&'a str>,
     pub package_id: Option<&'a str>,
     pub end_epoch: Option<i32>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct VectorDb {
@@ -1704,6 +1706,7 @@ mod tests {
             agent_id: None,
             package_id: None,
             end_epoch: None,
+            created_at: None,
         }
     }
 
@@ -1800,6 +1803,408 @@ mod tests {
         let landed = rows_for_owner(&db, &owner, &namespace).await;
         delete_rows_for_owner(&db, &owner).await;
         assert_eq!(landed, 3, "every row in a successful batch must be visible");
+    }
+
+    /// Regression test for #1060: `insert_vectors_atomic` runs in one
+    /// PostgreSQL transaction where `NOW()` is constant for the entire batch.
+    /// When `VectorInsert.created_at` carries each memory's original write
+    /// timestamp, `vector_entries.created_at` must preserve those distinct
+    /// timestamps instead of stamping every restored row with `NOW()`.
+    #[tokio::test]
+    async fn restore_batch_insert_preserves_original_created_at_timestamps() {
+        let Some(db) = test_db().await else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let owner = format!("0xrestore-created-at-{suffix}");
+        let namespace = format!("ns-{suffix}");
+        let old_id = format!("restore-old-{suffix}");
+        let new_id = format!("restore-new-{suffix}");
+        let old_blob = format!("blob-old-{suffix}");
+        let new_blob = format!("blob-new-{suffix}");
+        let vector = vec![0.1_f32; 1536];
+        let old_ts = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:23:16.416599Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let new_ts = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:24:07.559558Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut row_old = restore_row(&old_id, &owner, &namespace, &old_blob, &vector);
+        row_old.created_at = Some(old_ts);
+        let mut row_new = restore_row(&new_id, &owner, &namespace, &new_blob, &vector);
+        row_new.created_at = Some(new_ts);
+
+        db.insert_vectors_atomic(&[row_old, row_new])
+            .await
+            .expect("restore batch with explicit created_at must commit");
+
+        let hits = db
+            .search_similar(&vector, &owner, &namespace, 10)
+            .await
+            .expect("search_similar must succeed");
+        delete_rows_for_owner(&db, &owner).await;
+
+        let by_blob: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = hits
+            .into_iter()
+            .map(|h| (h.blob_id, h.created_at))
+            .collect();
+        assert_eq!(by_blob.get(&old_blob).copied(), Some(old_ts));
+        assert_eq!(by_blob.get(&new_blob).copied(), Some(new_ts));
+        assert!(
+            by_blob[&new_blob] > by_blob[&old_blob],
+            "newer fact must retain a strictly newer created_at after atomic restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_original_created_at_by_blob_ids_resolves_remember_job_timestamps() {
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgresql://memwal:memwal_secret@localhost:5432/memwal".into());
+        let Ok(pool) = PgPoolOptions::new().max_connections(2).connect(&url).await else {
+            eprintln!("skipping DB integration test: PostgreSQL is not reachable");
+            return;
+        };
+        {
+            let _guard = VECTOR_SCHEMA_SETUP_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
+            execute_idempotent_migration(&pool, migration_sql("005_remember_jobs.sql")).await;
+        }
+
+        let suffix = uuid::Uuid::new_v4();
+        let owner = format!("0xrestore-ts-owner-{suffix}");
+        let other_owner = format!("0xrestore-ts-other-{suffix}");
+        let namespace = format!("ns-{suffix}");
+        let blob_old = format!("blob-old-{suffix}");
+        let blob_new = format!("blob-new-{suffix}");
+        let blob_foreign = format!("blob-foreign-{suffix}");
+        let ts_old = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:23:16.416599Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_new = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:24:07.559558Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_other_ns = chrono::DateTime::parse_from_rfc3339("2026-09-30T08:00:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        for (id, row_owner, row_ns, status, blob_id, created_at) in [
+            (
+                format!("job-old-{suffix}"),
+                &owner,
+                namespace.as_str(),
+                "done",
+                &blob_old,
+                ts_old,
+            ),
+            (
+                format!("job-old-other-ns-{suffix}"),
+                &owner,
+                "other-ns",
+                "done",
+                &blob_old,
+                ts_other_ns,
+            ),
+            (
+                format!("job-new-{suffix}"),
+                &owner,
+                namespace.as_str(),
+                "done",
+                &blob_new,
+                ts_new,
+            ),
+            (
+                format!("job-foreign-{suffix}"),
+                &other_owner,
+                namespace.as_str(),
+                "done",
+                &blob_foreign,
+                ts_new,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            )
+            .bind(id)
+            .bind(row_owner)
+            .bind(row_ns)
+            .bind(status)
+            .bind(blob_id)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let requested = vec![
+            blob_old.clone(),
+            blob_new.clone(),
+            blob_foreign.clone(),
+            format!("blob-missing-{suffix}"),
+        ];
+        let resolved = super::get_original_created_at_by_blob_ids_on_pool(
+            &pool, &owner, &namespace, &requested,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM remember_jobs WHERE owner = ANY($1)")
+            .bind(vec![owner.clone(), other_owner.clone()])
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.get(&blob_old).copied(),
+            Some(ts_old),
+            "matching namespace job timestamp must win for blob_old"
+        );
+        assert_eq!(
+            resolved.get(&blob_new).copied(),
+            Some(ts_new),
+            "blob_new must resolve its original remember_jobs.created_at"
+        );
+        assert!(
+            !resolved.contains_key(&blob_foreign),
+            "must never leak timestamps from another owner's remember_jobs"
+        );
+    }
+
+    async fn cleanup_test_owner(db: &VectorDb, owner: &str) {
+        let _ = sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(owner)
+            .execute(db.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM forgotten_blob_timestamps WHERE owner = $1")
+            .bind(owner)
+            .execute(db.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(owner)
+            .execute(db.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM memory_tombstones WHERE owner = $1")
+            .bind(owner)
+            .execute(db.pool())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_indexed_timestamp_over_out_of_order_enqueue_and_orders_by_recency() {
+        let Some(db) = test_db().await else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let owner = format!("0xooo-{suffix}");
+        let namespace = format!("ns-{suffix}");
+        let blob_a = format!("blob-a-{suffix}");
+        let blob_b = format!("blob-b-{suffix}");
+        let id_a = format!("id-a-{suffix}");
+        let id_b = format!("id-b-{suffix}");
+        let vector = vec![0.1_f32; 1536];
+
+        // Job A enqueued first at 10:00:00, Job B enqueued second at 10:05:00
+        let ts_a_enqueued = chrono::DateTime::parse_from_rfc3339("2026-09-30T10:00:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_b_enqueued = chrono::DateTime::parse_from_rfc3339("2026-09-30T10:05:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Out of order execution: Job B completed and indexed first at 10:06:00,
+        // Job A completed and indexed later at 10:10:00.
+        let ts_b_indexed = chrono::DateTime::parse_from_rfc3339("2026-09-30T10:06:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_a_indexed = chrono::DateTime::parse_from_rfc3339("2026-09-30T10:10:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Record audit rows in remember_jobs reflecting the enqueue times
+        for (job_id, blob, ts) in [
+            (format!("job-a-{suffix}"), &blob_a, ts_a_enqueued),
+            (format!("job-b-{suffix}"), &blob_b, ts_b_enqueued),
+        ] {
+            sqlx::query(
+                "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, 'done', $4, $5, $5)",
+            )
+            .bind(job_id)
+            .bind(&owner)
+            .bind(&namespace)
+            .bind(blob)
+            .bind(ts)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        // Live vector insertion with the actual indexed timestamps (Job A newer than Job B)
+        let mut row_a = restore_row(&id_a, &owner, &namespace, &blob_a, &vector);
+        row_a.created_at = Some(ts_a_indexed);
+        let mut row_b = restore_row(&id_b, &owner, &namespace, &blob_b, &vector);
+        row_b.created_at = Some(ts_b_indexed);
+
+        db.insert_vectors_atomic(&[row_a, row_b])
+            .await
+            .expect("insert_vectors_atomic must succeed");
+
+        // Forget the namespace: vector rows are removed and their actual vector_entries.created_at
+        // timestamps are saved atomically into forgotten_blob_timestamps.
+        let deleted = db
+            .delete_by_namespace(&owner, &namespace)
+            .await
+            .expect("delete_by_namespace must succeed");
+        assert_eq!(deleted, 2);
+
+        // Verify lookup_original_blob_created_at retrieves the exact indexed timestamps (ts_a_indexed, ts_b_indexed)
+        // instead of falling back to remember_jobs enqueue timestamps.
+        let resolved = db
+            .lookup_original_blob_created_at(&owner, &namespace, &[blob_a.clone(), blob_b.clone()])
+            .await
+            .expect("lookup_original_blob_created_at must succeed");
+
+        assert_eq!(
+            resolved.get(&blob_a).copied(),
+            Some(ts_a_indexed),
+            "Job A must preserve its indexed timestamp (10:10:00), not enqueue timestamp (10:00:00)"
+        );
+        assert_eq!(
+            resolved.get(&blob_b).copied(),
+            Some(ts_b_indexed),
+            "Job B must preserve its indexed timestamp (10:06:00), not enqueue timestamp (10:05:00)"
+        );
+
+        // Now simulate restore using the resolved timestamps
+        let id_restored_a = format!("restored-a-{suffix}");
+        let mut restored_a = restore_row(&id_restored_a, &owner, &namespace, &blob_a, &vector);
+        restored_a.created_at = resolved.get(&blob_a).copied();
+        let id_restored_b = format!("restored-b-{suffix}");
+        let mut restored_b = restore_row(&id_restored_b, &owner, &namespace, &blob_b, &vector);
+        restored_b.created_at = resolved.get(&blob_b).copied();
+
+        db.insert_vectors_atomic(&[restored_a, restored_b])
+            .await
+            .expect("restored batch must commit");
+
+        // Verify recency ordering in search_similar: A must have newer created_at than B
+        let hits = db
+            .search_similar(&vector, &owner, &namespace, 10)
+            .await
+            .expect("search_similar must succeed");
+
+        let by_blob: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = hits
+            .into_iter()
+            .map(|h| (h.blob_id, h.created_at))
+            .collect();
+
+        assert_eq!(by_blob.get(&blob_a).copied(), Some(ts_a_indexed));
+        assert_eq!(by_blob.get(&blob_b).copied(), Some(ts_b_indexed));
+        assert!(
+            by_blob[&blob_a] > by_blob[&blob_b],
+            "Job A (indexed 10:10:00) must be strictly newer than Job B (indexed 10:06:00)"
+        );
+
+        cleanup_test_owner(&db, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_manual_writes_and_survives_two_forget_restore_cycles() {
+        let Some(db) = test_db().await else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let owner = format!("0xmanual-{suffix}");
+        let namespace = format!("ns-{suffix}");
+        let blob_id = format!("blob-manual-{suffix}");
+        let id = format!("id-manual-{suffix}");
+        let vector = vec![0.2_f32; 1536];
+
+        // Manual write: has no remember_jobs row, only vector_entries
+        let ts_manual = chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut row = restore_row(&id, &owner, &namespace, &blob_id, &vector);
+        row.created_at = Some(ts_manual);
+
+        db.insert_vectors_atomic(&[row])
+            .await
+            .expect("manual write must insert");
+
+        // Cycle 1: Forget namespace
+        let deleted = db
+            .delete_by_namespace(&owner, &namespace)
+            .await
+            .expect("cycle 1 delete must succeed");
+        assert_eq!(deleted, 1);
+
+        // Cycle 1: Restore
+        let resolved_1 = db
+            .lookup_original_blob_created_at(&owner, &namespace, &[blob_id.clone()])
+            .await
+            .expect("cycle 1 lookup must succeed");
+        assert_eq!(
+            resolved_1.get(&blob_id).copied(),
+            Some(ts_manual),
+            "manual write must retain its indexed timestamp across forget without remember_jobs"
+        );
+
+        let id_restored_1 = format!("id-r1-{suffix}");
+        let mut restored_1 = restore_row(&id_restored_1, &owner, &namespace, &blob_id, &vector);
+        restored_1.created_at = resolved_1.get(&blob_id).copied();
+        db.insert_vectors_atomic(&[restored_1])
+            .await
+            .expect("cycle 1 restore must insert");
+
+        // Simulate tombstone sweeping: delete tombstones
+        sqlx::query("DELETE FROM memory_tombstones WHERE owner = $1")
+            .bind(&owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Cycle 2: Forget namespace again
+        let deleted_2 = db
+            .delete_by_namespace(&owner, &namespace)
+            .await
+            .expect("cycle 2 delete must succeed");
+        assert_eq!(deleted_2, 1);
+
+        // Cycle 2: Restore again
+        let resolved_2 = db
+            .lookup_original_blob_created_at(&owner, &namespace, &[blob_id.clone()])
+            .await
+            .expect("cycle 2 lookup must succeed");
+        assert_eq!(
+            resolved_2.get(&blob_id).copied(),
+            Some(ts_manual),
+            "retained timestamp must survive across two consecutive forget and restore cycles"
+        );
+
+        let id_restored_2 = format!("id-r2-{suffix}");
+        let mut restored_2 = restore_row(&id_restored_2, &owner, &namespace, &blob_id, &vector);
+        restored_2.created_at = resolved_2.get(&blob_id).copied();
+        db.insert_vectors_atomic(&[restored_2])
+            .await
+            .expect("cycle 2 restore must insert");
+
+        let hits = db
+            .search_similar(&vector, &owner, &namespace, 10)
+            .await
+            .expect("search_similar must succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].created_at, ts_manual);
+
+        cleanup_test_owner(&db, &owner).await;
     }
 
     /// The original bug's actual trigger: `POST /api/restore` wraps the restore
@@ -2805,6 +3210,151 @@ pub async fn release_storage_reservations_with_pool(pool: &PgPool, ids: &[String
     }
 }
 
+pub(crate) async fn ensure_forgotten_blob_timestamps_table_on_pool(
+    pool: &PgPool,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
+            owner TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            blob_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (owner, namespace, blob_id)
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to ensure forgotten_blob_timestamps table on pool: {}",
+            e
+        ))
+    })?;
+    Ok(())
+}
+
+async fn ensure_forgotten_blob_timestamps_table_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
+            owner TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            blob_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (owner, namespace, blob_id)
+        )",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to ensure forgotten_blob_timestamps table in tx: {}",
+            e
+        ))
+    })?;
+    Ok(())
+}
+
+/// Look up the original write timestamps for `blob_ids` belonging to `owner` (#1060).
+///
+/// Priority order:
+/// 1. Exact retained `vector_entries.created_at` from `forgotten_blob_timestamps`
+///    in the target namespace, preserved atomically during `delete_by_namespace`.
+/// 2. Exact indexed `vector_entries.created_at` from live rows (e.g. if present
+///    in another namespace for this owner).
+/// 3. Exact retained `created_at` from `forgotten_blob_timestamps` in any other
+///    namespace for this owner.
+/// 4. Legacy enqueue-time estimate from `remember_jobs` in the target namespace.
+/// 5. Legacy enqueue-time estimate from `remember_jobs` in any other namespace.
+pub(crate) async fn lookup_original_blob_created_at_on_pool(
+    pool: &PgPool,
+    owner: &str,
+    namespace: &str,
+    blob_ids: &[String],
+) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>, AppError> {
+    if blob_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let _ = ensure_forgotten_blob_timestamps_table_on_pool(pool).await;
+
+    let started = std::time::Instant::now();
+    let result: Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, AppError> = sqlx::query_as(
+        "WITH candidates AS (
+            -- 1. Exact retained indexed timestamp from forgotten_blob_timestamps in target namespace
+            SELECT blob_id, created_at, 1 AS priority
+            FROM forgotten_blob_timestamps
+            WHERE owner = $1 AND namespace = $2 AND blob_id = ANY($3)
+
+            UNION ALL
+
+            -- 2. Exact indexed timestamp from live vector_entries (e.g. stored in another namespace)
+            SELECT blob_id, MAX(created_at) AS created_at, 2 AS priority
+            FROM vector_entries
+            WHERE owner = $1 AND blob_id = ANY($3)
+            GROUP BY blob_id
+
+            UNION ALL
+
+            -- 3. Exact retained indexed timestamp from forgotten_blob_timestamps in any other namespace
+            SELECT blob_id, MAX(created_at) AS created_at, 3 AS priority
+            FROM forgotten_blob_timestamps
+            WHERE owner = $1 AND namespace <> $2 AND blob_id = ANY($3)
+            GROUP BY blob_id
+
+            UNION ALL
+
+            -- 4. Legacy enqueue-time estimate from remember_jobs in target namespace
+            SELECT blob_id, MIN(created_at) AS created_at,
+                   CASE WHEN status IN ('done', 'uploaded') THEN 4 ELSE 5 END AS priority
+            FROM remember_jobs
+            WHERE owner = $1 AND namespace = $2 AND blob_id = ANY($3)
+            GROUP BY blob_id, status
+
+            UNION ALL
+
+            -- 5. Legacy enqueue-time estimate from remember_jobs in any other namespace
+            SELECT blob_id, MIN(created_at) AS created_at,
+                   CASE WHEN status IN ('done', 'uploaded') THEN 6 ELSE 7 END AS priority
+            FROM remember_jobs
+            WHERE owner = $1 AND namespace <> $2 AND blob_id = ANY($3)
+            GROUP BY blob_id, status
+        )
+        SELECT DISTINCT ON (blob_id) blob_id, created_at
+        FROM candidates
+        ORDER BY blob_id, priority ASC, created_at ASC",
+    )
+    .bind(owner)
+    .bind(namespace)
+    .bind(blob_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to lookup original created_at by blob_ids: {}",
+            e
+        ))
+    });
+    crate::observability::observe_db(
+        "vector.lookup_original_blob_created_at",
+        db_status(&result),
+        started.elapsed(),
+    );
+    let rows = result?;
+
+    Ok(rows.into_iter().collect())
+}
+
+pub(crate) async fn get_original_created_at_by_blob_ids_on_pool(
+    pool: &PgPool,
+    owner: &str,
+    namespace: &str,
+    blob_ids: &[String],
+) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>, AppError> {
+    lookup_original_blob_created_at_on_pool(pool, owner, namespace, blob_ids).await
+}
+
 /// One pending write awaiting admission against an owner's storage quota.
 ///
 /// `id` is supplied by the caller rather than generated here, because the
@@ -2962,6 +3512,7 @@ impl VectorDb {
                 agent_id,
                 package_id,
                 end_epoch,
+                created_at: None,
             },
         )
         .await?;
@@ -3028,8 +3579,8 @@ impl VectorDb {
                 AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
             })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch, created_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, NOW())
              WHERE NOT EXISTS (
                  SELECT 1 FROM memory_tombstones WHERE memory_id = $1
              )
@@ -3043,6 +3594,7 @@ impl VectorDb {
                 agent_id = EXCLUDED.agent_id,
                 package_id = EXCLUDED.package_id,
                 end_epoch = EXCLUDED.end_epoch,
+                created_at = COALESCE($11, vector_entries.created_at),
                 updated_at = NOW()",
         )
         .bind(row.id)
@@ -3055,6 +3607,7 @@ impl VectorDb {
         .bind(row.agent_id)
         .bind(row.package_id)
         .bind(row.end_epoch)
+        .bind(row.created_at)
         .execute(&mut **tx)
         .await;
         // A Postgres storage-exhaustion failure is a write outage, not a user
@@ -3325,6 +3878,31 @@ impl VectorDb {
         Ok(rows.into_iter().map(|(blob_id,)| blob_id).collect())
     }
 
+    /// Look up original write timestamps for `blob_ids` belonging to `owner` (#1060).
+    ///
+    /// Preserves exact indexed `vector_entries.created_at` from `forgotten_blob_timestamps`
+    /// (retained during `delete_by_namespace`), live `vector_entries`, or legacy
+    /// `remember_jobs` audit rows.
+    pub async fn lookup_original_blob_created_at(
+        &self,
+        owner: &str,
+        namespace: &str,
+        blob_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>, AppError> {
+        lookup_original_blob_created_at_on_pool(&self.pool, owner, namespace, blob_ids).await
+    }
+
+    /// Backwards-compatible alias for [`Self::lookup_original_blob_created_at`].
+    #[allow(dead_code)]
+    pub async fn get_original_created_at_by_blob_ids(
+        &self,
+        owner: &str,
+        namespace: &str,
+        blob_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>, AppError> {
+        self.lookup_original_blob_created_at(owner, namespace, blob_ids).await
+    }
+
     /// Count + total stored bytes for a given owner + namespace.
     /// Used by `POST /api/stats` for harness verification. Returns
     /// `(memory_count, storage_bytes)`; both 0 if the namespace is empty.
@@ -3440,6 +4018,7 @@ impl VectorDb {
             .begin()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to begin forget tx: {}", e)))?;
+        ensure_forgotten_blob_timestamps_table_tx(&mut tx).await?;
         if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
             .bind(owner)
             .bind(namespace)
@@ -3456,32 +4035,40 @@ impl VectorDb {
                 e
             )));
         }
-        let result = sqlx::query(
+        let rows: i64 = sqlx::query_scalar(
             "WITH removed AS (
                 DELETE FROM vector_entries
                 WHERE owner = $1 AND namespace = $2
-                RETURNING id, owner, namespace, blob_id
+                RETURNING id, owner, namespace, blob_id, created_at
+             ),
+             retained_ts AS (
+                INSERT INTO forgotten_blob_timestamps (owner, namespace, blob_id, created_at)
+                SELECT owner, namespace, blob_id, MAX(created_at)
+                FROM removed
+                GROUP BY owner, namespace, blob_id
+                ON CONFLICT (owner, namespace, blob_id)
+                DO UPDATE SET created_at = EXCLUDED.created_at
+             ),
+             tombstoned AS (
+                INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+                SELECT id, owner, namespace, blob_id FROM removed
+                ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             SELECT COUNT(*)::BIGINT FROM removed",
         )
         .bind(owner)
         .bind(namespace)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to delete by namespace: {}", e)));
-        let result = match result {
-            Ok(result) => result,
-            Err(e) => {
-                crate::observability::observe_db(
-                    "vector.delete_by_namespace",
-                    "error",
-                    started.elapsed(),
-                );
-                return Err(e);
-            }
-        };
+        .map_err(|e| {
+            crate::observability::observe_db(
+                "vector.delete_by_namespace",
+                "error",
+                started.elapsed(),
+            );
+            AppError::Internal(format!("Failed to delete by namespace: {}", e))
+        })?;
+        let rows = rows.max(0) as u64;
         let fence_in_flight = sqlx::query(
             "WITH fenced_jobs AS (
                 UPDATE remember_jobs
@@ -3560,7 +4147,6 @@ impl VectorDb {
             )));
         }
         crate::observability::observe_db("vector.delete_by_namespace", "ok", started.elapsed());
-        let rows = result.rows_affected();
         tracing::info!(
             "deleted {} entries for owner={}, ns={}",
             rows,

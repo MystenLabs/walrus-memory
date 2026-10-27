@@ -150,28 +150,58 @@ function finalizedTransaction(response: any): any | null {
  * return its sender. The current object's `previousTransaction` is insufficient:
  * metadata attachment, lease renewal and ownership transfer all mutate a Blob.
  */
-export async function findBlobCreationSender(
+export type BlobProvenanceRecord = {
+    sender: string | null;
+    createdAt: string | null;
+};
+
+/**
+ * Find the transaction that originally minted a Walrus `Blob` object and
+ * return its sender and creation timestamp. The current object's
+ * `previousTransaction` is insufficient: metadata attachment, lease renewal
+ * and ownership transfer all mutate a Blob.
+ */
+export async function findBlobCreationProvenance(
     blob: Pick<RawBlobObj, "objectId" | "previousTransaction">,
     client: BlobHistoryClient
-): Promise<string | null> {
+): Promise<BlobProvenanceRecord> {
     const digest = await client.getCreationTransaction(blob.objectId);
-    if (!digest) return null;
+    if (!digest) return { sender: null, createdAt: null };
     const transaction = finalizedTransaction(await client.getTransaction(digest));
-    if (!transaction?.status?.success) return null;
+    if (!transaction?.status?.success) return { sender: null, createdAt: null };
     const created = transaction.effects?.changedObjects?.find(
         (object: any) =>
             normalizedSuiAddressOrNull(object?.objectId) === normalizedSuiAddressOrNull(blob.objectId) &&
             object?.idOperation === "Created"
     );
-    return created ? normalizedSuiAddressOrNull(transaction.transaction?.sender) : null;
+    if (!created) return { sender: null, createdAt: null };
+    const createdAt =
+        typeof transaction.effects?.timestamp === "string" && transaction.effects.timestamp.length > 0
+            ? transaction.effects.timestamp
+            : typeof transaction.timestamp === "string" && transaction.timestamp.length > 0
+              ? transaction.timestamp
+              : getCachedBlobCreationTimestamp(blob.objectId);
+    const sender = normalizedSuiAddressOrNull(transaction.transaction?.sender);
+    if (sender) {
+        cacheBlobProvenance(blob.objectId, { sender, createdAt });
+    }
+    return { sender, createdAt };
+}
+
+export async function findBlobCreationSender(
+    blob: Pick<RawBlobObj, "objectId" | "previousTransaction">,
+    client: BlobHistoryClient
+): Promise<string | null> {
+    const prov = await findBlobCreationProvenance(blob, client);
+    return prov.sender;
 }
 
 const CREATION_TRANSACTION_QUERY = `
 query BlobCreationTransaction($objectId: SuiAddress!) {
   object(address: $objectId) {
-    previousTransaction { digest }
+    previousTransaction { digest timestamp effects { timestamp } }
     objectVersionsBefore(first: 1) {
-      nodes { previousTransaction { digest } }
+      nodes { previousTransaction { digest timestamp effects { timestamp } } }
     }
   }
 }`;
@@ -206,35 +236,84 @@ const blobHistoryClient: BlobHistoryClient = {
         // earliest retained version. A never-mutated object has no prior nodes,
         // so its current version is itself the creation version.
         const creationVersion = object.objectVersionsBefore?.nodes?.[0] ?? object;
-        return typeof creationVersion?.previousTransaction?.digest === "string"
-            ? creationVersion.previousTransaction.digest
+        const previousTx = creationVersion?.previousTransaction;
+        const createdAt =
+            typeof previousTx?.effects?.timestamp === "string" && previousTx.effects.timestamp.length > 0
+                ? previousTx.effects.timestamp
+                : typeof previousTx?.timestamp === "string" && previousTx.timestamp.length > 0
+                  ? previousTx.timestamp
+                  : null;
+        if (createdAt) {
+            cacheBlobProvenance(objectId, { createdAt });
+        }
+        return typeof previousTx?.digest === "string"
+            ? previousTx.digest
             : null;
     },
 };
 
 // Creation provenance is immutable for an object ID. Bound the process cache
 // so repeated restores avoid walking the same version history while memory use
-// remains predictable. Null/error results are not cached because they may be
-// caused by transient archive-node lag.
+// remains predictable. Sender and createdAt are stored together in one LRU cache
+// record so hits refresh both fields simultaneously. Null/error results are not
+// cached because they may be caused by transient archive-node lag.
 const BLOB_PROVENANCE_CACHE_MAX = 10_000;
-const blobCreationSenderCache = new Map<string, string>();
+const blobProvenanceCache = new Map<string, BlobProvenanceRecord>();
 
-async function cachedBlobCreationSender(blob: Pick<RawBlobObj, "objectId" | "previousTransaction">) {
-    const cached = blobCreationSenderCache.get(blob.objectId);
-    if (cached) {
-        // Refresh insertion order for simple LRU eviction.
-        blobCreationSenderCache.delete(blob.objectId);
-        blobCreationSenderCache.set(blob.objectId, cached);
+export function cacheBlobProvenance(
+    objectId: string,
+    update: { sender?: string | null; createdAt?: string | null }
+): BlobProvenanceRecord {
+    const existing = blobProvenanceCache.get(objectId);
+    const record: BlobProvenanceRecord = {
+        sender: update.sender !== undefined ? update.sender : (existing?.sender ?? null),
+        createdAt: update.createdAt !== undefined ? update.createdAt : (existing?.createdAt ?? null),
+    };
+    blobProvenanceCache.delete(objectId);
+    blobProvenanceCache.set(objectId, record);
+    if (blobProvenanceCache.size > BLOB_PROVENANCE_CACHE_MAX) {
+        blobProvenanceCache.delete(blobProvenanceCache.keys().next().value!);
+    }
+    return record;
+}
+
+export function getRefreshedBlobProvenance(objectId: string): BlobProvenanceRecord | null {
+    const cached = blobProvenanceCache.get(objectId);
+    if (!cached) return null;
+    blobProvenanceCache.delete(objectId);
+    blobProvenanceCache.set(objectId, cached);
+    return cached;
+}
+
+export function getCachedBlobCreationTimestamp(objectId: string): string | null {
+    return blobProvenanceCache.get(objectId)?.createdAt ?? null;
+}
+
+export function getCachedBlobCreationProvenance(objectId: string): BlobProvenanceRecord | null {
+    return blobProvenanceCache.get(objectId) ?? null;
+}
+
+export function clearBlobProvenanceCacheForTests(): void {
+    blobProvenanceCache.clear();
+}
+
+export async function cachedBlobCreationProvenance(
+    blob: Pick<RawBlobObj, "objectId" | "previousTransaction">,
+    client: BlobHistoryClient = blobHistoryClient
+): Promise<BlobProvenanceRecord> {
+    const cached = getRefreshedBlobProvenance(blob.objectId);
+    if (cached && cached.sender) {
         return cached;
     }
-    const sender = await findBlobCreationSender(blob, blobHistoryClient);
-    if (sender) {
-        blobCreationSenderCache.set(blob.objectId, sender);
-        if (blobCreationSenderCache.size > BLOB_PROVENANCE_CACHE_MAX) {
-            blobCreationSenderCache.delete(blobCreationSenderCache.keys().next().value!);
-        }
-    }
-    return sender;
+    const record = await findBlobCreationProvenance(blob, client);
+    return record;
+}
+
+async function cachedBlobCreationSender(
+    blob: Pick<RawBlobObj, "objectId" | "previousTransaction">
+): Promise<string | null> {
+    const prov = await cachedBlobCreationProvenance(blob);
+    return prov.sender;
 }
 
 export async function trustedBlobCandidate(
@@ -259,17 +338,31 @@ export async function filterTrustedBlobCandidates<
     recipient: string,
     requestId: string,
     creationSender: (blob: T) => Promise<string | null> = cachedBlobCreationSender
-): Promise<T[]> {
+): Promise<(T & { createdAt?: string | null })[]> {
     const provenance = await mapConcurrent(candidates, 2, async (blob) => {
         try {
-            const result = !ownerMatchesRecipient(blob.owner, recipient)
-                ? { trusted: false as const, reason: "owner" as const, uploader: null }
-                : await creationSender(blob).then((uploader) =>
-                      uploader && SERVER_SUI_ADDRESS_SET.has(uploader)
-                          ? { trusted: true as const, reason: "trusted" as const, uploader }
-                          : { trusted: false as const, reason: "provenance" as const, uploader }
-                  );
-            return { blob, result };
+            if (!ownerMatchesRecipient(blob.owner, recipient)) {
+                return {
+                    blob: { ...blob, createdAt: null },
+                    result: { trusted: false as const, reason: "owner" as const, uploader: null, createdAt: null },
+                };
+            }
+            const uploader = await creationSender(blob);
+            const isTrusted = !!uploader && SERVER_SUI_ADDRESS_SET.has(uploader);
+            // Retain the resolved provenance record (createdAt) directly on request-local
+            // candidates through response assembly so bounded cache eviction during later
+            // async work cannot drop createdAt for an earlier candidate in the same request.
+            const cachedProv = getCachedBlobCreationProvenance(blob.objectId);
+            const createdAt = cachedProv?.createdAt ?? null;
+            return {
+                blob: {
+                    ...blob,
+                    ...(createdAt ? { createdAt } : {}),
+                },
+                result: isTrusted
+                    ? { trusted: true as const, reason: "trusted" as const, uploader, createdAt }
+                    : { trusted: false as const, reason: "provenance" as const, uploader, createdAt },
+            };
         } catch (error: unknown) {
             // Abort this query on the first exhausted archival lookup rather
             // than silently omitting a legitimate Blob or waiting for every
@@ -791,18 +884,21 @@ export function registerWalrusQueryRoute(app: Express): void {
                 namespace: string;
                 packageId: string;
                 agentId: string;
+                createdAt?: string;
             }[] = [];
 
             for (const meta of trustedMetas) {
                 if (meta.rawBlobId) {
                     const blobIdStr = blobIdFromRaw(meta.rawBlobId);
                     if (blobIdStr) {
+                        const createdAt = meta.createdAt ?? getCachedBlobCreationTimestamp(meta.objectId);
                         blobs.push({
                             blobId: blobIdStr,
                             objectId: meta.objectId,
                             namespace: meta.blobNamespace,
                             packageId: meta.blobPackageId,
                             agentId: meta.blobAgentId,
+                            ...(createdAt ? { createdAt } : {}),
                         });
                     }
                 }
