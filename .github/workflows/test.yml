@@ -513,7 +513,7 @@ jobs:
         env:
           # Always staging, even on a main merge: the suite stores real memories and
           # there is no reason to put test data on mainnet.
-          MEMWAL_SERVER_URL: https://relayer-staging.memory.walrus.xyz
+          MEMWAL_SERVER_URL: https://relayer.dev.memwal.ai
           MEMWAL_PRIVATE_KEY: ${{ secrets.MEMWAL_E2E_PRIVATE_KEY }}
           MEMWAL_ACCOUNT_ID: ${{ secrets.MEMWAL_E2E_ACCOUNT_ID }}
           MEMWAL_E2E_WRITE: "1"

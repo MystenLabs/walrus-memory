@@ -66,7 +66,7 @@ interface ParsedArgs {
 const ENV_PRESETS: Record<string, { relayer: string; web: string }> = {
     prod: { relayer: "https://relayer.memory.walrus.xyz", web: "https://memory.walrus.xyz" },
     dev: { relayer: "https://relayer.dev.memwal.ai", web: "https://dev.memwal.ai" },
-    staging: { relayer: "https://relayer-staging.memory.walrus.xyz", web: "https://staging.memory.walrus.xyz" },
+    staging: { relayer: "https://relayer.dev.memwal.ai", web: "https://dev.memwal.ai" },
     local: { relayer: "http://127.0.0.1:8000", web: "http://localhost:5173" },
 };
 

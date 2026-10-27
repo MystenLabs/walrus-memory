@@ -67,7 +67,7 @@ import { MemWal } from "@mysten-incubation/memwal";
 const memwal = MemWal.create({
   key: process.env.MEMWAL_PRIVATE_KEY,
   accountId: process.env.MEMWAL_ACCOUNT_ID,
-  // Mainnet relayer. Use https://relayer-staging.memory.walrus.xyz for Testnet.
+  // Mainnet relayer. Use https://relayer.dev.memwal.ai for Testnet.
   serverUrl: "https://relayer.memory.walrus.xyz",
   namespace: "agent-memory",
 });

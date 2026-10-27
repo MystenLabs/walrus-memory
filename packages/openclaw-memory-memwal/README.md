@@ -53,7 +53,7 @@ For the relayer, use a managed endpoint or [self-host your own](https://docs.wal
 | Environment | Relayer URL |
 |-------------|-------------|
 | **Production** (mainnet) | `https://relayer.memory.walrus.xyz` |
-| **Staging** (testnet) | `https://relayer-staging.memory.walrus.xyz` |
+| **Staging** (testnet) | `https://relayer.dev.memwal.ai` |
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ Add the plugin config to `~/.openclaw/openclaw.json`:
         "config": {
           "privateKey": "${MEMWAL_PRIVATE_KEY}",             // References the env var
           "accountId": "0x3247e3da...",                    // Your account ID from the dashboard
-          "serverUrl": "https://relayer-staging.memory.walrus.xyz"    // Or your self-hosted relayer
+          "serverUrl": "https://relayer.dev.memwal.ai"    // Or your self-hosted relayer
         }
       }
     }

@@ -2,7 +2,7 @@
 """
 Integration tests for the Walrus Memory Python SDK against a live server.
 
-Targets MEMWAL_SERVER_URL (default: https://relayer-staging.memory.walrus.xyz).
+Targets MEMWAL_SERVER_URL (default: https://relayer.dev.memwal.ai).
 
 No-auth tests (always run, no env vars needed):
   - /health endpoint
@@ -31,7 +31,7 @@ Usage:
   # Run against staging using env vars
   export MEMWAL_PRIVATE_KEY="<your-ed25519-delegate-private-key-hex>"
   export MEMWAL_ACCOUNT_ID="0x-your-walrus-memory-account-id"
-  export MEMWAL_SERVER_URL="https://relayer-staging.memory.walrus.xyz"
+  export MEMWAL_SERVER_URL="https://relayer.dev.memwal.ai"
   python -m pytest tests/test_integration.py -v
 """
 
@@ -54,7 +54,7 @@ pytestmark = pytest.mark.integration
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-SERVER_URL = os.environ.get("MEMWAL_SERVER_URL", "https://relayer-staging.memory.walrus.xyz")
+SERVER_URL = os.environ.get("MEMWAL_SERVER_URL", "https://relayer.dev.memwal.ai")
 PRIVATE_KEY_HEX = os.environ.get("MEMWAL_PRIVATE_KEY", "")
 ACCOUNT_ID = os.environ.get("MEMWAL_ACCOUNT_ID", "")
 
@@ -98,6 +98,9 @@ def _async_client(namespace: str = _E2E_NAMESPACE) -> MemWal:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+_HTTP_CLIENT = httpx.Client(timeout=30, transport=httpx.HTTPTransport(retries=3))
+
+
 def _raw_signed_request(
     method: str,
     path: str,
@@ -125,20 +128,19 @@ def _raw_signed_request(
     signature_hex = signed.signature.hex()
     pub_key_hex = pub_key_override or signing_key.verify_key.encode().hex()
 
-    with httpx.Client(timeout=30) as client:
-        return client.request(
-            method,
-            f"{base_url}{path}",
-            content=body_bytes,
-            headers={
-                "Content-Type": "application/json",
-                "x-public-key": pub_key_hex,
-                "x-signature": signature_hex,
-                "x-timestamp": timestamp,
-                "x-nonce": nonce,
-                "x-account-id": ACCOUNT_ID or "0x0",
-            },
-        )
+    return _HTTP_CLIENT.request(
+        method,
+        f"{base_url}{path}",
+        content=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "x-public-key": pub_key_hex,
+            "x-signature": signature_hex,
+            "x-timestamp": timestamp,
+            "x-nonce": nonce,
+            "x-account-id": ACCOUNT_ID or "0x0",
+        },
+    )
 
 
 # ── No-auth tests (always run) ────────────────────────────────────────────────
@@ -168,8 +170,7 @@ class TestAuthRejection:
 
     def test_unsigned_request_rejected(self) -> None:
         """Request with no auth headers → 401."""
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(f"{SERVER_URL}/api/remember", json=self._body)
+        resp = _HTTP_CLIENT.post(f"{SERVER_URL}/api/remember", json=self._body)
         assert resp.status_code == 401, f"Expected 401, got {resp.status_code}: {resp.text}"
 
     def test_wrong_signature_rejected(self) -> None:

@@ -140,7 +140,7 @@ memwal = MemWal.create(
 |-------|-------------|
 | `prod` | `https://relayer.memory.walrus.xyz` |
 | `dev` | `https://relayer.dev.memwal.ai` |
-| `staging` | `https://relayer-staging.memory.walrus.xyz` |
+| `staging` | `https://relayer.dev.memwal.ai` |
 
 Precedence: any explicit **`server_url` wins over `env`**, including the hosted
 default. `env` applies only when `server_url` is omitted (`None`). An unknown

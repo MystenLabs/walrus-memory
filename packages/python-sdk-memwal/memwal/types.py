@@ -24,7 +24,7 @@ DEFAULT_SERVER_URL = "https://relayer.memory.walrus.xyz"
 ENV_PRESETS = {
     "prod": "https://relayer.memory.walrus.xyz",
     "dev": "https://relayer.dev.memwal.ai",
-    "staging": "https://relayer-staging.memory.walrus.xyz",
+    "staging": "https://relayer.dev.memwal.ai",
     "local": "http://127.0.0.1:8000",
 }
 
