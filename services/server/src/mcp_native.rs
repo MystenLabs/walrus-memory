@@ -270,6 +270,58 @@ fn normalize_recall_dedupe_key(text: &str) -> String {
         .to_lowercase()
 }
 
+struct CollapsedDuplicate {
+    index: usize,
+    total: usize,
+    collapsed: usize,
+    blob_ids: Vec<String>,
+}
+
+fn format_collapsed_duplicates_note(duplicates: &[CollapsedDuplicate]) -> String {
+    if duplicates.is_empty() {
+        return String::new();
+    }
+    if let [d] = duplicates {
+        let copy_word = if d.collapsed == 1 { "copy" } else { "copies" };
+        let backing = if d.blob_ids.len() > 1 {
+            format!("#{} is stored across {} blobs", d.index, d.blob_ids.len())
+        } else {
+            format!("{} copies total", d.total)
+        };
+        return format!(
+            "\n({} duplicate {copy_word} of #{} collapsed — {backing}; the same fact is stored more than once.)",
+            d.collapsed, d.index
+        );
+    }
+
+    let total_collapsed: usize = duplicates.iter().map(|d| d.collapsed).sum();
+    let copy_word = if total_collapsed == 1 {
+        "copy"
+    } else {
+        "copies"
+    };
+    let details = duplicates
+        .iter()
+        .map(|d| {
+            let dup_word = if d.collapsed == 1 {
+                "duplicate"
+            } else {
+                "duplicates"
+            };
+            let backing = if d.blob_ids.len() > 1 {
+                format!("{} blobs", d.blob_ids.len())
+            } else {
+                format!("{} copies", d.total)
+            };
+            format!("#{} ({} {dup_word}, {backing})", d.index, d.collapsed)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n({total_collapsed} duplicate {copy_word} collapsed: {details}; the same fact is stored more than once.)"
+    )
+}
+
 pub(crate) fn format_recall_output(
     results: &[Value],
     max_distance: Option<f64>,
@@ -279,26 +331,67 @@ pub(crate) fn format_recall_output(
         .iter()
         .filter(|item| {
             let dist = item.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-            max_distance.is_none_or(|cutoff| dist <= cutoff)
+            max_distance.is_none_or(|cutoff| dist < cutoff)
         })
         .collect();
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, CollapsedDuplicate> =
+        std::collections::HashMap::new();
+    let mut seen_order: Vec<String> = Vec::new();
     let mut unique = Vec::with_capacity(filtered.len());
-    let mut collapsed: usize = 0;
     for item in filtered {
         let text = item.get("text").and_then(Value::as_str).unwrap_or("");
         let key = normalize_recall_dedupe_key(text);
-        if seen.insert(key) {
-            unique.push(item);
+        let blob_id = item
+            .get("blob_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(existing) = seen.get_mut(&key) {
+            existing.total += 1;
+            existing.collapsed += 1;
+            if let Some(bid) = blob_id {
+                if !existing.blob_ids.iter().any(|b| b == bid) {
+                    existing.blob_ids.push(bid.to_owned());
+                }
+            }
         } else {
-            collapsed += 1;
+            unique.push(item);
+            let index = unique.len();
+            let mut blob_ids = Vec::new();
+            if let Some(bid) = blob_id {
+                blob_ids.push(bid.to_owned());
+            }
+            seen_order.push(key.clone());
+            seen.insert(
+                key,
+                CollapsedDuplicate {
+                    index,
+                    total: 1,
+                    collapsed: 0,
+                    blob_ids,
+                },
+            );
         }
     }
 
     if unique.is_empty() {
         if !results.is_empty() {
-            return "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches.".to_owned();
+            let dropped_note = if dropped_count > 0 {
+                let match_word = if dropped_count == 1 {
+                    "match was"
+                } else {
+                    "matches were"
+                };
+                format!(
+                    " ({dropped_count} further {match_word} never checked against the cutoff: they failed to download or decrypt.)"
+                )
+            } else {
+                String::new()
+            };
+            return format!(
+                "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches.{dropped_note}"
+            );
         }
         if dropped_count > 0 {
             return format!(
@@ -326,13 +419,14 @@ pub(crate) fn format_recall_output(
         }
     }
 
+    let duplicates: Vec<CollapsedDuplicate> = seen_order
+        .into_iter()
+        .filter_map(|k| seen.remove(&k))
+        .filter(|d| d.collapsed > 0)
+        .collect();
+
     let mut out = lines.join("\n");
-    if collapsed > 0 {
-        let noun = if collapsed == 1 { "copy" } else { "copies" };
-        out.push_str(&format!(
-            "\n({collapsed} duplicate {noun} of the above collapsed; the same fact is stored more than once.)"
-        ));
-    }
+    out.push_str(&format_collapsed_duplicates_note(&duplicates));
     if dropped_count > 0 {
         out.push_str(&format!(
             "\n({dropped_count} additional matches could not be decrypted and were omitted.)"
@@ -1433,29 +1527,51 @@ mod tests {
             json!({
                 "text": "User prefers dark mode",
                 "distance": 0.12,
-                "created_at": "2026-04-19T10:20:30Z"
+                "created_at": "2026-04-19T10:20:30Z",
+                "blob_id": "blob-a"
             }),
             json!({
                 "text": "  user   PREFERS dark mode ",
                 "distance": 0.15,
-                "created_at": "2026-04-18T08:00:00Z"
+                "created_at": "2026-04-18T08:00:00Z",
+                "blob_id": "blob-b"
             }),
             json!({
                 "text": "Uses Rust 2021 edition",
-                "distance": 0.45
+                "distance": 0.30
             }),
         ];
 
+        // Strict `dist < cutoff` drops the 0.30 item when max_distance = Some(0.30).
         let rendered = format_recall_output(&results, Some(0.30), 2);
         assert_eq!(
             rendered,
-            "1. [score=0.880 distance=0.120] [written=2026-04-19] User prefers dark mode\n(1 duplicate copy of the above collapsed; the same fact is stored more than once.)\n(2 additional matches could not be decrypted and were omitted.)"
+            "1. [score=0.880 distance=0.120] [written=2026-04-19] User prefers dark mode\n(1 duplicate copy of #1 collapsed — #1 is stored across 2 blobs; the same fact is stored more than once.)\n(2 additional matches could not be decrypted and were omitted.)"
+        );
+
+        let multi_dup = vec![
+            json!({ "text": "Fact one", "distance": 0.10, "blob_id": "b1" }),
+            json!({ "text": "Fact two", "distance": 0.11, "blob_id": "b2" }),
+            json!({ "text": "Fact three", "distance": 0.12 }),
+            json!({ "text": "fact ONE", "distance": 0.13, "blob_id": "b3" }),
+            json!({ "text": "fact THREE", "distance": 0.14 }),
+            json!({ "text": "fact three ", "distance": 0.15 }),
+        ];
+        assert_eq!(
+            format_recall_output(&multi_dup, None, 0),
+            "1. [score=0.900 distance=0.100] Fact one\n2. [score=0.890 distance=0.110] Fact two\n3. [score=0.880 distance=0.120] Fact three\n(3 duplicate copies collapsed: #1 (1 duplicate, 2 blobs), #3 (2 duplicates, 3 copies); the same fact is stored more than once.)"
         );
 
         let all_filtered = format_recall_output(&results, Some(0.05), 0);
         assert_eq!(
             all_filtered,
             "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches."
+        );
+
+        let all_filtered_with_dropped = format_recall_output(&results, Some(0.05), 1);
+        assert_eq!(
+            all_filtered_with_dropped,
+            "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches. (1 further match was never checked against the cutoff: they failed to download or decrypt.)"
         );
 
         let all_dropped = format_recall_output(&[], None, 3);

@@ -18,11 +18,12 @@ use fastcrypto::serde_helpers::ToFromByteArray as _;
 use fastcrypto::traits::{KeyPair as _, Signer as _, ToFromBytes as _};
 use rand::thread_rng;
 use seal_crypto::{
-    seal_encrypt as crypto_seal_encrypt, EncryptedObject, EncryptionInput, IBEPublicKeys, ObjectID,
+    create_full_id, ibe::UserSecretKey, seal_decrypt as crypto_seal_decrypt,
+    seal_encrypt as crypto_seal_encrypt, EncryptedObject, EncryptionInput, IBEPublicKeys,
+    IBEUserSecretKeys, ObjectID,
 };
 use seal_sdk::{
-    decrypt_seal_responses, genkey, seal_decrypt_object, signed_message, types::FetchKeyResponse,
-    IBEPublicKey,
+    decrypt_seal_responses, genkey, signed_message, types::FetchKeyResponse, IBEPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use sui_rpc::field::{FieldMask, FieldMaskUtil};
@@ -563,8 +564,6 @@ pub async fn resolve_seal_key_servers(
         }
     }
 
-    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
-
     let v1_key_bcs = 1u64.to_le_bytes();
     let v2_key_bcs = 2u64.to_le_bytes();
 
@@ -589,12 +588,28 @@ pub async fn resolve_seal_key_servers(
     }
     batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "bcs"]));
 
-    let batch_resp = client
-        .ledger_client()
-        .batch_get_objects(batch_req)
-        .await
-        .map_err(|e| format!("BatchGetObjects for SEAL KeyServers failed: {e}"))?
-        .into_inner();
+    let mut last_grpc_err = String::new();
+    let mut batch_resp_opt = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200 * (1 << (attempt - 1)))).await;
+        }
+        let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
+        match client
+            .ledger_client()
+            .batch_get_objects(batch_req.clone())
+            .await
+        {
+            Ok(resp) => {
+                batch_resp_opt = Some(resp.into_inner());
+                break;
+            }
+            Err(e) => {
+                last_grpc_err = format!("BatchGetObjects for SEAL KeyServers failed: {e}");
+            }
+        }
+    }
+    let batch_resp = batch_resp_opt.ok_or(last_grpc_err)?;
 
     let mut resolved = Vec::with_capacity(specs.len());
     for ((spec, ks_addr, ks_obj_id), pair) in
@@ -688,20 +703,32 @@ pub async fn fetch_seal_encrypt_identity(
         .parse()
         .map_err(|e| format!("invalid package_id '{immutable_package_id}': {e}"))?;
 
-    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
-
     let mut req = GetObjectRequest::default();
     req.object_id = Some(account_id.to_owned());
     req.read_mask = Some(FieldMask::from_paths(["object_id", "object_type", "json"]));
 
-    let obj = client
-        .ledger_client()
-        .get_object(req)
-        .await
-        .map_err(|e| format!("GetObject({account_id}) failed: {e}"))?
-        .into_inner()
-        .object
-        .ok_or_else(|| format!("MemWalAccount {account_id} not found on chain"))?;
+    let mut last_err = String::new();
+    let mut obj_opt = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200 * (1 << (attempt - 1)))).await;
+        }
+        let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
+        match client.ledger_client().get_object(req.clone()).await {
+            Ok(resp) => {
+                obj_opt = Some(
+                    resp.into_inner()
+                        .object
+                        .ok_or_else(|| format!("MemWalAccount {account_id} not found on chain"))?,
+                );
+                break;
+            }
+            Err(e) => {
+                last_err = format!("GetObject({account_id}) failed: {e}");
+            }
+        }
+    }
+    let obj = obj_opt.ok_or(last_err)?;
 
     let obj_type = obj.object_type.as_deref().unwrap_or_default();
     let type_parts: Vec<&str> = obj_type.split("::").collect();
@@ -777,8 +804,6 @@ pub async fn fetch_shared_object_versions(
         }
     }
 
-    let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
-
     let mut batch_req = BatchGetObjectsRequest::default();
     for id in [account_id, registry_id] {
         let mut r = GetObjectRequest::default();
@@ -787,12 +812,28 @@ pub async fn fetch_shared_object_versions(
     }
     batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "owner"]));
 
-    let resp = client
-        .ledger_client()
-        .batch_get_objects(batch_req)
-        .await
-        .map_err(|e| format!("BatchGetObjects for MemWalAccount/AccountRegistry failed: {e}"))?
-        .into_inner();
+    let mut last_err = String::new();
+    let mut resp_opt = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200 * (1 << (attempt - 1)))).await;
+        }
+        let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
+        match client
+            .ledger_client()
+            .batch_get_objects(batch_req.clone())
+            .await
+        {
+            Ok(resp) => {
+                resp_opt = Some(resp.into_inner());
+                break;
+            }
+            Err(e) => {
+                last_err = format!("BatchGetObjects for MemWalAccount/AccountRegistry failed: {e}");
+            }
+        }
+    }
+    let resp = resp_opt.ok_or(last_err)?;
 
     let acct_obj = resp
         .objects
@@ -1311,7 +1352,13 @@ pub async fn seal_decrypt_batch_in_process(
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<FetchKeyResponse>().await {
                         Ok(parsed) => Ok((srv.object_id, srv.weight, parsed)),
-                        Err(e) => Err(format!("invalid FetchKeyResponse from {}: {e}", srv.name)),
+                        Err(e) => Err((
+                            false,
+                            format!(
+                                "fetch_keys failed: invalid FetchKeyResponse from {}: {e}",
+                                srv.name
+                            ),
+                        )),
                     }
                 }
                 Ok(resp) => {
@@ -1319,15 +1366,37 @@ pub async fn seal_decrypt_batch_in_process(
                     let body = resp.text().await.unwrap_or_default();
                     let sanitized_body =
                         crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
-                    let err_tag = if status.as_u16() == 403 {
+                    let is_perm_access = status.as_u16() == 403
+                        || sanitized_body.contains("NoAccessError")
+                        || sanitized_body.contains("InvalidPersonalMessageSignature")
+                        || sanitized_body.contains("InvalidSignature")
+                        || sanitized_body.contains("InvalidCertificate")
+                        || sanitized_body.contains("InvalidPackage")
+                        || sanitized_body.contains("InvalidSDKVersion")
+                        || sanitized_body.contains("DeprecatedSDKVersion")
+                        || sanitized_body.contains("InvalidParameter");
+                    let err_tag = if status.as_u16() == 403 || sanitized_body.contains("NoAccessError") {
                         "NoAccessError"
                     } else {
                         "KeyServerError"
                     };
-                    Err(format!(
-                        "fetch_keys failed: {err_tag}: key server {} returned {status}: {sanitized_body}",
-                        srv.name
-                    ))
+                    if is_perm_access {
+                        Err((
+                            true,
+                            format!(
+                                "{err_tag}: key server {} returned {status}: {sanitized_body}",
+                                srv.name
+                            ),
+                        ))
+                    } else {
+                        Err((
+                            false,
+                            format!(
+                                "fetch_keys failed: {err_tag}: key server {} returned {status}: {sanitized_body}",
+                                srv.name
+                            ),
+                        ))
+                    }
                 }
                 Err(e) => {
                     let timeout_prefix = if e.is_timeout() {
@@ -1335,9 +1404,12 @@ pub async fn seal_decrypt_batch_in_process(
                     } else {
                         ""
                     };
-                    Err(format!(
-                        "fetch_keys failed: {timeout_prefix}key server {} request failed: {e}",
-                        srv.name
+                    Err((
+                        false,
+                        format!(
+                            "fetch_keys failed: {timeout_prefix}key server {} request failed: {e}",
+                            srv.name
+                        ),
                     ))
                 }
             }
@@ -1346,26 +1418,35 @@ pub async fn seal_decrypt_batch_in_process(
 
     let mut seal_responses: Vec<(ObjectID, FetchKeyResponse)> = Vec::new();
     let mut responded_weight: usize = 0;
+    let mut has_transient_err = false;
+    let mut last_perm_err: Option<String> = None;
     let mut last_err = String::new();
     for res in futures::future::join_all(fetch_futures).await {
         match res {
             Ok((obj_id, weight, parsed)) => {
                 seal_responses.push((obj_id, parsed));
                 responded_weight += usize::from(weight.max(1));
-                if responded_weight >= usize::from(threshold) {
-                    break;
-                }
             }
-            Err(err) => {
+            Err((is_perm, err)) => {
+                if is_perm {
+                    last_perm_err = Some(err.clone());
+                } else {
+                    has_transient_err = true;
+                }
                 last_err = err;
             }
         }
     }
 
     if responded_weight < usize::from(threshold) {
-        let error = format!(
-            "fetch_keys failed: Not enough shares ({responded_weight}/{threshold}): {last_err}",
-        );
+        let error = match (!has_transient_err, last_perm_err) {
+            (true, Some(perm_err)) => {
+                format!("seal/decrypt failed: Not enough shares ({responded_weight}/{threshold}): {perm_err}")
+            }
+            _ => {
+                format!("fetch_keys failed: Not enough shares ({responded_weight}/{threshold}): {last_err}")
+            }
+        };
         let permanent = DecryptOutcome::permanent_from_error(&error);
         return Ok(parsed_items
             .into_iter()
@@ -1391,7 +1472,7 @@ pub async fn seal_decrypt_batch_in_process(
     let mut out = Vec::with_capacity(parsed_items.len());
     for enc_res in parsed_items {
         match enc_res {
-            Ok(enc_obj) => match seal_decrypt_object(&enc_obj, &usk_map, &pk_map) {
+            Ok(enc_obj) => match decrypt_encrypted_object(&enc_obj, &usk_map, &pk_map) {
                 Ok(plaintext) => {
                     out.push(DecryptOutcome::Ok(plaintext));
                 }
@@ -1411,11 +1492,59 @@ pub async fn seal_decrypt_batch_in_process(
     Ok(out)
 }
 
+/// Decrypts an [`EncryptedObject`] using the collected user secret keys, supporting
+/// weighted key servers (`weight > 1` where `services` repeats a server's `ObjectID`
+/// across multiple share indices) and gracefully skipping full-committee PK verification
+/// if a non-threshold server was retired from `pk_map`.
+pub(crate) fn decrypt_encrypted_object(
+    encrypted_object: &EncryptedObject,
+    cached_keys: &HashMap<Vec<u8>, HashMap<ObjectID, UserSecretKey>>,
+    pk_map: &HashMap<ObjectID, IBEPublicKey>,
+) -> Result<Vec<u8>, String> {
+    let full_id = create_full_id(
+        &encrypted_object.package_id.into_inner(),
+        &encrypted_object.id,
+    );
+    let keys_for_id = cached_keys
+        .get(&full_id)
+        .ok_or_else(|| format!("No keys available for object {}", hex::encode(&full_id)))?;
+
+    let mut usk_for_object: HashMap<ObjectID, UserSecretKey> = HashMap::new();
+    let mut available_shares = 0usize;
+    for (service_id, _) in &encrypted_object.services {
+        if let Some(usk) = keys_for_id.get(service_id) {
+            usk_for_object.insert(*service_id, *usk);
+            available_shares += 1;
+        }
+    }
+
+    if available_shares < usize::from(encrypted_object.threshold) {
+        return Err(format!(
+            "Insufficient keys for object (available_shares={available_shares}, threshold={})",
+            encrypted_object.threshold
+        ));
+    }
+
+    let pks: Option<IBEPublicKeys> = encrypted_object
+        .services
+        .iter()
+        .map(|(id, _)| pk_map.get(id).copied())
+        .collect::<Option<Vec<_>>>()
+        .map(IBEPublicKeys::BonehFranklinBLS12381);
+
+    crypto_seal_decrypt(
+        encrypted_object,
+        &IBEUserSecretKeys::BonehFranklinBLS12381(usk_for_object),
+        pks.as_ref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fastcrypto::groups::Scalar as _;
-    use seal_crypto::{create_full_id, elgamal, ibe};
+    use seal_crypto::{elgamal, ibe};
     use seal_sdk::types::DecryptionKey;
 
     #[test]
@@ -1496,9 +1625,71 @@ mod tests {
         let usk_map =
             decrypt_seal_responses(&eg_sk, &[(srv_0, resp_0), (srv_1, resp_1)], &pk_map).unwrap();
 
-        let recovered = seal_decrypt_object(&decoded_obj, &usk_map, &pk_map)
-            .expect("seal_decrypt_object should succeed");
+        let recovered = decrypt_encrypted_object(&decoded_obj, &usk_map, &pk_map)
+            .expect("decrypt_encrypted_object should succeed");
         assert_eq!(recovered, plaintext);
+
+        // Also verify decryption succeeds when a non-threshold server is retired from `pk_map`
+        // (1-of-2 threshold with only srv_0 in pk_map and usk_map).
+        let (encrypted_1of2, _) = crypto_seal_encrypt(
+            pkg_id,
+            id_bytes.clone(),
+            vec![srv_0, srv_1],
+            &IBEPublicKeys::BonehFranklinBLS12381(vec![pk_0, pk_1]),
+            1,
+            EncryptionInput::Aes256Gcm {
+                data: plaintext.clone(),
+                aad: None,
+            },
+        )
+        .expect("1-of-2 seal_encrypt should succeed");
+        let mut partial_pk_map = HashMap::new();
+        partial_pk_map.insert(srv_0, pk_0);
+        let mut srv0_only = HashMap::new();
+        srv0_only.insert(srv_0, *usk_map[&full_id].get(&srv_0).unwrap());
+        let mut partial_usk_map = HashMap::new();
+        partial_usk_map.insert(full_id, srv0_only);
+        let recovered_partial =
+            decrypt_encrypted_object(&encrypted_1of2, &partial_usk_map, &partial_pk_map).expect(
+                "decrypt_encrypted_object should succeed when retired server is absent from pk_map",
+            );
+        assert_eq!(recovered_partial, plaintext);
+
+        // Also verify decryption succeeds for a single weighted key server (weight = 2, threshold = 2)
+        // where `services` contains two shares for the same server ObjectID.
+        let (encrypted_weighted, _) = crypto_seal_encrypt(
+            pkg_id,
+            id_bytes,
+            vec![srv_0, srv_0],
+            &IBEPublicKeys::BonehFranklinBLS12381(vec![pk_0, pk_0]),
+            2,
+            EncryptionInput::Aes256Gcm {
+                data: plaintext.clone(),
+                aad: None,
+            },
+        )
+        .expect("weighted seal_encrypt should succeed");
+        let recovered_weighted =
+            decrypt_encrypted_object(&encrypted_weighted, &partial_usk_map, &partial_pk_map)
+                .expect("decrypt_encrypted_object should support weighted key servers");
+        assert_eq!(recovered_weighted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_outcome_classifies_deterministic_no_access_as_permanent_and_timeout_as_transient() {
+        let perm_err =
+            "seal/decrypt failed: Not enough shares (0/2): NoAccessError: key server s1 returned 403 Forbidden: Access denied";
+        assert!(
+            DecryptOutcome::permanent_from_error(perm_err),
+            "deterministic 403 NoAccessError must be classified as permanent for GH #501 negative caching"
+        );
+
+        let transient_err =
+            "fetch_keys failed: Not enough shares (1/2): fetch_keys failed: TimeoutError: The operation was aborted due to timeout: key server s2 request failed";
+        assert!(
+            !DecryptOutcome::permanent_from_error(transient_err),
+            "transient key server timeout must be classified as non-permanent"
+        );
     }
 
     #[test]
