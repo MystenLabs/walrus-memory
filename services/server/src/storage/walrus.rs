@@ -65,6 +65,7 @@ pub struct UploadJournal {
     pub register_transaction: Option<PreparedRegisterTransaction>,
 }
 
+#[derive(Debug)]
 pub enum DurableUploadAdvance {
     /// Exact signed bytes are ready to checkpoint before execution.
     Prepared(UploadJournal),
@@ -649,14 +650,7 @@ pub async fn advance_durable_upload(
 ) -> Result<DurableUploadAdvance, AppError> {
     if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
         return crate::storage::walrus_native::advance_durable_upload_in_process(
-            client,
-            data,
-            epochs,
-            owner,
-            namespace,
-            package_id,
-            job_id,
-            journal,
+            client, data, epochs, owner, namespace, package_id, job_id, journal,
         )
         .await;
     }

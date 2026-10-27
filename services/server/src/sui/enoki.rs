@@ -146,6 +146,42 @@ impl EnokiError {
                 .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
         }
     }
+
+    /// Returns `true` when Enoki rejected the sponsorship handle because it expired (`400 expired`)
+    /// or was evicted / not found (`404 not_found`).
+    #[must_use]
+    pub fn is_sponsorship_invalidated(&self) -> bool {
+        match self {
+            Self::Rejected { status: 404, .. } => true,
+            Self::BadRequest(msg)
+            | Self::Rejected { message: msg, .. }
+            | Self::FallbackEligible { message: msg, .. } => {
+                is_enoki_sponsorship_invalidated_message(msg)
+            }
+            Self::NotConfigured | Self::Transport(_) => false,
+        }
+    }
+}
+
+/// Mirrors `isEnokiSponsorshipExpiredError` in `services/server/scripts/enoki-retry.ts`.
+#[must_use]
+pub fn is_enoki_sponsorship_expired_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("sponsored transaction has expired")
+        || lower.contains("\"code\":\"expired\"")
+        || lower.contains("\"code\": \"expired\"")
+}
+
+/// Mirrors `isEnokiSponsorshipInvalidatedError` in `services/server/scripts/walrus-error-detection.ts`.
+#[must_use]
+pub fn is_enoki_sponsorship_invalidated_message(msg: &str) -> bool {
+    if is_enoki_sponsorship_expired_message(msg) {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("sponsored transaction not found")
+        || lower.contains("\"code\":\"not_found\"")
+        || lower.contains("\"code\": \"not_found\"")
 }
 
 /// Sanitizes an upstream HTTP/RPC error body before logging or embedding in diagnostic strings:
@@ -394,9 +430,24 @@ pub async fn enoki_execute_sponsored_transaction(
 ) -> Result<EnokiExecuteOutput, EnokiError> {
     let api_key = enoki_api_key().ok_or(EnokiError::NotConfigured)?;
     let api_url = enoki_api_url();
+    enoki_execute_sponsored_transaction_with_base_url(http, &api_url, &api_key, digest, signature)
+        .await
+}
+
+/// Execute a sponsored transaction via an explicit Enoki base URL and API key.
+pub async fn enoki_execute_sponsored_transaction_with_base_url(
+    http: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    digest: &str,
+    signature: &str,
+) -> Result<EnokiExecuteOutput, EnokiError> {
     let encoded_digest =
         percent_encoding::utf8_percent_encode(digest, percent_encoding::NON_ALPHANUMERIC);
-    let url = format!("{api_url}/v1/transaction-blocks/sponsor/{encoded_digest}");
+    let url = format!(
+        "{}/v1/transaction-blocks/sponsor/{encoded_digest}",
+        api_url.trim_end_matches('/')
+    );
 
     let payload = serde_json::json!({
         "digest": digest,
@@ -405,7 +456,7 @@ pub async fn enoki_execute_sponsored_transaction(
 
     let resp = http
         .post(&url)
-        .bearer_auth(&api_key)
+        .bearer_auth(api_key)
         .json(&payload)
         .send()
         .await
