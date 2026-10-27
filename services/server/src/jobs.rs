@@ -747,6 +747,12 @@ async fn keep_upload_storage_reservation(
     owner: &str,
     encrypted_b64: &str,
 ) {
+    if matches!(
+        upload_resume_disposition(state.db.pool(), job_id).await,
+        UploadResume::Forgotten | UploadResume::AlreadyDone { .. }
+    ) {
+        return;
+    }
     let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
     let extended = sqlx::query(
         "UPDATE storage_reservations
@@ -1182,6 +1188,20 @@ pub(crate) async fn execute_wallet_job(
             // permit. A worker that already took this key's next upload can
             // register while the metadata transaction is in flight. Priority
             // still prefers this job over an upload that has not been prefetched.
+            if let Some(ref jid) = remember_job_id {
+                if matches!(
+                    upload_resume_disposition(state.db.pool(), jid).await,
+                    UploadResume::Forgotten
+                ) {
+                    tracing::info!(
+                        "[wallet-job:set-metadata] job_id={} namespace forgotten while in flight — skipping metadata/transfer",
+                        jid
+                    );
+                    crate::rate_limit::release_storage_quota_one(state, jid).await;
+                    return Ok(());
+                }
+            }
+
             let _wallet_slot = state.key_pool.begin_attempt(enqueued_wallet_index);
 
             touch_uploaded_remember_job(state.db.pool(), remember_job_id.as_deref()).await;
@@ -1489,17 +1509,32 @@ async fn insert_vector_and_mark_remember_done(
 
     if let Some(jid) = remember_job_id {
         let _ = sqlx::query(
-            "UPDATE remember_jobs SET status = 'done', blob_id = $1, prepare_claimed_at = NULL, prepare_claim_token = NULL, recovery_claimed_at = NULL, recovery_claim_token = NULL, error_msg = NULL, updated_at = NOW() WHERE id = $2",
+            "UPDATE remember_jobs
+             SET status = 'done',
+                 blob_id = $1,
+                 prepare_claimed_at = NULL,
+                 prepare_claim_token = NULL,
+                 recovery_claimed_at = NULL,
+                 recovery_claim_token = NULL,
+                 error_msg = NULL,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND NOT (
+                   status = 'failed'
+                   AND COALESCE(error_msg, '') = $3
+               )",
         )
         .bind(blob_id)
         .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(state.db.pool())
         .await;
 
-        // Release only now that the vector row is committed. The row carries
-        // the bytes from here on, so holding the reservation would double count
-        // them; releasing before the insert would instead open a window where
-        // neither counts and a concurrent burst could slip past the quota.
+        // Release only now that the vector row is committed (or fenced by
+        // forget). The row carries the bytes from here on, so holding the
+        // reservation would double count them; releasing before the insert
+        // would instead open a window where neither counts and a concurrent
+        // burst could slip past the quota.
         crate::rate_limit::release_storage_quota_one(state, jid).await;
     }
 
@@ -1570,6 +1605,9 @@ async fn enqueue_finalize_uploaded_blob(
 enum UploadResume {
     /// Job already reached its terminal `done` state — nothing to redo.
     AlreadyDone { blob_id: String },
+    /// Namespace was forgotten while this job was in flight — do not mint,
+    /// transfer, or index into the forgotten namespace.
+    Forgotten,
     /// Paid blob already minted AND its object id is known, but metadata/transfer
     /// (and indexing) may not have finished. Resume via the metadata/transfer
     /// recovery path with the stored object id — never re-mint, never prematurely
@@ -1604,12 +1642,22 @@ enum UploadResume {
 /// A lookup **error** returns `Indeterminate` (fail closed): after a possible
 /// mint we must not re-upload on a transient read failure, so the caller retries
 /// without uploading rather than risking a duplicate paid blob.
+type UploadResumeRow = (String, Option<String>, Option<String>, bool);
+
 async fn upload_resume_disposition(pool: &sqlx::PgPool, job_id: &str) -> UploadResume {
-    let looked_up: Result<Option<(String, Option<String>, Option<String>)>, sqlx::Error> =
-        sqlx::query_as("SELECT status, blob_id, blob_object_id FROM remember_jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_optional(pool)
-            .await;
+    let looked_up: Result<Option<UploadResumeRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT
+            status,
+            blob_id,
+            blob_object_id,
+            (status = 'failed' AND COALESCE(error_msg, '') = $2) AS forgotten
+         FROM remember_jobs
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+    .fetch_optional(pool)
+    .await;
 
     let existing = match looked_up {
         Ok(row) => row,
@@ -1617,15 +1665,16 @@ async fn upload_resume_disposition(pool: &sqlx::PgPool, job_id: &str) -> UploadR
     };
 
     match existing {
+        Some((_, _, _, true)) => UploadResume::Forgotten,
         // Any recorded blob_id means the paid mint already happened → never upload.
-        Some((status, Some(blob_id), _)) if status == "done" => {
+        Some((status, Some(blob_id), _, false)) if status == "done" => {
             UploadResume::AlreadyDone { blob_id }
         }
-        Some((_, Some(blob_id), Some(blob_object_id))) => UploadResume::ResumeTransfer {
+        Some((_, Some(blob_id), Some(blob_object_id), false)) => UploadResume::ResumeTransfer {
             blob_id,
             blob_object_id,
         },
-        Some((_, Some(blob_id), None)) => UploadResume::ResumeIndex { blob_id },
+        Some((_, Some(blob_id), None, false)) => UploadResume::ResumeIndex { blob_id },
         // No durable blob record means there is nothing to resume. Trust the DB;
         // scanning every historical server-wallet Blob is both redundant and too
         // slow for the sidecar read deadline.
@@ -1820,13 +1869,26 @@ async fn persist_uploaded_state(
     remember_job_id: &str,
     blob_id: &str,
     blob_object_id: Option<&str>,
-) -> Result<(), WalletJobError> {
-    sqlx::query(
-        "UPDATE remember_jobs SET status = 'uploaded', blob_id = $1, blob_object_id = $2, prepare_claimed_at = NULL, prepare_claim_token = NULL, error_msg = NULL, updated_at = NOW() WHERE id = $3",
+) -> Result<bool, WalletJobError> {
+    let updated = sqlx::query(
+        "UPDATE remember_jobs
+         SET status = 'uploaded',
+             blob_id = $1,
+             blob_object_id = $2,
+             prepare_claimed_at = NULL,
+             prepare_claim_token = NULL,
+             error_msg = NULL,
+             updated_at = NOW()
+         WHERE id = $3
+           AND NOT (
+               status = 'failed'
+               AND COALESCE(error_msg, '') = $4
+           )",
     )
     .bind(blob_id)
     .bind(blob_object_id)
     .bind(remember_job_id)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await
     .map_err(|e| {
@@ -1835,7 +1897,7 @@ async fn persist_uploaded_state(
             remember_job_id, e
         ))
     })?;
-    Ok(())
+    Ok(updated.rows_affected() > 0)
 }
 
 /// Resume an `uploaded`-but-not-`done` job by re-enqueuing the metadata/transfer
@@ -2128,13 +2190,21 @@ async fn execute_durable_upload(
 
                 let blob_id = durable_step_field(&step, "blobId")?;
                 let object_id = durable_step_field(&step, "blobObjectId")?;
-                persist_uploaded_state(
+                if !persist_uploaded_state(
                     state.db.pool(),
                     remember_job_id,
                     &blob_id,
                     Some(&object_id),
                 )
-                .await?;
+                .await?
+                {
+                    tracing::info!(
+                        "[wallet-job:upload] job_id={} namespace forgotten before uploaded state persisted; skipping transfer and indexing",
+                        remember_job_id,
+                    );
+                    crate::rate_limit::release_storage_quota_one(state, remember_job_id).await;
+                    return Ok(());
+                }
                 warm_blob_cache_after_upload(state, &blob_id, encrypted).await;
                 return resume_metadata_and_transfer(
                     state,
@@ -2508,6 +2578,14 @@ async fn execute_upload_and_transfer_locked(
                 );
                 return Ok(());
             }
+            UploadResume::Forgotten => {
+                tracing::info!(
+                    "[wallet-job:upload] job_id={} namespace forgotten while in flight — skipping upload",
+                    jid,
+                );
+                crate::rate_limit::release_storage_quota_one(state, jid).await;
+                return Ok(());
+            }
             UploadResume::ResumeTransfer {
                 blob_id,
                 blob_object_id,
@@ -2829,7 +2907,11 @@ async fn execute_upload_and_transfer_locked(
             // the recovery job (see persist_uploaded_state). A retry that lands
             // here reads this to resume the transfer instead of re-minting.
             if let Some(ref jid) = remember_job_id {
-                persist_uploaded_state(state.db.pool(), jid, &blob_id, Some(&object_id)).await?;
+                if !persist_uploaded_state(state.db.pool(), jid, &blob_id, Some(&object_id)).await?
+                {
+                    crate::rate_limit::release_storage_quota_one(state, jid).await;
+                    return Ok(());
+                }
             }
 
             let job_id_for_log = remember_job_id.as_deref().unwrap_or("-").to_string();
@@ -3064,7 +3146,12 @@ async fn execute_upload_and_transfer_locked(
     // the old fire-and-forget `let _ =`. Also stores blob_object_id so an
     // uploaded-but-not-done retry can resume the transfer without re-minting.
     if let Some(ref jid) = remember_job_id {
-        persist_uploaded_state(state.db.pool(), jid, &blob_id, upload.object_id.as_deref()).await?;
+        if !persist_uploaded_state(state.db.pool(), jid, &blob_id, upload.object_id.as_deref())
+            .await?
+        {
+            crate::rate_limit::release_storage_quota_one(state, jid).await;
+            return Ok(());
+        }
     }
 
     // The sidecar's `/walrus/upload` endpoint already performs metadata+transfer
@@ -6380,5 +6467,72 @@ the checkpoint it replied about",
             }
             other => panic!("expected transient handoff error, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn upload_resume_returns_forgotten_after_delete_by_namespace_and_blocks_uploaded_transition(
+    ) {
+        let pool = test_pool().await;
+        let owner = format!("0xforget-owner-{}", uuid::Uuid::new_v4());
+        let namespace = "forgotten-ns";
+        let pending_id = format!("job-pending-{}", uuid::Uuid::new_v4());
+        let uploaded_id = format!("job-uploaded-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, error_msg)
+             VALUES ($1, $2, $3, 'failed', $4)",
+        )
+        .bind(&pending_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'blob-already-minted', '0xobj', $4)",
+        )
+        .bind(&uploaded_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending_disp = upload_resume_disposition(&pool, &pending_id).await;
+        let uploaded_disp = upload_resume_disposition(&pool, &uploaded_id).await;
+        assert_eq!(pending_disp, UploadResume::Forgotten);
+        assert_eq!(uploaded_disp, UploadResume::Forgotten);
+        assert!(!resume_needs_upload_slot(&pending_disp));
+
+        // Even if an in-flight upload finished minting right as forget ran,
+        // persist_uploaded_state must return false and must not flip a
+        // forgotten job back to 'uploaded'.
+        let transitioned =
+            persist_uploaded_state(&pool, &pending_id, "blob-late-mint", Some("0xlate"))
+                .await
+                .expect("persist_uploaded_state on forgotten job");
+        assert!(
+            !transitioned,
+            "persist_uploaded_state must report false when job was forgotten"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM remember_jobs WHERE id = $1")
+            .bind(&pending_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "forgotten job must remain failed after persist_uploaded_state"
+        );
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
     }
 }

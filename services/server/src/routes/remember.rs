@@ -292,7 +292,7 @@ fn spawn_prepare_remember_job(
                 // wallet handoff. Post-mint recovery must use these bytes/vector;
                 // re-encrypting plaintext would no longer match the paid blob.
                 let persisted = sqlx::query(
-                    "UPDATE remember_jobs SET preparation_encrypted_b64 = $1, preparation_vector = $2, preparation_importance = $3, preparation_account_id = $4, preparation_public_key = $5, updated_at = NOW() WHERE id = $6 AND ($7::TEXT IS NULL OR prepare_claim_token = $7)",
+                    "UPDATE remember_jobs SET preparation_encrypted_b64 = $1, preparation_vector = $2, preparation_importance = $3, preparation_account_id = $4, preparation_public_key = $5, updated_at = NOW() WHERE id = $6 AND status IN ('pending', 'running') AND ($7::TEXT IS NULL OR prepare_claim_token = $7)",
                 )
                 .bind(&encrypted_b64)
                 .bind(serde_json::to_value(&vector).map_err(|e| {
@@ -311,6 +311,7 @@ fn spawn_prepare_remember_job(
                         "remember preparation lost fenced claim: job_id={}",
                         job_id
                     );
+                    rate_limit::release_storage_quota_one(&state, &job_id).await;
                     return Ok(());
                 }
 
