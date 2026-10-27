@@ -499,7 +499,9 @@ class MemWalMock:
         return False
 
     async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
-        resolved = namespace or self._namespace
+        resolved = self._namespace if namespace is None else namespace
+        if not resolved:
+            raise ValueError("namespace cannot be empty")
         deleted = self.clear(resolved)
         return ForgetResult(deleted=deleted, namespace=resolved, owner=self._owner)
 

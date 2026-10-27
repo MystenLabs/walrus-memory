@@ -16,7 +16,14 @@ class CaptureMemWal(MemWal):
         }
 
     async def _signed_request(
-        self, method, path, body, accepted_statuses=(200,), include_seal_session=True,
+        self,
+        method,
+        path,
+        body,
+        accepted_statuses=(200,),
+        include_seal_session=True,
+        *args,
+        **kwargs,
     ):
         self.captured.append((method, path, body))
         return {"deleted": 2, "namespace": body["namespace"], "owner": "0xowner"}
@@ -36,6 +43,32 @@ async def test_forget_posts_the_client_namespace():
     await client.close()
 
 
+@pytest.mark.asyncio
+async def test_forget_rejects_empty_namespace_without_deleting_default():
+    client = CaptureMemWal.create(
+        key="11" * 32,
+        account_id="0x" + "ab" * 32,
+        server_url="https://relayer.example",
+        namespace="important",
+    )
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        await client.forget("")
+    assert client.captured == []
+    await client.close()
+
+
 def test_sync_client_has_forget():
     assert hasattr(MemWal, "forget")
     assert hasattr(MemWalSync, "forget")
+    sync_client = MemWalSync(
+        CaptureMemWal.create(
+            key="11" * 32,
+            account_id="0x" + "ab" * 32,
+            server_url="https://relayer.example",
+            namespace="important",
+        )
+    )
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        sync_client.forget("")
+    assert sync_client._inner.captured == []
+    sync_client.close()

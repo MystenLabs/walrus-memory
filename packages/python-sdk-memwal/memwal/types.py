@@ -227,14 +227,14 @@ class RestoreResult:
     #: ``limit`` can still expand that fetch (``limit < 20``). Once the cap
     #: is saturated, truncation follows this call's missing-blob page, not
     #: on-chain ``total``, so a fully restored namespace does not loop
-    #: (GH #762). Also true when an inspected page produced only
-    #: transients (download/decrypt/embed) so the caller retries.
+    #: (WALM-431 / GH #762). Also true when an inspected page produced only
+    #: transients (download/decrypt/embed) so the caller retries (WALM-480).
     #:
     #: ``truncated=False`` is not proof the sidecar saw every on-chain blob.
     #: Blobs beyond the owner-wide sidecar candidate cap can still be
-    #: missing. Follow-up field:  (``sourceCapped``).
+    #: missing. Follow-up field: WALM-451 (``sourceCapped``).
     #:
-    #: Relayers older than  don't send this field at all; the SDK
+    #: Relayers older than WALM-319 don't send this field at all; the SDK
     #: defaults it to ``False`` in that case rather than requiring it.
     truncated: bool = False
     #: Permanent decrypt/UTF-8 failures on this on-chain page: negative-cache

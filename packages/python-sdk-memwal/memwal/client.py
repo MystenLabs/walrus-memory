@@ -381,7 +381,7 @@ def _occurred_at_to_wire(
     Aware ``datetime`` objects are converted to UTC. **Naïve datetimes
     are rejected** with ``ValueError``: silently assuming UTC would
     produce timezone-off-by-N anchors for callers outside UTC and
-    undermine 's "honest temporal anchoring" guarantee. Callers
+    undermine WALM-55's "honest temporal anchoring" guarantee. Callers
     should pass ``datetime.now(timezone.utc)`` or attach a ``tzinfo``
     explicitly.
 
@@ -1251,10 +1251,11 @@ class MemWal:
         Wraps ``POST /api/forget``. Walrus blobs persist; the rows stop being
         retrievable. Defaults to the client namespace.
         """
+        resolved_namespace = self._resolve_namespace(namespace)
         data = await self._signed_request(
             "POST",
             "/api/forget",
-            {"namespace": namespace or self._namespace},
+            {"namespace": resolved_namespace},
             include_seal_session=False,
         )
         return ForgetResult(
@@ -1452,7 +1453,7 @@ class MemWal:
         * ``truncated`` — True when this restore is known-incomplete (limit
           truncation or an upstream on-chain candidate-fetch cap; see
           :class:`~memwal.types.RestoreResult`). Defaults to ``False`` when
-          talking to a relayer older than  that omits the field.
+          talking to a relayer older than WALM-319 that omits the field.
 
         Args:
             namespace: Namespace to restore. Exact match — no prefix or

@@ -121,6 +121,9 @@ async def test_mock_supports_jobs_bulk_analyze_forget_and_clear():
 
     assert mock.forget_blob("mock-blob-000001") is True
     assert mock.forget_blob("missing") is False
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        await mock.forget("")
+    assert (await mock.recall("bulk", namespace="two")).total == 1
     forgotten = await mock.forget("one")
     assert forgotten.namespace == "one"
     assert forgotten.deleted == 1
