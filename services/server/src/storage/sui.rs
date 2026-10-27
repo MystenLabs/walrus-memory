@@ -818,7 +818,10 @@ fn address_hex(address: &Address) -> String {
 }
 
 fn normalize_object_id(value: &str) -> Option<String> {
-    let bare = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let bare = value
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     if bare.len() != 64 || !bare.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -923,7 +926,9 @@ pub fn parse_owner_account_fields(
         let public_key_hex = node
             .get("public_key")
             .and_then(public_key_hex)
-            .ok_or_else(|| OnchainVerifyError::RpcError("delegate key missing public_key".into()))?;
+            .ok_or_else(|| {
+                OnchainVerifyError::RpcError("delegate key missing public_key".into())
+            })?;
         let sui_address = node
             .get("sui_address")
             .and_then(|v| v.as_str())
@@ -934,10 +939,7 @@ pub fn parse_owner_account_fields(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let created_at = node
-            .get("created_at")
-            .map(created_at_u64)
-            .unwrap_or(0);
+        let created_at = node.get("created_at").map(created_at_u64).unwrap_or(0);
         keys.push(OnchainDelegateKeyPublic {
             public_key_hex,
             sui_address,
@@ -1203,10 +1205,14 @@ async fn grpc_get_object(
 fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match &value.kind {
         Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
-        Some(prost_types::value::Kind::NumberValue(number)) => serde_json::Number::from_f64(*number)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Some(prost_types::value::Kind::StringValue(text)) => serde_json::Value::String(text.clone()),
+        Some(prost_types::value::Kind::NumberValue(number)) => {
+            serde_json::Number::from_f64(*number)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        Some(prost_types::value::Kind::StringValue(text)) => {
+            serde_json::Value::String(text.clone())
+        }
         Some(prost_types::value::Kind::BoolValue(flag)) => serde_json::Value::Bool(*flag),
         Some(prost_types::value::Kind::StructValue(fields)) => {
             let mut map = serde_json::Map::new();

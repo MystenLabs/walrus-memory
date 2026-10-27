@@ -1866,8 +1866,14 @@ mod tests {
         server.abort();
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["registerTransaction"]["digest"], "cancelled-digest");
-        assert_eq!(requests[1]["resumeStep"]["registerRebuild"], "cancelled-digest");
+        assert_eq!(
+            requests[0]["registerTransaction"]["digest"],
+            "cancelled-digest"
+        );
+        assert_eq!(
+            requests[1]["resumeStep"]["registerRebuild"],
+            "cancelled-digest"
+        );
         assert_eq!(requests[1]["resumeStep"]["blobId"], "blob");
         assert!(requests[1]["registerTransaction"].is_null());
     }

@@ -1643,6 +1643,13 @@ pub struct McpRateLimitConfig {
     pub per_minute: i64,
     /// Requests per hour for every client IP (default: 8000).
     pub per_hour: i64,
+    /// Requests per minute for one tenant, keyed by account id + delegate
+    /// public key after authentication (default: 1000). Must stay below
+    /// `global_per_minute` so one tenant cannot fill the shared ceiling.
+    pub tenant_per_minute: i64,
+    /// Requests per hour for one tenant (default: 6000). Must stay below
+    /// `global_per_hour`.
+    pub tenant_per_hour: i64,
     /// Deployment-wide cap (default: 2500). Must stay above `per_minute`.
     pub global_per_minute: i64,
     /// Deployment-wide sustained cap (default: 15000). Must stay above `per_hour`.
@@ -1654,6 +1661,8 @@ impl Default for McpRateLimitConfig {
         Self {
             per_minute: 2000,
             per_hour: 8000,
+            tenant_per_minute: 1000,
+            tenant_per_hour: 6000,
             global_per_minute: 2500,
             global_per_hour: 15000,
         }
@@ -1678,6 +1687,14 @@ impl McpRateLimitConfig {
         let config = Self {
             per_minute: env_positive_i64("MCP_RATE_LIMIT_PER_MINUTE", defaults.per_minute),
             per_hour: env_positive_i64("MCP_RATE_LIMIT_PER_HOUR", defaults.per_hour),
+            tenant_per_minute: env_positive_i64(
+                "MCP_TENANT_RATE_LIMIT_PER_MINUTE",
+                defaults.tenant_per_minute,
+            ),
+            tenant_per_hour: env_positive_i64(
+                "MCP_TENANT_RATE_LIMIT_PER_HOUR",
+                defaults.tenant_per_hour,
+            ),
             global_per_minute: env_positive_i64(
                 "MCP_GLOBAL_RATE_LIMIT_PER_MINUTE",
                 defaults.global_per_minute,
@@ -1692,6 +1709,20 @@ impl McpRateLimitConfig {
                 "MCP global per-minute cap {} is not above the per-IP cap {}; one IP can exhaust the deployment",
                 config.global_per_minute,
                 config.per_minute
+            );
+        }
+        if config.global_per_minute <= config.tenant_per_minute {
+            tracing::warn!(
+                "MCP global per-minute cap {} is not above the per-tenant cap {}; one tenant can exhaust the deployment",
+                config.global_per_minute,
+                config.tenant_per_minute
+            );
+        }
+        if config.global_per_hour <= config.tenant_per_hour {
+            tracing::warn!(
+                "MCP global per-hour cap {} is not above the per-tenant cap {}; one tenant can exhaust the deployment",
+                config.global_per_hour,
+                config.tenant_per_hour
             );
         }
         if config.global_per_hour <= config.per_hour {
