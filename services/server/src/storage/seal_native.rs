@@ -4,6 +4,8 @@
 //! Replaces `services/server/scripts/sidecar/routes/seal.ts`, `seal-ptb.ts`, and
 //! `seal-identity.ts` using `seal-sdk` and `seal-crypto` (`MystenLabs/seal`).
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -283,11 +285,15 @@ pub async fn resolve_seal_key_servers(
     {
         let mut resolved = Vec::with_capacity(specs.len());
         for s in &specs {
+            let (Some(url), Some(pk_hex_raw)) = (s.url.as_ref(), s.public_key_hex.as_deref())
+            else {
+                continue;
+            };
             let object_id: ObjectID = s
                 .object_id
                 .parse()
                 .map_err(|e| format!("invalid key server object_id '{}': {e}", s.object_id))?;
-            let pk_hex = s.public_key_hex.as_deref().unwrap().trim();
+            let pk_hex = pk_hex_raw.trim();
             let pk_bytes = hex::decode(pk_hex.strip_prefix("0x").unwrap_or(pk_hex))
                 .map_err(|e| format!("invalid key server public_key hex: {e}"))?;
             let pk = parse_bls_g2_pk(&pk_bytes)?;
@@ -295,7 +301,7 @@ pub async fn resolve_seal_key_servers(
                 object_id,
                 weight: s.weight,
                 name: s.object_id.clone(),
-                url: s.url.clone().unwrap(),
+                url: url.clone(),
                 pk,
             });
         }
@@ -311,8 +317,8 @@ pub async fn resolve_seal_key_servers(
 
     let mut client = crate::sui::enoki::shared_sui_grpc_client(grpc_url)?;
 
-    let v1_key_bcs = bcs::to_bytes(&1u64).unwrap();
-    let v2_key_bcs = bcs::to_bytes(&2u64).unwrap();
+    let v1_key_bcs = 1u64.to_le_bytes();
+    let v2_key_bcs = 2u64.to_le_bytes();
 
     let mut resolved = Vec::with_capacity(specs.len());
     for spec in &specs {
@@ -846,6 +852,9 @@ fn get_or_create_session_cert_from_delegate_key(
 
     if let Ok(kp_bytes) = bcs::to_bytes(&session_kp) {
         if let Ok(mut guard) = cache.write() {
+            if guard.len() >= 512 {
+                guard.retain(|_, v| v.created_at.elapsed() < SESSION_CACHE_DURATION);
+            }
             guard.insert(
                 cache_key,
                 CachedSessionCert {
@@ -1070,13 +1079,15 @@ pub async fn seal_decrypt_batch_in_process(
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
+                    let sanitized_body =
+                        crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
                     let err_tag = if status.as_u16() == 403 {
                         "NoAccessError"
                     } else {
                         "KeyServerError"
                     };
                     Err(format!(
-                        "fetch_keys failed: {err_tag}: key server {} returned {status}: {body}",
+                        "fetch_keys failed: {err_tag}: key server {} returned {status}: {sanitized_body}",
                         srv.name
                     ))
                 }
@@ -1294,5 +1305,80 @@ mod tests {
                 other => panic!("expected MoveCall, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn validate_expected_committee_identity_enforces_threshold_and_server_set() {
+        let srv_0 = "0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75";
+        let srv_1 = "0xf5d14a81a982144ae441cd7d64b09027f116a468bd36e7eca494f750591623c8";
+        let specs = vec![
+            ConfiguredKeyServerSpec {
+                object_id: srv_0.to_owned(),
+                weight: 1,
+                url: Some("https://s0.example.com".to_owned()),
+                public_key_hex: None,
+            },
+            ConfiguredKeyServerSpec {
+                object_id: srv_1.to_owned(),
+                weight: 1,
+                url: Some("https://s1.example.com".to_owned()),
+                public_key_hex: None,
+            },
+        ];
+
+        let expected = serde_json::json!({
+            "threshold": 2,
+            "servers": [
+                { "objectId": srv_0, "weight": 1 },
+                { "objectId": srv_1, "weight": 1 }
+            ]
+        });
+
+        assert!(validate_expected_committee_identity(Some(&expected), &specs, 2).is_ok());
+
+        // Threshold mismatch must fail closed with SEAL_COMMITTEE_MISMATCH
+        let thresh_err =
+            validate_expected_committee_identity(Some(&expected), &specs, 1).unwrap_err();
+        assert!(thresh_err.contains("SEAL_COMMITTEE_MISMATCH: expected threshold 2, configured 1"));
+
+        // Server count mismatch must fail closed with SEAL_COMMITTEE_MISMATCH
+        let count_err =
+            validate_expected_committee_identity(Some(&expected), &specs[..1], 2).unwrap_err();
+        assert!(count_err.contains("SEAL_COMMITTEE_MISMATCH: expected 2 servers, configured 1"));
+    }
+
+    #[test]
+    fn session_certificate_from_delegate_key_roundtrips_through_import_validation() {
+        let seed = [0x55u8; 32];
+        let hex_key = format!("0x{}", hex::encode(seed));
+        let pkg: Address =
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .parse()
+                .unwrap();
+        let other_pkg: Address =
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+                .parse()
+                .unwrap();
+
+        let (session_kp, cert) = get_or_create_session_cert_from_delegate_key(pkg, &hex_key)
+            .expect("should mint valid session certificate");
+        let session_sk_hex = format!("0x{}", hex::encode(session_kp.private().as_bytes()));
+        let exported = serde_json::json!({
+            "address": cert.user.to_string(),
+            "packageId": pkg.to_string(),
+            "creationTimeMs": cert.creation_time,
+            "ttlMin": cert.ttl_min,
+            "personalMessageSignature": cert.signature_base64,
+            "sessionKey": session_sk_hex,
+        });
+        let exported_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&exported).unwrap());
+
+        let (_, reimported_cert) = import_exported_session_key(&exported_b64, pkg)
+            .expect("reimporting valid session key should succeed");
+        assert_eq!(reimported_cert.session_vk, cert.session_vk);
+
+        // Package mismatch is rejected
+        assert!(import_exported_session_key(&exported_b64, other_pkg).is_err());
     }
 }

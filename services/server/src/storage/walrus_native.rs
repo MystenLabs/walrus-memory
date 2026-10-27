@@ -6,6 +6,8 @@
 //! `BlobId`, `BlobMetadataApi`, `ConfirmationCertificate`), `seal-crypto` (`EncryptedObject`),
 //! and `sui-rpc` gRPC.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::num::NonZeroU16;
 use std::sync::{
@@ -206,7 +208,7 @@ pub fn get_native_runtime_config() -> NativeRuntimeConfig {
     NATIVE_RUNTIME_CONFIG
         .get_or_init(|| StdRwLock::new(NativeRuntimeConfig::from_env_fallback()))
         .read()
-        .expect("NativeRuntimeConfig lock poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
 
@@ -216,6 +218,7 @@ pub fn get_native_runtime_config() -> NativeRuntimeConfig {
 /// Defaults to `true` when `sidecar_url` is the default (`http://localhost:9000` / `in-process`)
 /// or when `IN_PROCESS_SIDECAR=true`. Preserves HTTP sidecar execution when unit tests pass an
 /// ephemeral mock HTTP server port (`http://127.0.0.1:<random_port>`) unless `IN_PROCESS_SIDECAR=true`.
+#[must_use]
 pub fn is_in_process_sidecar_enabled(sidecar_url: &str) -> bool {
     if let Ok(val) = std::env::var("IN_PROCESS_SIDECAR") {
         let trimmed = val.trim().to_ascii_lowercase();
@@ -324,6 +327,7 @@ pub struct InProcessUploadLimiter {
     notify: Notify,
 }
 
+#[must_use = "if unused, the upload slot is immediately released"]
 pub struct UploadSlotGuard<'a> {
     limiter: &'a InProcessUploadLimiter,
     slots: usize,
@@ -338,7 +342,31 @@ impl Drop for UploadSlotGuard<'_> {
     }
 }
 
+/// RAII guard that ensures `limiter.queued` is always decremented even if an
+/// awaiting `InProcessUploadLimiter::acquire` future is cancelled/dropped.
+struct QueuedWaiterGuard<'a> {
+    limiter: &'a InProcessUploadLimiter,
+}
+
+impl Drop for QueuedWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.limiter.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl InProcessUploadLimiter {
+    #[must_use]
+    pub fn new(max_concurrent: usize, max_queue_depth: usize, queue_timeout_ms: u64) -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            max_concurrent: max_concurrent.max(1),
+            max_queue_depth,
+            queue_timeout_ms: queue_timeout_ms.max(1),
+            notify: Notify::new(),
+        }
+    }
+
     fn from_env() -> Self {
         let max_concurrent = std::env::var("WALRUS_MAX_CONCURRENT_UPLOADS")
             .ok()
@@ -354,16 +382,10 @@ impl InProcessUploadLimiter {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(60_000);
-        Self {
-            in_flight: AtomicUsize::new(0),
-            queued: AtomicUsize::new(0),
-            max_concurrent,
-            max_queue_depth,
-            queue_timeout_ms,
-            notify: Notify::new(),
-        }
+        Self::new(max_concurrent, max_queue_depth, queue_timeout_ms)
     }
 
+    #[must_use]
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "activeWalrusUploads": self.in_flight.load(Ordering::Relaxed) as u64,
@@ -404,8 +426,8 @@ impl InProcessUploadLimiter {
         }
 
         let current_queued = self.queued.fetch_add(1, Ordering::SeqCst);
+        let _queued_guard = QueuedWaiterGuard { limiter: self };
         if current_queued >= self.max_queue_depth {
-            self.queued.fetch_sub(1, Ordering::SeqCst);
             return Err(format!(
                 "Walrus upload queue full ({}/{} queued)",
                 current_queued, self.max_queue_depth
@@ -422,7 +444,6 @@ impl InProcessUploadLimiter {
                     .compare_exchange(current, current + slots, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                self.queued.fetch_sub(1, Ordering::SeqCst);
                 return Ok(UploadSlotGuard {
                     limiter: self,
                     slots,
@@ -431,7 +452,6 @@ impl InProcessUploadLimiter {
 
             let now = Instant::now();
             if now >= deadline {
-                self.queued.fetch_sub(1, Ordering::SeqCst);
                 return Err(format!(
                     "Timed out waiting for Walrus upload slot after {}ms",
                     self.queue_timeout_ms
@@ -439,7 +459,6 @@ impl InProcessUploadLimiter {
             }
             let remaining = deadline - now;
             if tokio::time::timeout(remaining, notified).await.is_err() {
-                self.queued.fetch_sub(1, Ordering::SeqCst);
                 return Err(format!(
                     "Timed out waiting for Walrus upload slot after {}ms",
                     self.queue_timeout_ms
@@ -607,6 +626,7 @@ pub struct WalrusSystemSnapshot {
 }
 
 impl WalrusSystemSnapshot {
+    #[must_use]
     pub fn storage_cost(&self, encoded_size: u64, epochs: u32) -> u64 {
         let units = encoded_size.div_ceil(BYTES_PER_UNIT_SIZE);
         units
@@ -614,6 +634,7 @@ impl WalrusSystemSnapshot {
             .saturating_mul(u64::from(epochs))
     }
 
+    #[must_use]
     pub fn write_cost(&self, encoded_size: u64) -> u64 {
         let units = encoded_size.div_ceil(BYTES_PER_UNIT_SIZE);
         units.saturating_mul(self.write_price_per_unit_size)
@@ -824,6 +845,7 @@ pub enum RelayTipConfig {
 }
 
 impl RelayTipConfig {
+    #[must_use]
     pub fn calculate_tip(&self, n_shards: u16, unencoded_length: u64) -> Option<(Address, u64)> {
         match self {
             Self::NoTip => None,
@@ -835,7 +857,7 @@ impl RelayTipConfig {
                         base,
                         encoded_size_mul_per_kib,
                     } => {
-                        let shards = NonZeroU16::new(n_shards.max(1)).unwrap();
+                        let shards = NonZeroU16::new(n_shards.max(1))?;
                         let encoded_len = encoded_blob_length_for_n_shards(
                             shards,
                             unencoded_length,
@@ -1138,7 +1160,7 @@ pub async fn build_register_blob_ptb(
     );
 
     for (k, v) in attributes {
-        let key_arg = builder.pure(&(*k).to_owned());
+        let key_arg = builder.pure(k);
         let val_arg = builder.pure(v);
         builder.move_call(
             Function::new(
@@ -1200,7 +1222,8 @@ pub async fn post_blob_to_upload_relay(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Walrus upload relay returned {status}: {body}"));
+        let safe_body = crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
+        return Err(format!("Walrus upload relay returned {status}: {safe_body}"));
     }
 
     let parsed: RelayUploadResponse = resp
@@ -1366,10 +1389,9 @@ pub async fn build_certify_ptb(
     ));
     let blob_arg = builder.object(ObjectInput::owned(blob_addr, blob_ver, blob_digest));
 
-    let sig_bytes: Vec<u8> = certificate.signature.as_ref().to_vec();
     let bitmap = signers_to_bitmap(&certificate.signers, system.committee_size);
 
-    let sig_arg = builder.pure(&sig_bytes);
+    let sig_arg = builder.pure(&certificate.signature.as_ref());
     let bitmap_arg = builder.pure(&bitmap);
     let msg_arg = builder.pure(&certificate.serialized_message);
 
@@ -1891,7 +1913,7 @@ pub async fn set_metadata_batch_in_process(
         }
 
         for (k, v) in pairs {
-            let key_arg = builder.pure(&k.to_owned());
+            let key_arg = builder.pure(&k);
             let val_arg = builder.pure(&v);
             builder.move_call(
                 Function::new(
@@ -1996,7 +2018,7 @@ async fn read_blob_metadata_map(
 
     // Fast path: derive the `vector<u8>` dynamic child ID for `b"metadata"` directly (`1` gRPC GetObject).
     if let Ok(blob_addr) = blob_object_id.parse::<Address>() {
-        if let Ok(key_bcs) = bcs::to_bytes(&b"metadata".to_vec()) {
+        if let Ok(key_bcs) = bcs::to_bytes(b"metadata".as_slice()) {
             let metadata_field_id =
                 blob_addr.derive_dynamic_child_id(&TypeTag::Vector(Box::new(TypeTag::U8)), &key_bcs);
             let mut obj_req = GetObjectRequest::default();
@@ -2151,7 +2173,7 @@ pub async fn query_blobs_by_owner_in_process(
     // (chunks of 50) instead of issuing N sequential `GetObject` gRPC calls.
     let mut batch_metadata: HashMap<String, HashMap<String, String>> =
         HashMap::with_capacity(candidates.len());
-    if let Ok(key_bcs) = bcs::to_bytes(&b"metadata".to_vec()) {
+    if let Ok(key_bcs) = bcs::to_bytes(b"metadata".as_slice()) {
         let key_type = TypeTag::Vector(Box::new(TypeTag::U8));
         for chunk in candidates.chunks(50) {
             let mut reqs = Vec::with_capacity(chunk.len());
@@ -2587,6 +2609,77 @@ mod tests {
             effective_walrus_upload_relay_url("testnet", "http://127.0.0.1:19000"),
             "http://127.0.0.1:19000"
         );
+    }
+
+    #[tokio::test]
+    async fn in_process_upload_limiter_enforces_capacity_queue_depth_and_cancellation_safety() {
+        let limiter = std::sync::Arc::new(InProcessUploadLimiter::new(1, 1, 80));
+
+        // 1. Acquire the single active slot.
+        let guard_1 = limiter.acquire(1).await.expect("first slot should succeed");
+        assert_eq!(limiter.snapshot()["activeWalrusUploads"], 1);
+        assert_eq!(limiter.snapshot()["queuedWalrusUploads"], 0);
+
+        // 2. Start a queued waiter and cancel/drop its future while it is waiting.
+        //    Verify that `QueuedWaiterGuard` decrements `queued` back to 0 so the queue never leaks.
+        let limiter_clone = std::sync::Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move {
+            let _ = limiter_clone.acquire(1).await;
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(limiter.snapshot()["queuedWalrusUploads"], 1);
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            limiter.snapshot()["queuedWalrusUploads"],
+            0,
+            "dropping/aborting a queued acquire future must not leak queued count"
+        );
+
+        // 3. When queue depth (1) is occupied, a second waiter fails immediately with queue full.
+        let limiter_q1 = std::sync::Arc::clone(&limiter);
+        let held_waiter = tokio::spawn(async move {
+            let guard = limiter_q1.acquire(1).await?;
+            let active = limiter_q1.snapshot()["activeWalrusUploads"]
+                .as_u64()
+                .unwrap_or(0);
+            drop(guard);
+            Ok::<u64, String>(active)
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(limiter.snapshot()["queuedWalrusUploads"], 1);
+
+        let overflow_err = limiter
+            .acquire(1)
+            .await
+            .err()
+            .expect("should reject when queue is full");
+        assert!(overflow_err.contains("Walrus upload queue full"));
+
+        // 4. Releasing `guard_1` wakes `held_waiter`, which acquires and then releases the slot.
+        drop(guard_1);
+        let active_during_hold = held_waiter
+            .await
+            .expect("task should join")
+            .expect("queued waiter should acquire slot after release");
+        assert_eq!(active_during_hold, 1);
+        assert_eq!(limiter.snapshot()["activeWalrusUploads"], 0);
+        assert_eq!(limiter.snapshot()["queuedWalrusUploads"], 0);
+    }
+
+    #[test]
+    fn decimal_u256_to_blob_id_converts_decimal_and_preserves_base64() {
+        // Zero u256 -> 32 zero bytes in URL_SAFE_NO_PAD base64
+        let zero_b64 = decimal_u256_to_blob_id("0");
+        assert_eq!(
+            zero_b64,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32])
+        );
+
+        // Already base64url string is returned unchanged
+        let existing = "abcDEF_123-xyz";
+        assert_eq!(decimal_u256_to_blob_id(existing), existing);
     }
 }
 
