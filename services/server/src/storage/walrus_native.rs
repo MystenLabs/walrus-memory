@@ -290,7 +290,7 @@ pub fn effective_walrus_upload_relay_url(network: &str, configured_publisher: &s
         }
     }
     let pub_trimmed = configured_publisher.trim();
-    if !pub_trimmed.is_empty() && !pub_trimmed.contains("publisher.walrus") {
+    if !pub_trimmed.is_empty() && !pub_trimmed.contains("publisher.") {
         return pub_trimmed.to_owned();
     }
     if network.trim().eq_ignore_ascii_case("testnet") {
@@ -689,7 +689,7 @@ struct TimedValue<T> {
     fetched_at: Instant,
 }
 
-static SYSTEM_SNAPSHOT_CACHE: OnceLock<RwLock<Option<TimedValue<WalrusSystemSnapshot>>>> =
+static SYSTEM_SNAPSHOT_CACHE: OnceLock<RwLock<HashMap<String, TimedValue<WalrusSystemSnapshot>>>> =
     OnceLock::new();
 
 pub(crate) fn prost_to_json(value: &prost_types::Value) -> serde_json::Value {
@@ -727,7 +727,7 @@ fn json_u64(val: Option<&serde_json::Value>) -> Option<u64> {
 
 pub async fn invalidate_walrus_system_snapshot_cache() {
     if let Some(cache) = SYSTEM_SNAPSHOT_CACHE.get() {
-        *cache.write().await = None;
+        cache.write().await.clear();
     }
 }
 
@@ -737,16 +737,17 @@ pub async fn resolve_walrus_system_snapshot(
     configured_package_id: &str,
     configured_system_id: &str,
 ) -> Result<WalrusSystemSnapshot, String> {
-    let cache = SYSTEM_SNAPSHOT_CACHE.get_or_init(|| RwLock::new(None));
-    if let Some(cached) = cache.read().await.as_ref() {
+    let origin_pkg_str = effective_walrus_package_id(network, configured_package_id);
+    let system_id_str = effective_walrus_system_object_id(network, configured_system_id);
+    let cache_key = format!("{}|{}", grpc_url.trim(), system_id_str);
+    let cache = SYSTEM_SNAPSHOT_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(cached) = cache.read().await.get(&cache_key) {
         if cached.fetched_at.elapsed() < Duration::from_secs(30) {
             return Ok(cached.value.clone());
         }
     }
 
-    let origin_pkg_str = effective_walrus_package_id(network, configured_package_id);
-    let system_id_str = effective_walrus_system_object_id(network, configured_system_id);
-    let origin_package_id: Address = origin_pkg_str
+    let fallback_origin_package_id: Address = origin_pkg_str
         .parse()
         .map_err(|e| format!("invalid Walrus package ID '{origin_pkg_str}': {e}"))?;
     let system_object_id: Address = system_id_str
@@ -757,7 +758,12 @@ pub async fn resolve_walrus_system_snapshot(
 
     let mut sys_req = GetObjectRequest::default();
     sys_req.object_id = Some(system_id_str.clone());
-    sys_req.read_mask = Some(FieldMask::from_paths(["object_id", "owner", "json"]));
+    sys_req.read_mask = Some(FieldMask::from_paths([
+        "object_id",
+        "object_type",
+        "owner",
+        "json",
+    ]));
     let sys_obj = client
         .ledger_client()
         .get_object(sys_req)
@@ -766,6 +772,13 @@ pub async fn resolve_walrus_system_snapshot(
         .into_inner()
         .object
         .ok_or_else(|| format!("Walrus System object {system_id_str} not found"))?;
+
+    let origin_package_id = sys_obj
+        .object_type
+        .as_deref()
+        .and_then(|t| t.split("::").next())
+        .and_then(|addr| addr.parse::<Address>().ok())
+        .unwrap_or(fallback_origin_package_id);
 
     let initial_shared_version = sys_obj
         .owner
@@ -856,10 +869,13 @@ pub async fn resolve_walrus_system_snapshot(
         write_price_per_unit_size,
     };
 
-    *cache.write().await = Some(TimedValue {
-        value: snapshot.clone(),
-        fetched_at: Instant::now(),
-    });
+    cache.write().await.insert(
+        cache_key,
+        TimedValue {
+            value: snapshot.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
 
     Ok(snapshot)
 }
@@ -1041,7 +1057,7 @@ async fn select_owned_wal_coins(
     grpc_url: &str,
     owner: &str,
     wal_coin_type: &str,
-) -> Result<(u64, Vec<(Address, u64, Digest)>), String> {
+) -> Result<(Option<u64>, Vec<(Address, u64, Digest)>), String> {
     let mut bal_client = shared_sui_grpc_client(grpc_url)?;
     let mut obj_client = bal_client.clone();
     let mut bal_state = bal_client.state_client();
@@ -1061,16 +1077,20 @@ async fn select_owned_wal_coins(
         obj_state.list_owned_objects(req),
     );
 
-    let mut address_wal: u64 = 0;
-    if let Ok(resp) = bal_res {
-        for bal in resp.into_inner().balances {
-            let ct = bal.coin_type.as_deref().unwrap_or_default();
-            if ct == wal_coin_type || ct.ends_with("::wal::WAL") {
-                address_wal = bal.address_balance.unwrap_or(0);
-                break;
+    let address_wal = match bal_res {
+        Ok(resp) => {
+            let mut found = 0u64;
+            for bal in resp.into_inner().balances {
+                let ct = bal.coin_type.as_deref().unwrap_or_default();
+                if ct == wal_coin_type || ct.ends_with("::wal::WAL") {
+                    found = bal.address_balance.unwrap_or(0);
+                    break;
+                }
             }
+            Some(found)
         }
-    }
+        Err(_) => None,
+    };
 
     let mut coins = Vec::new();
     if let Ok(resp) = obj_res {
@@ -1151,27 +1171,37 @@ pub async fn build_register_blob_ptb(
         .map_err(|e| format!("invalid WAL StructTag '{wal_coin_type_str}': {e}"))?;
     let wal_type_tag = TypeTag::Struct(Box::new(wal_struct_tag));
 
-    let (address_wal, owned_wal_coins) =
+    let (address_wal_opt, owned_wal_coins) =
         select_owned_wal_coins(grpc_url, &sender.to_string(), &wal_coin_type_str).await?;
 
-    let (wal_coin_arg, destroy_zero_after) =
-        if address_wal >= total_wal_cost || owned_wal_coins.is_empty() {
-            (
-                builder.funds_withdrawal_coin(wal_type_tag.clone(), total_wal_cost),
-                true,
-            )
-        } else {
-            let (first_id, first_ver, first_dig) = owned_wal_coins[0];
-            let primary = builder.object(ObjectInput::owned(first_id, first_ver, first_dig));
-            if owned_wal_coins.len() > 1 {
-                let extras: Vec<_> = owned_wal_coins[1..]
-                    .iter()
-                    .map(|&(id, ver, dig)| builder.object(ObjectInput::owned(id, ver, dig)))
-                    .collect();
-                builder.merge_coins(primary, extras);
-            }
-            (primary, false)
-        };
+    if let Some(available_wal) = address_wal_opt {
+        if available_wal < total_wal_cost && owned_wal_coins.is_empty() {
+            return Err(format!(
+                "Insufficient balance of {wal_coin_type_str} for owner {sender}. Required: {total_wal_cost}, Available: {available_wal}"
+            ));
+        }
+    }
+
+    let (wal_coin_arg, destroy_zero_after) = if address_wal_opt.unwrap_or(total_wal_cost)
+        >= total_wal_cost
+        || owned_wal_coins.is_empty()
+    {
+        (
+            builder.funds_withdrawal_coin(wal_type_tag.clone(), total_wal_cost),
+            true,
+        )
+    } else {
+        let (first_id, first_ver, first_dig) = owned_wal_coins[0];
+        let primary = builder.object(ObjectInput::owned(first_id, first_ver, first_dig));
+        if owned_wal_coins.len() > 1 {
+            let extras: Vec<_> = owned_wal_coins[1..]
+                .iter()
+                .map(|&(id, ver, dig)| builder.object(ObjectInput::owned(id, ver, dig)))
+                .collect();
+            builder.merge_coins(primary, extras);
+        }
+        (primary, false)
+    };
 
     let system_arg = builder.object(ObjectInput::shared(
         system.system_object_id,
