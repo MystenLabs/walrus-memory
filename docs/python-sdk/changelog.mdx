@@ -46,6 +46,7 @@ Unreleased.
 
 ### Fixed
 
+- `health()`, `compatibility()`, `_fetch_server_config()`, package-version preflight probes, and `_signed_request()` raise `MemWalJsonBodyError` (a `MemWalError` subclass carrying `.status`, `.endpoint`, and `.body`) instead of Python's raw `json.JSONDecodeError` when a 2xx response has an empty or non-JSON body. (#1219)
 - Shield shared `_build_seal_session` and `_resolve_owner` initialization tasks with `asyncio.shield`, clear the shared task slot via a completion callback that consumes exceptions on orphaned tasks, and cancel/drain in-flight initialization tasks in `close()` so cancelling one concurrent caller does not abort sibling callers or leave unretrieved task exceptions. (#1029)
 - `health`, `ask`, `restore`, `list_namespaces`, `remember_manual`, and `recall` raise `MemWalError` naming the endpoint and field when a 2xx response omits a required field. They used to raise a bare `KeyError` that callers catching `MemWalError` never saw. (#1250, #1256)
 - `ask()` rejects a blank `question` and a `limit` that is not a positive integer before it signs the request. A NaN `limit` used to serialize as an invalid-JSON `NaN` token, and negative or fractional values were sent as-is. (#1249, #1255)

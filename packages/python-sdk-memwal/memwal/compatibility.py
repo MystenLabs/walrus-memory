@@ -12,6 +12,12 @@ SUPPORTED_RELAYER_API_MAJOR = 1
 def compatibility_error(metadata: Dict[str, Any], server_url: str) -> Optional[str]:
     """Return an actionable error string when relayer metadata is unsupported."""
 
+    if not isinstance(metadata, dict):
+        return (
+            f"Walrus Memory relayer at {server_url} does not expose compatibility metadata. "
+            "Upgrade the relayer to a version that serves GET /version, or use an older SDK."
+        )
+
     api_version = metadata.get("apiVersion")
     relayer_version = metadata.get("relayerVersion")
     min_supported = metadata.get("minSupportedSdk")
