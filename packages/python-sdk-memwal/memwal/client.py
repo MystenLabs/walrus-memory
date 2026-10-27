@@ -160,6 +160,18 @@ def _require(data: object, field: str, endpoint: str) -> Any:
     return data[field]
 
 
+def _require_positive_int(value: object, name: str) -> None:
+    """Reject anything but a positive ``int`` before it is signed (#1249).
+
+    ``json.dumps`` writes ``float("nan")`` as a bare ``NaN`` token, which is
+    not valid JSON, and negative or fractional values were forwarded as-is.
+    ``bool`` is an ``int`` subclass and is rejected explicitly.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+
 IDEMPOTENCY_BUCKET_MS = 30 * 60 * 1000
 
 
@@ -1371,6 +1383,8 @@ class MemWal:
         Returns:
             :class:`AskResult` with answer, memories_used count, and memories list.
         """
+        _reject_blank_text(question, "question cannot be empty")
+        _require_positive_int(limit, "limit")
         data = await self._signed_request("POST", "/api/ask", {
             "question": question,
             "limit": limit,
