@@ -1471,6 +1471,10 @@ pub struct SponsorRateLimitConfig {
     pub global_per_minute: i64,
     /// Deployment-wide sustained cap that protects the sponsor budget.
     pub global_per_hour: i64,
+    /// Deployment-wide cumulative rolling 24-hour cap (default: 2000) that
+    /// prevents multi-IP rotation from draining the sponsor gas budget across
+    /// consecutive hourly windows.
+    pub global_per_day: i64,
 }
 
 impl Default for SponsorRateLimitConfig {
@@ -1480,6 +1484,7 @@ impl Default for SponsorRateLimitConfig {
             per_hour: 30,
             global_per_minute: 100,
             global_per_hour: 1000,
+            global_per_day: 2000,
         }
     }
 }
@@ -1505,6 +1510,19 @@ impl SponsorRateLimitConfig {
         if let Ok(v) = std::env::var("SPONSOR_GLOBAL_RATE_LIMIT_PER_HOUR") {
             if let Ok(n) = v.parse() {
                 c.global_per_hour = n;
+            }
+        }
+        for key in [
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY",
+            "SPONSOR_RL_GLOBAL_PER_DAY",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                if let Ok(n) = v.parse::<i64>() {
+                    if n > 0 {
+                        c.global_per_day = n;
+                        break;
+                    }
+                }
             }
         }
         c
@@ -3850,6 +3868,8 @@ mod tests {
 
     // ── SponsorRateLimitConfig defaults ─────────────────────────────────
 
+    static SPONSOR_RATE_LIMIT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn sponsor_rate_limit_default_values() {
         let config = SponsorRateLimitConfig::default();
@@ -3857,6 +3877,53 @@ mod tests {
         assert_eq!(config.per_hour, 30);
         assert_eq!(config.global_per_minute, 100);
         assert_eq!(config.global_per_hour, 1000);
+        assert_eq!(config.global_per_day, 2000);
+    }
+
+    #[test]
+    fn sponsor_rate_limit_from_env_parses_daily_cap_and_rejects_non_positive() {
+        let _lock = SPONSOR_RATE_LIMIT_ENV_LOCK.lock().unwrap();
+        let keys = [
+            "SPONSOR_RATE_LIMIT_PER_MINUTE",
+            "SPONSOR_RATE_LIMIT_PER_HOUR",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_MINUTE",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_HOUR",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY",
+            "SPONSOR_RL_GLOBAL_PER_DAY",
+        ];
+        let saved: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        struct Restore<'a>(&'a [(&'static str, Option<String>)]);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                for (key, previous) in self.0 {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(&saved);
+
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "0");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2000);
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "-10");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2000);
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "3500");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 3500);
+
+        std::env::remove_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY");
+        std::env::set_var("SPONSOR_RL_GLOBAL_PER_DAY", "2400");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2400);
     }
 
     // ── ReadApiRateLimitConfig defaults ─────────────────────────────────
