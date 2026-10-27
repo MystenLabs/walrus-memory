@@ -1437,6 +1437,7 @@ export class MemWal {
         if (wireOccurredAt !== undefined) body.occurred_at = wireOccurredAt;
         return this.signedRequest<AnalyzeResult>("POST", "/api/analyze", body, [200, 202], {
             timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+            signal: options.signal,
         });
     }
 
@@ -2110,7 +2111,9 @@ export class MemWal {
             : acceptedStatusesOrOptions;
         // Before the version probe. A destroyed client must not open GET /version. (#1090)
         if (this.destroyed) throw destroyedClientError();
+        options.signal?.throwIfAborted();
         await this.ensureCompatibleRelayer();
+        options.signal?.throwIfAborted();
         const ed = await getEd();
 
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -2131,6 +2134,7 @@ export class MemWal {
         // Again after the version await. A destroy that lands while that
         // request is in flight must still refuse to sign. (#1090)
         if (this.destroyed) throw destroyedClientError();
+        options.signal?.throwIfAborted();
         // Sign with Ed25519
         const signature = await ed.signAsync(msgBytes, this.privateKey);
         // destroy() during the sign, or during public-key derivation, must
@@ -2138,6 +2142,7 @@ export class MemWal {
         if (this.destroyed) throw destroyedClientError();
         const publicKey = await this.getPublicKey();
         if (this.destroyed) throw destroyedClientError();
+        options.signal?.throwIfAborted();
 
         // Make HTTP request
         const url = `${this.serverUrl}${path}`;
@@ -2155,6 +2160,7 @@ export class MemWal {
         // out and transmit no decrypt credential at all.
         if (options.includeDelegateKey !== false) {
             headers["x-seal-session"] = await this.buildSealSession();
+            options.signal?.throwIfAborted();
         }
         // WALM-598: the caller's deadline starts HERE, not at the top of the
         // call. Everything above — `ensureCompatibleRelayer()` (`/version` ->

@@ -345,6 +345,12 @@ export interface AnalyzeOptions {
      * no server-readable metadata column for it (Architecture A).
      */
     occurredAt?: string | Date;
+    /**
+     * Optional `AbortSignal` to cancel the `/api/analyze` request. When
+     * aborted before or during the request, the in-flight HTTP call is aborted
+     * immediately and `analyze()` rejects with the signal's abort reason.
+     */
+    signal?: AbortSignal;
 }
 
 /** A fact extracted by analyze() and accepted for background storage. */

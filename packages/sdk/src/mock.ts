@@ -494,6 +494,9 @@ export class MemWalMock {
             ? undefined
             : namespaceOrOptions?.occurredAt;
         assertOccurredAt(occurredAt);
+        if (typeof namespaceOrOptions === "object" && namespaceOrOptions?.signal) {
+            namespaceOrOptions.signal.throwIfAborted();
+        }
         const namespace =
             typeof namespaceOrOptions === "string"
                 ? namespaceOrOptions

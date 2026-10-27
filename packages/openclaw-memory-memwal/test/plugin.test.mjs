@@ -383,3 +383,339 @@ test("memory_search and memory_store are pinned to the calling agent", async () 
     ["recall", "default"],
   ]);
 });
+
+// ── GH #1106: auto-capture watermark & message timestamps ──────
+
+test("auto-capture watermarks captured messages across turns and preserves message creation time", async () => {
+  const analyzeCalls = [];
+  const client = {
+    async analyze(text, opts) {
+      analyzeCalls.push({
+        text,
+        namespace: opts?.namespace,
+        occurredAt: opts?.occurredAt instanceof Date ? opts.occurredAt.toISOString() : opts?.occurredAt,
+      });
+      return { facts: [{ id: `f-${analyzeCalls.length}`, text }] };
+    },
+  };
+  const h = makeApi();
+  const cfg = parseConfig({ ...VALID, autoRecall: false, autoCapture: true, captureMaxMessages: 10 });
+  registerHooks(h.api, client, cfg);
+
+  const history = [
+    {
+      id: "msg-1",
+      role: "user",
+      content: "My launch is tomorrow and we are deploying to production.",
+      timestamp: "2026-04-17T23:55:00.000Z",
+    },
+    {
+      id: "msg-2",
+      role: "assistant",
+      content: "Noted, your production launch is scheduled for 2026-04-18.",
+      timestamp: "2026-04-17T23:55:05.000Z",
+    },
+  ];
+
+  await h.hooks["agent_end"]({ success: true, messages: [...history] }, { sessionKey: "agent:main:s1" });
+  assert.equal(analyzeCalls.length, 1);
+  assert.ok(analyzeCalls[0].text.includes("My launch is tomorrow"));
+  assert.equal(analyzeCalls[0].occurredAt, "2026-04-17T23:55:00.000Z");
+
+  // Turn 2 after midnight: msg-1 and msg-2 are still in the sliding window,
+  // plus a new turn on 2026-04-18. Only the new turn should be analyzed.
+  history.push(
+    {
+      id: "msg-3",
+      role: "user",
+      content: "We also prefer Postgres over MySQL for all primary transactional stores.",
+      timestamp: "2026-04-18T00:05:00.000Z",
+    },
+    {
+      id: "msg-4",
+      role: "assistant",
+      content: "Got it, using Postgres for transactional workloads.",
+      timestamp: "2026-04-18T00:05:04.000Z",
+    },
+  );
+
+  await h.hooks["agent_end"]({ success: true, messages: [...history] }, { sessionKey: "agent:main:s1" });
+  assert.equal(analyzeCalls.length, 2);
+  assert.ok(!analyzeCalls[1].text.includes("My launch is tomorrow"), "turn 1 must not be re-analyzed on turn 2");
+  assert.ok(analyzeCalls[1].text.includes("prefer Postgres over MySQL"));
+  assert.equal(analyzeCalls[1].occurredAt, "2026-04-18T00:05:00.000Z");
+
+  // Re-running with no new messages sends nothing to analyze().
+  await h.hooks["agent_end"]({ success: true, messages: [...history] }, { sessionKey: "agent:main:s1" });
+  assert.equal(analyzeCalls.length, 2);
+});
+
+test("auto-capture preserves first-seen timestamp when an unwatermarked turn is retried after midnight", async () => {
+  let shouldFail = true;
+  const analyzeCalls = [];
+  const client = {
+    async analyze(text, opts) {
+      analyzeCalls.push({
+        text,
+        occurredAt: opts?.occurredAt instanceof Date ? opts.occurredAt.toISOString() : opts?.occurredAt,
+      });
+      if (shouldFail) throw new Error("transient network error");
+      return { facts: [{ id: "f-1", text }] };
+    },
+  };
+  const h = makeApi();
+  const cfg = parseConfig({ ...VALID, autoRecall: false, autoCapture: true });
+  registerHooks(h.api, client, cfg);
+
+  // Message without explicit timestamp — firstSeenAt should be recorded on initial attempt
+  const messages = [
+    { role: "user", content: "My launch is tomorrow morning at 9am UTC." },
+  ];
+  await h.hooks["agent_end"]({ success: true, messages }, { sessionKey: "agent:main:s-retry" });
+  // Initial call + 1 retry on transient non-timeout error = 2 calls
+  assert.equal(analyzeCalls.length, 2);
+  const firstOccurredAt = analyzeCalls[0].occurredAt;
+  assert.ok(firstOccurredAt);
+
+  // Wait 20ms and run another turn; the uncaptured message must keep its original firstSeenAt
+  await new Promise((r) => setTimeout(r, 20));
+  shouldFail = false;
+  await h.hooks["agent_end"]({ success: true, messages }, { sessionKey: "agent:main:s-retry" });
+  assert.equal(analyzeCalls.length, 3);
+  assert.equal(analyzeCalls[2].occurredAt, firstOccurredAt);
+});
+
+// ── GH #1095: timeout aborts signal & does not retry ───────────
+
+test("withTimeout aborts its AbortSignal on deadline and withRetry does not retry timeouts", async () => {
+  let receivedSignal = null;
+  let attempts = 0;
+
+  await assert.rejects(
+    () =>
+      withRetry(
+        () =>
+          withTimeout(
+            (signal) => {
+              attempts++;
+              receivedSignal = signal;
+              return new Promise((_resolve, reject) => {
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              });
+            },
+            40,
+            "auto-capture",
+          ),
+        1,
+        10,
+      ),
+    /auto-capture timed out after 40ms/,
+  );
+
+  assert.equal(attempts, 1, "timed-out calls must not be retried by withRetry");
+  assert.ok(receivedSignal?.aborted, "withTimeout must abort the signal passed to fn");
+});
+
+test("auto-capture passes AbortSignal to analyze() and does not retry or overlap on timeout", async () => {
+  const signals = [];
+  let inFlightCount = 0;
+  let maxConcurrent = 0;
+
+  const slowClient = {
+    analyze(_text, opts) {
+      signals.push(opts?.signal);
+      inFlightCount++;
+      maxConcurrent = Math.max(maxConcurrent, inFlightCount);
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          inFlightCount--;
+          resolve({ facts: [{ id: "f1", text: "late" }] });
+        }, 120);
+      });
+    },
+  };
+
+  const h = makeApi();
+  // Use a short timeout override via parseConfig + manual override for fast unit test
+  const cfg = { ...parseConfig({ ...VALID, autoRecall: false, autoCapture: true }), requestTimeoutMs: 40 };
+  registerHooks(h.api, slowClient, cfg);
+
+  await h.hooks["agent_end"](
+    { success: true, messages: [{ role: "user", content: "I prefer TypeScript over Rust for backend services" }] },
+    { sessionKey: "agent:main:timeout-session" },
+  );
+
+  assert.equal(signals.length, 1, "must not retry a timed-out analyze() call");
+  assert.ok(signals[0]?.aborted, "analyze() must receive an AbortSignal that aborts on timeout");
+
+  // While the uncancelled background promise from turn 1 is still settling (40ms < 120ms),
+  // a second turn in the same session must be skipped by the in-flight guard.
+  await h.hooks["agent_end"](
+    { success: true, messages: [{ role: "user", content: "Another fact while previous request is still running" }] },
+    { sessionKey: "agent:main:timeout-session" },
+  );
+  assert.equal(signals.length, 1, "in-flight guard must prevent overlapping analyze() calls");
+  assert.equal(maxConcurrent, 1);
+
+  // Wait for the slow promise to finish so it does not leak
+  await new Promise((r) => setTimeout(r, 100));
+});
+
+// ── GH #1101: memory_store async job status reporting ──────────
+
+test("memory_store reports accepted (not stored) when jobs remain pending, created when done, and failed on job error", async () => {
+  // Case 1: /api/analyze returns pending jobs and client has no waitForRememberJobs
+  const pendingOnlyClient = {
+    async analyze(text) {
+      return {
+        facts: [{ id: "job-1", text, status: "pending", blob_id: null }],
+        job_ids: ["job-1"],
+      };
+    },
+  };
+  const h1 = makeApi({ sessionKey: "agent:main:test" });
+  registerTools(h1.api, pendingOnlyClient, { defaultNamespace: "default", requestTimeoutMs: 1_000 });
+  const pendingRes = await h1.tools.memory_store.execute("c1", {
+    text: "User prefers dark mode across all IDE editors.",
+  });
+  assert.equal(pendingRes.details.action, "accepted");
+  assert.equal(pendingRes.details.status, "pending");
+  assert.deepEqual(pendingRes.details.jobIds, ["job-1"]);
+  assert.match(pendingRes.content[0].text, /Accepted 1 fact \(not stored yet; job_ids=job-1\)/);
+  assert.doesNotMatch(pendingRes.content[0].text, /^Stored /);
+
+  // Case 2: waitForRememberJobs resolves with status: "done" and blob_id
+  const doneClient = {
+    async analyze(text) {
+      return {
+        facts: [{ id: "job-2", text, status: "pending", blob_id: null }],
+        job_ids: ["job-2"],
+      };
+    },
+    async waitForRememberJobs(jobIds) {
+      return {
+        results: jobIds.map((id) => ({ id, status: "done", blob_id: "blob-xyz", error: null })),
+        succeeded: jobIds.length,
+        failed: 0,
+      };
+    },
+  };
+  const h2 = makeApi({ sessionKey: "agent:main:test" });
+  registerTools(h2.api, doneClient, { defaultNamespace: "default", requestTimeoutMs: 1_000 });
+  const doneRes = await h2.tools.memory_store.execute("c2", {
+    text: "User prefers dark mode across all IDE editors.",
+  });
+  assert.equal(doneRes.details.action, "created");
+  assert.equal(doneRes.details.status, "done");
+  assert.match(doneRes.content[0].text, /^Stored 1 fact:/);
+
+  // Case 3: waitForRememberJobs surfaces a post-acceptance Walrus upload failure
+  const failedJobClient = {
+    async analyze(text) {
+      return {
+        facts: [{ id: "job-3", text, status: "pending", blob_id: null }],
+        job_ids: ["job-3"],
+      };
+    },
+    async waitForRememberJobs(jobIds) {
+      return {
+        results: jobIds.map((id) => ({
+          id,
+          status: "failed",
+          blob_id: null,
+          error: "Walrus publisher returned 502 Bad Gateway",
+        })),
+        succeeded: 0,
+        failed: jobIds.length,
+      };
+    },
+  };
+  const h3 = makeApi({ sessionKey: "agent:main:test" });
+  registerTools(h3.api, failedJobClient, { defaultNamespace: "default", requestTimeoutMs: 1_000 });
+  const failedRes = await h3.tools.memory_store.execute("c3", {
+    text: "User prefers dark mode across all IDE editors.",
+  });
+  assert.equal(failedRes.details.action, "failed");
+  assert.equal(failedRes.details.status, "failed");
+  assert.match(failedRes.details.error, /Walrus publisher returned 502 Bad Gateway/);
+  assert.match(failedRes.content[0].text, /Failed to store 1 of 1 fact after acceptance.*502 Bad Gateway/);
+});
+
+test("auto-capture with real MemWal client aborts stalled /api/analyze HTTP request on timeout", async () => {
+  const { createServer } = await import("node:http");
+  const { MemWal } = await import("@mysten-incubation/memwal");
+
+  let analyzeRequests = 0;
+  let socketClosedOnServer = false;
+  let resolveSocketClosed;
+  const socketClosedPromise = new Promise((resolve) => {
+    resolveSocketClosed = resolve;
+  });
+
+  const server = createServer((req, res) => {
+    if (req.url === "/version") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          apiVersion: "1.0.0",
+          relayerVersion: "1.0.0",
+          minSupportedSdk: { typescript: "0.0.4" },
+        }),
+      );
+      return;
+    }
+    if (req.url === "/api/analyze") {
+      analyzeRequests++;
+      req.on("close", () => {
+        socketClosedOnServer = true;
+        resolveSocketClosed();
+      });
+      // Intentionally stall and never end response
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const realClient = MemWal.create({
+      key: VALID.privateKey,
+      accountId: VALID.accountId,
+      serverUrl: baseUrl,
+    });
+    // Stub SEAL session build so no external Sui RPC is needed in unit tests
+    realClient.buildSealSession = async () => "test-seal-session";
+
+    const h = makeApi();
+    const cfg = {
+      ...parseConfig({ ...VALID, serverUrl: baseUrl, autoRecall: false, autoCapture: true }),
+      requestTimeoutMs: 60,
+    };
+    registerHooks(h.api, realClient, cfg);
+
+    await h.hooks["agent_end"](
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer TypeScript over Rust for backend services" }],
+      },
+      { sessionKey: "agent:main:real-http-abort" },
+    );
+
+    await Promise.race([
+      socketClosedPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("stalled /api/analyze HTTP socket was not aborted")), 1_500),
+      ),
+    ]);
+    assert.equal(analyzeRequests, 1, "stalled /api/analyze must not be retried on timeout");
+    assert.equal(socketClosedOnServer, true, "real MemWal client must abort the in-flight HTTP request");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+
