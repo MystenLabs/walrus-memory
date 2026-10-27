@@ -2133,32 +2133,32 @@ def _parse_json_response(response: httpx.Response, endpoint: str) -> Any:
     Mirrors the TypeScript SDK's ``jsonBodyError`` guard (#1201 / #1207): an
     empty or non-JSON 2xx response from a relayer or proxy in front of one
     surfaces as a :class:`MemWalError` naming the endpoint and HTTP status
-    rather than Python's raw :class:`json.JSONDecodeError`.
+    rather than Python's raw :class:`json.JSONDecodeError` or
+    :class:`UnicodeDecodeError`.
     """
     try:
-        raw = response.text
+        return response.json()
     except UnicodeDecodeError as exc:
         raise MemWalJsonBodyError(
             status=response.status_code,
             endpoint=endpoint,
             body="",
         ) from exc
-
-    if not raw or not raw.strip():
-        raise MemWalJsonBodyError(
-            status=response.status_code,
-            endpoint=endpoint,
-            body=raw,
-            empty=True,
-        )
-
-    try:
-        return json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
+        doc = getattr(exc, "doc", None)
+        if isinstance(doc, str):
+            raw = doc
+        else:
+            try:
+                raw = response.text
+            except UnicodeDecodeError:
+                raw = ""
+        is_empty = not raw or not raw.strip()
         raise MemWalJsonBodyError(
             status=response.status_code,
             endpoint=endpoint,
             body=raw,
+            empty=is_empty,
         ) from exc
 
 

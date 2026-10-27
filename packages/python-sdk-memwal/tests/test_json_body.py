@@ -250,3 +250,61 @@ def test_sync_client_surfaces_memwal_json_body_error() -> None:
         sync_client.health()
     assert exc.value.status == 200
     assert exc.value.endpoint == "GET /health"
+
+
+@respx.mock
+async def test_health_rejects_malformed_utf8_inside_json_string() -> None:
+    route = respx.get(f"{_SERVER}/health")
+    for raw in (
+        b'{"status":"ok","version":"\xff"}',
+        b"\x80\x81\x82",
+    ):
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                content=raw,
+                headers={"content-type": "application/json"},
+            )
+        )
+        with pytest.raises(MemWalJsonBodyError) as exc:
+            await _client().health()
+        assert isinstance(exc.value, MemWalError)
+        assert not isinstance(exc.value, UnicodeDecodeError)
+        assert exc.value.status == 200
+        assert exc.value.endpoint == "GET /health"
+        assert "response was not JSON" in str(exc.value)
+
+
+@respx.mock
+async def test_health_accepts_utf8_bom_and_utf16_json_bodies() -> None:
+    route = respx.get(f"{_SERVER}/health")
+    payload = '{"status":"ok","version":"0.2.2"}'
+    for encoded in (
+        b"\xef\xbb\xbf" + payload.encode("utf-8"),
+        payload.encode("utf-16"),
+        payload.encode("utf-16-le"),
+        payload.encode("utf-16-be"),
+    ):
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                content=encoded,
+                headers={"content-type": "application/json"},
+            )
+        )
+        health = await _client().health()
+        assert health.status == "ok"
+        assert health.version == "0.2.2"
+
+    # BOM-only or UTF-16 whitespace-only payloads still surface as empty JSON body errors
+    for empty_encoded in (
+        b"\xef\xbb\xbf",
+        b"\xef\xbb\xbf   ",
+        "   ".encode("utf-16"),
+    ):
+        route.mock(return_value=httpx.Response(200, content=empty_encoded))
+        with pytest.raises(MemWalJsonBodyError) as exc:
+            await _client().health()
+        assert exc.value.status == 200
+        assert exc.value.endpoint == "GET /health"
+        assert "empty body; expected JSON" in str(exc.value)
