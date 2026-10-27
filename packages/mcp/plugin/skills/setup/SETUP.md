@@ -72,10 +72,9 @@ Other environments:
 
 | Environment | MCP URL |
 | --- | --- |
-| Staging (Testnet) | `https://relayer-staging.memory.walrus.xyz/api/mcp` |
-| Dev | `https://relayer.dev.memwal.ai/api/mcp` |
+| Dev (Testnet) | `https://relayer.dev.memwal.ai/api/mcp` |
 
-Do not present the staging or development URL as the production connector.
+Do not present the development URL as the production connector.
 
 ## Troubleshooting
 

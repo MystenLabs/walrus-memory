@@ -136,10 +136,21 @@ for (const file of walk(".")) {
     const text = readFileSync(file, "utf8");
     const unresolved = text.match(PLACEHOLDER);
     if (unresolved) fail(`${file} still carries the generator placeholder ${unresolved[0]}`);
-    if (pin && file.endsWith(".md")) {
-        for (const match of text.matchAll(/@mysten-incubation\/memwal-mcp@([0-9A-Za-z._-]+)/g)) {
-            if (match[1] !== pin) {
-                fail(`${file} pins ${PACKAGE}@${match[1]}, expected ${pin} from plugin.json`);
+    if (file.endsWith(".md")) {
+        for (const retiredHost of [
+            "relayer-staging.memory.walrus.xyz",
+            "staging.memory.walrus.xyz",
+            "memwal-staging.mystenlabs.com",
+        ]) {
+            if (text.includes(retiredHost)) {
+                fail(`${file} references retired staging host ${retiredHost}; use relayer.dev.memwal.ai`);
+            }
+        }
+        if (pin) {
+            for (const match of text.matchAll(/@mysten-incubation\/memwal-mcp@([0-9A-Za-z._-]+)/g)) {
+                if (match[1] !== pin) {
+                    fail(`${file} pins ${PACKAGE}@${match[1]}, expected ${pin} from plugin.json`);
+                }
             }
         }
     }

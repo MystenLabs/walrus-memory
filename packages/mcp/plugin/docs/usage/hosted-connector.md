@@ -2,7 +2,7 @@
 
 The hosted Claude custom connector is a separate remote MCP surface that uses OAuth. It does not use this Claude Code plugin's local delegate-key credentials.
 
-The OAuth implementation landed in [MystenLabs/MemWal#584](https://github.com/MystenLabs/MemWal/pull/584). Production, staging, and development all serve the discovery routes.
+The OAuth implementation landed in [MystenLabs/MemWal#584](https://github.com/MystenLabs/MemWal/pull/584). Production and development serve the discovery routes.
 
 ## Production endpoint
 
@@ -33,10 +33,9 @@ The relayer generates the OAuth delegate keypair, encrypts the private key at re
 
 | Environment | MCP URL |
 | --- | --- |
-| Staging (Testnet) | `https://relayer-staging.memory.walrus.xyz/api/mcp` |
-| Dev | `https://relayer.dev.memwal.ai/api/mcp` |
+| Dev (Testnet) | `https://relayer.dev.memwal.ai/api/mcp` |
 
-Use staging or development only for internal testing. Do not submit those URLs as the official connector.
+Use the development endpoint only for internal testing. Do not submit that URL as the official connector.
 
 ## Relation to this plugin
 

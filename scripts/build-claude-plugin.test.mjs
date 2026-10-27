@@ -102,11 +102,19 @@ test("the generated plugin tree is deterministic, complete, free of placeholders
 
         for (const target of paths) {
             if (target === ".github/scripts/check-plugin-tree.mjs") continue;
+            const text = readFileSync(path.join(first, target), "utf8");
             assert.doesNotMatch(
-                readFileSync(path.join(first, target), "utf8"),
+                text,
                 /__MEMWAL_[A-Z_]+__/,
                 `${target} still carries a generator placeholder`,
             );
+            for (const retiredHost of [
+                "relayer-staging.memory.walrus.xyz",
+                "staging.memory.walrus.xyz",
+                "memwal-staging.mystenlabs.com",
+            ]) {
+                assert.ok(!text.includes(retiredHost), `${target} references retired host ${retiredHost}`);
+            }
         }
 
         const { AUTO_SAVE_OPT_IN_RULE, SECRET_EXCLUSION_RULES } = await import(
@@ -152,6 +160,17 @@ test("the generated plugin tree is deterministic, complete, free of placeholders
         });
         assert.equal(check.status, 0, check.stderr);
 
+        // Verify --check --against ignores a linked git worktree .git regular file
+        writeFileSync(path.join(first, ".git"), "gitdir: /tmp/fake-worktree-gitdir\n", "utf8");
+        const worktreeCheck = spawnSync(process.execPath, [SCRIPT, "--check", "--against", first], {
+            cwd: ROOT,
+            encoding: "utf8",
+        });
+        assert.equal(worktreeCheck.status, 0, worktreeCheck.stderr);
+        const worktreeTreeCheck = runCheckPluginTree(first, pin);
+        assert.equal(worktreeTreeCheck.status, 0, worktreeTreeCheck.stderr);
+        unlinkSync(path.join(first, ".git"));
+
         // Verify --check --against reports missing, differing, and extra files
         unlinkSync(path.join(second, "commands/analyze.md"));
         writeFileSync(path.join(second, "README.md"), "drifted\n", "utf8");
@@ -165,13 +184,14 @@ test("the generated plugin tree is deterministic, complete, free of placeholders
         assert.match(diffCheck.stderr, /README\.md differs/);
         assert.match(diffCheck.stderr, /extra\.txt is in .* but is not generated/);
 
-        // Verify emitted check-plugin-tree.mjs fails closed on missing files, placeholders, or missing span policy
+        // Verify emitted check-plugin-tree.mjs fails closed on missing files, placeholders, retired hosts, or missing span policy
         const broken = path.join(workspace, "broken");
         cpSync(first, broken, { recursive: true });
         unlinkSync(path.join(broken, ".codex-mcp.json"));
         writeFileSync(
             path.join(broken, "skills/setup/SETUP.md"),
-            readFileSync(path.join(broken, "skills/setup/SETUP.md"), "utf8") + "\n__MEMWAL_LEFTOVER__\n",
+            readFileSync(path.join(broken, "skills/setup/SETUP.md"), "utf8") +
+                "\n__MEMWAL_LEFTOVER__\nhttps://relayer-staging.memory.walrus.xyz/api/mcp\n",
         );
         writeFileSync(
             path.join(broken, "skills/setup/SKILL.md"),
@@ -184,6 +204,7 @@ test("the generated plugin tree is deterministic, complete, free of placeholders
         assert.notEqual(brokenCheck.status, 0);
         assert.match(brokenCheck.stderr, /Missing \.codex-mcp\.json/);
         assert.match(brokenCheck.stderr, /skills\/setup\/SETUP\.md still carries the generator placeholder/);
+        assert.match(brokenCheck.stderr, /references retired staging host relayer-staging\.memory\.walrus\.xyz/);
         assert.match(brokenCheck.stderr, /span does not carry AUTO_SAVE_OPT_IN_RULE/);
     } finally {
         rmSync(workspace, { recursive: true, force: true });
@@ -191,10 +212,29 @@ test("the generated plugin tree is deterministic, complete, free of placeholders
 });
 
 test("committed plugin markdown drift or unresolved placeholders fail --check and are repaired by --sync-in-place", () => {
-    const tempRoot = mkdtempSync(path.join(tmpdir(), "memwal-plugin-root-"));
+    const tempParent = mkdtempSync(path.join(tmpdir(), "memwal-plugin-parent-"));
+    const tempRoot = path.join(tempParent, "repo");
     try {
         for (const rel of ["packages/mcp/plugin", "packages/mcp/plugin-repo", "packages/mcp/test", "LICENSE"]) {
             cpSync(path.join(ROOT, rel), path.join(tempRoot, rel), { recursive: true });
+        }
+        const parentSentinel = path.join(tempParent, "parent-sentinel.txt");
+        const repoSentinel = path.join(tempRoot, "repo-sentinel.txt");
+        writeFileSync(parentSentinel, "keep-parent\n", "utf8");
+        writeFileSync(repoSentinel, "keep-repo\n", "utf8");
+        const beforeListing = listing(tempRoot);
+
+        // Verify --out rejects repository root, parent/ancestors, and paths inside the checkout before deleting anything
+        for (const unsafeOut of [".", tempRoot, tempParent, "..", "packages/mcp/plugin", "build/claude-plugin"]) {
+            const unsafeRun = spawnSync(process.execPath, [SCRIPT, "--out", unsafeOut], {
+                cwd: tempRoot,
+                encoding: "utf8",
+            });
+            assert.notEqual(unsafeRun.status, 0, `--out ${unsafeOut} should have been rejected`);
+            assert.match(unsafeRun.stderr, /refusing to emit into/);
+            assert.equal(readFileSync(parentSentinel, "utf8"), "keep-parent\n");
+            assert.equal(readFileSync(repoSentinel, "utf8"), "keep-repo\n");
+            assert.deepEqual(listing(tempRoot), beforeListing);
         }
 
         const rememberPath = path.join(tempRoot, "packages/mcp/plugin/commands/remember.md");
@@ -232,6 +272,6 @@ test("committed plugin markdown drift or unresolved placeholders fail --check an
         assert.equal(sync.status, 0, sync.stderr);
         assert.equal(readFileSync(rememberPath, "utf8"), originalRemember);
     } finally {
-        rmSync(tempRoot, { recursive: true, force: true });
+        rmSync(tempParent, { recursive: true, force: true });
     }
 });

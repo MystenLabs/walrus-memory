@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -12,7 +13,13 @@ const OVERLAY_DIR = "packages/mcp/plugin-repo";
 const MCP_TEST_DIR = "packages/mcp/test";
 const POLICY_MODULE = "packages/mcp/plugin/scripts/lib/memory-policy.mjs";
 const PLUGIN_REPO = "https://github.com/MystenLabs/walrus-memory-claude-plugin";
-const DEFAULT_OUT = "build/claude-plugin";
+const DEFAULT_OUT = path.join(os.tmpdir(), "memwal-claude-plugin");
+
+const RETIRED_HOSTS = [
+    "relayer-staging.memory.walrus.xyz",
+    "staging.memory.walrus.xyz",
+    "memwal-staging.mystenlabs.com",
+];
 
 const COPIED_TESTS = ["signals.test.mjs", "user-prompt-hook.test.mjs"];
 
@@ -78,6 +85,7 @@ const PLACEHOLDER = /__MEMWAL_[A-Z_]+__/g;
 function walk(dir, base = dir) {
     const found = [];
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === ".git") continue;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) found.push(...walk(full, base));
         else if (entry.isFile()) found.push(path.relative(base, full).split(path.sep).join("/"));
@@ -210,6 +218,14 @@ function verifyCommittedMarkdown(relative, rawText, renderedText, values, source
         );
     }
 
+    for (const retiredHost of RETIRED_HOSTS) {
+        if (rawText.includes(retiredHost)) {
+            throw new Error(
+                `${source} references retired staging host ${retiredHost}; use relayer.dev.memwal.ai`,
+            );
+        }
+    }
+
     const secretPolicy = values.get("__MEMWAL_SECRET_POLICY__");
     const autoSaveRule = values.get("__MEMWAL_AUTO_SAVE_RULE__");
 
@@ -318,7 +334,40 @@ function sha256(contents) {
     return createHash("sha256").update(contents).digest("hex");
 }
 
+function canonicalizePath(targetPath) {
+    const resolved = path.resolve(targetPath);
+    const tail = [];
+    let current = resolved;
+    while (!fs.existsSync(current)) {
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        tail.unshift(path.basename(current));
+        current = parent;
+    }
+    const base = fs.existsSync(current) ? fs.realpathSync(current) : current;
+    return tail.length > 0 ? path.join(base, ...tail) : base;
+}
+
+function assertSafeOutDir(outDir, rootDir = ROOT) {
+    const rootCanonical = canonicalizePath(rootDir);
+    const outCanonical = canonicalizePath(outDir);
+    if (path.parse(outCanonical).root === outCanonical) {
+        throw new Error(`refusing to emit into filesystem root ${outCanonical}`);
+    }
+    if (outCanonical === rootCanonical || rootCanonical.startsWith(outCanonical + path.sep)) {
+        throw new Error(
+            `refusing to emit into ${outDir}: output path overlaps the repository root or its ancestors (${rootCanonical})`,
+        );
+    }
+    if (outCanonical.startsWith(rootCanonical + path.sep)) {
+        throw new Error(
+            `refusing to emit into ${outDir}: output path is inside the repository checkout (${rootCanonical})`,
+        );
+    }
+}
+
 function emit(outDir, files) {
+    assertSafeOutDir(outDir);
     fs.rmSync(outDir, { recursive: true, force: true });
     for (const [target, contents] of files) {
         const destination = path.join(outDir, target);
@@ -331,7 +380,7 @@ function compare(files, againstDir) {
     const problems = [];
     const present = new Set(
         walk(againstDir).filter(
-            (target) => !target.startsWith(".git/") && !RESERVED.includes(target),
+            (target) => target !== ".git" && !target.startsWith(".git/") && !RESERVED.includes(target),
         ),
     );
 
@@ -352,23 +401,31 @@ function compare(files, againstDir) {
 
 function argument(name) {
     const index = process.argv.indexOf(name);
-    return index === -1 ? null : process.argv[index + 1] ?? null;
+    if (index === -1) return null;
+    const value = process.argv[index + 1];
+    if (!value || value.startsWith("--")) {
+        throw new Error(`${name} requires a value`);
+    }
+    return value;
 }
 
 async function main() {
     if (process.argv.includes("--sync-in-place")) {
         const updated = await syncInPlace();
         console.log(`synced ${PLUGIN_DIR} markdown in place (${updated} file(s) updated)`);
-        if (!process.argv.includes("--check") && !argument("--out")) return;
+        if (!process.argv.includes("--check") && !process.argv.includes("--out")) return;
     }
 
     const checking = process.argv.includes("--check");
     const against = argument("--against");
+    const outDir = checking ? null : path.resolve(ROOT, argument("--out") ?? DEFAULT_OUT);
+    if (outDir !== null) {
+        assertSafeOutDir(outDir);
+    }
 
     const files = await build();
 
     if (!checking) {
-        const outDir = path.resolve(ROOT, argument("--out") ?? DEFAULT_OUT);
         emit(outDir, files);
         console.log(`wrote ${files.size} files to ${path.relative(ROOT, outDir) || outDir}`);
         return;
