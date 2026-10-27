@@ -1,5 +1,11 @@
 # @mysten-incubation/memwal
 
+## 0.1.11
+
+### Fixed
+
+- `MemWal.create` and `MemWalManual.create` copy a caller-supplied `Uint8Array` key into an internal buffer so `destroy()` zeroes only the client's copy and leaves the caller's `Uint8Array` intact for reuse. `MemWalManual.destroy()` also drops references to `suiPrivateKey`, `embeddingApiKey`, `sealServerConfigs` API keys, `walletSigner`, and cached Sui/SEAL/keypair instances (zeroing any decoded keypair secret buffer) and rejects subsequent or in-flight calls instead of signing with a zeroed key. (#973, #977)
+
 ## 0.1.10
 
 ### Fixed
