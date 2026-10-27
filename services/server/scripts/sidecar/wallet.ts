@@ -43,20 +43,40 @@ export const ADDRESS_BALANCE_WALLET_FALLBACK_POLICY: EnokiFallbackPolicy = {
     gasMode: "addressBalance",
 };
 
+function executionFailureText(error: unknown): string {
+    if (typeof error === "string") return error.trim();
+    if (!error || typeof error !== "object") return "";
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+    try {
+        const text = JSON.stringify(error, (_key, value) => (
+            typeof value === "bigint" ? value.toString() : value
+        ));
+        return text === "{}" ? "" : text;
+    } catch {
+        return "";
+    }
+}
+
 export function assertFinalizedTransactionSuccess(result: any, label: string): any {
     if (
         result?.$kind === "FailedTransaction"
         && result.FailedTransaction?.status?.success === false
     ) {
-        // Only a congestion cancel proves the digest can never land. Any other
-        // finalized failure keeps the old digest so a retry re-prepares the
-        // same bytes and the digest lookup finds the transaction.
+        // Keep congestion cancellation distinct so retries rebuild with a new nonce.
         if (result.FailedTransaction.status.error?.$kind === "CongestedObjects") {
             throw new CongestionCancelledTransaction(
                 `${label} was cancelled by shared-object congestion`,
             );
         }
-        throw new FinalizedTransactionFailure(`${label} was not successful`);
+        // Only register failures carry abort details for stale WAL-price recovery.
+        // Certify and metadata transfer must retain their retryable message.
+        const detail = label === "registration transaction"
+            ? executionFailureText(result.FailedTransaction.status.error)
+            : "";
+        throw new FinalizedTransactionFailure(
+            detail ? `${label} was not successful: ${detail}` : `${label} was not successful`,
+        );
     }
     if (
         result?.$kind === "Transaction"
