@@ -198,6 +198,12 @@ async fn call_sidecar_sponsor_execute(
             Err(err) => {
                 let err_msg = err.error_message();
                 if let Some((code, msg)) = crate::sui::enoki::reactivate_rejection_code(&err_msg) {
+                    crate::observability::observe_external(
+                        "sidecar",
+                        "sponsor_execute",
+                        "409",
+                        started.elapsed(),
+                    );
                     let body = serde_json::json!({ "error": msg, "code": code }).to_string();
                     return Ok((
                         reqwest::StatusCode::CONFLICT,
@@ -213,7 +219,9 @@ async fn call_sidecar_sponsor_execute(
                     &status.as_u16().to_string(),
                     started.elapsed(),
                 );
-                let body = serde_json::json!({ "error": err_msg }).to_string();
+                let sanitized =
+                    crate::sui::enoki::sanitize_upstream_error_for_logging(&err_msg);
+                let body = serde_json::json!({ "error": sanitized }).to_string();
                 return Ok((status, axum::body::Bytes::from(body.into_bytes())));
             }
         }
@@ -562,14 +570,16 @@ async fn forward_sponsor(
                 }
                 let body = serde_json::to_vec(&sponsored)
                     .map_err(|_| AppError::Internal("Invalid sponsor upstream response".into()))?;
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .header("Content-Type", "application/json")
                     .body(Body::from(body))
-                    .unwrap());
+                    .map_err(|e| AppError::Internal(format!("Sponsor response build failed: {e}")));
             }
             Err(err) => {
                 let err_msg = err.error_message();
+                let sanitized_err =
+                    crate::sui::enoki::sanitize_upstream_error_for_logging(&err_msg);
                 let status_u16 = err.upstream_status_u16();
                 crate::observability::observe_external(
                     "sidecar",
@@ -582,7 +592,7 @@ async fn forward_sponsor(
                     request_id = %crate::observability::current_request_id().unwrap_or_default(),
                     "sponsor in-process error {}: {}",
                     status_u16,
-                    err_msg
+                    sanitized_err
                 );
                 if let Some((code, msg)) = crate::sui::enoki::reactivate_rejection_code(&err_msg) {
                     return Ok(json_error_response(
@@ -593,7 +603,7 @@ async fn forward_sponsor(
                 }
                 let status = reqwest::StatusCode::from_u16(status_u16)
                     .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-                let body = serde_json::json!({ "error": err_msg }).to_string();
+                let body = serde_json::json!({ "error": sanitized_err }).to_string();
                 return Ok(sponsor_error_response(status, body.as_bytes()));
             }
         }

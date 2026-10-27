@@ -526,7 +526,7 @@ async fn execute_mcp_tool(
                         .and_then(Value::as_array)
                         .unwrap_or(&empty_vec);
                     let mut lines = Vec::new();
-                    for (idx, item) in results.iter().enumerate() {
+                    for item in results {
                         let dist = item.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
                         if let Some(cutoff) = max_distance {
                             if dist >= cutoff {
@@ -535,12 +535,9 @@ async fn execute_mcp_tool(
                         }
                         let score = 1.0 - dist;
                         let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                        let rank = lines.len() + 1;
                         lines.push(format!(
-                            "{}. [score={:.3} distance={:.3}] {}",
-                            idx + 1,
-                            score,
-                            dist,
-                            text
+                            "{rank}. [score={score:.3} distance={dist:.3}] {text}"
                         ));
                     }
                     let rendered = if lines.is_empty() {
@@ -754,10 +751,16 @@ pub async fn handle_sse_in_process(
     let cleanup_session_id = session_id.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        // Skip the immediate initial tick so we only ping every 10s while watching `tx.closed()`.
+        interval.tick().await;
         loop {
-            interval.tick().await;
-            if tx.send(": ping\n\n".to_owned()).is_err() {
-                break;
+            tokio::select! {
+                () = tx.closed() => break,
+                _ = interval.tick() => {
+                    if tx.send(": ping\n\n".to_owned()).is_err() {
+                        break;
+                    }
+                }
             }
         }
         if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
@@ -849,7 +852,14 @@ pub async fn handle_streamable_in_process(
     body: Bytes,
 ) -> Response {
     match method {
-        Method::DELETE => (StatusCode::NO_CONTENT, ()).into_response(),
+        Method::DELETE => {
+            if let Some(session_id) = extract_header_str(&forwarded, "mcp-session-id") {
+                if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
+                    guard.remove(&session_id);
+                }
+            }
+            (StatusCode::NO_CONTENT, ()).into_response()
+        }
         Method::GET => handle_sse_in_process(state, forwarded).await,
         Method::POST => {
             let (delegate_key_hex, account_id, default_namespace) =
@@ -867,15 +877,45 @@ pub async fn handle_streamable_in_process(
             let session_id = extract_header_str(&forwarded, "mcp-session-id")
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-            if let Some(resp) = handle_jsonrpc_envelope(
-                &state,
-                &delegate_key_hex,
-                &account_id,
-                &default_namespace,
-                &parsed,
-            )
-            .await
-            {
+            let response_value = if let Some(arr) = parsed.as_array() {
+                if arr.is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "Empty JSON-RPC batch is not allowed",
+                    )
+                        .into_response();
+                }
+                let mut responses = Vec::with_capacity(arr.len());
+                for item in arr {
+                    if let Some(resp) = handle_jsonrpc_envelope(
+                        &state,
+                        &delegate_key_hex,
+                        &account_id,
+                        &default_namespace,
+                        item,
+                    )
+                    .await
+                    {
+                        responses.push(resp);
+                    }
+                }
+                if responses.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(responses))
+                }
+            } else {
+                handle_jsonrpc_envelope(
+                    &state,
+                    &delegate_key_hex,
+                    &account_id,
+                    &default_namespace,
+                    &parsed,
+                )
+                .await
+            };
+
+            if let Some(resp) = response_value {
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     axum::http::header::CONTENT_TYPE,
@@ -901,3 +941,61 @@ pub async fn handle_streamable_in_process(
         _ => (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tools_list_exposes_all_seven_walrus_memory_tools_with_valid_schemas() {
+        let list = mcp_tools_list();
+        let tools = list
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools array must exist");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "memwal_health",
+                "memwal_remember",
+                "memwal_remember_status",
+                "memwal_remember_bulk",
+                "memwal_recall",
+                "memwal_analyze",
+                "memwal_restore",
+            ]
+        );
+        for tool in tools {
+            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert!(tool
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()));
+        }
+    }
+
+    #[test]
+    fn extract_header_str_trims_and_ignores_blank_values() {
+        let mut headers = req_headers::HeaderMap::new();
+        headers.insert(
+            "x-memwal-namespace",
+            req_headers::HeaderValue::from_static("  work-ns  "),
+        );
+        headers.insert(
+            "x-empty",
+            req_headers::HeaderValue::from_static("   "),
+        );
+
+        assert_eq!(
+            extract_header_str(&headers, "x-memwal-namespace").as_deref(),
+            Some("work-ns")
+        );
+        assert_eq!(extract_header_str(&headers, "x-empty"), None);
+        assert_eq!(extract_header_str(&headers, "x-missing"), None);
+    }
+}
+

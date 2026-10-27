@@ -103,6 +103,7 @@ impl std::fmt::Display for EnokiError {
 impl std::error::Error for EnokiError {}
 
 impl EnokiError {
+    #[must_use]
     pub fn is_fallback_eligible(&self) -> bool {
         matches!(
             self,
@@ -110,6 +111,7 @@ impl EnokiError {
         )
     }
 
+    #[must_use]
     pub fn upstream_status_u16(&self) -> u16 {
         match self {
             Self::NotConfigured => 503,
@@ -119,6 +121,7 @@ impl EnokiError {
         }
     }
 
+    #[must_use]
     pub fn error_message(&self) -> String {
         match self {
             Self::NotConfigured => "Enoki sponsorship is not configured".to_owned(),
@@ -129,6 +132,7 @@ impl EnokiError {
         }
     }
 
+    #[must_use]
     #[allow(dead_code)]
     pub fn http_status_code(&self) -> axum::http::StatusCode {
         match self {
@@ -146,7 +150,42 @@ impl EnokiError {
     }
 }
 
+/// Sanitizes an upstream HTTP/RPC error body before logging or embedding in diagnostic strings:
+/// strips ASCII control characters, redacts `Bearer <token>` credentials, and caps length at 512 chars.
+#[must_use]
+pub fn sanitize_upstream_error_for_logging(raw: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut cleaned = String::with_capacity(raw.len().min(MAX_CHARS + 32));
+    for ch in raw.trim().chars() {
+        if ch.is_control() {
+            if !cleaned.ends_with(' ') {
+                cleaned.push(' ');
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    // Redact any accidental Bearer token reflection in upstream proxy/gateway errors.
+    let redacted = if let Some(idx) = cleaned.to_ascii_lowercase().find("bearer ") {
+        let prefix = &cleaned[..idx];
+        let after_bearer = &cleaned[idx + 7..];
+        let token_end = after_bearer
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | ')'))
+            .unwrap_or(after_bearer.len());
+        format!("{prefix}Bearer [REDACTED]{}", &after_bearer[token_end..])
+    } else {
+        cleaned
+    };
+    if redacted.chars().count() > MAX_CHARS {
+        let truncated: String = redacted.chars().take(MAX_CHARS).collect();
+        format!("{truncated}...(truncated)")
+    } else {
+        redacted
+    }
+}
+
 /// Returns true if `ENOKI_API_KEY` or `ENOKI_SECRET_KEY` is configured in the environment.
+#[must_use]
 pub fn enoki_is_enabled() -> bool {
     enoki_api_key().is_some()
 }
@@ -174,6 +213,7 @@ fn enoki_api_url() -> String {
 
 /// Default `allowedMoveCallTargets` when `ENOKI_RESTRICT_MOVE_CALLS=true`,
 /// matching `services/server/scripts/sidecar/routes/sponsor.ts`.
+#[must_use]
 pub fn default_sponsor_allowed_move_call_targets(
     package_id: &str,
     seal_policy_package_id: &str,
@@ -216,6 +256,7 @@ pub fn default_sponsor_allowed_move_call_targets(
 
 /// Detects `account::reactivate_account` MoveAbort codes 11 (`account_already_active`)
 /// and 20 (`account_quarantined`), matching `reactivateRejectionCode` in `enoki.ts`.
+#[must_use]
 pub fn reactivate_rejection_code(message: &str) -> Option<(&'static str, &'static str)> {
     let lower = message.to_ascii_lowercase();
     if !lower.contains("moveabort") {
@@ -254,7 +295,8 @@ struct EnokiEnvelope<T> {
 }
 
 fn classify_enoki_http_error(status: u16, body: &str) -> EnokiError {
-    let lower = body.to_ascii_lowercase();
+    let sanitized = sanitize_upstream_error_for_logging(body);
+    let lower = sanitized.to_ascii_lowercase();
     if status == 429
         || status >= 500
         || lower.contains("insufficient gas")
@@ -264,14 +306,14 @@ fn classify_enoki_http_error(status: u16, body: &str) -> EnokiError {
     {
         EnokiError::FallbackEligible {
             status,
-            message: body.to_owned(),
+            message: sanitized,
         }
     } else if status == 400 {
-        EnokiError::BadRequest(body.to_owned())
+        EnokiError::BadRequest(sanitized)
     } else {
         EnokiError::Rejected {
             status,
-            message: body.to_owned(),
+            message: sanitized,
         }
     }
 }
@@ -568,7 +610,9 @@ pub fn parse_sui_private_key_bytes(raw: &str) -> Result<[u8; 32], String> {
                 decoded[0]
             ));
         }
-        decoded[1..33].try_into().unwrap()
+        decoded[1..33]
+            .try_into()
+            .map_err(|_| "suiprivkey seed slice must be 32 bytes".to_owned())?
     } else {
         let hex_candidate = trimmed.strip_prefix("0x").unwrap_or(trimmed);
         if hex_candidate.len() == 64 && hex_candidate.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -584,8 +628,12 @@ pub fn parse_sui_private_key_bytes(raw: &str) -> Result<[u8; 32], String> {
                 .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
                 .map_err(|e| format!("invalid Sui private key encoding: {e}"))?;
             match decoded.len() {
-                32 => decoded.try_into().unwrap(),
-                33 if decoded[0] == 0x00 => decoded[1..33].try_into().unwrap(),
+                32 => decoded
+                    .try_into()
+                    .map_err(|_| "decoded base64 key must be 32 bytes".to_owned())?,
+                33 if decoded[0] == 0x00 => decoded[1..33]
+                    .try_into()
+                    .map_err(|_| "decoded keystore key seed must be 32 bytes".to_owned())?,
                 33 => {
                     return Err(format!(
                         "unsupported Sui keystore scheme byte 0x{:02x} (expected 0x00 for Ed25519)",
@@ -1095,5 +1143,97 @@ mod tests {
         assert!(
             verify_sponsored_transaction_matches_ptb(&valid_bytes, sender, &tampered_ptb).is_err()
         );
+    }
+
+    #[test]
+    fn classify_enoki_http_error_distinguishes_fallback_eligible_and_permanent_errors() {
+        let rate_limited = classify_enoki_http_error(
+            429,
+            r#"{"errors":[{"message":"Rate limit exceeded"}]}"#,
+        );
+        assert!(rate_limited.is_fallback_eligible());
+        assert_eq!(rate_limited.http_status_code(), 429);
+
+        let gas_pool_exhausted = classify_enoki_http_error(
+            400,
+            r#"{"errors":[{"message":"Sponsor has insufficient gas balance"}]}"#,
+        );
+        assert!(gas_pool_exhausted.is_fallback_eligible());
+        assert_eq!(gas_pool_exhausted.http_status_code(), 502);
+
+        let server_err = classify_enoki_http_error(503, "upstream unavailable");
+        assert!(server_err.is_fallback_eligible());
+        assert_eq!(server_err.http_status_code(), 502);
+
+        let rejected = classify_enoki_http_error(
+            403,
+            r#"{"message":"Move call target not allowed"}"#,
+        );
+        assert!(!rejected.is_fallback_eligible());
+        assert_eq!(rejected.http_status_code(), 403);
+
+        let bad_req = classify_enoki_http_error(
+            400,
+            r#"{"errors":[{"message":"Invalid transactionKindBytes"}]}"#,
+        );
+        assert!(!bad_req.is_fallback_eligible());
+        assert_eq!(bad_req.http_status_code(), 400);
+    }
+
+    #[test]
+    fn sanitize_upstream_error_redacts_bearer_tokens_and_strips_control_chars() {
+        let raw = "upstream failed:\n\r\tAuthorization: Bearer secret_enoki_token_12345 with \x07bell";
+        let sanitized = sanitize_upstream_error_for_logging(raw);
+        assert!(!sanitized.contains("secret_enoki_token_12345"));
+        assert!(sanitized.contains("Bearer [REDACTED]"));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\x07'));
+
+        let oversized = "x".repeat(800);
+        let truncated = sanitize_upstream_error_for_logging(&oversized);
+        assert!(truncated.ends_with("...(truncated)"));
+        assert!(truncated.len() < 550);
+    }
+
+    #[test]
+    fn reactivate_rejection_code_detects_move_abort_11_and_20() {
+        assert_eq!(
+            reactivate_rejection_code(
+                "MoveAbort in 0x1::account::reactivate_account, abort code: 11"
+            ),
+            Some((
+                "account_already_active",
+                "This account is already active, so it cannot be reactivated.",
+            ))
+        );
+        assert_eq!(
+            reactivate_rejection_code(
+                r#"MoveAbort({"functionName":"reactivate_account","abortCode":"20"})"#
+            ),
+            Some((
+                "account_quarantined",
+                "This account is still locked, so it cannot be reactivated yet.",
+            ))
+        );
+        assert_eq!(
+            reactivate_rejection_code(
+                "MoveAbort in 0x1::account::reactivate_account, abort code: 99"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sign_personal_message_bytes_produces_97_byte_ed25519_serialized_signature() {
+        let seed = [0x24u8; 32];
+        let hex_key = format!("0x{}", hex::encode(seed));
+        let sig_b64 =
+            sign_personal_message_bytes(&hex_key, b"MemWal session certificate").unwrap();
+        let raw_sig = base64::engine::general_purpose::STANDARD
+            .decode(&sig_b64)
+            .unwrap();
+        assert_eq!(raw_sig.len(), 97);
+        assert_eq!(raw_sig[0], 0x00); // Ed25519 scheme flag
     }
 }
