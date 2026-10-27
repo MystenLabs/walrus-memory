@@ -548,10 +548,65 @@ mod tests {
         assert!(matches!(local_direct, std::borrow::Cow::Borrowed(url) if url == local));
     }
 
+    static ADVISORY_LOCK_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn advisory_lock_test_database_url() -> Option<String> {
+        use sqlx::Connection as _;
+
+        if let Some(url) = test_database_url() {
+            return Some(url);
+        }
+        let fallback = "postgresql://memwal:memwal_secret@localhost:5432/memwal";
+        let conn = tokio::time::timeout(
+            Duration::from_secs(2),
+            sqlx::PgConnection::connect(fallback),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let _ = conn.close().await;
+        Some(fallback.to_string())
+    }
+
+    fn replace_database_name_in_url(database_url: &str, new_db_name: &str) -> Option<String> {
+        let mut parsed = reqwest::Url::parse(database_url).ok()?;
+        parsed.set_path(&format!("/{new_db_name}"));
+        Some(parsed.into())
+    }
+
+    async fn sibling_database_url_for_test(primary_url: &str) -> Option<String> {
+        use sqlx::Connection as _;
+
+        let current_db: String = {
+            let mut conn = sqlx::PgConnection::connect(primary_url).await.ok()?;
+            let db: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&mut conn)
+                .await
+                .ok()?;
+            let _ = conn.close().await;
+            db
+        };
+
+        for candidate in ["postgres", "template1"] {
+            if candidate == current_db {
+                continue;
+            }
+            let Some(candidate_url) = replace_database_name_in_url(primary_url, candidate) else {
+                continue;
+            };
+            if let Ok(conn) = sqlx::PgConnection::connect(&candidate_url).await {
+                let _ = conn.close().await;
+                return Some(candidate_url);
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn concurrent_index_recovery_releases_session_lock_on_exit() {
         use sqlx::Connection as _;
 
+        let _guard = ADVISORY_LOCK_TEST_MUTEX.lock().await;
         let Some(database_url) = test_database_url() else {
             eprintln!("skipping DB integration test: DATABASE_URL is not configured");
             return;
@@ -583,6 +638,228 @@ mod tests {
             .expect("pg_advisory_unlock should succeed");
         assert!(unlocked);
         let _ = probe.close().await;
+    }
+
+    #[tokio::test]
+    async fn release_orphaned_concurrent_index_lock_only_targets_current_database() {
+        use sqlx::Connection as _;
+
+        let _guard = ADVISORY_LOCK_TEST_MUTEX.lock().await;
+        let Some(primary_url) = advisory_lock_test_database_url().await else {
+            eprintln!("skipping advisory lock DB scoping test: Postgres is not reachable");
+            return;
+        };
+        let Some(other_db_url) = sibling_database_url_for_test(&primary_url).await else {
+            eprintln!(
+                "skipping advisory lock DB scoping test: no sibling database is reachable on this cluster"
+            );
+            return;
+        };
+
+        let mut other_db_holder = sqlx::PgConnection::connect(&other_db_url)
+            .await
+            .expect("sibling database connection should succeed");
+        let other_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut other_db_holder)
+            .await
+            .expect("pg_backend_pid on sibling database should succeed");
+        let other_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut other_db_holder)
+            .await
+            .expect("sibling database pg_try_advisory_lock should succeed");
+        assert!(
+            other_acquired,
+            "sibling database should acquire advisory lock"
+        );
+
+        let mut primary_holder = sqlx::PgConnection::connect(&primary_url)
+            .await
+            .expect("primary database holder connection should succeed");
+        let primary_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut primary_holder)
+            .await
+            .expect("pg_backend_pid on primary database should succeed");
+        let primary_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut primary_holder)
+            .await
+            .expect("primary database pg_try_advisory_lock should succeed");
+        assert!(
+            primary_acquired,
+            "primary database should acquire advisory lock independently of sibling database"
+        );
+
+        // Wait until both connections have been idle for > 5 seconds.
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+
+        let mut inspector = sqlx::PgConnection::connect(&primary_url)
+            .await
+            .expect("primary database inspector connection should succeed");
+        let holders = super::inspect_concurrent_index_lock_holders(&mut inspector)
+            .await
+            .expect("inspect_concurrent_index_lock_holders should succeed");
+        let holder_pids: Vec<i32> = holders.iter().map(|row| row.0).collect();
+        assert!(
+            holder_pids.contains(&primary_pid),
+            "inspector in current_database() must discover primary holder pid {primary_pid}, got {holder_pids:?}"
+        );
+        assert!(
+            !holder_pids.contains(&other_pid),
+            "inspector in current_database() must never match sibling database holder pid {other_pid}, got {holder_pids:?}"
+        );
+
+        super::release_orphaned_concurrent_index_lock(&mut inspector).await;
+
+        // Wait briefly for backend termination in primary_url to release the session lock.
+        let mut reacquired = false;
+        for _ in 0..20 {
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+                .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+                .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+                .fetch_one(&mut inspector)
+                .await
+                .expect("inspector pg_try_advisory_lock should succeed");
+            if acquired {
+                reacquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reacquired,
+            "primary database orphaned lock holder should be terminated so inspector can acquire the lock"
+        );
+        let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut inspector)
+            .await
+            .expect("inspector pg_advisory_unlock should succeed");
+
+        // Verify the sibling database backend was NOT terminated and still holds its lock.
+        let sibling_alive: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut other_db_holder)
+            .await
+            .expect("sibling database backend must remain alive after primary DB lock cleanup");
+        assert_eq!(sibling_alive, 1);
+        let sibling_unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut other_db_holder)
+            .await
+            .expect("sibling database pg_advisory_unlock should succeed");
+        assert!(
+            sibling_unlocked,
+            "sibling database backend must still hold its advisory lock"
+        );
+
+        let _ = inspector.close().await;
+        let _ = other_db_holder.close().await;
+    }
+
+    #[tokio::test]
+    async fn terminate_verified_idle_lock_holder_refuses_stale_state_change_snapshot() {
+        use sqlx::Connection as _;
+
+        let _guard = ADVISORY_LOCK_TEST_MUTEX.lock().await;
+        let Some(database_url) = advisory_lock_test_database_url().await else {
+            eprintln!("skipping advisory lock stale snapshot test: Postgres is not reachable");
+            return;
+        };
+
+        let mut holder = sqlx::PgConnection::connect(&database_url)
+            .await
+            .expect("holder connection should succeed");
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut holder)
+            .await
+            .expect("pg_backend_pid should succeed");
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut holder)
+            .await
+            .expect("pg_try_advisory_lock should succeed");
+        assert!(acquired, "holder should acquire advisory lock");
+
+        // Let the holder sit idle for > 5 seconds so it qualifies during inspection.
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+
+        let mut inspector = sqlx::PgConnection::connect(&database_url)
+            .await
+            .expect("inspector connection should succeed");
+        let holders = super::inspect_concurrent_index_lock_holders(&mut inspector)
+            .await
+            .expect("inspect_concurrent_index_lock_holders should succeed");
+        let observed_state_change = holders
+            .into_iter()
+            .find_map(|(pid, _, _, _, state_change)| (pid == holder_pid).then_some(state_change))
+            .flatten()
+            .expect("holder should be discovered with a non-null state_change timestamp");
+
+        // Case 1: Between inspection and termination, the holder executes a statement
+        // and returns to idle, advancing its `state_change` timestamp.
+        let _: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut holder)
+            .await
+            .expect("holder query should succeed and advance state_change");
+
+        let terminated_after_activity = super::terminate_verified_idle_lock_holder(
+            &mut inspector,
+            holder_pid,
+            observed_state_change,
+        )
+        .await
+        .expect("terminate_verified_idle_lock_holder query should succeed");
+        assert_eq!(
+            terminated_after_activity, None,
+            "must not terminate a backend whose state_change advanced after the inspection snapshot"
+        );
+
+        let still_alive: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut holder)
+            .await
+            .expect("holder must still be alive after refused stale-snapshot termination");
+        assert_eq!(still_alive, 1);
+
+        // Case 2: The holder is actively executing a statement when termination is attempted.
+        let active_holder_task = tokio::spawn(async move {
+            let _: () = sqlx::query_scalar("SELECT pg_sleep(0.4)")
+                .fetch_one(&mut holder)
+                .await
+                .expect("active pg_sleep query must not be terminated");
+            holder
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let terminated_while_active = super::terminate_verified_idle_lock_holder(
+            &mut inspector,
+            holder_pid,
+            observed_state_change,
+        )
+        .await
+        .expect("terminate_verified_idle_lock_holder query should succeed while holder is active");
+        assert_eq!(
+            terminated_while_active, None,
+            "must never terminate an active backend"
+        );
+
+        let mut holder = active_holder_task
+            .await
+            .expect("active holder task should complete cleanly");
+        let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(super::CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut holder)
+            .await
+            .expect("holder pg_advisory_unlock should succeed");
+        assert!(unlocked);
+
+        let _ = holder.close().await;
+        let _ = inspector.close().await;
     }
 
     fn test_database_url() -> Option<String> {
@@ -2850,22 +3127,30 @@ async fn lock_and_rebuild_concurrent_indexes(
     (result, unlocked)
 }
 
-/// Advisory locks are database-wide. A pooled backend that leaked
-/// `CONCURRENT_INDEX_LOCK_KEYS` before this path moved to the direct endpoint
-/// will block even a direct connection. If that holder is idle (an idle
-/// PgBouncer backend now serving unrelated traffic) and has been in that state
-/// for at least 5s, terminate it so the next poll can proceed. Never kill an
-/// `active` backend — that could be a live replica running `DROP INDEX
-/// CONCURRENTLY` or `CREATE INDEX CONCURRENTLY`.
-async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
-    type AdvisoryLockHolder = (i32, Option<String>, Option<String>, Option<String>);
+type AdvisoryLockHolder = (
+    i32,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
-    let holders: Vec<AdvisoryLockHolder> = match sqlx::query_as(
-        "SELECT a.pid, a.application_name, a.state, left(a.query, 120)
+/// Inspects backends in the current database holding `CONCURRENT_INDEX_LOCK_KEYS`
+/// whose `state_change` is at least 5 seconds old.
+///
+/// Scoped to `current_database()` (`l.database = ... AND a.datid = l.database`)
+/// because `pg_locks` is cluster-wide while PostgreSQL advisory locks are
+/// per-database.
+async fn inspect_concurrent_index_lock_holders(
+    conn: &mut PgConnection,
+) -> Result<Vec<AdvisoryLockHolder>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT a.pid, a.application_name, a.state, left(a.query, 120), a.state_change
          FROM pg_locks l
-         JOIN pg_stat_activity a ON a.pid = l.pid
+         JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
          WHERE l.locktype = 'advisory'
            AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
            AND l.objsubid = 2
            AND l.classid::int4 = $1
            AND l.objid::int4 = $2
@@ -2876,7 +3161,58 @@ async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
     .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
     .fetch_all(&mut *conn)
     .await
-    {
+}
+
+/// Atomically revalidates that `pid` still holds `CONCURRENT_INDEX_LOCK_KEYS`
+/// in `current_database()`, is still `idle` or `idle in transaction`, has not
+/// transitioned state since `observed_state_change`, and has no active entry in
+/// `pg_stat_progress_create_index` before invoking `pg_terminate_backend`.
+///
+/// Returns `Ok(None)` without terminating if the backend resumed work or
+/// released the lock after the inspection snapshot was taken.
+async fn terminate_verified_idle_lock_holder(
+    conn: &mut PgConnection,
+    pid: i32,
+    observed_state_change: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT pg_terminate_backend(a.pid)
+         FROM pg_locks l
+         JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
+         WHERE l.locktype = 'advisory'
+           AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND l.objsubid = 2
+           AND l.classid::int4 = $1
+           AND l.objid::int4 = $2
+           AND a.pid = $3
+           AND a.pid <> pg_backend_pid()
+           AND a.state IN ('idle', 'idle in transaction')
+           AND a.state_change = $4
+           AND a.state_change <= NOW() - INTERVAL '5 seconds'
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_stat_progress_create_index p WHERE p.pid = a.pid
+           )",
+    )
+    .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
+    .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
+    .bind(pid)
+    .bind(observed_state_change)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// Advisory locks are database-wide. A pooled backend that leaked
+/// `CONCURRENT_INDEX_LOCK_KEYS` before this path moved to the direct endpoint
+/// will block even a direct connection. If that holder is in the current
+/// database, is idle (an idle PgBouncer backend now serving unrelated traffic),
+/// and has remained in that exact idle state for at least 5s through the
+/// termination check, terminate it so the next poll can proceed. Never kill an
+/// `active` backend or a backend whose `state_change` advanced since
+/// inspection — that could be a live replica running `DROP INDEX CONCURRENTLY`
+/// or `CREATE INDEX CONCURRENTLY`.
+async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
+    let holders = match inspect_concurrent_index_lock_holders(conn).await {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(
@@ -2886,7 +3222,7 @@ async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
             return;
         }
     };
-    for (pid, application_name, state, query) in holders {
+    for (pid, application_name, state, query, state_change) in holders {
         tracing::warn!(
             pid,
             application_name = application_name.as_deref().unwrap_or(""),
@@ -2897,18 +3233,21 @@ async fn release_orphaned_concurrent_index_lock(conn: &mut PgConnection) {
         if !matches!(state.as_deref(), Some("idle") | Some("idle in transaction")) {
             continue;
         }
-        match sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
-            .bind(pid)
-            .fetch_one(&mut *conn)
-            .await
-        {
-            Ok(true) => tracing::warn!(
+        let Some(observed_state_change) = state_change else {
+            continue;
+        };
+        match terminate_verified_idle_lock_holder(conn, pid, observed_state_change).await {
+            Ok(Some(true)) => tracing::warn!(
                 pid,
                 "concurrent-index recovery: terminated idle backend holding leaked advisory lock"
             ),
-            Ok(false) => tracing::warn!(
+            Ok(Some(false)) => tracing::warn!(
                 pid,
                 "concurrent-index recovery: pg_terminate_backend returned false"
+            ),
+            Ok(None) => tracing::info!(
+                pid,
+                "concurrent-index recovery: skipped terminating lock holder after state changed since inspection"
             ),
             Err(error) => tracing::warn!(
                 pid,
