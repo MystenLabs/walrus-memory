@@ -82,12 +82,8 @@ pub async fn verify_delegate_key_onchain(
 
     let result = rpc_response
         .result
-        .ok_or_else(|| OnchainVerifyError::NotFound("No result in RPC response".into()))?;
-
-    let content = result
-        .data
-        .and_then(|d| d.content)
-        .ok_or_else(|| OnchainVerifyError::NotFound("Object has no content".into()))?;
+        .ok_or_else(|| partial_get_object(PARTIAL_RPC_NO_RESULT))?;
+    let content = require_get_object_content(result)?;
 
     // #398: reject foreign/lookalike objects — verify the Move type against the
     // configured immutable type-origin package id before trusting any field.
@@ -462,6 +458,9 @@ pub fn should_record_rejection(current_len: usize, already_present: bool) -> boo
 /// returned, and still evicts. Without it the TTL helps only callers who
 /// repeat inside 30s, which is not how the MCP clients that hit this
 /// actually behave (WALM-618).
+///
+/// OAuth refresh does not use that grace. It calls
+/// [`verify_delegate_key_cached_for_refresh`].
 pub async fn verify_delegate_key_cached(
     cache: &DelegateVerifyCache,
     reject_cache: &DelegateRejectCache,
@@ -472,6 +471,59 @@ pub async fn verify_delegate_key_cached(
     public_key_bytes: &[u8],
     expected_type_origin_package_id: &str,
 ) -> Result<String, OnchainVerifyError> {
+    verify_delegate_key_cached_inner(
+        cache,
+        reject_cache,
+        http_client,
+        rpc_url,
+        grpc_client,
+        account_object_id,
+        public_key_bytes,
+        expected_type_origin_package_id,
+        false,
+    )
+    .await
+}
+
+/// OAuth refresh. Same cache as [`verify_delegate_key_cached`], but a
+/// positive older than [`DELEGATE_VERIFY_CACHE_TTL`] is not served when the
+/// chain is down, and only [`OnchainVerifyError::revokes_oauth_refresh`]
+/// evicts. Other callers keep the 600s stale grace.
+pub async fn verify_delegate_key_cached_for_refresh(
+    cache: &DelegateVerifyCache,
+    reject_cache: &DelegateRejectCache,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    public_key_bytes: &[u8],
+    expected_type_origin_package_id: &str,
+) -> Result<String, OnchainVerifyError> {
+    verify_delegate_key_cached_inner(
+        cache,
+        reject_cache,
+        http_client,
+        rpc_url,
+        grpc_client,
+        account_object_id,
+        public_key_bytes,
+        expected_type_origin_package_id,
+        true,
+    )
+    .await
+}
+
+async fn verify_delegate_key_cached_inner(
+    cache: &DelegateVerifyCache,
+    reject_cache: &DelegateRejectCache,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    public_key_bytes: &[u8],
+    expected_type_origin_package_id: &str,
+    for_refresh: bool,
+) -> Result<String, OnchainVerifyError> {
     // Borrowed probe: a hit — the common case on both hot paths — allocates
     // nothing. The owned key is built only where the map is actually written.
     let probe: &dyn DelegateAccountKey = &(account_object_id, public_key_bytes);
@@ -480,7 +532,9 @@ pub async fn verify_delegate_key_cached(
         let entries = cache.entries.read().await;
         match entries.get(probe) {
             Some(cached) if cached.is_fresh() => return Ok(cached.owner.clone()),
-            Some(cached) if cached.is_servable_while_unavailable() => 1,
+            // The one-attempt shortcut exists to fall into the stale grace.
+            // Refresh does not serve that grace, so it retries in full.
+            Some(cached) if !for_refresh && cached.is_servable_while_unavailable() => 1,
             _ => GET_OBJECT_ATTEMPTS,
         }
     };
@@ -494,12 +548,17 @@ pub async fn verify_delegate_key_cached(
     // A pair we refused moments ago is refused again without a chain read.
     // Checked after the positive lookup so a key that has since been
     // registered and verified is never held back by an older rejection.
-    if reject_cache
-        .read()
-        .await
-        .get(probe)
-        .copied()
-        .is_some_and(reject_entry_is_fresh)
+    // Refresh never consumes this map: it records only that signed auth
+    // refused the pair, not why, so a `WrongObjectType` recorded there would
+    // come back as a synthetic `KeyNotFound` and revoke the grant refresh is
+    // supposed to hold. Refresh re-reads the chain instead.
+    if !for_refresh
+        && reject_cache
+            .read()
+            .await
+            .get(probe)
+            .copied()
+            .is_some_and(reject_entry_is_fresh)
     {
         return Err(OnchainVerifyError::KeyNotFound(format!(
             "delegate key not registered on account {account_object_id} (cached)"
@@ -548,7 +607,7 @@ pub async fn verify_delegate_key_cached(
             Ok(owner)
         }
         Err(err) => {
-            if verify_cache_miss_action(&err) == VerifyCacheMissAction::Evict {
+            if delegate_verify_evicts(&err, for_refresh) {
                 // One guard across the removal, the bump and the rejection
                 // record. A concurrent success takes this same `entries` lock
                 // to insert and reads the generation while holding it, so it
@@ -588,6 +647,10 @@ pub async fn verify_delegate_key_cached(
                 }
                 drop(rejects);
                 drop(entries);
+                return Err(err);
+            }
+            // Refresh must not mint from a positive past the 30s TTL.
+            if for_refresh {
                 return Err(err);
             }
             // Unavailable: the chain proved nothing about this key, so a
@@ -659,6 +722,17 @@ pub fn verify_cache_miss_action(err: &OnchainVerifyError) -> VerifyCacheMissActi
         VerifyCacheMissAction::Keep
     } else {
         VerifyCacheMissAction::Evict
+    }
+}
+
+/// Shared callers evict on every definitive miss. Refresh evicts only on
+/// answers that revoke the grant, so a partial read is not remembered as
+/// `KeyNotFound` for the next refresh.
+fn delegate_verify_evicts(err: &OnchainVerifyError, for_refresh: bool) -> bool {
+    if for_refresh {
+        err.revokes_oauth_refresh()
+    } else {
+        verify_cache_miss_action(err) == VerifyCacheMissAction::Evict
     }
 }
 
@@ -941,11 +1015,8 @@ pub async fn list_delegate_keys_onchain(
 
     let result = rpc_response
         .result
-        .ok_or_else(|| OnchainVerifyError::NotFound("No result in RPC response".into()))?;
-    let content = result
-        .data
-        .and_then(|d| d.content)
-        .ok_or_else(|| OnchainVerifyError::NotFound("Object has no content".into()))?;
+        .ok_or_else(|| partial_get_object(PARTIAL_RPC_NO_RESULT))?;
+    let content = require_get_object_content(result)?;
 
     ensure_memwal_account_type(
         content.object_type.as_deref(),
@@ -1028,14 +1099,35 @@ fn parse_object_id(account_object_id: &str) -> Result<sui_sdk_types::Address, On
         .map_err(|error| OnchainVerifyError::NotFound(format!("invalid object id: {error}")))
 }
 
+/// JSON-RPC omitted `result`. Not proof the object is missing.
+pub(crate) const PARTIAL_RPC_NO_RESULT: &str = "No result in RPC response";
+/// JSON-RPC object had no `content`. Not proof the object is missing.
+pub(crate) const PARTIAL_RPC_NO_CONTENT: &str = "Object has no content";
+/// gRPC status was success but `object` was absent. Not proof it is missing.
+pub(crate) const PARTIAL_GRPC_OBJECT_ABSENT: &str = "gRPC response missing object";
+/// Prefix on gRPC `Code::NotFound` for the object. Owned by us so refresh
+/// does not parse tonic's English `code:` text.
+pub(crate) const GRPC_OBJECT_NOT_FOUND_PREFIX: &str = "gRPC object not found: ";
+
+/// A GetObject body that does not say whether the object exists.
+///
+/// `RpcError` so `is_unavailable` is true. A partial read must not revoke an
+/// OAuth grant or be remembered as a delegate-key rejection.
+pub(crate) fn partial_get_object(reason: &str) -> OnchainVerifyError {
+    OnchainVerifyError::RpcError(reason.to_string())
+}
+
 /// Classify LedgerService.GetObject failures by gRPC *code*, never by message
 /// text. tonic's Display embeds the code's English name, so matching "not found"
 /// in the string would also fire on INTERNAL errors that merely mention a
 /// missing object.
-fn map_get_object_status(status: tonic::Status) -> OnchainVerifyError {
+///
+/// Only `NotFound` means the object is gone. `InvalidArgument` is a malformed
+/// request, so it stays unavailable and must not revoke a grant.
+pub(crate) fn map_get_object_status(status: tonic::Status) -> OnchainVerifyError {
     match status.code() {
-        tonic::Code::NotFound | tonic::Code::InvalidArgument => {
-            OnchainVerifyError::NotFound(format!("gRPC GetObject failed: {status}"))
+        tonic::Code::NotFound => {
+            OnchainVerifyError::NotFound(format!("{GRPC_OBJECT_NOT_FOUND_PREFIX}{status}"))
         }
         _ => OnchainVerifyError::RpcError(format!("gRPC GetObject failed: {status}")),
     }
@@ -1105,7 +1197,7 @@ async fn grpc_get_object(
     .map_err(map_get_object_status)?
     .into_inner()
     .object
-    .ok_or_else(|| OnchainVerifyError::NotFound("gRPC response missing object".into()))
+    .ok_or_else(|| partial_get_object(PARTIAL_GRPC_OBJECT_ABSENT))
 }
 
 fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
@@ -1530,6 +1622,30 @@ struct RpcError {
 #[derive(Debug, Deserialize)]
 struct RpcResult {
     data: Option<ObjectData>,
+    /// Set when the object is missing or deleted. `data` is absent in that body.
+    error: Option<ObjectReadError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectReadError {
+    code: String,
+}
+
+/// `notExists` and `deleted` are a real removal. Any other body with no
+/// content is a partial read (`RpcError`), not a miss.
+fn require_get_object_content(result: RpcResult) -> Result<ObjectContent, OnchainVerifyError> {
+    if let Some(error) = &result.error {
+        if error.code == "notExists" || error.code == "deleted" {
+            return Err(OnchainVerifyError::NotFound(format!(
+                "sui_getObject {}",
+                error.code
+            )));
+        }
+    }
+    result
+        .data
+        .and_then(|data| data.content)
+        .ok_or_else(|| partial_get_object(PARTIAL_RPC_NO_CONTENT))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1609,6 +1725,30 @@ impl OnchainVerifyError {
             | Self::WrongObjectType(_) => false,
         }
     }
+
+    /// Whether OAuth refresh may revoke the grant on this answer.
+    ///
+    /// A removed key, a deactivated account, gRPC `NotFound`, and JSON-RPC
+    /// `notExists` / `deleted`. A present foreign type holds instead of
+    /// revoking: a package/type-origin misconfiguration turns every account
+    /// into `WrongObjectType`, and revoking would destroy every grant on a
+    /// config slip. Refresh still refuses to mint, so a real lookalike cannot
+    /// authenticate (#398). A partial body, `InvalidArgument`, a missing
+    /// `object_type`, an unparseable id, and any unavailable RPC are not a
+    /// removal either.
+    pub fn revokes_oauth_refresh(&self) -> bool {
+        match self {
+            Self::KeyNotFound(_) | Self::AccountDeactivated(_) => true,
+            // gRPC `Code::NotFound` uses the prefix. JSON-RPC removal uses
+            // the two codes. `invalid object id` is neither.
+            Self::NotFound(msg) => {
+                msg.starts_with(GRPC_OBJECT_NOT_FOUND_PREFIX)
+                    || msg == "sui_getObject notExists"
+                    || msg == "sui_getObject deleted"
+            }
+            Self::RpcError(_) | Self::ScanCapExceeded(_) | Self::WrongObjectType(_) => false,
+        }
+    }
 }
 
 /// Reject any object whose Move type is not
@@ -1617,7 +1757,7 @@ impl OnchainVerifyError {
 /// current upgraded package object's id. The origin id comes from trusted
 /// config, never from the object itself, so foreign lookalikes cannot
 /// authenticate as an arbitrary owner (#398).
-fn ensure_memwal_account_type(
+pub(crate) fn ensure_memwal_account_type(
     actual_type: Option<&str>,
     expected_type_origin_package_id: &str,
     account_object_id: &str,
@@ -1641,9 +1781,12 @@ fn ensure_object_type(
     let expected = format!("{expected_type_origin_package_id}::{module}::{struct_name}");
     match actual_type {
         Some(t) if t == expected => Ok(()),
-        other => Err(OnchainVerifyError::WrongObjectType(format!(
-            "object {} has type {:?}, expected {} — foreign object rejected",
-            object_id, other, expected
+        Some(other) => Err(OnchainVerifyError::WrongObjectType(format!(
+            "object {object_id} has type {other:?}, expected {expected} — foreign object rejected"
+        ))),
+        // Missing type is an incomplete read, not a foreign object.
+        None => Err(OnchainVerifyError::RpcError(format!(
+            "object {object_id} response is missing object_type; expected {expected}"
         ))),
     }
 }
@@ -1935,10 +2078,68 @@ mod tests {
     }
 
     #[test]
+    fn partial_get_object_reads_do_not_revoke_or_evict() {
+        let missing_type = ensure_memwal_account_type(None, "0xpkg", "0xobj").unwrap_err();
+        for err in [
+            partial_get_object(PARTIAL_RPC_NO_RESULT),
+            partial_get_object(PARTIAL_RPC_NO_CONTENT),
+            partial_get_object(PARTIAL_GRPC_OBJECT_ABSENT),
+            map_get_object_status(tonic::Status::invalid_argument("bad object id")),
+            missing_type,
+        ] {
+            assert!(err.is_unavailable(), "{err}");
+            assert!(!err.revokes_oauth_refresh(), "{err}");
+            assert!(!delegate_verify_evicts(&err, true), "{err}");
+            assert!(!delegate_verify_evicts(&err, false), "{err}");
+        }
+
+        let real = map_get_object_status(tonic::Status::not_found("no such object"));
+        assert!(!real.is_unavailable(), "{real}");
+        assert!(real.revokes_oauth_refresh(), "{real}");
+        assert!(delegate_verify_evicts(&real, true), "{real}");
+
+        // A present foreign type is a finished read: signed auth rejects it
+        // and evicts a cached positive, but refresh holds rather than
+        // revoking so a package-id misconfiguration cannot wipe grants.
+        let foreign = OnchainVerifyError::WrongObjectType("foreign".into());
+        assert!(!foreign.revokes_oauth_refresh());
+        assert!(delegate_verify_evicts(&foreign, false));
+        assert!(!delegate_verify_evicts(&foreign, true));
+
+        let invalid_id = parse_object_id("not-a-sui-object-id").unwrap_err();
+        assert!(!invalid_id.revokes_oauth_refresh(), "{invalid_id}");
+        assert!(!delegate_verify_evicts(&invalid_id, true));
+    }
+
+    #[test]
+    fn json_rpc_not_exists_and_deleted_revoke_but_a_bare_body_does_not() {
+        for code in ["notExists", "deleted"] {
+            let body = format!(r#"{{"result":{{"error":{{"code":"{code}"}}}}}}"#);
+            let response: RpcResponse = serde_json::from_str(&body).expect(&body);
+            let err =
+                require_get_object_content(response.result.expect("result")).expect_err(&body);
+            assert!(matches!(err, OnchainVerifyError::NotFound(_)), "{err}");
+            assert!(err.to_string().contains(code), "{err}");
+            assert!(!err.is_unavailable(), "{err}");
+            assert!(err.revokes_oauth_refresh(), "{err}");
+            assert!(delegate_verify_evicts(&err, true), "{err}");
+            assert!(delegate_verify_evicts(&err, false), "{err}");
+        }
+
+        let bare: RpcResponse = serde_json::from_str(r#"{"result":{}}"#).unwrap();
+        let err = require_get_object_content(bare.result.unwrap()).unwrap_err();
+        assert!(matches!(err, OnchainVerifyError::RpcError(_)), "{err}");
+        assert!(err.to_string().contains(PARTIAL_RPC_NO_CONTENT), "{err}");
+        assert!(err.is_unavailable(), "{err}");
+        assert!(!err.revokes_oauth_refresh(), "{err}");
+        assert!(!delegate_verify_evicts(&err, true));
+    }
+
+    #[test]
     fn get_object_status_classifies_by_grpc_code() {
         for (status, unavailable) in [
             (tonic::Status::not_found("no such object"), false),
-            (tonic::Status::invalid_argument("bad object id"), false),
+            (tonic::Status::invalid_argument("bad object id"), true),
             (
                 tonic::Status::resource_exhausted("429 Too Many Requests"),
                 true,
@@ -2372,6 +2573,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_verify_does_not_serve_a_stale_positive() {
+        // OAuth refresh skips `DELEGATE_VERIFY_STALE_GRACE`. Past the 30s TTL
+        // an unreachable chain is an error, not a mint.
+        let cache = new_delegate_verify_cache();
+        let account_id = "0xaccount-refresh-no-grace";
+        let pk = sample_pk();
+        seed_verify_cache(
+            &cache,
+            account_id,
+            &pk,
+            DELEGATE_VERIFY_CACHE_TTL + std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        let client = reqwest::Client::new();
+        let result = verify_delegate_key_cached_for_refresh(
+            &cache,
+            &new_delegate_reject_cache(),
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            &pk,
+            "0xpkg",
+        )
+        .await;
+
+        let err = result.expect_err("refresh must not mint from the stale grace");
+        assert!(err.is_unavailable(), "{err}");
+        assert!(!err.revokes_oauth_refresh(), "{err}");
+        assert!(
+            cache
+                .entries
+                .read()
+                .await
+                .contains_key(&(account_id.to_string(), pk)),
+            "an unavailable read must not evict the positive other callers still serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_verify_still_serves_a_fresh_positive() {
+        // The revocation window on refresh is the 30s TTL, not zero.
+        let cache = new_delegate_verify_cache();
+        let account_id = "0xaccount-refresh-fresh";
+        let pk = sample_pk();
+        let owner = seed_verify_cache(&cache, account_id, &pk, std::time::Duration::ZERO).await;
+
+        let client = reqwest::Client::new();
+        let result = verify_delegate_key_cached_for_refresh(
+            &cache,
+            &new_delegate_reject_cache(),
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            &pk,
+            "0xpkg",
+        )
+        .await;
+
+        assert_eq!(result.ok(), Some(owner));
+    }
+
+    #[tokio::test]
     async fn verify_delegate_key_cached_refuses_stale_entry_past_the_grace() {
         // The grace is bounded. Past it the outage is no longer an excuse and
         // the caller gets the unavailable error, so a key revoked during a
@@ -2518,6 +2784,41 @@ mod tests {
         assert!(
             !err.is_unavailable(),
             "served from the reject cache, so it must not look like an RPC failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_ignores_a_rejection_recorded_by_signed_auth() {
+        // Signed auth records a refusal without its cause, so replaying it to
+        // refresh turns a held `WrongObjectType` into a `KeyNotFound` and
+        // revokes the grant. Refresh must consult the chain instead.
+        let cache = new_delegate_verify_cache();
+        let rejects = new_delegate_reject_cache();
+        let account_id = "0xaccount-refresh-ignores-reject";
+        let pk = sample_pk();
+        seed_reject_cache(&rejects, account_id, &pk, std::time::Duration::ZERO).await;
+
+        let client = reqwest::Client::new();
+        let err = verify_delegate_key_cached_for_refresh(
+            &cache,
+            &rejects,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            &pk,
+            "0xpkg",
+        )
+        .await
+        .expect_err("the unreachable RPC still fails");
+
+        assert!(
+            err.is_unavailable(),
+            "refresh must re-read the chain, not reuse signed auth's rejection: {err}"
+        );
+        assert!(
+            !err.revokes_oauth_refresh(),
+            "a held refresh must keep the grant: {err}"
         );
     }
 
@@ -3005,11 +3306,11 @@ mod tests {
             ),
             Err(OnchainVerifyError::WrongObjectType(_))
         ));
-        // Missing type — rejected.
-        assert!(matches!(
-            ensure_memwal_account_type(None, original_type_origin_pkg, "0xobj"),
-            Err(OnchainVerifyError::WrongObjectType(_))
-        ));
+        // Missing type is an incomplete read, not a foreign object.
+        let missing = ensure_memwal_account_type(None, original_type_origin_pkg, "0xobj")
+            .expect_err("missing type");
+        assert!(missing.is_unavailable(), "{missing}");
+        assert!(!missing.revokes_oauth_refresh(), "{missing}");
     }
 
     #[test]

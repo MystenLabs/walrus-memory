@@ -24,8 +24,11 @@ use crate::oauth::{self, OAuthError};
 use crate::storage::db::oauth_rows::{
     OAuthClientRow, OAuthCodeRow, OAuthDelegateRow, OAuthGrantRow, OAuthSessionRow, OAuthTokenRow,
 };
-use crate::storage::sui::{verify_delegate_key_onchain, OnchainVerifyError, GET_OBJECT_ATTEMPTS};
-use crate::types::AppState;
+use crate::storage::sui::{
+    verify_delegate_key_cached_for_refresh, verify_delegate_key_onchain, OnchainVerifyError,
+    GET_OBJECT_ATTEMPTS,
+};
+use crate::types::{AppError, AppState};
 
 /// Read the configured `McpOAuthConfig`, or fail with 404 if not configured.
 fn require_oauth(state: &AppState) -> Result<&oauth::McpOAuthConfig, OAuthError> {
@@ -748,6 +751,114 @@ fn classify_pending_key_preflight(
     }
 }
 
+/// What an OAuth refresh may do after the custodied delegate key is re-checked.
+///
+/// The token handler acts only on this value, so the unit tests lock the
+/// policy without a database or a live chain. A positive inside
+/// `DELEGATE_VERIFY_CACHE_TTL` (30s) may still mint. Refresh does not use
+/// the 600s stale grace, and it does not consume the signed-auth rejection
+/// cache: that map records only that a pair was refused, so replaying it
+/// would turn a held `WrongObjectType` into a revoke (GH #1141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshDelegateDecision {
+    /// Key is still registered to the grant's owner. Rotate and mint.
+    Rotate,
+    /// Definitive miss, or the on-chain owner is not the grant owner.
+    /// Revoke the grant and do not mint.
+    RejectAndRevoke,
+    /// Chain could not be consulted. Do not revoke and do not mint.
+    Unavailable,
+}
+
+impl RefreshDelegateDecision {
+    fn revokes_grant(self) -> bool {
+        matches!(self, Self::RejectAndRevoke)
+    }
+
+    /// `None` only when the refresh may mint. A miss is `invalid_grant`;
+    /// an RPC blip is `temporarily_unavailable` (503 + Retry-After) so the
+    /// grant stays usable and the client retries later.
+    fn failure(self) -> Option<OAuthError> {
+        match self {
+            Self::Rotate => None,
+            Self::RejectAndRevoke => Some(OAuthError::invalid_grant(
+                "delegate key is no longer registered on-chain",
+            )),
+            Self::Unavailable => Some(OAuthError::temporarily_unavailable(
+                "delegate key could not be verified on-chain",
+            )),
+        }
+    }
+}
+
+/// Classify a cached delegate verify for refresh.
+///
+/// Revoke only when [`OnchainVerifyError::revokes_oauth_refresh`] is set, or
+/// the verified owner is not the grant owner. A partial read and any
+/// unavailable RPC, including a Sui 429, are `temporarily_unavailable`.
+fn refresh_delegate_decision(
+    verified: Result<String, OnchainVerifyError>,
+    grant_owner: &str,
+) -> RefreshDelegateDecision {
+    match verified {
+        Ok(owner) if owner.eq_ignore_ascii_case(grant_owner) => RefreshDelegateDecision::Rotate,
+        Ok(_) => RefreshDelegateDecision::RejectAndRevoke,
+        Err(err) if err.revokes_oauth_refresh() => RefreshDelegateDecision::RejectAndRevoke,
+        Err(_) => RefreshDelegateDecision::Unavailable,
+    }
+}
+
+/// The single database capability refresh needs to apply a decision, kept
+/// narrow so the wiring is unit-testable without a Postgres pool.
+#[async_trait::async_trait]
+trait RefreshGrantRevoker: Send + Sync {
+    async fn revoke_grant_and_delegate(
+        &self,
+        grant_id: &str,
+        delegate_ref: &str,
+    ) -> Result<(), AppError>;
+}
+
+#[async_trait::async_trait]
+impl RefreshGrantRevoker for crate::storage::db::VectorDb {
+    async fn revoke_grant_and_delegate(
+        &self,
+        grant_id: &str,
+        delegate_ref: &str,
+    ) -> Result<(), AppError> {
+        self.revoke_oauth_grant_and_delegate(grant_id, delegate_ref)
+            .await
+    }
+}
+
+/// Apply a refresh decision before any minting: a revoke lands first, and a
+/// failure is returned so the caller cannot rotate without it.
+async fn apply_refresh_decision<D: RefreshGrantRevoker>(
+    db: &D,
+    grant_id: &str,
+    delegate_ref: &str,
+    decision: RefreshDelegateDecision,
+) -> Result<(), OAuthError> {
+    if decision.revokes_grant() {
+        db.revoke_grant_and_delegate(grant_id, delegate_ref).await?;
+    }
+    match decision.failure() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Stored delegate public keys are raw 32-byte hex (`generate_delegate_key`).
+/// Anything else is a corrupt row, not evidence the key was removed.
+fn decode_refresh_delegate_public_key(hex_key: &str) -> Option<Vec<u8>> {
+    let bytes = hex::decode(hex_key).ok()?;
+    if bytes.len() == 32 {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
 /// Atomically claim a pending session so it can only ever be completed once —
 /// Postgres analog of the WALM-30 prior art's Redis GETDEL guarantee. This is
 /// the single gate on issuing an authorization code, so it stays the last step
@@ -842,6 +953,15 @@ pub async fn session_complete(
             )));
         }
         DelegateVerifyOutcome::Unregistered { reason } => {
+            // A reused row is still `active`, so session_account would offer
+            // it again and burn a session on every reconnect. Retire it
+            // before failing so the next connect registers a fresh key.
+            if is_reused {
+                state
+                    .db
+                    .revoke_oauth_delegate(&delegate.delegate_ref)
+                    .await?;
+            }
             claim_oauth_session(&state, &session_id).await?;
             return Err(OAuthError::invalid_request(format!(
                 "delegate key is not registered on-chain: {reason}"
@@ -1207,6 +1327,60 @@ pub async fn token(
                 return Err(OAuthError::invalid_grant("refresh_token has expired"));
             }
 
+            // GH #1141: refresh must not outlive `remove_delegate_key`.
+            // Revoke when the key is gone, the account is deactivated, the
+            // owner does not match, or gRPC NotFound / JSON-RPC notExists /
+            // deleted hits the object. A partial RPC read and a present
+            // foreign type are both `temporarily_unavailable` and do not
+            // revoke; a foreign type means package or RPC config changed, and
+            // revoking every grant for that is worse than holding. A
+            // definitive miss retires the grant *and* the delegate atomically,
+            // so reconnect cannot reuse the dead key. Do not log
+            // `encrypted_private_key` or the key bytes.
+            //
+            // Window on this path: a positive inside `DELEGATE_VERIFY_CACHE_TTL`
+            // (30s) may still mint. `DELEGATE_VERIFY_STALE_GRACE` (600s) is
+            // not used — past 30s an unreachable chain is
+            // `temporarily_unavailable`, not a mint and not a revoke. The
+            // signed-auth rejection cache (10s) is not consulted: it records
+            // only the refusal, not the error class, so replaying it would
+            // revoke on a held foreign type.
+            let Some(public_key_bytes) =
+                decode_refresh_delegate_public_key(&preview.delegate_public_key)
+            else {
+                return Err(OAuthError::server_error(
+                    "stored delegate public key is invalid",
+                ));
+            };
+            let verified = verify_delegate_key_cached_for_refresh(
+                &state.delegate_verify_cache,
+                &state.delegate_reject_cache,
+                &state.http_client,
+                &state.config.sui_rpc_url,
+                state.sui_grpc_client.as_ref(),
+                &preview.account_id,
+                &public_key_bytes,
+                &state.config.package_id,
+            )
+            .await;
+            if let Err(err) = &verified {
+                tracing::warn!(
+                    account_id = %preview.account_id,
+                    error = %err,
+                    "oauth refresh delegate verify failed"
+                );
+            }
+            let decision = refresh_delegate_decision(verified, &preview.owner_address);
+            // Revoke (grant + delegate) and fail before any token is minted;
+            // the helper returns the decision's error, if any.
+            apply_refresh_decision(
+                state.db.as_ref(),
+                &preview.grant_id,
+                &preview.delegate_ref,
+                decision,
+            )
+            .await?;
+
             // Consume and replace the refresh token in one database
             // transaction. Exactly one concurrent presenter can succeed.
             let (access_token, access_row, refresh_token, refresh_row) =
@@ -1274,7 +1448,9 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::sync::Mutex;
 
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use sui_crypto::ed25519::Ed25519PrivateKey;
     use sui_crypto::SuiSigner;
@@ -1282,12 +1458,299 @@ mod tests {
 
     use crate::oauth::{OAuthError, OAUTH_UPSTREAM_RETRY_AFTER_SECS};
     use crate::security_delete_auth::{NativeWalletSignatureVerifier, WalletSignatureVerifier};
-    use crate::storage::sui::OnchainVerifyError;
+    use crate::storage::sui::{
+        ensure_memwal_account_type, map_get_object_status, partial_get_object, OnchainVerifyError,
+        PARTIAL_GRPC_OBJECT_ABSENT, PARTIAL_RPC_NO_CONTENT, PARTIAL_RPC_NO_RESULT,
+    };
+    use crate::types::AppError;
 
     use super::{
-        classify_delegate_verify, classify_pending_key_preflight, oauth_owner_proof_message,
-        DelegateVerifyOutcome, PendingKeyPreflight,
+        apply_refresh_decision, classify_delegate_verify, classify_pending_key_preflight,
+        decode_refresh_delegate_public_key, oauth_owner_proof_message, refresh_delegate_decision,
+        DelegateVerifyOutcome, PendingKeyPreflight, RefreshDelegateDecision, RefreshGrantRevoker,
     };
+
+    fn assert_refresh_policy(
+        decision: RefreshDelegateDecision,
+        rotates: bool,
+        revokes: bool,
+        error: Option<&str>,
+    ) {
+        assert_eq!(
+            matches!(decision, RefreshDelegateDecision::Rotate),
+            rotates,
+            "{decision:?}"
+        );
+        assert_eq!(decision.revokes_grant(), revokes, "{decision:?}");
+        assert_eq!(
+            decision.revokes_grant(),
+            matches!(decision, RefreshDelegateDecision::RejectAndRevoke),
+            "{decision:?}"
+        );
+        assert!(
+            !(rotates && revokes),
+            "a refresh must not both mint and revoke"
+        );
+        match decision.failure() {
+            None => {
+                assert!(rotates, "{decision:?} with no error must mint");
+                assert!(error.is_none(), "{decision:?} must not mint an error");
+            }
+            Some(err) => {
+                assert!(!rotates, "{decision:?} must not mint");
+                assert_eq!(err.error, error.expect("expected an oauth error code"));
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_rotates_only_when_the_verified_owner_matches() {
+        assert_refresh_policy(
+            refresh_delegate_decision(Ok("0xAbC".into()), "0xabc"),
+            true,
+            false,
+            None,
+        );
+        assert_refresh_policy(
+            refresh_delegate_decision(Ok("0xowner".into()), "0xowner"),
+            true,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn refresh_revokes_on_definitive_miss_and_owner_mismatch() {
+        for err in [
+            OnchainVerifyError::KeyNotFound("gone".into()),
+            OnchainVerifyError::AccountDeactivated("dead".into()),
+            map_get_object_status(tonic::Status::not_found("no such object")),
+            OnchainVerifyError::NotFound("sui_getObject notExists".into()),
+            OnchainVerifyError::NotFound("sui_getObject deleted".into()),
+        ] {
+            let label = err.to_string();
+            assert!(err.revokes_oauth_refresh(), "{label}");
+            let decision = refresh_delegate_decision(Err(err), "0xowner");
+            assert_refresh_policy(decision, false, true, Some("invalid_grant"));
+            let err = decision
+                .failure()
+                .expect("definitive miss is invalid_grant");
+            assert!(
+                err.description.contains("no longer registered on-chain"),
+                "{label}"
+            );
+        }
+        let mismatch = refresh_delegate_decision(Ok("0xOther".into()), "0xowner");
+        assert_refresh_policy(mismatch, false, true, Some("invalid_grant"));
+        assert!(mismatch
+            .failure()
+            .expect("owner mismatch is invalid_grant")
+            .description
+            .contains("no longer registered on-chain"));
+    }
+
+    #[test]
+    fn refresh_holds_a_foreign_object_instead_of_revoking() {
+        // A package/type-origin misconfiguration makes every account look
+        // foreign. Revoking here would destroy every grant on a config slip,
+        // while refusing to mint still blocks a real lookalike (#398).
+        let err = OnchainVerifyError::WrongObjectType("foreign".into());
+        assert!(!err.revokes_oauth_refresh());
+        let decision = refresh_delegate_decision(Err(err), "0xowner");
+        assert_refresh_policy(decision, false, false, Some("temporarily_unavailable"));
+        assert!(!decision.revokes_grant());
+        assert_eq!(
+            decision.failure().expect("a foreign type holds").status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Signed auth still treats a present foreign type as definitive.
+        assert!(!OnchainVerifyError::WrongObjectType("foreign".into()).is_unavailable());
+    }
+
+    #[test]
+    fn refresh_does_not_revoke_on_a_partial_rpc_read() {
+        let missing_type =
+            ensure_memwal_account_type(None, "0xpkg", "0xobj").expect_err("missing object_type");
+        let cases = [
+            partial_get_object(PARTIAL_RPC_NO_RESULT),
+            partial_get_object(PARTIAL_RPC_NO_CONTENT),
+            partial_get_object(PARTIAL_GRPC_OBJECT_ABSENT),
+            map_get_object_status(tonic::Status::invalid_argument("bad object id")),
+            missing_type,
+        ];
+        for err in cases {
+            let label = err.to_string();
+            assert!(
+                err.is_unavailable(),
+                "{label} is a partial read, not a missing key"
+            );
+            assert!(!err.revokes_oauth_refresh(), "{label}");
+            let decision = refresh_delegate_decision(Err(err), "0xowner");
+            assert_refresh_policy(decision, false, false, Some("temporarily_unavailable"));
+            assert!(
+                !decision.revokes_grant(),
+                "{label} must not revoke the grant"
+            );
+        }
+
+        // Historical partial strings, if they still arrive as NotFound, and an
+        // unparseable object id, are not a real removal and must not revoke.
+        let stale_shapes = [
+            OnchainVerifyError::NotFound(PARTIAL_RPC_NO_RESULT.into()),
+            OnchainVerifyError::NotFound(PARTIAL_RPC_NO_CONTENT.into()),
+            OnchainVerifyError::NotFound(PARTIAL_GRPC_OBJECT_ABSENT.into()),
+            OnchainVerifyError::NotFound(format!(
+                "gRPC GetObject failed: {}",
+                tonic::Status::invalid_argument("bad object id")
+            )),
+            OnchainVerifyError::NotFound("invalid object id: bad".into()),
+        ];
+        for err in stale_shapes {
+            let label = err.to_string();
+            assert!(!err.revokes_oauth_refresh(), "{label}");
+            assert_refresh_policy(
+                refresh_delegate_decision(Err(err), "0xowner"),
+                false,
+                false,
+                Some("temporarily_unavailable"),
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_holds_when_the_chain_is_unavailable() {
+        for err in [
+            OnchainVerifyError::RpcError("gRPC GetObject failed: 429 Too Many Requests".into()),
+            OnchainVerifyError::ScanCapExceeded("registry scan cap".into()),
+        ] {
+            let decision = refresh_delegate_decision(Err(err), "0xowner");
+            assert_refresh_policy(decision, false, false, Some("temporarily_unavailable"));
+            assert!(
+                !decision.revokes_grant(),
+                "an RPC blip must not revoke the grant"
+            );
+            assert!(
+                matches!(decision, RefreshDelegateDecision::Unavailable),
+                "an RPC blip must not mint"
+            );
+            assert_eq!(
+                decision.failure().expect("an RPC blip is retryable").status,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    /// Records the revokes the refresh helper performs. A `Mutex` rather than
+    /// a `RefCell` because the trait is `Send + Sync`; still no DB, no I/O.
+    #[derive(Default)]
+    struct RecordingRevoker {
+        calls: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingRevoker {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RefreshGrantRevoker for RecordingRevoker {
+        async fn revoke_grant_and_delegate(
+            &self,
+            grant_id: &str,
+            delegate_ref: &str,
+        ) -> Result<(), AppError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("{grant_id}:{delegate_ref}"));
+            if self.fail {
+                return Err(AppError::Internal("revoke failed".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_reject_and_revoke_retires_grant_and_delegate_before_failing() {
+        let db = RecordingRevoker::default();
+        let err = apply_refresh_decision(
+            &db,
+            "grant-1",
+            "delegate-1",
+            RefreshDelegateDecision::RejectAndRevoke,
+        )
+        .await
+        .expect_err("a definitive miss must fail the refresh");
+        assert_eq!(db.calls(), vec!["grant-1:delegate-1".to_string()]);
+        assert_eq!(err.error, "invalid_grant");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn refresh_unavailable_holds_without_revoking_and_returns_503() {
+        let db = RecordingRevoker::default();
+        let err = apply_refresh_decision(
+            &db,
+            "grant-1",
+            "delegate-1",
+            RefreshDelegateDecision::Unavailable,
+        )
+        .await
+        .expect_err("an RPC blip must not mint");
+        assert!(db.calls().is_empty(), "an RPC blip must not revoke");
+        assert_eq!(err.error, "temporarily_unavailable");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn refresh_rotate_reaches_the_mint_without_revoking() {
+        let db = RecordingRevoker::default();
+        assert!(apply_refresh_decision(
+            &db,
+            "grant-1",
+            "delegate-1",
+            RefreshDelegateDecision::Rotate,
+        )
+        .await
+        .is_ok());
+        assert!(db.calls().is_empty(), "a rotate must not revoke");
+    }
+
+    #[tokio::test]
+    async fn refresh_revoke_failure_blocks_the_mint() {
+        let db = RecordingRevoker {
+            fail: true,
+            ..Default::default()
+        };
+        let err = apply_refresh_decision(
+            &db,
+            "grant-1",
+            "delegate-1",
+            RefreshDelegateDecision::RejectAndRevoke,
+        )
+        .await
+        .expect_err("a failed revoke must fail the refresh");
+        assert_eq!(db.calls(), vec!["grant-1:delegate-1".to_string()]);
+        // `From<AppError>` maps a DB failure to server_error; the point is
+        // that no token is minted when the revoke did not land.
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn refresh_delegate_public_key_must_be_32_byte_hex() {
+        assert!(decode_refresh_delegate_public_key("zz").is_none());
+        assert!(decode_refresh_delegate_public_key("").is_none());
+        assert!(decode_refresh_delegate_public_key(&"ab".repeat(31)).is_none());
+        assert!(decode_refresh_delegate_public_key(&"ab".repeat(33)).is_none());
+        let key = decode_refresh_delegate_public_key(&"ab".repeat(32)).expect("32 bytes");
+        assert_eq!(key.len(), 32);
+        assert_eq!(
+            decode_refresh_delegate_public_key(&"AB".repeat(32)).expect("uppercase hex"),
+            key
+        );
+    }
 
     // ── WALM-605: a Sui 429 must not read as "unregistered" ──────────
     //
