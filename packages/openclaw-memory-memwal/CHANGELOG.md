@@ -5,6 +5,7 @@
 ### Fixed
 
 - Update MemWal SDK dependency to `0.1.10`.
+- Detect letter-spaced prompt injection before capture and recall by joining punctuation, symbols, or short runs of spaces between single letters (`i-g-n-o-r-e`, `i g n o r e`, `r.e.v.e.a.l`). Ordinary hyphenated words such as `e-mail` and `built-in` stay unchanged.
 
 ## 0.0.7
 

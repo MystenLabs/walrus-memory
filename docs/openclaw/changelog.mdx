@@ -28,7 +28,7 @@ questions:
   - What changed in the MemWal OpenClaw plugin changelog?
   - When was the MemWal OpenClaw plugin first released?
 answer: >-
-  Version 0.0.8 updates the MemWal SDK dependency to 0.1.10.
+  Version 0.0.8 updates the MemWal SDK dependency to 0.1.10 and detects letter-spaced prompt injection keywords such as i-g-n-o-r-e and r.e.v.e.a.l by joining punctuation, symbols, or short runs of spaces between single letters. Ordinary hyphenated words such as e-mail and built-in stay unchanged.
 ---
 
 ## 0.0.8
@@ -36,6 +36,7 @@ answer: >-
 ### Fixed
 
 - Update MemWal SDK dependency to `0.1.10`.
+- Detect letter-spaced prompt injection before capture and recall by joining punctuation, symbols, or short runs of spaces between single letters (`i-g-n-o-r-e`, `i g n o r e`, `r.e.v.e.a.l`). Ordinary hyphenated words such as `e-mail` and `built-in` stay unchanged.
 
 ## 0.0.7
 

@@ -76,7 +76,7 @@ const TRIGGER_PATTERNS = [
   /[\w.-]+@[\w.-]+\.\w+/,
 ];
 
-/** Normalize text by stripping invisible/format characters, decomposing Unicode, and mapping confusable scripts. */
+/** Normalize text by stripping invisible/format characters, decomposing Unicode, mapping confusable scripts, and joining single-character letter spacing. */
 export function normalizeForInjectionCheck(text: string): string {
   const noInvisible = text.replace(/[\p{Cf}\p{Cc}\p{Co}\p{Cs}]/gu, "");
   const decomposed = noInvisible
@@ -87,7 +87,20 @@ export function normalizeForInjectionCheck(text: string): string {
   for (const char of decomposed) {
     mapped += VISUAL_CONFUSABLES[char] ?? char;
   }
-  return mapped.replace(/\s+/g, " ").trim();
+
+  // Join characters that stand alone between separators (i-g-n-o-r-e, i  g  n),
+  // but never a character that is part of a longer word, so e-mail stays e-mail.
+  // Punctuation pass first so word gaps in "i-g-n y-o-u" survive the space pass.
+  const joined = mapped
+    .replace(
+      /(?<=(?:^|[^A-Za-z0-9])[A-Za-z0-9])\s{0,3}[\p{P}\p{S}]{1,3}\s{0,3}(?=[A-Za-z0-9](?:[^A-Za-z0-9]|$))/gu,
+      "",
+    )
+    .replace(
+      /(?<=(?:^|[^A-Za-z0-9])[A-Za-z])\s{1,3}(?=[A-Za-z](?:[^A-Za-z0-9]|$))/gu,
+      "",
+    );
+  return joined.replace(/\s+/g, " ").trim();
 }
 
 /** Check if text matches known prompt injection patterns. */
