@@ -30,4 +30,6 @@ export type {
     RecallManualResult,
     RecallManualHit,
     RecallManualMemory,
+    RestoreResult,
+    ForgetResult,
 } from "./types.js";

@@ -21,6 +21,7 @@ import type {
     RememberJobStatus,
     RememberResult,
     RestoreResult,
+    ForgetResult,
     NamespacesResult,
     ListNamespacesOptions,
 } from "./types.js";
@@ -32,6 +33,7 @@ import {
     assertReadableNamespace,
     assertPositiveIntegerLimit,
     derivedBulkIdempotencyKey,
+    resolveForgetNamespace,
     validateIdempotencyKey,
 } from "./utils.js";
 import { MemWalRememberJobNotFoundError } from "./errors.js";
@@ -653,6 +655,17 @@ export class MemWalMock {
         this.jobs.delete(memory.jobId);
         this.releaseIdempotency(memory.jobId);
         return true;
+    }
+
+    /** Delete all mock records in `namespace` (defaults to the client namespace) and return `{ deleted, namespace, owner }`. */
+    forgetNamespace(namespace?: string): ForgetResult {
+        const resolvedNamespace = resolveForgetNamespace(namespace, this.namespace);
+        const deleted = this.clear(resolvedNamespace);
+        return {
+            deleted,
+            namespace: resolvedNamespace,
+            owner: this.owner,
+        };
     }
 
     /** Clear one namespace, or every mock record when omitted. */

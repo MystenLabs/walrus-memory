@@ -36,6 +36,7 @@ import type {
     RecallManualMemory,
     MemWalManualRecallOptions,
     RestoreResult,
+    ForgetResult,
     SealServerConfig,
     RelayerVersionMetadata,
 } from "./types.js";
@@ -58,6 +59,8 @@ import {
     RESTORE_REQUEST_TIMEOUT_MS,
     deadlineSignal,
     requestTimeoutError,
+    resolveForgetNamespace,
+    parseForgetResult,
 } from "./utils.js";
 import { assertCompatibleRelayer, compatibilityErrorFromStatus } from "./compatibility.js";
 import { resolveLimitOrOptions } from "./recall-args.js";
@@ -1139,5 +1142,43 @@ export class MemWalManual {
             truncated: result.truncated ?? false,
             failed: result.failed ?? 0,
         };
+    }
+
+    // ============================================================
+    // Forget
+    // ============================================================
+
+    /**
+     * Soft-delete all indexed memories in a namespace via `POST /api/forget`.
+     *
+     * Marks every active memory row for `(owner, namespace)` as deleted in the
+     * relayer's vector index so subsequent `recallManual()` calls no longer
+     * return them. Encrypted blobs already stored on Walrus remain immutable
+     * until their storage epochs expire.
+     *
+     * Does not build or attach a SEAL session (`x-seal-session`).
+     *
+     * @param namespace - Namespace to clear (defaults to the client's configured namespace)
+     * @returns ForgetResult with `deleted` count, `namespace`, and `owner`
+     */
+    async forget(namespace?: string): Promise<ForgetResult> {
+        if (this.destroyed) throw destroyedClientError();
+        const resolvedNamespace = resolveForgetNamespace(namespace, this.namespace);
+        const result = await this.signedRequest<ForgetResult>(
+            "POST",
+            "/api/forget",
+            { namespace: resolvedNamespace },
+        );
+        return parseForgetResult(result, "POST /api/forget");
+    }
+
+    /**
+     * Alias for {@link forget} matching {@link MemWalMock.forgetNamespace}.
+     *
+     * @param namespace - Namespace to clear (defaults to the client's configured namespace)
+     * @returns ForgetResult with `deleted` count, `namespace`, and `owner`
+     */
+    async forgetNamespace(namespace?: string): Promise<ForgetResult> {
+        return this.forget(namespace);
     }
 }
