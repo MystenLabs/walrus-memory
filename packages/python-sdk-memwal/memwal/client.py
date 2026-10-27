@@ -51,6 +51,7 @@ from .types import (
     AskMemory,
     AskResult,
     EmbedResult,
+    ForgetResult,
     HealthResult,
     MemWalConfig,
     NamespacesResult,
@@ -1244,6 +1245,30 @@ class MemWal:
             dropped_count=dropped,
         )
 
+    async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Delete this owner's index rows for ``namespace``.
+
+        Wraps ``POST /api/forget``. Walrus blobs persist; the rows stop being
+        retrievable. Defaults to the client namespace.
+        """
+        resolved_namespace = self._resolve_namespace(namespace)
+        data = await self._signed_request(
+            "POST",
+            "/api/forget",
+            {"namespace": resolved_namespace},
+            include_seal_session=False,
+        )
+        endpoint = "POST /api/forget"
+        return ForgetResult(
+            deleted=int(_require(data, "deleted", endpoint)),
+            namespace=_require(data, "namespace", endpoint),
+            owner=_require(data, "owner", endpoint),
+        )
+
+    async def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Alias for :meth:`forget` matching :meth:`MemWalMock.forget_namespace`."""
+        return await self.forget(namespace)
+
     async def analyze(
         self,
         text: str,
@@ -2395,6 +2420,14 @@ class MemWalSync:
         """Synchronous version of :meth:`MemWal.recall` (accepts
         :class:`RecallParams` for the recommended object-style call)."""
         return self._run(self._inner.recall(query, limit, namespace, max_distance))
+
+    def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget`."""
+        return self._run(self._inner.forget(namespace))
+
+    def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget_namespace`."""
+        return self._run(self._inner.forget_namespace(namespace))
 
     def analyze(
         self,
