@@ -1295,29 +1295,50 @@ pub async fn post_blob_to_upload_relay(
         "{base}/v1/blob-upload-relay?blob_id={blob_id_str}&deletable_blob_object={blob_object_id}&tx_id={register_tx_digest}&nonce={nonce_b64}&encoding_type=RS2"
     );
 
-    let resp = http
-        .post(&url)
-        .header("content-type", "application/octet-stream")
-        .body(data)
-        .timeout(Duration::from_secs(90))
-        .send()
-        .await
-        .map_err(|e| format!("Walrus upload relay POST failed: {e}"))?;
+    const BACKOFF_MS: &[u64] = &[250, 500, 1000, 2000];
+    let mut last_err = String::new();
+    for attempt in 0..=BACKOFF_MS.len() {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
+        }
+        let resp = match http
+            .post(&url)
+            .header("content-type", "application/octet-stream")
+            .body(data.clone())
+            .timeout(Duration::from_secs(90))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("Walrus upload relay POST failed: {e}");
+                continue;
+            }
+        };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let safe_body = crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
-        return Err(format!(
-            "Walrus upload relay returned {status}: {safe_body}"
-        ));
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let safe_body = crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
+            last_err = format!("Walrus upload relay returned {status}: {safe_body}");
+            let lower = safe_body.to_ascii_lowercase();
+            let is_replica_lag = lower.contains("not found")
+                || lower.contains("could not find the referenced")
+                || lower.contains("transaction effects");
+            if status.as_u16() == 429 || status.is_server_error() || is_replica_lag {
+                continue;
+            }
+            return Err(last_err);
+        }
+
+        let parsed: RelayUploadResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("failed to parse Walrus upload relay certificate JSON: {e}"))?;
+        return Ok(parsed.confirmation_certificate);
     }
 
-    let parsed: RelayUploadResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse Walrus upload relay certificate JSON: {e}"))?;
-    Ok(parsed.confirmation_certificate)
+    Err(last_err)
 }
 
 fn signers_to_bitmap(signers: &[u16], committee_size: u16) -> Vec<u8> {
@@ -2978,33 +2999,63 @@ pub async fn advance_durable_upload_in_process(
                 });
             }
 
-            let certify_ptb = build_certify_ptb(
-                &runtime.grpc_url,
-                sender,
-                &system,
-                &blob_object_id,
-                &certificate,
-            )
-            .await
-            .map_err(AppError::Internal)?;
-
-            let outcome = match submit_wallet_ptb(
-                http,
-                &runtime.grpc_url,
-                &runtime.sui_network,
-                private_key,
-                certify_ptb,
-                SponsorshipMode::EnokiFirst,
-                EffectsFetchMode::DigestOnly,
-            )
-            .await
-            {
-                Ok(out) => out,
-                Err(err) => {
-                    invalidate_walrus_system_snapshot_cache().await;
-                    return Err(AppError::Internal(err));
+            const CERTIFY_BACKOFF_MS: &[u64] = &[250, 500, 1000];
+            let mut last_certify_err = String::new();
+            let mut outcome_opt = None;
+            for attempt in 0..=CERTIFY_BACKOFF_MS.len() {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(CERTIFY_BACKOFF_MS[attempt - 1]))
+                        .await;
                 }
-            };
+                let certify_ptb = match build_certify_ptb(
+                    &runtime.grpc_url,
+                    sender,
+                    &system,
+                    &blob_object_id,
+                    &certificate,
+                )
+                .await
+                {
+                    Ok(ptb) => ptb,
+                    Err(err) => {
+                        last_certify_err = err;
+                        if attempt < CERTIFY_BACKOFF_MS.len()
+                            && is_rebuildable_object_or_sponsor_error(&last_certify_err)
+                        {
+                            continue;
+                        }
+                        return Err(AppError::Internal(last_certify_err));
+                    }
+                };
+
+                match submit_wallet_ptb(
+                    http,
+                    &runtime.grpc_url,
+                    &runtime.sui_network,
+                    private_key,
+                    certify_ptb,
+                    SponsorshipMode::EnokiFirst,
+                    EffectsFetchMode::DigestOnly,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        outcome_opt = Some(out);
+                        break;
+                    }
+                    Err(err) => {
+                        last_certify_err = err;
+                        if attempt < CERTIFY_BACKOFF_MS.len()
+                            && is_rebuildable_object_or_sponsor_error(&last_certify_err)
+                        {
+                            continue;
+                        }
+                        invalidate_walrus_system_snapshot_cache().await;
+                        return Err(AppError::Internal(last_certify_err));
+                    }
+                }
+            }
+            let outcome = outcome_opt.ok_or(AppError::Internal(last_certify_err))?;
 
             let step_json = serde_json::json!({
                 "step": "certified",
@@ -3174,142 +3225,206 @@ pub async fn set_metadata_batch_in_process(
     .await
     .map_err(AppError::Internal)?;
 
-    // Resolve shared object versions once before the loop and batch-fetch all owned blob
-    // object refs in a single `BatchGetObjects` gRPC call (`M-THROUGHPUT`).
     let object_ids: Vec<String> = blobs.iter().map(|b| b.blob_object_id.clone()).collect();
-    let (shared_versions_res, resolved_refs_res) = tokio::join!(
-        crate::storage::seal_native::fetch_shared_object_versions(
-            &runtime.grpc_url,
-            account_id,
-            registry_id,
-        ),
-        resolve_owned_object_refs_batch(&runtime.grpc_url, &object_ids),
-    );
+    let shared_versions_res = crate::storage::seal_native::fetch_shared_object_versions(
+        &runtime.grpc_url,
+        account_id,
+        registry_id,
+    )
+    .await;
     let (acct_ver, reg_ver) = shared_versions_res.unwrap_or((1, 1));
-    let resolved_refs = resolved_refs_res.map_err(AppError::Internal)?;
 
-    let already_at_owner_ids: Vec<String> = blobs
-        .iter()
-        .zip(resolved_refs.iter())
-        .filter_map(|(entry, &(_, _, _, current_owner))| {
-            if current_owner == Some(owner) {
-                Some(entry.blob_object_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let onchain_metadata = if already_at_owner_ids.is_empty() {
-        HashMap::new()
-    } else {
-        let mut client = shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
-        let mut batch_meta =
-            batch_read_blob_metadata_maps(&mut client, &already_at_owner_ids).await;
-        for id in &already_at_owner_ids {
-            if !batch_meta.contains_key(id) {
-                let map = read_blob_metadata_map(&mut client, id).await;
-                if !map.is_empty() {
-                    batch_meta.insert(id.clone(), map);
+    const METADATA_BACKOFF_MS: &[u64] = &[250, 500, 1000];
+    let mut last_err = String::new();
+    for attempt in 0..=METADATA_BACKOFF_MS.len() {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(METADATA_BACKOFF_MS[attempt - 1])).await;
+        }
+
+        let resolved_refs =
+            match resolve_owned_object_refs_batch(&runtime.grpc_url, &object_ids).await {
+                Ok(refs) => refs,
+                Err(err) => {
+                    last_err = err;
+                    if attempt < METADATA_BACKOFF_MS.len()
+                        && is_rebuildable_object_or_sponsor_error(&last_err)
+                    {
+                        continue;
+                    }
+                    return Err(AppError::Internal(last_err));
+                }
+            };
+
+        let already_at_owner_ids: Vec<String> = blobs
+            .iter()
+            .zip(resolved_refs.iter())
+            .filter_map(|(entry, &(_, _, _, current_owner))| {
+                if current_owner == Some(owner) {
+                    Some(entry.blob_object_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let onchain_metadata = if already_at_owner_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let mut client =
+                shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
+            let mut batch_meta =
+                batch_read_blob_metadata_maps(&mut client, &already_at_owner_ids).await;
+            for id in &already_at_owner_ids {
+                if !batch_meta.contains_key(id) {
+                    let map = read_blob_metadata_map(&mut client, id).await;
+                    if !map.is_empty() {
+                        batch_meta.insert(id.clone(), map);
+                    }
                 }
             }
-        }
-        batch_meta
-    };
-
-    let pending = reconcile_metadata_batch_entries(
-        &blobs,
-        &resolved_refs,
-        &onchain_metadata,
-        sender,
-        owner,
-        package_id,
-        agent_id,
-    )?;
-    if pending.is_empty() {
-        return Ok(0);
-    }
-
-    let mut builder = TransactionBuilder::new();
-    let mut blob_args = Vec::with_capacity(pending.len());
-    let canonical_owner_str = owner.to_string();
-
-    for (entry, (blob_addr, blob_ver, blob_digest)) in &pending {
-        if let Some(enc_b64) = &entry.encrypted_data {
-            let enc_bytes = base64::engine::general_purpose::STANDARD
-                .decode(enc_b64)
-                .map_err(|e| {
-                    AppError::Internal(format!("invalid encryptedData base64 in batch: {e}"))
-                })?;
-            append_seal_encrypt_fence_move_call(
-                &mut builder,
-                package_id,
-                policy_package_id,
-                &runtime.seal_policy_package_id,
-                reg_addr,
-                reg_ver,
-                acct_addr,
-                acct_ver,
-                &enc_bytes,
-            )
-            .map_err(AppError::Internal)?;
-        }
-
-        let blob_arg = builder.object(ObjectInput::owned(*blob_addr, *blob_ver, *blob_digest));
-        blob_args.push(blob_arg);
-
-        let ns = if entry.namespace.trim().is_empty() {
-            "default"
-        } else {
-            entry.namespace.as_str()
+            batch_meta
         };
-        let mut pairs = vec![
-            ("memwal_namespace", ns.to_owned()),
-            ("memwal_owner", canonical_owner_str.clone()),
-        ];
-        if !package_id.trim().is_empty() {
-            pairs.push(("memwal_package_id", package_id.to_owned()));
-        }
-        if let Some(agent) = agent_id.filter(|s| !s.trim().is_empty()) {
-            pairs.push(("memwal_agent_id", agent.to_owned()));
+
+        let pending = reconcile_metadata_batch_entries(
+            &blobs,
+            &resolved_refs,
+            &onchain_metadata,
+            sender,
+            owner,
+            package_id,
+            agent_id,
+        )?;
+        if pending.is_empty() {
+            return Ok(0);
         }
 
-        for (k, v) in pairs {
-            let key_arg = builder.pure(&k);
-            let val_arg = builder.pure(&v);
-            builder.move_call(
-                Function::new(
-                    system.call_package_id,
-                    Identifier::from_static("blob"),
-                    Identifier::from_static("insert_or_update_metadata_pair"),
-                ),
-                vec![blob_arg, key_arg, val_arg],
-            );
+        let mut builder = TransactionBuilder::new();
+        let mut blob_args = Vec::with_capacity(pending.len());
+        let canonical_owner_str = owner.to_string();
+
+        for (entry, (blob_addr, blob_ver, blob_digest)) in &pending {
+            if let Some(enc_b64) = &entry.encrypted_data {
+                let enc_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(enc_b64)
+                    .map_err(|e| {
+                        AppError::Internal(format!("invalid encryptedData base64 in batch: {e}"))
+                    })?;
+                append_seal_encrypt_fence_move_call(
+                    &mut builder,
+                    package_id,
+                    policy_package_id,
+                    &runtime.seal_policy_package_id,
+                    reg_addr,
+                    reg_ver,
+                    acct_addr,
+                    acct_ver,
+                    &enc_bytes,
+                )
+                .map_err(AppError::Internal)?;
+            }
+
+            let blob_arg = builder.object(ObjectInput::owned(*blob_addr, *blob_ver, *blob_digest));
+            blob_args.push(blob_arg);
+
+            let ns = if entry.namespace.trim().is_empty() {
+                "default"
+            } else {
+                entry.namespace.as_str()
+            };
+            let mut pairs = vec![
+                ("memwal_namespace", ns.to_owned()),
+                ("memwal_owner", canonical_owner_str.clone()),
+            ];
+            if !package_id.trim().is_empty() {
+                pairs.push(("memwal_package_id", package_id.to_owned()));
+            }
+            if let Some(agent) = agent_id.filter(|s| !s.trim().is_empty()) {
+                pairs.push(("memwal_agent_id", agent.to_owned()));
+            }
+
+            for (k, v) in pairs {
+                let key_arg = builder.pure(&k);
+                let val_arg = builder.pure(&v);
+                builder.move_call(
+                    Function::new(
+                        system.call_package_id,
+                        Identifier::from_static("blob"),
+                        Identifier::from_static("insert_or_update_metadata_pair"),
+                    ),
+                    vec![blob_arg, key_arg, val_arg],
+                );
+            }
+        }
+
+        let owner_arg = builder.pure(&owner);
+        builder.transfer_objects(blob_args, owner_arg);
+
+        let ptb = finalize_offline_ptb(builder, sender).map_err(AppError::Internal)?;
+        let count = pending.len();
+        let mut allowed_addrs = vec![sender.to_string()];
+        if owner != sender {
+            allowed_addrs.push(owner.to_string());
+        }
+        match submit_wallet_ptb_with_allowed_addresses(
+            http,
+            &runtime.grpc_url,
+            &runtime.sui_network,
+            private_key,
+            ptb,
+            Some(allowed_addrs),
+            SponsorshipMode::EnokiFirst,
+            EffectsFetchMode::DigestOnly,
+        )
+        .await
+        {
+            Ok(_) => return Ok(count),
+            Err(err) => {
+                last_err = err;
+                if attempt < METADATA_BACKOFF_MS.len()
+                    && is_rebuildable_object_or_sponsor_error(&last_err)
+                {
+                    continue;
+                }
+                return Err(AppError::Internal(last_err));
+            }
         }
     }
 
-    let owner_arg = builder.pure(&owner);
-    builder.transfer_objects(blob_args, owner_arg);
+    Err(AppError::Internal(last_err))
+}
 
-    let ptb = finalize_offline_ptb(builder, sender).map_err(AppError::Internal)?;
-    let count = pending.len();
-    let mut allowed_addrs = vec![sender.to_string()];
-    if owner != sender {
-        allowed_addrs.push(owner.to_string());
+fn decode_percent_encoded_loose(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
-    submit_wallet_ptb_with_allowed_addresses(
-        http,
-        &runtime.grpc_url,
-        &runtime.sui_network,
-        private_key,
-        ptb,
-        Some(allowed_addrs),
-        SponsorshipMode::EnokiFirst,
-        EffectsFetchMode::DigestOnly,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    String::from_utf8_lossy(&out).into_owned()
+}
 
-    Ok(count)
+pub(crate) fn is_rebuildable_object_or_sponsor_error(msg: &str) -> bool {
+    let decoded = decode_percent_encoded_loose(msg).to_ascii_lowercase();
+    let is_stale_ref =
+        decoded.contains("could not find the referenced object") && decoded.contains("at version");
+    let is_locked_or_unavailable = decoded.contains("objectversionunavailableforconsumption")
+        || decoded.contains("not available for consumption");
+    let is_sponsor_expired = decoded.contains("sponsored transaction has expired")
+        || decoded.contains("\"code\":\"expired\"")
+        || decoded.contains("'code':'expired'");
+    let is_transient_not_found =
+        decoded.contains("object 0x") && decoded.contains("not found on chain");
+    is_stale_ref || is_locked_or_unavailable || is_sponsor_expired || is_transient_not_found
 }
 
 // ---------------------------------------------------------------------------
@@ -4106,27 +4221,11 @@ pub async fn query_blobs_by_owner_in_process(
         raw_candidates.push((object_id, blob_id));
     }
 
-    // Verify immutable creation-transaction provenance for every candidate Blob and filter out
-    // any third-party blobs transferred to `owner_address` (failing closed on lookup errors).
-    let grpc_url_ref = runtime.grpc_url.clone();
-    let sui_network_ref = runtime.sui_network.clone();
-    let candidates = filter_trusted_blob_candidates_with_resolver(
-        &canonical_owner,
-        raw_candidates,
-        &trusted_uploaders,
-        move |obj_id| {
-            let grpc = grpc_url_ref.clone();
-            let net = sui_network_ref.clone();
-            async move { find_blob_creation_sender(&grpc, &net, &obj_id).await }
-        },
-    )
-    .await?;
+    let raw_candidate_ids: Vec<String> = raw_candidates.iter().map(|(id, _)| id.clone()).collect();
+    let mut batch_metadata = batch_read_blob_metadata_maps(&mut client, &raw_candidate_ids).await;
 
-    let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-    let mut batch_metadata = batch_read_blob_metadata_maps(&mut client, &candidate_ids).await;
-
-    let mut blobs = Vec::new();
-    for (object_id, blob_id) in candidates {
+    let mut matched_blobs = Vec::new();
+    for (object_id, blob_id) in raw_candidates {
         let metadata = match batch_metadata.remove(&object_id) {
             Some(map) => map,
             None => read_blob_metadata_map(&mut client, &object_id).await,
@@ -4152,7 +4251,7 @@ pub async fn query_blobs_by_owner_in_process(
         }
         let agent_id = metadata.get("memwal_agent_id").cloned();
 
-        blobs.push(OnChainBlob {
+        matched_blobs.push(OnChainBlob {
             blob_id,
             object_id,
             namespace: blob_ns,
@@ -4160,6 +4259,33 @@ pub async fn query_blobs_by_owner_in_process(
             agent_id,
         });
     }
+
+    // Verify immutable creation-transaction provenance only for candidates that passed the
+    // metadata filter, filtering out third-party blobs transferred to `owner_address`
+    // (failing closed on lookup errors).
+    let matched_pairs: Vec<(String, String)> = matched_blobs
+        .iter()
+        .map(|b| (b.object_id.clone(), b.blob_id.clone()))
+        .collect();
+    let grpc_url_ref = runtime.grpc_url.clone();
+    let sui_network_ref = runtime.sui_network.clone();
+    let trusted_pairs = filter_trusted_blob_candidates_with_resolver(
+        &canonical_owner,
+        matched_pairs,
+        &trusted_uploaders,
+        move |obj_id| {
+            let grpc = grpc_url_ref.clone();
+            let net = sui_network_ref.clone();
+            async move { find_blob_creation_sender(&grpc, &net, &obj_id).await }
+        },
+    )
+    .await?;
+    let trusted_obj_ids: std::collections::HashSet<String> =
+        trusted_pairs.into_iter().map(|(id, _)| id).collect();
+    let blobs: Vec<OnChainBlob> = matched_blobs
+        .into_iter()
+        .filter(|b| trusted_obj_ids.contains(&b.object_id))
+        .collect();
 
     Ok((blobs, source_capped))
 }
@@ -4169,6 +4295,9 @@ pub async fn query_blob_storage_leases_in_process(
     blob_ids: &[String],
 ) -> Result<BlobStorageLeases, AppError> {
     let runtime = get_native_runtime_config();
+    let trusted_uploaders = runtime
+        .trusted_uploader_addresses()
+        .map_err(AppError::Internal)?;
     let system = resolve_walrus_system_snapshot(
         &runtime.grpc_url,
         &runtime.sui_network,
@@ -4185,15 +4314,22 @@ pub async fn query_blob_storage_leases_in_process(
         });
     }
 
+    let canonical_owner = owner_address
+        .trim()
+        .parse::<Address>()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| owner_address.trim().to_owned());
+
     let mut client = shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
 
     let requested: std::collections::HashSet<&str> = blob_ids.iter().map(String::as_str).collect();
+    let mut matched_blob_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut found = Vec::new();
     let mut page_token: Option<Vec<u8>> = None;
 
     loop {
         let mut req = ListOwnedObjectsRequest::default();
-        req.owner = Some(owner_address.to_owned());
+        req.owner = Some(canonical_owner.clone());
         req.page_size = Some(500);
         req.page_token = page_token.clone().map(Into::into);
         req.object_type = Some(format!("{}::blob::Blob", runtime.walrus_package_id));
@@ -4219,19 +4355,44 @@ pub async fn query_blob_storage_leases_in_process(
             if !requested.contains(blob_id.as_str()) {
                 continue;
             }
-            let end_epoch = json_val
+            let end_epoch_u64 = json_val
                 .as_ref()
                 .and_then(|v| v.get("storage"))
                 .and_then(|s| json_u64(s.get("end_epoch")))
-                .unwrap_or(system.epoch as u64) as i32;
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "Blob {object_id} (blob_id={blob_id}) missing storage.end_epoch"
+                    ))
+                })?;
+
+            // Verify creation-transaction provenance before accepting the lease so an untrusted
+            // third-party blob with the same content blob_id cannot poison lease expiry.
+            let grpc_url_ref = runtime.grpc_url.clone();
+            let sui_network_ref = runtime.sui_network.clone();
+            let trusted = filter_trusted_blob_candidates_with_resolver(
+                &canonical_owner,
+                vec![(object_id.clone(), blob_id.clone())],
+                &trusted_uploaders,
+                move |obj_id| {
+                    let grpc = grpc_url_ref.clone();
+                    let net = sui_network_ref.clone();
+                    async move { find_blob_creation_sender(&grpc, &net, &obj_id).await }
+                },
+            )
+            .await?;
+            if trusted.is_empty() {
+                continue;
+            }
+
+            matched_blob_ids.insert(blob_id.clone());
             found.push(BlobStorageLease {
                 blob_id,
                 object_id,
-                storage_end_epoch: end_epoch,
+                storage_end_epoch: end_epoch_u64 as i32,
             });
         }
 
-        if found.len() >= requested.len() {
+        if matched_blob_ids.len() >= requested.len() {
             break;
         }
         match resp.next_page_token {
@@ -5818,5 +5979,24 @@ mod tests {
         assert_eq!(extract_raw_blob_id(Some(&s_json)), "123456789");
         assert_eq!(extract_raw_blob_id(Some(&n_json)), "123456789");
         assert_eq!(extract_raw_blob_id(None), "");
+    }
+
+    #[test]
+    fn is_rebuildable_object_or_sponsor_error_detects_stale_refs_and_expired_sponsorships() {
+        assert!(is_rebuildable_object_or_sponsor_error(
+            r#"Enoki create failed: 400 {"errors":[{"code":"dry_run_failed","message":"Could%20not%20find%20the%20referenced%20object%200xabc%20at%20version%20Some(12)"}]}"#
+        ));
+        assert!(is_rebuildable_object_or_sponsor_error(
+            "ObjectVersionUnavailableForConsumption: object 0x123 version 7 is not available for consumption"
+        ));
+        assert!(is_rebuildable_object_or_sponsor_error(
+            "Enoki execute failed: 400 Sponsored transaction has expired"
+        ));
+        assert!(is_rebuildable_object_or_sponsor_error(
+            "object 0xdeadbeef not found on chain"
+        ));
+        assert!(!is_rebuildable_object_or_sponsor_error(
+            "BLOB_OWNER_MISMATCH: Blob 0x123 is owned by 0x456"
+        ));
     }
 }

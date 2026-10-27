@@ -1065,6 +1065,7 @@ pub fn verify_sponsored_transaction_matches_ptb(
 
 /// Controls whether a wallet transaction should attempt Enoki gas sponsorship first
 /// before falling back to direct address-balance execution (`C-CUSTOM-TYPE` / Effective Rust Item 1).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SponsorshipMode {
     /// Attempt Enoki gas sponsorship when `ENOKI_API_KEY` is configured, falling back
