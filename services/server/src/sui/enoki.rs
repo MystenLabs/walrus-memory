@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock as StdRwLock};
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -113,12 +114,7 @@ impl EnokiError {
 
     #[must_use]
     pub fn upstream_status_u16(&self) -> u16 {
-        match self {
-            Self::NotConfigured => 503,
-            Self::BadRequest(_) => 400,
-            Self::FallbackEligible { status, .. } | Self::Rejected { status, .. } => *status,
-            Self::Transport(_) => 502,
-        }
+        self.http_status_code().as_u16()
     }
 
     #[must_use]
@@ -133,7 +129,6 @@ impl EnokiError {
     }
 
     #[must_use]
-    #[allow(dead_code)]
     pub fn http_status_code(&self) -> axum::http::StatusCode {
         match self {
             Self::NotConfigured => axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -331,13 +326,12 @@ struct EnokiEnvelope<T> {
 fn classify_enoki_http_error(status: u16, body: &str) -> EnokiError {
     let sanitized = sanitize_upstream_error_for_logging(body);
     let lower = sanitized.to_ascii_lowercase();
-    if status == 429
-        || status >= 500
-        || lower.contains("insufficient gas")
-        || lower.contains("gas pool")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-    {
+    if status == 429 || lower.contains("rate limit") || lower.contains("too many requests") {
+        EnokiError::FallbackEligible {
+            status: 429,
+            message: sanitized,
+        }
+    } else if status >= 500 || lower.contains("insufficient gas") || lower.contains("gas pool") {
         EnokiError::FallbackEligible {
             status,
             message: sanitized,
@@ -350,6 +344,143 @@ fn classify_enoki_http_error(status: u16, body: &str) -> EnokiError {
             message: sanitized,
         }
     }
+}
+
+fn enoki_transient_max_attempts() -> usize {
+    std::env::var("ENOKI_TRANSIENT_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 10))
+        .unwrap_or(4)
+}
+
+fn enoki_transient_base_delay_ms() -> u64 {
+    std::env::var("ENOKI_TRANSIENT_BASE_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.max(10))
+        .unwrap_or(500)
+}
+
+fn enoki_transient_max_delay_ms(base_ms: u64) -> u64 {
+    std::env::var("ENOKI_TRANSIENT_MAX_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.max(base_ms))
+        .unwrap_or(15_000)
+}
+
+fn is_enoki_transient_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+pub(crate) fn parse_enoki_retry_delay_ms(
+    retry_after_header: Option<&str>,
+    body: &str,
+) -> Option<u64> {
+    if let Some(raw_header) = retry_after_header.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(secs) = raw_header.parse::<f64>() {
+            if secs.is_finite() && secs > 0.0 {
+                return Some((secs * 1000.0).ceil() as u64);
+            }
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    if let Some(idx) = lower.find("try again in ") {
+        let rest = lower[idx + "try again in ".len()..].trim_start();
+        let num_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || *b == b'.')
+            .count();
+        if num_len > 0 {
+            if let Ok(val) = rest[..num_len].parse::<f64>() {
+                if val.is_finite() && val > 0.0 {
+                    let unit = rest[num_len..].trim_start();
+                    if unit.starts_with("ms") || unit.starts_with("millisecond") {
+                        return Some(val.ceil() as u64);
+                    }
+                    if unit.starts_with('s') || unit.starts_with("sec") {
+                        return Some((val * 1000.0).ceil() as u64);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn compute_enoki_retry_delay(
+    attempt_one_based: usize,
+    base_ms: u64,
+    max_ms: u64,
+    hinted_ms: Option<u64>,
+) -> Duration {
+    let shift = attempt_one_based.saturating_sub(1).min(10) as u32;
+    let exp = base_ms.saturating_mul(1u64 << shift);
+    let clamped = hinted_ms.unwrap_or(exp).clamp(base_ms.min(max_ms), max_ms);
+    Duration::from_millis(clamped)
+}
+
+async fn post_enoki_json_with_retry<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    payload: &serde_json::Value,
+    op_label: &str,
+) -> Result<T, EnokiError> {
+    let max_attempts = enoki_transient_max_attempts();
+    let base_ms = enoki_transient_base_delay_ms();
+    let max_ms = enoki_transient_max_delay_ms(base_ms);
+
+    for attempt in 1..=max_attempts {
+        let resp = match http
+            .post(url)
+            .bearer_auth(api_key)
+            .json(payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(req_err) => {
+                if attempt < max_attempts {
+                    let delay = compute_enoki_retry_delay(attempt, base_ms, max_ms, None);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(EnokiError::Transport(req_err.to_string()));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let body = resp.text().await.unwrap_or_default();
+            let err = classify_enoki_http_error(status, &body);
+            let is_transient = is_enoki_transient_http_status(status)
+                || matches!(err, EnokiError::FallbackEligible { status: 429, .. });
+            if attempt < max_attempts && is_transient {
+                let hinted = parse_enoki_retry_delay_ms(retry_after.as_deref(), &body);
+                let delay = compute_enoki_retry_delay(attempt, base_ms, max_ms, hinted);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            return Err(err);
+        }
+
+        let parsed: EnokiEnvelope<T> = resp
+            .json()
+            .await
+            .map_err(|e| EnokiError::Transport(format!("invalid Enoki {op_label} JSON: {e}")))?;
+        return Ok(parsed.data);
+    }
+
+    Err(EnokiError::Transport(format!(
+        "Enoki {op_label} exhausted retry attempts"
+    )))
 }
 
 /// Sponsor a `transactionBlockKindBytes` (base64) via Enoki HTTP API (`POST /v1/transaction-blocks/sponsor`).
@@ -401,25 +532,7 @@ pub async fn enoki_sponsor_transaction_kind_with_addresses(
         }
     }
 
-    let resp = http
-        .post(&url)
-        .bearer_auth(&api_key)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| EnokiError::Transport(e.to_string()))?;
-
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(classify_enoki_http_error(status, &body));
-    }
-
-    let parsed: EnokiEnvelope<EnokiSponsorOutput> = resp
-        .json()
-        .await
-        .map_err(|e| EnokiError::Transport(format!("invalid Enoki sponsor JSON: {e}")))?;
-    Ok(parsed.data)
+    post_enoki_json_with_retry(http, &url, &api_key, &payload, "sponsor").await
 }
 
 /// Execute a sponsored transaction via Enoki HTTP API (`POST /v1/transaction-blocks/sponsor/:digest`).
@@ -454,25 +567,7 @@ pub async fn enoki_execute_sponsored_transaction_with_base_url(
         "signature": signature,
     });
 
-    let resp = http
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| EnokiError::Transport(e.to_string()))?;
-
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(classify_enoki_http_error(status, &body));
-    }
-
-    let parsed: EnokiEnvelope<EnokiExecuteOutput> = resp
-        .json()
-        .await
-        .map_err(|e| EnokiError::Transport(format!("invalid Enoki execute JSON: {e}")))?;
-    Ok(parsed.data)
+    post_enoki_json_with_retry(http, &url, api_key, &payload, "execute").await
 }
 
 /// Executes a sponsored transaction via Enoki and optionally verifies on-chain effects
@@ -1225,15 +1320,26 @@ mod tests {
         );
         assert!(gas_pool_exhausted.is_fallback_eligible());
         assert_eq!(gas_pool_exhausted.http_status_code(), 502);
+        assert_eq!(gas_pool_exhausted.upstream_status_u16(), 502);
+
+        let rate_limit_in_400_body = classify_enoki_http_error(
+            400,
+            r#"{"errors":[{"message":"Too many requests; try again in 2s"}]}"#,
+        );
+        assert!(rate_limit_in_400_body.is_fallback_eligible());
+        assert_eq!(rate_limit_in_400_body.http_status_code(), 429);
+        assert_eq!(rate_limit_in_400_body.upstream_status_u16(), 429);
 
         let server_err = classify_enoki_http_error(503, "upstream unavailable");
         assert!(server_err.is_fallback_eligible());
         assert_eq!(server_err.http_status_code(), 502);
+        assert_eq!(server_err.upstream_status_u16(), 502);
 
         let rejected =
             classify_enoki_http_error(403, r#"{"message":"Move call target not allowed"}"#);
         assert!(!rejected.is_fallback_eligible());
         assert_eq!(rejected.http_status_code(), 403);
+        assert_eq!(rejected.upstream_status_u16(), 403);
 
         let bad_req = classify_enoki_http_error(
             400,
@@ -1241,6 +1347,21 @@ mod tests {
         );
         assert!(!bad_req.is_fallback_eligible());
         assert_eq!(bad_req.http_status_code(), 400);
+        assert_eq!(bad_req.upstream_status_u16(), 400);
+    }
+
+    #[test]
+    fn parse_enoki_retry_delay_ms_extracts_retry_after_header_and_message_hints() {
+        assert_eq!(parse_enoki_retry_delay_ms(Some("2.5"), ""), Some(2500));
+        assert_eq!(
+            parse_enoki_retry_delay_ms(None, "Rate limit hit, try again in 750ms."),
+            Some(750)
+        );
+        assert_eq!(
+            parse_enoki_retry_delay_ms(None, "Rate limit hit, try again in 3s"),
+            Some(3000)
+        );
+        assert_eq!(parse_enoki_retry_delay_ms(None, "permanent error"), None);
     }
 
     #[test]

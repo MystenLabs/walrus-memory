@@ -229,6 +229,175 @@ async fn call_local_relayer(
     Ok((status, parsed))
 }
 
+const REMEMBER_RETRY_BUCKET_MS: u64 = 30 * 60 * 1000;
+
+/// Derives a 30-minute bucketed idempotency key (`r1-<64hex>`) matching
+/// `derivedIdempotencyKey` in `services/server/scripts/mcp/tools/remember-wait.ts`.
+pub(crate) fn derived_remember_idempotency_key(
+    text: &str,
+    resolved_namespace: &str,
+    now_ms: u64,
+) -> String {
+    let bucket = now_ms / REMEMBER_RETRY_BUCKET_MS;
+    let digest = hex::encode(Sha256::digest(
+        format!("{bucket}\0{resolved_namespace}\0{text}").as_bytes(),
+    ));
+    format!("r1-{digest}")
+}
+
+fn extract_written_date(created_at: Option<&str>) -> Option<&str> {
+    let raw = created_at?.trim();
+    if raw.len() >= 10 {
+        let prefix = &raw[..10];
+        let b = prefix.as_bytes();
+        if b[0..4].iter().all(u8::is_ascii_digit)
+            && b[4] == b'-'
+            && b[5..7].iter().all(u8::is_ascii_digit)
+            && b[7] == b'-'
+            && b[8..10].iter().all(u8::is_ascii_digit)
+        {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+fn normalize_recall_dedupe_key(text: &str) -> String {
+    text.trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+pub(crate) fn format_recall_output(
+    results: &[Value],
+    max_distance: Option<f64>,
+    dropped_count: u64,
+) -> String {
+    let filtered: Vec<&Value> = results
+        .iter()
+        .filter(|item| {
+            let dist = item.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
+            max_distance.is_none_or(|cutoff| dist <= cutoff)
+        })
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::with_capacity(filtered.len());
+    let mut collapsed: usize = 0;
+    for item in filtered {
+        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+        let key = normalize_recall_dedupe_key(text);
+        if seen.insert(key) {
+            unique.push(item);
+        } else {
+            collapsed += 1;
+        }
+    }
+
+    if unique.is_empty() {
+        if !results.is_empty() {
+            return "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches.".to_owned();
+        }
+        if dropped_count > 0 {
+            return format!(
+                "No matching memories could be returned ({dropped_count} match(es) failed to decrypt)."
+            );
+        }
+        return "No matching memories found.".to_owned();
+    }
+
+    let mut lines = Vec::with_capacity(unique.len());
+    for (idx, item) in unique.iter().enumerate() {
+        let rank = idx + 1;
+        let dist = item.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
+        let score = 1.0 - dist;
+        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+        let created_at = item.get("created_at").and_then(Value::as_str);
+        if let Some(date) = extract_written_date(created_at) {
+            lines.push(format!(
+                "{rank}. [score={score:.3} distance={dist:.3}] [written={date}] {text}"
+            ));
+        } else {
+            lines.push(format!(
+                "{rank}. [score={score:.3} distance={dist:.3}] {text}"
+            ));
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if collapsed > 0 {
+        let noun = if collapsed == 1 { "copy" } else { "copies" };
+        out.push_str(&format!(
+            "\n({collapsed} duplicate {noun} of the above collapsed; the same fact is stored more than once.)"
+        ));
+    }
+    if dropped_count > 0 {
+        out.push_str(&format!(
+            "\n({dropped_count} additional matches could not be decrypted and were omitted.)"
+        ));
+    }
+    out
+}
+
+pub(crate) fn format_restore_output(body: &Value, resolved_namespace: &str) -> String {
+    let Some(total) = body.get("total").and_then(Value::as_u64) else {
+        return body.to_string();
+    };
+    let restored = body.get("restored").and_then(Value::as_u64).unwrap_or(0);
+    let skipped = body.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+    let failed = body.get("failed").and_then(Value::as_u64).unwrap_or(0);
+    let has_more = body
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let next_cursor = body.get("next_cursor").and_then(Value::as_str);
+
+    let headline = if failed > 0 {
+        "Restore partially complete."
+    } else {
+        "Restore page finished."
+    };
+    let mut lines = vec![format!(
+        "{headline} namespace={resolved_namespace} total={total} restored={restored} skipped={skipped} failed={failed} truncated={has_more}"
+    )];
+
+    if has_more {
+        let cursor_hint = next_cursor
+            .map(|c| format!(" (next_cursor={c})"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "More blobs remain on-chain{cursor_hint}. Run memwal_restore again to continue."
+        ));
+    }
+
+    if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+        if !errors.is_empty() {
+            lines.push("Errors:".to_owned());
+            for err in errors {
+                let blob_id = err
+                    .get("blob_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let object_id = err
+                    .get("object_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let msg = err
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                lines.push(format!(
+                    "  - blob_id={blob_id} object_id={object_id}: {msg}"
+                ));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn mcp_tools_list(oauth_scope: &str) -> Value {
     let all_tools = vec![
         json!({
@@ -246,7 +415,8 @@ fn mcp_tools_list(oauth_scope: &str) -> Value {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The full, detailed fact to save." },
-                    "namespace": { "type": "string", "description": "Optional namespace bucket." }
+                    "namespace": { "type": "string", "description": "Optional namespace bucket." },
+                    "dedupe": { "type": "boolean", "description": "Optional near-duplicate precheck flag (cosine similarity >= 0.85)." }
                 },
                 "required": ["text"]
             }
@@ -277,7 +447,8 @@ fn mcp_tools_list(oauth_scope: &str) -> Value {
                             "required": ["text"]
                         }
                     },
-                    "namespace": { "type": "string" }
+                    "namespace": { "type": "string" },
+                    "_idempotency_key": { "type": "string", "description": "Optional logical-call idempotency key injected by the MCP bridge." }
                 },
                 "required": ["items"]
             }
@@ -315,7 +486,7 @@ fn mcp_tools_list(oauth_scope: &str) -> Value {
                 "type": "object",
                 "properties": {
                     "namespace": { "type": "string", "description": "Optional namespace bucket." },
-                    "limit": { "type": "number", "description": "Max blobs to restore." }
+                    "limit": { "type": "number", "description": "Max blobs to restore (1-100, default 10)." }
                 }
             }
         }),
@@ -398,12 +569,19 @@ async fn execute_mcp_tool(
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(default_namespace);
 
-            let idem_hash = hex::encode(Sha256::digest(format!("{namespace}:{text}").as_bytes()));
-            let idem_key = format!("mcp-{}", &idem_hash[..32]);
-            let payload = json!({
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let idem_key = derived_remember_idempotency_key(text, namespace, now_ms);
+            let mut payload = json!({
                 "text": text,
                 "namespace": namespace,
+                "idempotency_key": idem_key,
             });
+            if let Some(dedupe) = args.get("dedupe").and_then(Value::as_bool) {
+                payload["dedupe"] = Value::Bool(dedupe);
+            }
             match call_local_relayer(
                 state,
                 delegate_key_hex,
@@ -411,16 +589,33 @@ async fn execute_mcp_tool(
                 Method::POST,
                 "/api/remember",
                 Some(&payload),
-                &[("idempotency-key", &idem_key)],
+                &[],
             )
             .await
             {
                 Ok((status, body)) if status.is_success() => {
-                    if let Some(blob_id) = body.get("blob_id").and_then(Value::as_str) {
+                    let job_status = body
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("running");
+                    if let Some(blob_id) = body
+                        .get("blob_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let rendered = if job_status == "already_exists" {
+                            format!(
+                                "Already in Walrus Memory (skipped duplicate write). blob_id={blob_id} namespace={namespace}"
+                            )
+                        } else {
+                            format!(
+                                "Saved to Walrus Memory. blob_id={blob_id} namespace={namespace}"
+                            )
+                        };
                         json!({
                             "content": [{
                                 "type": "text",
-                                "text": format!("Saved to Walrus Memory. blob_id={blob_id} namespace={namespace}")
+                                "text": rendered
                             }]
                         })
                     } else {
@@ -428,10 +623,6 @@ async fn execute_mcp_tool(
                             .get("job_id")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let job_status = body
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("running");
                         json!({
                             "content": [{
                                 "type": "text",
@@ -536,10 +727,19 @@ async fn execute_mcp_tool(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(default_namespace);
-            let payload = json!({
+            let mut payload = json!({
                 "items": items,
                 "namespace": namespace,
             });
+            if let Some(idem_key) = args
+                .get("_idempotency_key")
+                .or_else(|| args.get("idempotency_key"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                payload["idempotency_key"] = Value::String(idem_key.to_owned());
+            }
             match call_local_relayer(
                 state,
                 delegate_key_hex,
@@ -606,26 +806,11 @@ async fn execute_mcp_tool(
                         .get("results")
                         .and_then(Value::as_array)
                         .unwrap_or(&empty_vec);
-                    let mut lines = Vec::new();
-                    for item in results {
-                        let dist = item.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-                        if let Some(cutoff) = max_distance {
-                            if dist >= cutoff {
-                                continue;
-                            }
-                        }
-                        let score = 1.0 - dist;
-                        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                        let rank = lines.len() + 1;
-                        lines.push(format!(
-                            "{rank}. [score={score:.3} distance={dist:.3}] {text}"
-                        ));
-                    }
-                    let rendered = if lines.is_empty() {
-                        "No matching memories found.".to_owned()
-                    } else {
-                        lines.join("\n")
-                    };
+                    let dropped_count = body
+                        .get("dropped_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let rendered = format_recall_output(results, max_distance, dropped_count);
                     json!({
                         "content": [{ "type": "text", "text": rendered }]
                     })
@@ -688,7 +873,11 @@ async fn execute_mcp_tool(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(default_namespace);
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(10)
+                .clamp(1, 100);
             let payload = json!({
                 "namespace": namespace,
                 "limit": limit,
@@ -704,9 +893,12 @@ async fn execute_mcp_tool(
             )
             .await
             {
-                Ok((status, body)) if status.is_success() => json!({
-                    "content": [{ "type": "text", "text": body.to_string() }]
-                }),
+                Ok((status, body)) if status.is_success() => {
+                    let rendered = format_restore_output(&body, namespace);
+                    json!({
+                        "content": [{ "type": "text", "text": rendered }]
+                    })
+                }
                 Ok((status, body)) => json!({
                     "isError": true,
                     "content": [{ "type": "text", "text": format!("memwal_restore failed (HTTP {}): {}", status.as_u16(), body) }]
@@ -1208,5 +1400,99 @@ mod tests {
     fn public_types_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<McpNativeSession>();
+    }
+
+    #[test]
+    fn derived_remember_idempotency_key_uses_30_minute_buckets_and_r1_prefix() {
+        let base_ms: u64 = 1_800_000 * 1_000;
+        let k1 = derived_remember_idempotency_key("Fact A", "default", base_ms);
+        let k2 = derived_remember_idempotency_key("Fact A", "default", base_ms + 60_000);
+        let k_next_bucket = derived_remember_idempotency_key(
+            "Fact A",
+            "default",
+            base_ms + REMEMBER_RETRY_BUCKET_MS,
+        );
+        let k_other_ns = derived_remember_idempotency_key("Fact A", "work", base_ms);
+
+        assert!(k1.starts_with("r1-"));
+        assert_eq!(k1.len(), 3 + 64);
+        assert_eq!(
+            k1, k2,
+            "retries within the same 30-minute window must share key"
+        );
+        assert_ne!(
+            k1, k_next_bucket,
+            "re-saves in a later 30-minute window must get a fresh key"
+        );
+        assert_ne!(k1, k_other_ns, "different namespaces must not collide");
+    }
+
+    #[test]
+    fn format_recall_output_includes_written_date_collapses_duplicates_and_reports_dropped() {
+        let results = vec![
+            json!({
+                "text": "User prefers dark mode",
+                "distance": 0.12,
+                "created_at": "2026-04-19T10:20:30Z"
+            }),
+            json!({
+                "text": "  user   PREFERS dark mode ",
+                "distance": 0.15,
+                "created_at": "2026-04-18T08:00:00Z"
+            }),
+            json!({
+                "text": "Uses Rust 2021 edition",
+                "distance": 0.45
+            }),
+        ];
+
+        let rendered = format_recall_output(&results, Some(0.30), 2);
+        assert_eq!(
+            rendered,
+            "1. [score=0.880 distance=0.120] [written=2026-04-19] User prefers dark mode\n(1 duplicate copy of the above collapsed; the same fact is stored more than once.)\n(2 additional matches could not be decrypted and were omitted.)"
+        );
+
+        let all_filtered = format_recall_output(&results, Some(0.05), 0);
+        assert_eq!(
+            all_filtered,
+            "All matching memories were outside maxDistance. Increase maxDistance or omit it to inspect weaker matches."
+        );
+
+        let all_dropped = format_recall_output(&[], None, 3);
+        assert_eq!(
+            all_dropped,
+            "No matching memories could be returned (3 match(es) failed to decrypt)."
+        );
+    }
+
+    #[test]
+    fn format_restore_output_renders_summary_cursor_and_errors() {
+        let ok_page = json!({
+            "total": 10,
+            "restored": 7,
+            "skipped": 3,
+            "failed": 0,
+            "has_more": true,
+            "next_cursor": "cursor-abc"
+        });
+        assert_eq!(
+            format_restore_output(&ok_page, "default"),
+            "Restore page finished. namespace=default total=10 restored=7 skipped=3 failed=0 truncated=true\nMore blobs remain on-chain (next_cursor=cursor-abc). Run memwal_restore again to continue."
+        );
+
+        let partial = json!({
+            "total": 4,
+            "restored": 3,
+            "skipped": 0,
+            "failed": 1,
+            "has_more": false,
+            "errors": [
+                { "blob_id": "b1", "object_id": "0x1", "error": "decrypt failed" }
+            ]
+        });
+        assert_eq!(
+            format_restore_output(&partial, "work"),
+            "Restore partially complete. namespace=work total=4 restored=3 skipped=0 failed=1 truncated=false\nErrors:\n  - blob_id=b1 object_id=0x1: decrypt failed"
+        );
     }
 }

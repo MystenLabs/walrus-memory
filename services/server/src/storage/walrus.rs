@@ -298,7 +298,7 @@ struct DurableUploadErrorResponse {
     code: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetMetadataBatchEntry {
     pub blob_object_id: String,
