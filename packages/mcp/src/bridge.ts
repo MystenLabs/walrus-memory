@@ -127,6 +127,38 @@ export function annotateHealthResult(
         : `${block.text} account=${accountId}`;
 }
 
+/** Write tools whose replayed calls must carry an idempotency key so the
+ * server can de-duplicate a reconnect replay that re-sends an already-accepted
+ * request. The key is minted once per logical call and mutated into
+ * `params.arguments` before the message is tracked in `inFlight`, so every
+ * replay carries the same key the original POST used. */
+const IDEMPOTENT_WRITE_TOOLS = new Set([
+    "memwal_remember_bulk",
+]);
+
+/**
+ * Inject a stable idempotency key into an outbound `tools/call` for a write
+ * tool. Mutates `msg.params.arguments` in place — call BEFORE the message
+ * is stored in `inFlight` so reconnect replays carry the same key.
+ *
+ * No-op when:
+ *   - the message is not a `tools/call` for a write tool, or
+ *   - the caller already supplied a `_idempotency_key`.
+ */
+export function applyIdempotencyKey(msg: RpcMessage): RpcMessage {
+    if (msg.method !== "tools/call") return msg;
+    const params = msg.params as
+        | { name?: string; arguments?: Record<string, unknown> }
+        | undefined;
+    if (!params || typeof params.name !== "string" || !IDEMPOTENT_WRITE_TOOLS.has(params.name)) {
+        return msg;
+    }
+    const args = (params.arguments ??= {});
+    if (typeof args._idempotency_key === "string") return msg;
+    args._idempotency_key = randomUUID();
+    return msg;
+}
+
 export function applyDefaultNamespace(msg: RpcMessage, namespace?: string): RpcMessage {
     if (!namespace) return msg;
     if (msg.method !== "tools/call") return msg;
@@ -2210,6 +2242,14 @@ export async function runBridge(
                 // forwarded — and any replayed-on-reconnect — copy carries it.
                 applyDefaultNamespace(msg, config.namespace);
 
+                // Stamp write tools with a stable idempotency key, once per
+                // logical call, so a reconnect replay carries the same key as
+                // the original (issue #1045). The MCP server sends it to the
+                // relayer as `idempotency_key` on `/api/remember/bulk`, and the
+                // relayer answers a replayed key with the jobs it already
+                // queued instead of registering a second paid Walrus blob.
+                applyIdempotencyKey(msg);
+
                 // Track `tools/list` requests so the SSE pump can splice
                 // our local tools into the upstream response.
                 if (msg.method === "tools/list" && msg.id != null) {
@@ -2486,11 +2526,13 @@ export async function runBridge(
      *
      * The relayer answers these with HTTP 202 and finishes the work in a
      * durable queue, so a client-side deadline cancels nothing: the write can
-     * still land minutes after we have given up waiting for the reply. And
-     * `/api/remember/bulk` carries no idempotency key — unlike the single
-     * path — so a blind retry mints a second paid blob that `recall` will then
-     * hide behind the first. Telling the user to "please retry" here is how a
-     * lost reply turns into duplicate paid storage. */
+     * still land minutes after we have given up waiting for the reply. And a
+     * retry the agent issues of `memwal_remember_bulk` is a NEW call with a
+     * NEW bridge idempotency key (only a transport replay reuses the key,
+     * unlike the content-derived key on the single path), so a blind retry
+     * mints a second paid blob that `recall` will then hide behind the first.
+     * Telling the user to "please retry" here is how a lost reply turns into
+     * duplicate paid storage. */
     const MUTATING_TOOLS = new Set([
         "memwal_remember",
         "memwal_remember_bulk",

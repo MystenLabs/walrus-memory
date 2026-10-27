@@ -1,8 +1,15 @@
 # @mysten-incubation/memwal-mcp
 
-## 0.0.16
+## 0.0.17
 
-Unreleased. Package and plugin manifests are bumped manually to 0.0.16. The launcher still installs the published 0.0.15 through `mcpPackageVersion` until 0.0.16 is available on npm; retarget that pin after publishing.
+Unreleased. Package and plugin manifests are bumped manually to 0.0.17. The launcher installs the published 0.0.16 through `mcpPackageVersion` until 0.0.17 is available on npm; retarget that pin after publishing.
+
+### Fixed
+
+- `memwal_remember_bulk` no longer registers a second paid Walrus blob when the bridge reconnects and replays the call. The bridge stamps each call with a stable idempotency key before tracking it, and the sidecar sends that key to the relayer, which answers a replayed key with the jobs it already queued. A bulk call the agent retries itself is a new call and gets a new key. (#1045)
+- The plugin launcher installs `@mysten-incubation/memwal-mcp@0.0.16` instead of `0.0.15`.
+
+## 0.0.16
 
 ### Security
 

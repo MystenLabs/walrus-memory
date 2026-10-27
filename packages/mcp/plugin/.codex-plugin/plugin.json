@@ -1,6 +1,6 @@
 {
     "name": "memwal",
-    "version": "0.0.16",
+    "version": "0.0.17",
     "description": "Persistent Walrus Memory for Codex. Remembers decisions, preferences, and project context across sessions.",
     "author": {
         "name": "Mysten Labs",
