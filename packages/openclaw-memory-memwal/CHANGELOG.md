@@ -1,5 +1,11 @@
 # @mysten-incubation/oc-memwal
 
+## 0.0.8
+
+### Fixed
+
+- Update MemWal SDK dependency to `0.1.10`.
+
 ## 0.0.7
 
 ### Fixed

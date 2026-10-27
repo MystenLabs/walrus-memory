@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `waitForRememberJob` throws the exported `MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, and `MemWalRememberJobTimeoutError` classes, which carry `status` and `jobId` and support `instanceof` checks. `waitForRememberJobs` and `rememberBulkAndWait` throw `MemWalRateLimitedError`, which carries `status` and `jobIds`, when every status read for the batch is rate-limited. (#687)
 - `MemWal.recallManual` and `MemWalManual.recallManual` reject a non-finite `scoringWeights` value (`NaN` or `Infinity`) before signing, with the same `scoringWeights.<name> must be a finite number` error as `recall`. `JSON.stringify` rewrote the weight to `null`, so the relayer received `{"semantic": null}` instead of the caller's value. (WALM-861, #1246)
 - A 2xx response that is valid JSON of the wrong shape raises an SDK error that names the endpoint, instead of a raw `TypeError`. `recall`, `analyzeAndWait`, `listMemories`, and `getRememberBulkStatus` (so `waitForRememberJobs`) name the missing `results`, `job_ids`, or `memories` array, and the bulk status error is not retried. `getRememberStatus` returns `not_found` and `waitForRememberJob` throws `MemWalRememberJobNotFoundError` when the status body is null or not an object. (WALM-860, #1247)
 - `remember`, `rememberBulk`, `analyze`, `embed`, and `recall` reject text made only of whitespace and zero-width format characters (U+200B, U+200C, U+200D, U+2060, U+FEFF) before signing, with the same error as blank text. The relayer still accepts that text, and the call used to sit until the client timed out. `MemWalMock` rejects the same set. (WALM-810, #1156)
@@ -12,7 +13,6 @@
 
 ### Fixed
 
-- `waitForRememberJob` throws exported, `instanceof`-checkable error classes (`MemWalRememberJobNotFoundError`, `MemWalRememberJobFailedError`, `MemWalRememberJobTimeoutError`) instead of a plain `Error` with `status`/`jobId` bolted on. `waitForRememberJobs` / `rememberBulkAndWait` throw `MemWalRateLimitedError` (`status`/`jobIds` on the class) when every status read for the batch is rate-limited. (WALM-615, GH #687)
 - `rememberBulk` and `rememberBulkAsync` send an idempotency key derived from the batch (a 30-minute bucket plus each item's namespace and text). A retry inside that window returns the same jobs instead of storing the batch again. An explicit `idempotencyKey` still wins. (#1080)
 - `listMemories()` pages every stored memory without a similarity query. It returns metadata only: no blob download and no decrypt. An optional namespace filter runs on the client, so a filtered page can be empty while `has_more` is true. (WALM-388)
 - `withMemWal` does not recall or auto-save on a tool-execution step. A later tool step reuses the recall cached for that user message. Auto-save still runs only on a user turn. (#1079)
