@@ -399,6 +399,57 @@ mod cors_tests {
         );
     }
 
+    // #1119: the main relayer CORS layer is an allowlist (deny-all when
+    // ALLOWED_ORIGINS is unset), while the emergency security-delete routes
+    // merged after the main layer deliberately emit Access-Control-Allow-Origin: *
+    // so browser-based recovery/deletion tools can call them directly without a proxy.
+    #[tokio::test]
+    async fn relayer_cors_allows_only_listed_origins() {
+        let listed = "https://app.memwal.test";
+        let app = Router::new()
+            .route("/config", get(|| async {}))
+            .layer(relayer_cors(vec![listed.parse().unwrap()]))
+            .merge(
+                Router::new()
+                    .route("/api/security-deletable-blobs", get(|| async {}))
+                    .route("/api/security-delete", post(|| async {}))
+                    .layer(security_delete_cors()),
+            );
+
+        for (origin, allowed) in [(listed, true), ("https://example.com", false)] {
+            let preflight = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/config")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(preflight).await.unwrap();
+            let allow = response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            if allowed {
+                assert_eq!(allow.unwrap(), origin);
+            } else {
+                assert!(allow.is_none(), "unlisted origin {origin} was allowed");
+            }
+
+            let sec_delete_preflight = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/security-deletable-blobs")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap();
+            let sec_delete_response = app.clone().oneshot(sec_delete_preflight).await.unwrap();
+            assert_eq!(
+                sec_delete_response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn relayer_cors_exposes_x_auth_error_and_retry_after() {
         let origin = "https://app.memwal.test";

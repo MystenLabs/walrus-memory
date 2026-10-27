@@ -58,6 +58,7 @@ const memwal = MemWal.create({
 - **Shared App ID** - all users of the managed relayer share the same Walrus Memory package ID. Your own `owner + namespace` (Memory Space) isolates your data, but the underlying deployment is shared.
 - **Trust assumption** - the relayer sees plaintext during encryption and embedding. By using the managed relayer, you're trusting the Walrus Foundation-hosted instance with that data. See [Trust and Security Model](/fundamentals/architecture/data-flow-security-model) for details.
 - **Availability** - the Walrus Foundation provides the managed relayer as a public good without SLA guarantees.
+- **No direct browser access to the main API** - the managed relayer's main API only allows cross-origin requests from Walrus Memory's own apps. For any other origin, preflight and `GET` responses on the main API carry no `Access-Control-Allow-Origin`, so the browser blocks them — call the main relayer API from your server, or through a same-origin proxy, and keep the delegate key server-side (a self-hosted relayer can allow your origins with `ALLOWED_ORIGINS`). As an intentional exception, the emergency [security-delete endpoints](/api/security-delete) (`/api/security-deletable-blobs` and `/api/security-delete`) always send `Access-Control-Allow-Origin: *` so browser-based recovery and deletion tools can call them directly without a backend proxy.
 
 ## Storage costs
 
