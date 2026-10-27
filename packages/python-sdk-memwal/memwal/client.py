@@ -676,7 +676,7 @@ class MemWal:
         if generated_key:
             self._pending_remember_keys.pop(request_identity, None)
         return RememberAcceptedResult(
-            job_id=data["job_id"],
+            job_id=_require(data, "job_id", "POST /api/remember"),
             status=data.get("status", "pending"),
         )
 
@@ -718,6 +718,10 @@ class MemWal:
                 # Status is metadata. No SEAL decrypt, so no session. Matches TS.
                 include_seal_session=False,
             )
+        except MemWalJsonBodyError as err:
+            if err.status != 404:
+                raise
+            data = None
         except (json.JSONDecodeError, UnicodeDecodeError):
             data = None
         if not isinstance(data, dict):
@@ -801,6 +805,10 @@ class MemWal:
                         )
                     else:
                         raise
+            except MemWalJsonBodyError as err:
+                if err.status == 404:
+                    raise MemWalRememberJobNotFound(job_id) from None
+                raise
             except (json.JSONDecodeError, UnicodeDecodeError):
                 raise MemWalRememberJobNotFound(job_id) from None
             except _HttpStatusError as err:
@@ -1587,7 +1595,7 @@ class MemWal:
             raise _destroyed_client_error()
         if response.status_code != 200:
             raise MemWalError(f"Health check failed: {response.status_code}")
-        data = response.json()
+        data = _parse_json_response(response, "GET /health")
         return HealthResult(
             status=_require(data, "status", "GET /health"),
             version=_require(data, "version", "GET /health"),
@@ -1715,7 +1723,7 @@ class MemWal:
             if self._destroyed:
                 raise _destroyed_client_error()
             if version_response.status_code == 200:
-                metadata = version_response.json()
+                metadata = _parse_json_response(version_response, "GET /version")
             elif version_response.status_code in (404, 405):
                 health_response = await self._http.get(f"{self._server_url}/health")
                 if self._destroyed:
@@ -1726,7 +1734,7 @@ class MemWal:
                         f"GET /version returned {version_response.status_code}, "
                         f"and GET /health returned {health_response.status_code}"
                     )
-                metadata = health_response.json()
+                metadata = _parse_json_response(health_response, "GET /health")
             else:
                 raise MemWalError(
                     "Walrus Memory compatibility check failed: "
@@ -1748,7 +1756,11 @@ class MemWal:
         if response.status_code != 200:
             raise MemWalError(f"GET /config returned {response.status_code}")
 
-        data = response.json()
+        data = _parse_json_response(response, "GET /config")
+        if not isinstance(data, dict):
+            raise MemWalError(
+                f"GET /config response was {type(data).__name__}, expected an object"
+            )
         package_id = data.get("packageId")
         network = data.get("network")
         sui_rpc_url = data.get("suiRpcUrl")
@@ -1783,8 +1795,9 @@ class MemWal:
         )
         if response.status_code != 200:
             raise MemWalError(f"Sui GraphQL returned {response.status_code}")
-        body = response.json()
-        obj = (body.get("data") or {}).get("object")
+        body = _parse_json_response(response, f"POST {graphql_url}")
+        data = body.get("data") if isinstance(body, dict) else None
+        obj = data.get("object") if isinstance(data, dict) else None
         if not isinstance(obj, dict) or obj.get("version") is None:
             raise MemWalError(f"Sui GraphQL could not resolve package {package_id}")
         return obj["version"]
@@ -1805,8 +1818,8 @@ class MemWal:
         if response.status_code != 200:
             raise MemWalError(f"sui_getObject returned {response.status_code}")
 
-        body = response.json()
-        result = body.get("result", {})
+        body = _parse_json_response(response, f"POST {sui_rpc_url}")
+        result = body.get("result", {}) if isinstance(body, dict) else {}
         version = None
         if isinstance(result, dict):
             data = result.get("data")
@@ -1929,7 +1942,7 @@ class MemWal:
         )
         if self._destroyed:
             raise _destroyed_client_error()
-        owner = data.get("owner")
+        owner = data.get("owner") if isinstance(data, dict) else None
         if not owner:
             raise MemWalError(
                 "Walrus Memory could not resolve this account's owner address "
@@ -2077,7 +2090,15 @@ class MemWal:
                 retry_after=response.headers.get("retry-after"),
             )
 
-        return response.json()
+        endpoint = f"{method_upper} {path}"
+        data = _parse_json_response(response, endpoint)
+        if response.status_code != 404 and not isinstance(data, dict):
+            raise MemWalJsonBodyError(
+                status=response.status_code,
+                endpoint=endpoint,
+                body=response.text,
+            )
+        return data
 
 
 class MemWalError(Exception):
@@ -2099,6 +2120,71 @@ class MemWalClockDriftError(MemWalError):
     relative to the relayer; sync via NTP or widen the relayer's window."""
 
     pass
+
+
+class MemWalJsonBodyError(MemWalError):
+    """Raised when an HTTP response that should carry JSON has an empty or non-JSON body."""
+
+    def __init__(
+        self,
+        status: int,
+        endpoint: str,
+        body: str,
+        *,
+        empty: bool = False,
+    ) -> None:
+        redacted = _redact_internal_urls(body.strip()[:200]) if body else ""
+        if empty:
+            message = (
+                f"MemWal ({endpoint}): HTTP {status} response had an empty body; "
+                "expected JSON"
+            )
+        elif redacted:
+            message = (
+                f"MemWal ({endpoint}): HTTP {status} response was not JSON: "
+                f"{redacted}"
+            )
+        else:
+            message = f"MemWal ({endpoint}): HTTP {status} response was not JSON"
+        super().__init__(message)
+        self.status = status
+        self.endpoint = endpoint
+        self.body = body
+
+
+def _parse_json_response(response: httpx.Response, endpoint: str) -> Any:
+    """Decode a JSON response body or raise :class:`MemWalJsonBodyError` (#1219).
+
+    Mirrors the TypeScript SDK's ``jsonBodyError`` guard (#1201 / #1207): an
+    empty or non-JSON 2xx response from a relayer or proxy in front of one
+    surfaces as a :class:`MemWalError` naming the endpoint and HTTP status
+    rather than Python's raw :class:`json.JSONDecodeError` or
+    :class:`UnicodeDecodeError`.
+    """
+    try:
+        return response.json()
+    except UnicodeDecodeError as exc:
+        raise MemWalJsonBodyError(
+            status=response.status_code,
+            endpoint=endpoint,
+            body="",
+        ) from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        doc = getattr(exc, "doc", None)
+        if isinstance(doc, str):
+            raw = doc
+        else:
+            try:
+                raw = response.text
+            except UnicodeDecodeError:
+                raw = ""
+        is_empty = not raw or not raw.strip()
+        raise MemWalJsonBodyError(
+            status=response.status_code,
+            endpoint=endpoint,
+            body=raw,
+            empty=is_empty,
+        ) from exc
 
 
 def _redact_internal_urls(text: str) -> str:
