@@ -39,7 +39,7 @@ function publicKeyHex(value: unknown): string | null {
 export function delegateAccountBindingError(
   objectType: unknown,
   fields: unknown,
-  expected: { publicKeyHex: string; packageId: string }
+  expected: { owner?: string; publicKeyHex: string; packageId: string }
 ): string | null {
   if (typeof objectType !== "string") return "Account object has no Move type";
   const [typePackage, moduleName, structName] = objectType.split("::");
@@ -58,6 +58,14 @@ export function delegateAccountBindingError(
 
   const account = fields as Record<string, unknown>;
   if (account.active !== true) return "Walrus Memory account is inactive";
+  if (
+    expected.owner !== undefined &&
+    (typeof account.owner !== "string" ||
+      normalizeSuiAddress(account.owner) !==
+        normalizeSuiAddress(expected.owner))
+  ) {
+    return "Walrus Memory account owner does not match the authenticated wallet";
+  }
   if (!Array.isArray(account.delegate_keys)) {
     return "Walrus Memory account has no delegate key list";
   }
@@ -75,6 +83,8 @@ export function delegateAccountBindingError(
 
 export async function assertDelegateAccountBinding(input: {
   accountId: string;
+  /** Wallet that must own the account. Omit only when no wallet is known. */
+  owner?: string;
   publicKeyHex: string;
 }): Promise<void> {
   if (!/^0x[0-9a-f]{64}$/i.test(input.accountId)) {
@@ -100,6 +110,7 @@ export async function assertDelegateAccountBinding(input: {
       );
     }
     const mockError = delegateAccountBindingError(mocked.type, mocked.json, {
+      owner: input.owner,
       publicKeyHex: input.publicKeyHex,
       packageId: enokiConfig.memwalPackageId,
     });
@@ -129,6 +140,7 @@ export async function assertDelegateAccountBinding(input: {
     response.object?.type,
     response.object?.json,
     {
+      owner: input.owner,
       publicKeyHex: input.publicKeyHex,
       packageId: enokiConfig.memwalPackageId,
     }
