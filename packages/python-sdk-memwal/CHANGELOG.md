@@ -1,21 +1,12 @@
 # memwal
 
-## 0.3.0
-
-### Added
-
-- `forget(namespace=None)` on `MemWal` and `MemWalSync` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It deletes the owner's index rows for the namespace; the Walrus blobs stay in place. (#1061)
-
-### Changed
-
-- **Breaking (mock):** `MemWalMock.forget(blob_id)` is renamed to `forget_blob(blob_id)`. `MemWalMock.forget` now matches the client: it is async, clears a namespace, and returns `ForgetResult`. An un-awaited `assert mock.forget(blob_id)` in an existing test gets a truthy coroutine and passes without deleting anything, so move those calls to `forget_blob`. (#1061)
-
 ## 0.2.2
 
 Unreleased.
 
 ### Added
 
+- `forget(namespace=None)` (and alias `forget_namespace(namespace=None)`) on `MemWal` and `MemWalSync` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It deletes the owner's index rows for the namespace while leaving Walrus blobs in place. `MemWalMock` and `MemWalMockSync` retain synchronous per-blob `forget(blob_id) -> bool` and add `forget_namespace(namespace=None) -> ForgetResult` for namespace erasure. (#1061)
 - `MemWal.destroy()` and `MemWalSync.destroy()` (plus `close(clear_keys=True)`) zero the client's internal `bytearray` seed copy in place, clear `_private_key_hex`, drop `_signing_key` and cached SEAL session credentials, cancel in-flight initialization tasks, and reject any subsequent or in-flight operation with `MemWalError`. `MemWal.create()` and `MemWalSync.create()` also accept 32-byte `bytes` / `bytearray` keys and copy caller `bytearray` buffers so `destroy()` leaves the caller's buffer intact. (#975)
 
 ### Fixed

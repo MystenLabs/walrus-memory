@@ -1258,11 +1258,16 @@ class MemWal:
             {"namespace": resolved_namespace},
             include_seal_session=False,
         )
+        endpoint = "POST /api/forget"
         return ForgetResult(
-            deleted=int(data["deleted"]),
-            namespace=data["namespace"],
-            owner=data["owner"],
+            deleted=int(_require(data, "deleted", endpoint)),
+            namespace=_require(data, "namespace", endpoint),
+            owner=_require(data, "owner", endpoint),
         )
+
+    async def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Alias for :meth:`forget` matching :meth:`MemWalMock.forget_namespace`."""
+        return await self.forget(namespace)
 
     async def analyze(
         self,
@@ -2419,6 +2424,10 @@ class MemWalSync:
     def forget(self, namespace: Optional[str] = None) -> ForgetResult:
         """Synchronous version of :meth:`MemWal.forget`."""
         return self._run(self._inner.forget(namespace))
+
+    def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget_namespace`."""
+        return self._run(self._inner.forget_namespace(namespace))
 
     def analyze(
         self,

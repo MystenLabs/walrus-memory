@@ -39,7 +39,12 @@ async def test_forget_posts_the_client_namespace():
     )
     result = await client.forget()
     assert result == ForgetResult(deleted=2, namespace="profile", owner="0xowner")
-    assert client.captured == [("POST", "/api/forget", {"namespace": "profile"})]
+    alias = await client.forget_namespace("custom")
+    assert alias == ForgetResult(deleted=2, namespace="custom", owner="0xowner")
+    assert client.captured == [
+        ("POST", "/api/forget", {"namespace": "profile"}),
+        ("POST", "/api/forget", {"namespace": "custom"}),
+    ]
     await client.close()
 
 
@@ -53,6 +58,8 @@ async def test_forget_rejects_empty_namespace_without_deleting_default():
     )
     with pytest.raises(ValueError, match="namespace cannot be empty"):
         await client.forget("")
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        await client.forget_namespace("")
     assert client.captured == []
     await client.close()
 
@@ -60,6 +67,8 @@ async def test_forget_rejects_empty_namespace_without_deleting_default():
 def test_sync_client_has_forget():
     assert hasattr(MemWal, "forget")
     assert hasattr(MemWalSync, "forget")
+    assert hasattr(MemWal, "forget_namespace")
+    assert hasattr(MemWalSync, "forget_namespace")
     sync_client = MemWalSync(
         CaptureMemWal.create(
             key="11" * 32,
@@ -70,5 +79,13 @@ def test_sync_client_has_forget():
     )
     with pytest.raises(ValueError, match="namespace cannot be empty"):
         sync_client.forget("")
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        sync_client.forget_namespace("")
     assert sync_client._inner.captured == []
+    assert sync_client.forget_namespace("archive") == ForgetResult(
+        deleted=2, namespace="archive", owner="0xowner"
+    )
+    assert sync_client._inner.captured == [
+        ("POST", "/api/forget", {"namespace": "archive"})
+    ]
     sync_client.close()
