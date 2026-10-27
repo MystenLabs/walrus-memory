@@ -28,10 +28,14 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  Version 0.1.11 copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, and adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal.
+  Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, and adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal.
 ---
 
 ## 0.1.11
+
+### Added
+
+- `remember`, `rememberAsync`, and `rememberAndWait` accept `{ dedupe: true }` (`RememberOptions` / `RememberWaitOptions`) for opt-in content-hash deduplication per `(owner, namespace, text)` without a 30-minute time window. When `dedupe: true` is set, the client derives a bucket-less `dedupe:<sha256>` key and sends `dedupe: true` to `POST /api/remember`, collapsing duplicate writes onto the existing live job and `blob_id` while writing fresh if the memory was later forgotten or deleted. `MemWalMock` mirrors the same behavior. (#769)
 
 ### Fixed
 

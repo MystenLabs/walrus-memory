@@ -8,6 +8,8 @@ import type {
     RecallParams,
     RecallResult,
     RelayerVersionMetadata,
+    RememberOptions,
+    RememberWaitOptions,
     RememberAcceptedResult,
     RememberBulkAcceptedResult,
     RememberBulkItem,
@@ -30,11 +32,7 @@ import { MemWalRememberJobNotFoundError } from "./errors.js";
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
 const MAX_BULK_ITEMS = 20;
 
-interface RememberCallOptions {
-    idempotencyKey?: string;
-    pollIntervalMs?: number;
-    timeoutMs?: number;
-}
+interface RememberCallOptions extends RememberWaitOptions {}
 
 /** A plain object in the namespace slot is options, not a namespace.
  * A third options argument is merged, and its fields win. (#1142) */
@@ -210,6 +208,8 @@ export class MemWalMock {
     private readonly jobs = new Map<string, MockMemory>();
     /** idempotency key → job id. Released when that job's memory is forgotten. */
     private readonly idempotency = new Map<string, string>();
+    /** content-dedupe key (`namespace\0text`) → job id for `dedupe: true` writes. */
+    private readonly dedupe = new Map<string, string>();
     private sequence = 0;
 
     private constructor(config: MemWalMockConfig = {}) {
@@ -229,12 +229,13 @@ export class MemWalMock {
         this.memories.length = 0;
         this.jobs.clear();
         this.idempotency.clear();
+        this.dedupe.clear();
     }
 
     async rememberAsync(
         text: string,
-        namespaceOrOptions?: string | { idempotencyKey?: string },
-        options?: { idempotencyKey?: string },
+        namespaceOrOptions?: string | RememberOptions,
+        options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         requireRememberText(text);
         const split = splitRememberArgs(namespaceOrOptions, options);
@@ -243,14 +244,16 @@ export class MemWalMock {
             split.namespace,
             undefined,
             split.options.idempotencyKey,
+            false,
+            split.options.dedupe === true,
         );
         return { job_id: memory.jobId, status: "done" };
     }
 
     async remember(
         text: string,
-        namespaceOrOptions?: string | { idempotencyKey?: string },
-        options?: { idempotencyKey?: string },
+        namespaceOrOptions?: string | RememberOptions,
+        options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         return this.rememberAsync(text, namespaceOrOptions, options);
     }
@@ -284,6 +287,7 @@ export class MemWalMock {
         const split = splitRememberArgs(namespaceOrOptions, opts);
         const accepted = await this.rememberAsync(text, split.namespace, {
             idempotencyKey: split.options.idempotencyKey,
+            dedupe: split.options.dedupe,
         });
         return this.waitForRememberJob(accepted.job_id, split.options);
     }
@@ -678,6 +682,7 @@ export class MemWalMock {
         blobId?: string,
         idempotencyKey?: string,
         skipKeyValidation: boolean = false,
+        dedupe: boolean = false,
     ): MockMemory {
         validateText(text);
         if (!skipKeyValidation) {
@@ -685,7 +690,13 @@ export class MemWalMock {
         }
         const resolvedNamespace = namespace ?? this.namespace;
         if (!resolvedNamespace) throw new Error("namespace cannot be empty");
-        if (idempotencyKey !== undefined) {
+        if (dedupe) {
+            const dedupeKey = `${resolvedNamespace}\0${text}`;
+            const existingId = this.dedupe.get(dedupeKey);
+            const existingDedupe = existingId ? this.jobs.get(existingId) : undefined;
+            if (existingDedupe) return existingDedupe;
+            if (existingId) this.dedupe.delete(dedupeKey);
+        } else if (idempotencyKey !== undefined) {
             const mapKey = `${resolvedNamespace}\0${idempotencyKey}`;
             const existingId = this.idempotency.get(mapKey);
             const existing = existingId ? this.jobs.get(existingId) : undefined;
@@ -711,7 +722,9 @@ export class MemWalMock {
         };
         this.memories.push(memory);
         this.jobs.set(memory.jobId, memory);
-        if (idempotencyKey !== undefined) {
+        if (dedupe) {
+            this.dedupe.set(`${resolvedNamespace}\0${text}`, memory.jobId);
+        } else if (idempotencyKey !== undefined) {
             this.idempotency.set(`${resolvedNamespace}\0${idempotencyKey}`, memory.jobId);
         }
         return memory;
@@ -720,6 +733,9 @@ export class MemWalMock {
     private releaseIdempotency(jobId: string): void {
         for (const [key, id] of this.idempotency) {
             if (id === jobId) this.idempotency.delete(key);
+        }
+        for (const [key, id] of this.dedupe) {
+            if (id === jobId) this.dedupe.delete(key);
         }
     }
 

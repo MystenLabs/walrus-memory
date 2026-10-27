@@ -41,6 +41,15 @@ export async function derivedIdempotencyKey(requestIdentity: string): Promise<st
     return `r1-${await sha256hex(`${bucket}\0${requestIdentity}`)}`;
 }
 
+/**
+ * Bucket-less content-hash idempotency key for opt-in `dedupe: true` (#769).
+ * Resolves identical `(namespace, text)` writes on the same client to one key
+ * across 30-minute time-bucket boundaries.
+ */
+export async function derivedContentDedupeKey(requestIdentity: string): Promise<string> {
+    return `dedupe:${await sha256hex(requestIdentity)}`;
+}
+
 export async function derivedBulkIdempotencyKey(requestIdentity: string): Promise<string> {
     const bucket = Math.floor(Date.now() / IDEMPOTENCY_BUCKET_MS);
     return `b1-${await sha256hex(`${bucket}\0${requestIdentity}`)}`;

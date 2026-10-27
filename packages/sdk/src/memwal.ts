@@ -53,6 +53,8 @@ import type {
     RememberBulkOptions,
     RememberBulkAsyncOptions,
     RememberBulkResult,
+    RememberOptions,
+    RememberWaitOptions,
     RememberAcceptedResult,
     RememberJobStatus,
     RememberBulkAcceptedResult,
@@ -74,6 +76,7 @@ import {
     assertFiniteScoringWeights,
     scoringWeightsToWire,
     derivedIdempotencyKey,
+    derivedContentDedupeKey,
     derivedBulkIdempotencyKey,
     DEFAULT_PREFLIGHT_TIMEOUT_MS,
     DEFAULT_RECALL_TIMEOUT_MS,
@@ -183,18 +186,7 @@ const CONFIRM_READ_TIMEOUT_MS = 5_000;
 /** Matches the relayer's `MAX_BULK_ITEMS`. Reject before a signed request. */
 const MAX_BULK_ITEMS = 20;
 
-interface RememberCallOptions {
-    /**
-     * Optional idempotency key to prevent duplicate writes on retries.
-     * Idempotency keys are scoped per (owner, namespace), so identical
-     * keys across different namespaces will not collide. Retrying within
-     * the same namespace with the same key dedupes, while reusing a key
-     * with different text in the same namespace produces HTTP 409 Conflict.
-     */
-    idempotencyKey?: string;
-    pollIntervalMs?: number;
-    timeoutMs?: number;
-}
+interface RememberCallOptions extends RememberWaitOptions {}
 
 /**
  * `remember(text, { idempotencyKey })` is the natural call when the namespace
@@ -620,27 +612,41 @@ export class MemWal {
      */
     async rememberAsync(
         text: string,
-        namespaceOrOptions?: string | { idempotencyKey?: string },
-        options?: { idempotencyKey?: string },
+        namespaceOrOptions?: string | RememberOptions,
+        options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         requireRememberText(text);
         assertNonBlankText(text);
         const split = splitRememberArgs(namespaceOrOptions, options);
         const resolvedNamespace = split.namespace ?? this.namespace;
+        const dedupe = split.options.dedupe === true;
         const requestIdentity = `${resolvedNamespace}\0${text}`;
+        const pendingIdentity = dedupe ? `dedupe\0${requestIdentity}` : requestIdentity;
         const generatedKey = split.options.idempotencyKey === undefined;
         const idempotencyKey = split.options.idempotencyKey
-            ?? this.pendingRememberKeys.get(requestIdentity)
-            ?? (await derivedIdempotencyKey(requestIdentity));
-        if (generatedKey) this.pendingRememberKeys.set(requestIdentity, idempotencyKey);
+            ?? this.pendingRememberKeys.get(pendingIdentity)
+            ?? (dedupe
+                ? await derivedContentDedupeKey(requestIdentity)
+                : await derivedIdempotencyKey(requestIdentity));
+        if (generatedKey) this.pendingRememberKeys.set(pendingIdentity, idempotencyKey);
+
+        const body: {
+            text: string;
+            namespace: string;
+            idempotency_key: string;
+            dedupe?: boolean;
+        } = { text, namespace: resolvedNamespace, idempotency_key: idempotencyKey };
+        if (dedupe) {
+            body.dedupe = true;
+        }
 
         const accepted = await this.signedRequest<RememberAcceptedResult>(
             "POST",
             "/api/remember",
-            { text, namespace: resolvedNamespace, idempotency_key: idempotencyKey },
+            body,
             [200, 202],
         );
-        if (generatedKey) this.pendingRememberKeys.delete(requestIdentity);
+        if (generatedKey) this.pendingRememberKeys.delete(pendingIdentity);
         return accepted;
     }
 
@@ -789,20 +795,27 @@ export class MemWal {
         requireRememberText(text);
         const split = splitRememberArgs(namespaceOrOptions, opts);
         const resolvedNamespace = split.namespace ?? this.namespace;
+        const dedupe = split.options.dedupe === true;
         const requestIdentity = `${resolvedNamespace}\0${text}`;
+        const pendingIdentity = dedupe ? `dedupe\0${requestIdentity}` : requestIdentity;
         const generatedKey = split.options.idempotencyKey === undefined;
         const idempotencyKey = split.options.idempotencyKey
-            ?? this.pendingRememberKeys.get(requestIdentity)
-            ?? (await derivedIdempotencyKey(requestIdentity));
-        if (generatedKey) this.pendingRememberKeys.set(requestIdentity, idempotencyKey);
+            ?? this.pendingRememberKeys.get(pendingIdentity)
+            ?? (dedupe
+                ? await derivedContentDedupeKey(requestIdentity)
+                : await derivedIdempotencyKey(requestIdentity));
+        if (generatedKey) this.pendingRememberKeys.set(pendingIdentity, idempotencyKey);
 
         // Pass the resolved string. rememberAsync would otherwise read the
         // options object in this slot as a namespace. (#1142)
-        const accepted = await this.rememberAsync(text, resolvedNamespace, { idempotencyKey });
+        const accepted = await this.rememberAsync(text, resolvedNamespace, {
+            idempotencyKey,
+            ...(dedupe ? { dedupe: true } : {}),
+        });
         const completed = await this.waitForRememberJob(accepted.job_id, split.options);
         // Clear only after terminal success. A polling timeout/transport failure
         // keeps the key so retrying the high-level operation reuses the same job.
-        if (generatedKey) this.pendingRememberKeys.delete(requestIdentity);
+        if (generatedKey) this.pendingRememberKeys.delete(pendingIdentity);
         return completed;
     }
 
@@ -813,12 +826,12 @@ export class MemWal {
      * Use rememberAndWait() when the caller needs the final blob_id before continuing.
      *
      * A plain object in the namespace position is options, so
-     * `remember(text, { idempotencyKey })` keeps the client namespace. (#1142)
+     * `remember(text, { idempotencyKey, dedupe })` keeps the client namespace. (#1142, #769)
      */
     async remember(
         text: string,
-        namespaceOrOptions?: string | { idempotencyKey?: string },
-        options?: { idempotencyKey?: string },
+        namespaceOrOptions?: string | RememberOptions,
+        options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         return this.rememberAsync(text, namespaceOrOptions, options);
     }

@@ -63,9 +63,11 @@ consume recall's budget.
 
 ## `MemWal` Methods
 
-### `remember(text, namespace?): Promise<RememberAcceptedResult>`
+### `remember(text, namespace?, options?): Promise<RememberAcceptedResult>`
 
 Submit one memory through the relayer. The method returns after the relayer creates a background job; embedding, SEAL encryption, Walrus upload, and vector indexing continue asynchronously.
+
+Pass `{ idempotencyKey?: string; dedupe?: boolean }` either as `options` or in the `namespace` position when using the client default namespace. When `dedupe: true` is set, identical `(owner, namespace, text)` writes resolve to the existing live remember job and `blob_id` without a time window, and write fresh if the memory was later forgotten or deleted.
 
 HTTP 426 throws `MemWalCompatibilityError`.
 
@@ -80,7 +82,7 @@ HTTP 426 throws `MemWalCompatibilityError`.
 
 ### `rememberAndWait(text, namespace?, opts?): Promise<RememberResult>`
 
-Submit one memory and poll until the background job completes.
+Submit one memory and poll until the background job completes. Accepts `{ idempotencyKey?: string; dedupe?: boolean; pollIntervalMs?: number; timeoutMs?: number }` in `opts` (or in the `namespace` position when using the client default namespace).
 
 **Returns:**
 

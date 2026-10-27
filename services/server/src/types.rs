@@ -1861,6 +1861,15 @@ pub struct RememberRequest {
     /// paid on-chain blob. Omit for the default (each request is independent).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Opt-in content-hash dedupe (#769). When true the server derives the
+    /// idempotency key from `(owner, namespace, text)`, so remembering the
+    /// same text twice returns the first job — and therefore its `blob_id` —
+    /// instead of paying for a second Walrus write and embedding call.
+    /// Overrides `idempotency_key` when both are set, because the first-party
+    /// SDKs always send an auto-generated one. Defaults to false: without it
+    /// every request stays an independent write.
+    #[serde(default)]
+    pub dedupe: bool,
 }
 
 // ============================================================
