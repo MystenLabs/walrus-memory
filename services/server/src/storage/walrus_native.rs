@@ -473,7 +473,7 @@ impl InProcessUploadLimiter {
         let _queued_guard = QueuedWaiterGuard { limiter: self };
         if current_queued >= self.max_queue_depth {
             return Err(format!(
-                "Walrus upload queue full ({}/{} queued)",
+                "Timed out waiting for Walrus upload slot: Walrus upload queue full ({}/{} queued)",
                 current_queued, self.max_queue_depth
             ));
         }
@@ -1365,12 +1365,24 @@ async fn resolve_owned_object_ref(
     Ok((addr, version, digest))
 }
 
-/// Resolves owned object `(Address, version, Digest)` triples for `object_ids` in batches of 50
-/// using `BatchGetObjectsRequest` (`M-THROUGHPUT`).
+fn extract_address_owner_from_proto(
+    owner: Option<&sui_rpc::proto::sui::rpc::v2::Owner>,
+) -> Option<Address> {
+    let o = owner?;
+    if let Some(kind) = o.kind {
+        if kind != sui_rpc::proto::sui::rpc::v2::owner::OwnerKind::Address as i32 {
+            return None;
+        }
+    }
+    o.address.as_deref()?.trim().parse::<Address>().ok()
+}
+
+/// Resolves owned object `(Address, version, Digest, Option<Address>)` tuples for `object_ids`
+/// in batches of 50 using `BatchGetObjectsRequest` (`M-THROUGHPUT`).
 async fn resolve_owned_object_refs_batch(
     grpc_url: &str,
     object_ids: &[String],
-) -> Result<Vec<(Address, u64, Digest)>, String> {
+) -> Result<Vec<(Address, u64, Digest, Option<Address>)>, String> {
     if object_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1391,7 +1403,12 @@ async fn resolve_owned_object_refs_batch(
         }
         let mut batch_req = BatchGetObjectsRequest::default();
         batch_req.requests = reqs;
-        batch_req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
+        batch_req.read_mask = Some(FieldMask::from_paths([
+            "object_id",
+            "version",
+            "digest",
+            "owner",
+        ]));
 
         let batch_resp = client
             .ledger_client()
@@ -1422,7 +1439,8 @@ async fn resolve_owned_object_refs_batch(
             let digest: Digest = digest_str
                 .parse()
                 .map_err(|e| format!("invalid digest '{digest_str}' for {id_str}: {e}"))?;
-            out.push((addr, version, digest));
+            let owner_addr = extract_address_owner_from_proto(obj.owner.as_ref());
+            out.push((addr, version, digest, owner_addr));
         }
     }
     Ok(out)
@@ -2657,7 +2675,7 @@ pub async fn advance_durable_upload_in_process(
             && !existing_wallet.trim().eq_ignore_ascii_case(&sender_str)
         {
             return Err(AppError::Conflict(
-                "keyIndex no longer maps to the journaled wallet".into(),
+                "WALLET_MAPPING_MISMATCH: keyIndex no longer maps to the journaled wallet".into(),
             ));
         }
     } else {
@@ -2822,7 +2840,9 @@ pub async fn advance_durable_upload_in_process(
                 Ok(PreparedStepAdvance::Executed(out)) => out,
                 Err(err) => {
                     invalidate_walrus_system_snapshot_cache().await;
-                    return Err(AppError::Internal(err));
+                    return Err(AppError::Internal(format!(
+                        "The registration transaction was not successful: {err}"
+                    )));
                 }
             };
 
@@ -3015,6 +3035,80 @@ pub async fn advance_durable_upload_in_process(
 // 6. Batch Metadata & Ownership Transfer (`set_metadata_batch_in_process`)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconcile_metadata_batch_entries<'a>(
+    blobs: &'a [SetMetadataBatchEntry],
+    resolved_refs: &[(Address, u64, Digest, Option<Address>)],
+    onchain_metadata: &HashMap<String, HashMap<String, String>>,
+    sender: Address,
+    owner: Address,
+    expected_package_id: &str,
+    expected_agent_id: Option<&str>,
+) -> Result<Vec<(&'a SetMetadataBatchEntry, (Address, u64, Digest))>, AppError> {
+    let expected_owner_str = owner.to_string();
+    let expected_pkg = expected_package_id.trim();
+    let expected_agent = expected_agent_id.map(str::trim).filter(|s| !s.is_empty());
+
+    let mut pending = Vec::with_capacity(blobs.len());
+    for (entry, &(blob_addr, blob_ver, blob_digest, current_owner)) in
+        blobs.iter().zip(resolved_refs.iter())
+    {
+        let expected_ns = if entry.namespace.trim().is_empty() {
+            "default"
+        } else {
+            entry.namespace.trim()
+        };
+
+        if current_owner == Some(owner) {
+            let meta = onchain_metadata.get(&entry.blob_object_id);
+            let meta_ns = meta.and_then(|m| m.get("memwal_namespace").map(String::as_str));
+            let meta_owner = meta.and_then(|m| m.get("memwal_owner").map(String::as_str));
+            let meta_pkg = meta.and_then(|m| m.get("memwal_package_id").map(String::as_str));
+            let meta_agent = meta.and_then(|m| m.get("memwal_agent_id").map(String::as_str));
+
+            let owner_matches = meta_owner
+                .and_then(|o| o.parse::<Address>().ok())
+                .is_some_and(|o| o == owner)
+                || meta_owner.is_some_and(|o| o.eq_ignore_ascii_case(&expected_owner_str));
+            let ns_matches = meta_ns == Some(expected_ns);
+            let pkg_matches = expected_pkg.is_empty()
+                || meta_pkg
+                    .and_then(|p| p.parse::<Address>().ok())
+                    .zip(expected_pkg.parse::<Address>().ok())
+                    .is_some_and(|(a, b)| a == b)
+                || meta_pkg.is_some_and(|p| p.eq_ignore_ascii_case(expected_pkg));
+            let agent_matches = match expected_agent {
+                None => true,
+                Some(exp_agent) => {
+                    meta_agent == Some(exp_agent) || (meta_agent.is_none() && sender == owner)
+                }
+            };
+
+            if !(owner_matches && ns_matches && pkg_matches && agent_matches) {
+                return Err(AppError::Internal(format!(
+                    "METADATA_RECEIPT_MISMATCH: {}",
+                    entry.blob_object_id
+                )));
+            }
+
+            // When sender == owner, registration already placed the blob at `owner`, so we still
+            // need to stamp the batch metadata unless `memwal_agent_id` was already written.
+            if sender == owner && !(expected_agent.is_some() && meta_agent == expected_agent) {
+                pending.push((entry, (blob_addr, blob_ver, blob_digest)));
+            }
+        } else if current_owner == Some(sender) {
+            pending.push((entry, (blob_addr, blob_ver, blob_digest)));
+        } else {
+            return Err(AppError::Conflict(format!(
+                "BLOB_OWNER_MISMATCH: {}",
+                entry.blob_object_id
+            )));
+        }
+    }
+
+    Ok(pending)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn set_metadata_batch_in_process(
     http: &reqwest::Client,
@@ -3039,6 +3133,38 @@ pub async fn set_metadata_batch_in_process(
         .parse()
         .map_err(|e| AppError::Internal(format!("invalid owner address '{owner_address}': {e}")))?;
 
+    let SealPersistence::V1New {
+        account_id,
+        registry_id,
+        policy_package_id,
+    } = seal_persistence;
+
+    let reg_addr: Address = registry_id
+        .parse()
+        .map_err(|e| AppError::Internal(format!("invalid registry_id '{registry_id}': {e}")))?;
+    let acct_addr: Address = account_id
+        .parse()
+        .map_err(|e| AppError::Internal(format!("invalid account_id '{account_id}': {e}")))?;
+
+    // Validate all Seal fence ciphertexts up-front before inspecting on-chain state so
+    // malformed ciphertexts fail deterministically even on retry after partial transfer.
+    for entry in &blobs {
+        if let Some(enc_b64) = &entry.encrypted_data {
+            let enc_bytes = base64::engine::general_purpose::STANDARD
+                .decode(enc_b64)
+                .map_err(|e| {
+                    AppError::Internal(format!("invalid encryptedData base64 in batch: {e}"))
+                })?;
+            validate_seal_persistence_ciphertext(
+                &enc_bytes,
+                package_id,
+                policy_package_id,
+                &runtime.seal_policy_package_id,
+            )
+            .map_err(AppError::Internal)?;
+        }
+    }
+
     let system = resolve_walrus_system_snapshot(
         &runtime.grpc_url,
         &runtime.sui_network,
@@ -3048,21 +3174,8 @@ pub async fn set_metadata_batch_in_process(
     .await
     .map_err(AppError::Internal)?;
 
-    let SealPersistence::V1New {
-        account_id,
-        registry_id,
-        policy_package_id,
-    } = seal_persistence;
-
     // Resolve shared object versions once before the loop and batch-fetch all owned blob
     // object refs in a single `BatchGetObjects` gRPC call (`M-THROUGHPUT`).
-    let reg_addr: Address = registry_id
-        .parse()
-        .map_err(|e| AppError::Internal(format!("invalid registry_id '{registry_id}': {e}")))?;
-    let acct_addr: Address = account_id
-        .parse()
-        .map_err(|e| AppError::Internal(format!("invalid account_id '{account_id}': {e}")))?;
-
     let object_ids: Vec<String> = blobs.iter().map(|b| b.blob_object_id.clone()).collect();
     let (shared_versions_res, resolved_refs_res) = tokio::join!(
         crate::storage::seal_native::fetch_shared_object_versions(
@@ -3075,11 +3188,52 @@ pub async fn set_metadata_batch_in_process(
     let (acct_ver, reg_ver) = shared_versions_res.unwrap_or((1, 1));
     let resolved_refs = resolved_refs_res.map_err(AppError::Internal)?;
 
+    let already_at_owner_ids: Vec<String> = blobs
+        .iter()
+        .zip(resolved_refs.iter())
+        .filter_map(|(entry, &(_, _, _, current_owner))| {
+            if current_owner == Some(owner) {
+                Some(entry.blob_object_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let onchain_metadata = if already_at_owner_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let mut client = shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::Internal)?;
+        let mut batch_meta =
+            batch_read_blob_metadata_maps(&mut client, &already_at_owner_ids).await;
+        for id in &already_at_owner_ids {
+            if !batch_meta.contains_key(id) {
+                let map = read_blob_metadata_map(&mut client, id).await;
+                if !map.is_empty() {
+                    batch_meta.insert(id.clone(), map);
+                }
+            }
+        }
+        batch_meta
+    };
+
+    let pending = reconcile_metadata_batch_entries(
+        &blobs,
+        &resolved_refs,
+        &onchain_metadata,
+        sender,
+        owner,
+        package_id,
+        agent_id,
+    )?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
     let mut builder = TransactionBuilder::new();
-    let mut blob_args = Vec::with_capacity(blobs.len());
+    let mut blob_args = Vec::with_capacity(pending.len());
     let canonical_owner_str = owner.to_string();
 
-    for (entry, (blob_addr, blob_ver, blob_digest)) in blobs.iter().zip(resolved_refs) {
+    for (entry, (blob_addr, blob_ver, blob_digest)) in &pending {
         if let Some(enc_b64) = &entry.encrypted_data {
             let enc_bytes = base64::engine::general_purpose::STANDARD
                 .decode(enc_b64)
@@ -3100,7 +3254,7 @@ pub async fn set_metadata_batch_in_process(
             .map_err(AppError::Internal)?;
         }
 
-        let blob_arg = builder.object(ObjectInput::owned(blob_addr, blob_ver, blob_digest));
+        let blob_arg = builder.object(ObjectInput::owned(*blob_addr, *blob_ver, *blob_digest));
         blob_args.push(blob_arg);
 
         let ns = if entry.namespace.trim().is_empty() {
@@ -3137,7 +3291,7 @@ pub async fn set_metadata_batch_in_process(
     builder.transfer_objects(blob_args, owner_arg);
 
     let ptb = finalize_offline_ptb(builder, sender).map_err(AppError::Internal)?;
-    let count = blobs.len();
+    let count = pending.len();
     let mut allowed_addrs = vec![sender.to_string()];
     if owner != sender {
         allowed_addrs.push(owner.to_string());
@@ -3482,6 +3636,22 @@ fn extract_verified_creation_sender_from_graphql_tx(
         .map(|a| a.to_string())
 }
 
+fn shared_graphql_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn extract_raw_blob_id(json_val: Option<&serde_json::Value>) -> String {
+    json_val
+        .and_then(|v| v.get("blob_id"))
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 async fn post_sui_graphql_query(
     http: &reqwest::Client,
     graphql_url: &str,
@@ -3514,7 +3684,8 @@ async fn post_sui_graphql_query(
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("GraphQL error");
-            return Err(format!("Sui GraphQL provenance query error: {msg}"));
+            let sanitized = crate::sui::enoki::sanitize_upstream_error_for_logging(msg);
+            return Err(format!("Sui GraphQL provenance query error: {sanitized}"));
         }
     }
 
@@ -3781,8 +3952,8 @@ pub(crate) async fn find_blob_creation_sender(
 
     // 2. Fallback to archival Sui GraphQL (`objectVersionsBefore(first: 1)` + `previousTransaction`).
     if let Some(graphql_url) = default_sui_graphql_url(sui_network) {
-        let http = reqwest::Client::new();
-        match query_creation_sender_via_graphql(&http, &graphql_url, &canonical_object_id).await {
+        let http = shared_graphql_http_client();
+        match query_creation_sender_via_graphql(http, &graphql_url, &canonical_object_id).await {
             Ok(Some(sender)) => {
                 set_cached_blob_provenance(canonical_object_id, sender.clone());
                 return Ok(Some(sender));
@@ -3927,15 +4098,7 @@ pub async fn query_blobs_by_owner_in_process(
             continue;
         };
         let json_val = obj.json.as_deref().map(prost_to_json);
-        let raw_blob_id = json_val
-            .as_ref()
-            .and_then(|v| v.get("blob_id"))
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .unwrap_or_default();
+        let raw_blob_id = extract_raw_blob_id(json_val.as_ref());
         if raw_blob_id.is_empty() {
             continue;
         }
@@ -4048,12 +4211,11 @@ pub async fn query_blob_storage_leases_in_process(
                 continue;
             };
             let json_val = obj.json.as_deref().map(prost_to_json);
-            let raw_blob_id = json_val
-                .as_ref()
-                .and_then(|v| v.get("blob_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let blob_id = decimal_u256_to_blob_id(raw_blob_id);
+            let raw_blob_id = extract_raw_blob_id(json_val.as_ref());
+            if raw_blob_id.is_empty() {
+                continue;
+            }
+            let blob_id = decimal_u256_to_blob_id(&raw_blob_id);
             if !requested.contains(blob_id.as_str()) {
                 continue;
             }
@@ -4159,13 +4321,12 @@ pub async fn find_blob_by_job_in_process(
 
                 if job_matches && owner_matches {
                     let json_val = obj.json.as_deref().map(prost_to_json);
-                    let raw_blob_id = json_val
-                        .as_ref()
-                        .and_then(|v| v.get("blob_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
+                    let raw_blob_id = extract_raw_blob_id(json_val.as_ref());
+                    if raw_blob_id.is_empty() {
+                        continue;
+                    }
                     return Ok(Some(FoundBlobByJob {
-                        blob_id: decimal_u256_to_blob_id(raw_blob_id),
+                        blob_id: decimal_u256_to_blob_id(&raw_blob_id),
                         object_id: Some(object_id),
                     }));
                 }
@@ -5531,5 +5692,131 @@ mod tests {
         })
         .expect("serialize HashedAuthPackage");
         assert_eq!(auth_pkg_bcs.len(), 72);
+    }
+
+    #[test]
+    fn reconcile_metadata_batch_entries_skips_verified_owner_and_rejects_mismatch() {
+        let sender: Address = "0x00000000000000000000000000000000000000000000000000000000000000a1"
+            .parse()
+            .unwrap();
+        let owner: Address = "0x00000000000000000000000000000000000000000000000000000000000000b2"
+            .parse()
+            .unwrap();
+        let stranger: Address =
+            "0x00000000000000000000000000000000000000000000000000000000000000c3"
+                .parse()
+                .unwrap();
+        let pkg = "0x00000000000000000000000000000000000000000000000000000000000000d4";
+
+        let obj1_str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let obj2_str = "0x0000000000000000000000000000000000000000000000000000000000000002";
+        let obj1: Address = obj1_str.parse().unwrap();
+        let obj2: Address = obj2_str.parse().unwrap();
+        let dummy_digest = Digest::from([7u8; 32]);
+
+        let blobs = vec![
+            SetMetadataBatchEntry {
+                blob_object_id: obj1_str.to_owned(),
+                namespace: "default".to_owned(),
+                encrypted_data: None,
+            },
+            SetMetadataBatchEntry {
+                blob_object_id: obj2_str.to_owned(),
+                namespace: "custom".to_owned(),
+                encrypted_data: None,
+            },
+        ];
+
+        // Case 1: obj1 already at `owner` with matching metadata; obj2 still at `sender` -> only obj2 pending
+        let refs = vec![
+            (obj1, 10, dummy_digest, Some(owner)),
+            (obj2, 11, dummy_digest, Some(sender)),
+        ];
+        let mut meta_map = HashMap::new();
+        let mut obj1_meta = HashMap::new();
+        obj1_meta.insert("memwal_namespace".to_owned(), "default".to_owned());
+        obj1_meta.insert("memwal_owner".to_owned(), owner.to_string());
+        obj1_meta.insert("memwal_package_id".to_owned(), pkg.to_owned());
+        meta_map.insert(obj1_str.to_owned(), obj1_meta);
+
+        let pending =
+            reconcile_metadata_batch_entries(&blobs, &refs, &meta_map, sender, owner, pkg, None)
+                .expect("valid partial batch should reconcile");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.blob_object_id, obj2_str);
+
+        // Case 2: Both at `owner` with matching metadata -> empty pending (`Ok(0)` in caller)
+        let refs_all_done = vec![
+            (obj1, 10, dummy_digest, Some(owner)),
+            (obj2, 11, dummy_digest, Some(owner)),
+        ];
+        let mut obj2_meta = HashMap::new();
+        obj2_meta.insert("memwal_namespace".to_owned(), "custom".to_owned());
+        obj2_meta.insert("memwal_owner".to_owned(), owner.to_string());
+        obj2_meta.insert("memwal_package_id".to_owned(), pkg.to_owned());
+        meta_map.insert(obj2_str.to_owned(), obj2_meta);
+
+        let pending_done = reconcile_metadata_batch_entries(
+            &blobs,
+            &refs_all_done,
+            &meta_map,
+            sender,
+            owner,
+            pkg,
+            None,
+        )
+        .expect("fully transferred batch should reconcile to empty");
+        assert!(pending_done.is_empty());
+
+        // Case 3: obj1 at `owner` with wrong namespace -> METADATA_RECEIPT_MISMATCH
+        meta_map
+            .get_mut(obj1_str)
+            .unwrap()
+            .insert("memwal_namespace".to_owned(), "wrong".to_owned());
+        let err_receipt = reconcile_metadata_batch_entries(
+            &blobs,
+            &refs_all_done,
+            &meta_map,
+            sender,
+            owner,
+            pkg,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err_receipt
+                .to_string()
+                .contains("METADATA_RECEIPT_MISMATCH"),
+            "expected METADATA_RECEIPT_MISMATCH, got {err_receipt}"
+        );
+
+        // Case 4: obj2 owned by `stranger` -> BLOB_OWNER_MISMATCH
+        let refs_stranger = vec![
+            (obj1, 10, dummy_digest, Some(sender)),
+            (obj2, 11, dummy_digest, Some(stranger)),
+        ];
+        let err_owner = reconcile_metadata_batch_entries(
+            &blobs,
+            &refs_stranger,
+            &HashMap::new(),
+            sender,
+            owner,
+            pkg,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err_owner.to_string().contains("BLOB_OWNER_MISMATCH"),
+            "expected BLOB_OWNER_MISMATCH, got {err_owner}"
+        );
+    }
+
+    #[test]
+    fn extract_raw_blob_id_handles_string_and_number() {
+        let s_json = serde_json::json!({ "blob_id": "123456789" });
+        let n_json = serde_json::json!({ "blob_id": 123456789u64 });
+        assert_eq!(extract_raw_blob_id(Some(&s_json)), "123456789");
+        assert_eq!(extract_raw_blob_id(Some(&n_json)), "123456789");
+        assert_eq!(extract_raw_blob_id(None), "");
     }
 }
