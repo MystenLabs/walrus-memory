@@ -218,6 +218,16 @@ Create a new async client.
 | `await remember_manual(opts)` | Store encrypted payload + pre-computed vector |
 | `await recall_manual(opts)` | Search with pre-computed vector |
 | `await get_public_key_hex()` | Get Ed25519 public key |
+| `destroy()` | Zero internal key seed buffer, drop signing credentials/session cache, and permanently invalidate the client |
+| `await close(clear_keys=False)` | Close the underlying HTTP client (pass `clear_keys=True` to also run `destroy()`) |
+
+### Key Lifecycle & `destroy()`
+
+For parity with the TypeScript SDK's `destroy()`, `MemWal` and `MemWalSync` expose `destroy()` and `close(clear_keys=True)`:
+
+- `key` may be passed as a hex string, `suiprivkey1...` string, or a 32-byte `bytes` / `bytearray`. When passed as `bytearray`, the SDK copies the bytes into its own internal buffer so `destroy()` zeroes only the client's copy and leaves the caller's `bytearray` untouched.
+- Calling `destroy()` (or `await client.close(clear_keys=True)` / `sync_client.close(clear_keys=True)`) zero-fills the client's internal `bytearray` seed copy in place, clears `_private_key_hex`, drops the `_signing_key` and cached SEAL session references, cancels any in-flight initialization tasks, and causes subsequent or in-flight calls to raise `MemWalError`.
+- **CPython memory semantics**: Python `str` and `bytes` objects (and PyNaCl's internal C-level `SigningKey` buffers) are immutable in CPython and cannot be overwritten in place from pure Python. `destroy()` zeroes the mutable `bytearray` copy and drops all references to immutable key objects so they become eligible for garbage collection once the caller also releases its references. To minimize plaintext `str` copies in process memory, pass a 32-byte `bytearray` to `MemWal.create()` and zero your own buffer after creation.
 
 ## Authentication
 
