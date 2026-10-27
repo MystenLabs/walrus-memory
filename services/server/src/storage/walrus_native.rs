@@ -5452,4 +5452,84 @@ mod tests {
         );
         assert_eq!(enoki_calls.load(Ordering::SeqCst), 3);
     }
+
+    #[tokio::test]
+    #[ignore = "hits live Sui Mainnet gRPC and Walrus Mainnet Upload Relay"]
+    async fn live_mainnet_walrus_upload_relay_and_seal_pipeline_verification() {
+        let mainnet_grpc_url = "https://fullnode.mainnet.sui.io:443";
+        let mainnet_relay_url = effective_walrus_upload_relay_url(
+            "mainnet",
+            "https://publisher.walrus-mainnet.walrus.space",
+        );
+        assert_eq!(
+            mainnet_relay_url,
+            "https://upload-relay.mainnet.walrus.space"
+        );
+
+        // 1. Live Mainnet Walrus System object + StakingPool + upgraded package resolution
+        let snapshot = resolve_walrus_system_snapshot(mainnet_grpc_url, "mainnet", "", "")
+            .await
+            .expect("resolve live Mainnet Walrus System snapshot");
+
+        let expected_origin_pkg: Address = MAINNET_WALRUS_PACKAGE_ID.parse().unwrap();
+        assert_eq!(
+            snapshot.origin_package_id, expected_origin_pkg,
+            "Mainnet origin_package_id must match original WAL/Blob package"
+        );
+        assert_ne!(
+            snapshot.call_package_id, snapshot.origin_package_id,
+            "Mainnet call_package_id must reflect upgraded Walrus System package"
+        );
+        assert_eq!(snapshot.n_shards, 1000);
+        assert!(snapshot.committee_size > 0);
+        assert!(snapshot.storage_price_per_unit_size > 0);
+        assert!(snapshot.write_price_per_unit_size > 0);
+
+        // 2. Live Mainnet Upload Relay `/v1/tip-config` (Linear tip calculation)
+        let http = reqwest::Client::new();
+        let tip_cfg = fetch_relay_tip_config(&http, &mainnet_relay_url)
+            .await
+            .expect("fetch live Mainnet Upload Relay tip-config");
+        assert!(
+            matches!(
+                tip_cfg,
+                RelayTipConfig::SendTip {
+                    kind: RelayTipKind::Linear { .. },
+                    ..
+                }
+            ),
+            "Mainnet Upload Relay uses Linear tip config, got: {tip_cfg:?}"
+        );
+
+        // 3. Live Mainnet SEAL KeyServer resolution + BLS12-381 IBE Encryption
+        let (servers, threshold) =
+            crate::storage::seal_native::resolve_seal_key_servers(mainnet_grpc_url, None)
+                .await
+                .expect("resolve live Mainnet SEAL KeyServers on Sui Mainnet");
+        assert_eq!(threshold, 2);
+        assert_eq!(servers.len(), 2);
+
+        // 4. In-process RedStuff RS2 encoding + HashedAuthPackage + Mainnet Linear tip calculation
+        let plaintext = b"live mainnet walrus upload relay + seal verification payload".to_vec();
+        let encoded = encode_walrus_blob_rs2(plaintext, snapshot.n_shards)
+            .await
+            .expect("encode RS2 blob for Mainnet 1000 shards");
+        let (tip_recipient, tip_mist) = tip_cfg
+            .calculate_tip(snapshot.n_shards, encoded.unencoded_length)
+            .expect("Mainnet tip-config must calculate a tip");
+        assert_ne!(tip_recipient, Address::ZERO);
+        assert!(
+            tip_mist > 0,
+            "Mainnet linear tip must be > 0 MIST for unencoded_length={}",
+            encoded.unencoded_length
+        );
+        let nonce_digest = Sha256::digest(&encoded.nonce).digest;
+        let auth_pkg_bcs = bcs::to_bytes(&HashedAuthPackage {
+            blob_digest: encoded.blob_digest,
+            nonce_digest,
+            unencoded_length: encoded.unencoded_length,
+        })
+        .expect("serialize HashedAuthPackage");
+        assert_eq!(auth_pkg_bcs.len(), 72);
+    }
 }

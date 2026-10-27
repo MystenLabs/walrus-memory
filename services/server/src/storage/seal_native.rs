@@ -388,14 +388,25 @@ pub fn parse_configured_key_servers_from_values(
     Ok((configs, threshold))
 }
 
-fn parse_configured_key_servers() -> Result<(Vec<ConfiguredKeyServerSpec>, u8), String> {
+fn parse_configured_key_servers_for_grpc_url(
+    grpc_url: &str,
+) -> Result<(Vec<ConfiguredKeyServerSpec>, u8), String> {
     let raw_server_configs = std::env::var("SEAL_SERVER_CONFIGS").ok();
     let raw_legacy_key_servers = std::env::var("SEAL_KEY_SERVERS").ok();
     let raw_threshold = std::env::var("SEAL_THRESHOLD").ok();
+    let grpc_lower = grpc_url.trim().to_ascii_lowercase();
     let network = std::env::var("SUI_NETWORK")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some(get_native_runtime_config().sui_network));
+        .or_else(|| {
+            if grpc_lower.contains("mainnet") {
+                Some("mainnet".to_owned())
+            } else if grpc_lower.contains("testnet") {
+                Some("testnet".to_owned())
+            } else {
+                Some(get_native_runtime_config().sui_network)
+            }
+        });
 
     parse_configured_key_servers_from_values(
         raw_server_configs.as_deref(),
@@ -476,6 +487,7 @@ pub fn validate_expected_committee_identity(
 }
 
 struct TimedCommittee {
+    grpc_url: String,
     specs: Vec<ConfiguredKeyServerSpec>,
     servers: Vec<ResolvedKeyServer>,
     threshold: u8,
@@ -498,7 +510,7 @@ pub async fn resolve_seal_key_servers(
     grpc_url: &str,
     expected_committee_identity: Option<&serde_json::Value>,
 ) -> Result<(Vec<ResolvedKeyServer>, u8), String> {
-    let (specs, threshold) = parse_configured_key_servers()?;
+    let (specs, threshold) = parse_configured_key_servers_for_grpc_url(grpc_url)?;
     validate_expected_committee_identity(expected_committee_identity, &specs, threshold)?;
 
     if specs.is_empty() {
@@ -543,6 +555,7 @@ pub async fn resolve_seal_key_servers(
     let cache = SEAL_COMMITTEE_CACHE.get_or_init(|| RwLock::new(None));
     if let Some(cached) = cache.read().await.as_ref() {
         if cached.fetched_at.elapsed() < Duration::from_secs(300)
+            && cached.grpc_url == grpc_url.trim()
             && cached.specs == specs
             && cached.threshold == threshold
         {
@@ -642,6 +655,7 @@ pub async fn resolve_seal_key_servers(
     }
 
     *cache.write().await = Some(TimedCommittee {
+        grpc_url: grpc_url.trim().to_owned(),
         specs,
         servers: resolved.clone(),
         threshold,
