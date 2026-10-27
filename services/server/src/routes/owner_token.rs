@@ -207,9 +207,54 @@ pub async fn issue_token(
     // primitive Console is expected to use before this call anyway). Reuses
     // the exact same DB helper accounts.rs calls
     // (`db.find_account_by_owner`), not a second implementation.
-    let exists = state.db.find_account_by_owner(&owner).await?.is_some();
-    if !exists {
+    let Some(account_id) = state.db.find_account_by_owner(&owner).await? else {
         return Err(AppError::BadRequest("owner has no MemWalAccount".into()));
+    };
+
+    // Verify on-chain that the resolved MemWalAccount is still active before
+    // minting an owner token (#1051). Also warms `DelegateVerifyCache` so the
+    // immediate follow-up `/v1/owners/{owner}/*` reads hit the cache.
+    match crate::storage::sui::verify_account_active_for_issuance(
+        &state.delegate_verify_cache,
+        &state.delegate_reject_cache,
+        &state.http_client,
+        &state.config.sui_rpc_url,
+        state.sui_grpc_client.as_ref(),
+        &account_id,
+        &state.config.package_id,
+    )
+    .await
+    {
+        Ok(onchain_owner) => {
+            if !same_owner(Some(&onchain_owner), &owner) {
+                state.delegate_keys_cache.write().await.remove(&account_id);
+                return Err(AppError::BadRequest("owner has no MemWalAccount".into()));
+            }
+        }
+        Err(crate::storage::sui::OnchainVerifyError::AccountDeactivated(_)) => {
+            state.delegate_keys_cache.write().await.remove(&account_id);
+            return Err(AppError::Forbidden(
+                "MemWalAccount has been deactivated".into(),
+            ));
+        }
+        Err(
+            crate::storage::sui::OnchainVerifyError::NotFound(_)
+            | crate::storage::sui::OnchainVerifyError::WrongObjectType(_),
+        ) => {
+            state.delegate_keys_cache.write().await.remove(&account_id);
+            return Err(AppError::BadRequest("owner has no MemWalAccount".into()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                account_id = %account_id,
+                owner = %owner,
+                error = %e,
+                "owner token issuance on-chain account verification failed"
+            );
+            return Err(AppError::UpstreamUnavailable(
+                "on-chain account verification temporarily unavailable".into(),
+            ));
+        }
     }
 
     let now = chrono::Utc::now().timestamp();
