@@ -47,6 +47,7 @@ Unreleased.
 ### Fixed
 
 - Shield shared `_build_seal_session` and `_resolve_owner` initialization tasks with `asyncio.shield`, clear the shared task slot via a completion callback that consumes exceptions on orphaned tasks, and cancel/drain in-flight initialization tasks in `close()` so cancelling one concurrent caller does not abort sibling callers or leave unretrieved task exceptions. (#1029)
+- `health`, `ask`, `restore`, `list_namespaces`, `remember_manual`, and `recall` raise `MemWalError` naming the endpoint and field when a 2xx response omits a required field. They used to raise a bare `KeyError` that callers catching `MemWalError` never saw. (#1250, #1256)
 
 ## 0.2.1
 

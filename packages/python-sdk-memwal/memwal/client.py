@@ -142,6 +142,24 @@ def _reject_blank_text(text: object, message: str = "Text cannot be empty") -> N
         raise ValueError(message)
 
 
+def _require(data: object, field: str, endpoint: str) -> Any:
+    """``data[field]`` from a parsed 2xx body, or a ``MemWalError`` naming both.
+
+    A bare ``KeyError`` is not a ``MemWalError``, carries only the field name,
+    and is raised far from the response that caused it (#1250). Optional
+    fields keep using ``.get()`` with a documented default.
+    """
+
+    if not isinstance(data, dict):
+        raise MemWalError(
+            f"{endpoint} response was {type(data).__name__}, expected an object "
+            f"with {field!r}"
+        )
+    if field not in data:
+        raise MemWalError(f"{endpoint} response missing {field!r}")
+    return data[field]
+
+
 IDEMPOTENCY_BUCKET_MS = 30 * 60 * 1000
 
 
@@ -1189,9 +1207,9 @@ class MemWal:
         data = await self._signed_request("POST", "/api/recall", body)
         memories = [
             RecallMemory(
-                blob_id=m["blob_id"],
-                text=m["text"],
-                distance=m["distance"],
+                blob_id=_require(m, "blob_id", "POST /api/recall"),
+                text=_require(m, "text", "POST /api/recall"),
+                distance=_require(m, "distance", "POST /api/recall"),
                 score=m.get("score"),
                 created_at=m.get("created_at"),
             )
@@ -1359,12 +1377,16 @@ class MemWal:
             "namespace": self._resolve_namespace(namespace),
         })
         memories = [
-            AskMemory(blob_id=m["blob_id"], text=m["text"], distance=m["distance"])
+            AskMemory(
+                blob_id=_require(m, "blob_id", "POST /api/ask"),
+                text=_require(m, "text", "POST /api/ask"),
+                distance=_require(m, "distance", "POST /api/ask"),
+            )
             for m in data.get("memories", [])
         ]
         return AskResult(
-            answer=data["answer"],
-            memories_used=data["memories_used"],
+            answer=_require(data, "answer", "POST /api/ask"),
+            memories_used=_require(data, "memories_used", "POST /api/ask"),
             memories=memories,
         )
 
@@ -1424,12 +1446,13 @@ class MemWal:
             "namespace": namespace,
             "limit": limit,
         })
+        endpoint = "POST /api/restore"
         return RestoreResult(
-            restored=data["restored"],
-            skipped=data["skipped"],
-            total=data["total"],
-            namespace=data["namespace"],
-            owner=data["owner"],
+            restored=_require(data, "restored", endpoint),
+            skipped=_require(data, "skipped", endpoint),
+            total=_require(data, "total", endpoint),
+            namespace=_require(data, "namespace", endpoint),
+            owner=_require(data, "owner", endpoint),
             # Relayers older than WALM-319 omit `truncated` entirely --
             # treat "not present" as "not known to be truncated" rather
             # than require every relayer version to send it.
@@ -1492,20 +1515,21 @@ class MemWal:
         # against `path_and_query`, not `path`.
         path = f"/v1/owners/{owner}/namespaces" + (f"?{query}" if query else "")
         data = await self._signed_request("GET", path, {}, include_seal_session=False)
+        endpoint = "GET /v1/owners/{owner}/namespaces"
         return NamespacesResult(
             namespaces=[
                 NamespaceSummary(
-                    id=ns["id"],
-                    name=ns["name"],
-                    memory_count=ns["memory_count"],
-                    storage_used=ns["storage_used"],
-                    updated_at=ns["updated_at"],
+                    id=_require(ns, "id", endpoint),
+                    name=_require(ns, "name", endpoint),
+                    memory_count=_require(ns, "memory_count", endpoint),
+                    storage_used=_require(ns, "storage_used", endpoint),
+                    updated_at=_require(ns, "updated_at", endpoint),
                 )
-                for ns in data["namespaces"]
+                for ns in _require(data, "namespaces", endpoint)
             ],
             next_cursor=data.get("next_cursor"),
-            has_more=data["has_more"],
-            snapshot_version=data["snapshot_version"],
+            has_more=_require(data, "has_more", endpoint),
+            snapshot_version=_require(data, "snapshot_version", endpoint),
         )
 
     async def health(self) -> HealthResult:
@@ -1523,8 +1547,8 @@ class MemWal:
             raise MemWalError(f"Health check failed: {response.status_code}")
         data = response.json()
         return HealthResult(
-            status=data["status"],
-            version=data["version"],
+            status=_require(data, "status", "GET /health"),
+            version=_require(data, "version", "GET /health"),
             relayer_version=data.get("relayerVersion"),
             api_version=data.get("apiVersion"),
             min_supported_sdk=data.get("minSupportedSdk"),
@@ -1569,11 +1593,12 @@ class MemWal:
             },
             include_seal_session=False,
         )
+        endpoint = "POST /api/remember/manual"
         return RememberManualResult(
-            id=data["id"],
-            blob_id=data["blob_id"],
-            owner=data["owner"],
-            namespace=data["namespace"],
+            id=_require(data, "id", endpoint),
+            blob_id=_require(data, "blob_id", endpoint),
+            owner=_require(data, "owner", endpoint),
+            namespace=_require(data, "namespace", endpoint),
         )
 
     async def recall_manual(self, opts: RecallManualOptions) -> RecallManualResult:
