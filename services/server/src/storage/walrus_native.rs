@@ -20,13 +20,17 @@ use base64::Engine as _;
 use fastcrypto::hash::{HashFunction as _, Sha256};
 use seal_crypto::EncryptedObject;
 use serde::{Deserialize, Serialize};
+use sui_crypto::SuiVerifier as _;
 use sui_rpc::field::{FieldMask, FieldMaskUtil};
 use sui_rpc::proto::sui::rpc::v2::{
-    BatchGetObjectsRequest, GetObjectRequest, ListBalancesRequest, ListDynamicFieldsRequest,
-    ListOwnedObjectsRequest,
+    changed_object, BatchGetObjectsRequest, ExecuteTransactionRequest, ExecutedTransaction,
+    GetEpochRequest, GetObjectRequest, GetServiceInfoRequest, GetTransactionRequest,
+    ListBalancesRequest, ListDynamicFieldsRequest, ListOwnedObjectsRequest,
 };
 use sui_sdk_types::{
-    Address, Digest, Identifier, ObjectData, ProgrammableTransaction, StructTag, TypeTag,
+    Address, Digest, ExecutionStatus, GasPayment, Identifier, ObjectData, ProgrammableTransaction,
+    StructTag, Transaction, TransactionEffects, TransactionExpiration, TransactionKind, TypeTag,
+    UserSignature,
 };
 use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 use tokio::sync::{Notify, RwLock};
@@ -39,12 +43,15 @@ use walrus_core::{
 
 use crate::storage::walrus::{
     BlobStorageLease, BlobStorageLeases, DurableUploadAdvance, FoundBlobByJob, OnChainBlob,
-    SealPersistence, SetMetadataBatchEntry, UploadBlobError, UploadExecutionIdentity,
-    UploadJournal, UploadResult,
+    PreparedRegisterTransaction, SealPersistence, SetMetadataBatchEntry, UploadBlobError,
+    UploadExecutionIdentity, UploadJournal, UploadResult,
 };
 use crate::sui::enoki::{
-    derive_sui_address, parse_sui_private_key, shared_sui_grpc_client, submit_wallet_ptb,
-    submit_wallet_ptb_with_allowed_addresses, WalletTxOutcome,
+    derive_sui_address, enoki_execute_sponsored_transaction, enoki_is_enabled,
+    enoki_sponsor_transaction_kind_with_addresses, fetch_executed_transaction_outcome,
+    parse_sui_private_key, shared_sui_grpc_client, sign_transaction_bytes, submit_wallet_ptb,
+    submit_wallet_ptb_with_allowed_addresses, verify_sponsored_transaction_matches_ptb,
+    CreatedObjectInfo, WalletTxOutcome,
 };
 use crate::types::{AppError, Config};
 
@@ -185,6 +192,19 @@ impl NativeRuntimeConfig {
         }
         let idx = key_index % self.sui_private_keys.len();
         Ok(self.sui_private_keys[idx].as_str())
+    }
+
+    pub fn trusted_uploader_addresses(&self) -> Result<std::collections::HashSet<String>, String> {
+        if self.sui_private_keys.is_empty() {
+            return Err("no SERVER_SUI_PRIVATE_KEYS configured".to_owned());
+        }
+        let mut set = std::collections::HashSet::with_capacity(self.sui_private_keys.len());
+        for (idx, raw_key) in self.sui_private_keys.iter().enumerate() {
+            let addr = derive_sui_address(raw_key)
+                .map_err(|e| format!("invalid SERVER_SUI_PRIVATE_KEYS[{idx}]: {e}"))?;
+            set.insert(addr);
+        }
+        Ok(set)
     }
 }
 
@@ -503,89 +523,35 @@ pub async fn fetch_wallet_balances_in_process() -> serde_json::Value {
     let expected_wal_type = default_wal_coin_type(&runtime.sui_network);
     let shared_client_res = shared_sui_grpc_client(&grpc_url);
 
-    let balance_futures =
-        runtime
-            .sui_private_keys
-            .iter()
-            .enumerate()
-            .map(|(index, raw_key)| {
-                let client_res = shared_client_res.clone();
-                let expected_wal = expected_wal_type.clone();
-                async move {
-                    let address = match derive_sui_address(raw_key) {
-                        Ok(addr) => addr,
-                        Err(err) => {
-                            return NativeWalletBalanceEntry {
-                                wallet_index: index,
-                                address: "invalid-key".to_owned(),
-                                sui_mist: "0".to_owned(),
-                                wal_frost: "0".to_owned(),
-                                sui_coin_balance_mist: "0".to_owned(),
-                                sui_address_balance_mist: "0".to_owned(),
-                                wal_coin_balance_frost: "0".to_owned(),
-                                wal_address_balance_frost: "0".to_owned(),
-                                error: Some(err),
-                            };
-                        }
-                    };
+    let balance_futures = runtime
+        .sui_private_keys
+        .iter()
+        .enumerate()
+        .map(|(index, raw_key)| {
+            let client_res = shared_client_res.clone();
+            let expected_wal = expected_wal_type.clone();
+            async move {
+                let address = match derive_sui_address(raw_key) {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        return NativeWalletBalanceEntry {
+                            wallet_index: index,
+                            address: "invalid-key".to_owned(),
+                            sui_mist: "0".to_owned(),
+                            wal_frost: "0".to_owned(),
+                            sui_coin_balance_mist: "0".to_owned(),
+                            sui_address_balance_mist: "0".to_owned(),
+                            wal_coin_balance_frost: "0".to_owned(),
+                            wal_address_balance_frost: "0".to_owned(),
+                            error: Some(err),
+                        };
+                    }
+                };
 
-                    let mut client = match client_res {
-                        Ok(c) => c,
-                        Err(err) => {
-                            return NativeWalletBalanceEntry {
-                                wallet_index: index,
-                                address,
-                                sui_mist: "0".to_owned(),
-                                wal_frost: "0".to_owned(),
-                                sui_coin_balance_mist: "0".to_owned(),
-                                sui_address_balance_mist: "0".to_owned(),
-                                wal_coin_balance_frost: "0".to_owned(),
-                                wal_address_balance_frost: "0".to_owned(),
-                                error: Some(err),
-                            };
-                        }
-                    };
-
-                    let mut req = ListBalancesRequest::default();
-                    req.owner = Some(address.clone());
-                    match client.state_client().list_balances(req).await {
-                        Ok(resp) => {
-                            let balances = resp.into_inner().balances;
-                            let mut sui_total: u64 = 0;
-                            let mut sui_coin: u64 = 0;
-                            let mut sui_addr: u64 = 0;
-                            let mut wal_total: u64 = 0;
-                            let mut wal_coin: u64 = 0;
-                            let mut wal_addr: u64 = 0;
-
-                            for bal in balances {
-                                let ct = bal.coin_type.as_deref().unwrap_or_default();
-                                if ct == SUI_COIN_TYPE
-                                    || (ct.ends_with("::sui::SUI") && ct.starts_with("0x00000000"))
-                                {
-                                    sui_total = bal.balance.unwrap_or(0);
-                                    sui_coin = bal.coin_balance.unwrap_or(0);
-                                    sui_addr = bal.address_balance.unwrap_or(0);
-                                } else if ct == expected_wal || ct.ends_with("::wal::WAL") {
-                                    wal_total = bal.balance.unwrap_or(0);
-                                    wal_coin = bal.coin_balance.unwrap_or(0);
-                                    wal_addr = bal.address_balance.unwrap_or(0);
-                                }
-                            }
-
-                            NativeWalletBalanceEntry {
-                                wallet_index: index,
-                                address,
-                                sui_mist: sui_total.to_string(),
-                                wal_frost: wal_total.to_string(),
-                                sui_coin_balance_mist: sui_coin.to_string(),
-                                sui_address_balance_mist: sui_addr.to_string(),
-                                wal_coin_balance_frost: wal_coin.to_string(),
-                                wal_address_balance_frost: wal_addr.to_string(),
-                                error: None,
-                            }
-                        }
-                        Err(err) => NativeWalletBalanceEntry {
+                let mut client = match client_res {
+                    Ok(c) => c,
+                    Err(err) => {
+                        return NativeWalletBalanceEntry {
                             wallet_index: index,
                             address,
                             sui_mist: "0".to_owned(),
@@ -594,11 +560,64 @@ pub async fn fetch_wallet_balances_in_process() -> serde_json::Value {
                             sui_address_balance_mist: "0".to_owned(),
                             wal_coin_balance_frost: "0".to_owned(),
                             wal_address_balance_frost: "0".to_owned(),
-                            error: Some(err.to_string()),
-                        },
+                            error: Some(err),
+                        };
                     }
+                };
+
+                let mut req = ListBalancesRequest::default();
+                req.owner = Some(address.clone());
+                match client.state_client().list_balances(req).await {
+                    Ok(resp) => {
+                        let balances = resp.into_inner().balances;
+                        let mut sui_total: u64 = 0;
+                        let mut sui_coin: u64 = 0;
+                        let mut sui_addr: u64 = 0;
+                        let mut wal_total: u64 = 0;
+                        let mut wal_coin: u64 = 0;
+                        let mut wal_addr: u64 = 0;
+
+                        for bal in balances {
+                            let ct = bal.coin_type.as_deref().unwrap_or_default();
+                            if ct == SUI_COIN_TYPE
+                                || (ct.ends_with("::sui::SUI") && ct.starts_with("0x00000000"))
+                            {
+                                sui_total = bal.balance.unwrap_or(0);
+                                sui_coin = bal.coin_balance.unwrap_or(0);
+                                sui_addr = bal.address_balance.unwrap_or(0);
+                            } else if ct == expected_wal || ct.ends_with("::wal::WAL") {
+                                wal_total = bal.balance.unwrap_or(0);
+                                wal_coin = bal.coin_balance.unwrap_or(0);
+                                wal_addr = bal.address_balance.unwrap_or(0);
+                            }
+                        }
+
+                        NativeWalletBalanceEntry {
+                            wallet_index: index,
+                            address,
+                            sui_mist: sui_total.to_string(),
+                            wal_frost: wal_total.to_string(),
+                            sui_coin_balance_mist: sui_coin.to_string(),
+                            sui_address_balance_mist: sui_addr.to_string(),
+                            wal_coin_balance_frost: wal_coin.to_string(),
+                            wal_address_balance_frost: wal_addr.to_string(),
+                            error: None,
+                        }
+                    }
+                    Err(err) => NativeWalletBalanceEntry {
+                        wallet_index: index,
+                        address,
+                        sui_mist: "0".to_owned(),
+                        wal_frost: "0".to_owned(),
+                        sui_coin_balance_mist: "0".to_owned(),
+                        sui_address_balance_mist: "0".to_owned(),
+                        wal_coin_balance_frost: "0".to_owned(),
+                        wal_address_balance_frost: "0".to_owned(),
+                        error: Some(err.to_string()),
+                    },
                 }
-            });
+            }
+        });
 
     let entries = futures::future::join_all(balance_futures).await;
 
@@ -838,10 +857,7 @@ pub enum RelayTipKind {
 #[serde(rename_all = "snake_case")]
 pub enum RelayTipConfig {
     NoTip,
-    SendTip {
-        address: String,
-        kind: RelayTipKind,
-    },
+    SendTip { address: String, kind: RelayTipKind },
 }
 
 impl RelayTipConfig {
@@ -939,9 +955,17 @@ pub async fn encode_walrus_blob_rs2(
     data: Vec<u8>,
     n_shards: u16,
 ) -> Result<EncodedWalrusBlob, String> {
+    encode_walrus_blob_rs2_with_nonce(data, n_shards, None).await
+}
+
+pub async fn encode_walrus_blob_rs2_with_nonce(
+    data: Vec<u8>,
+    n_shards: u16,
+    existing_nonce: Option<[u8; 32]>,
+) -> Result<EncodedWalrusBlob, String> {
     tokio::task::spawn_blocking(move || {
-        let shards = NonZeroU16::new(n_shards.max(1))
-            .ok_or_else(|| "invalid n_shards (0)".to_owned())?;
+        let shards =
+            NonZeroU16::new(n_shards.max(1)).ok_or_else(|| "invalid n_shards (0)".to_owned())?;
         let encoding_config = EncodingConfig::new(shards);
         let verified_meta = encoding_config
             .get_for_type(EncodingType::RS2)
@@ -961,8 +985,14 @@ pub async fn encode_walrus_blob_rs2(
             .ok_or_else(|| "failed to compute RS2 encoded blob length".to_owned())?;
 
         let blob_digest = Sha256::digest(&data).digest;
-        let mut nonce = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        let nonce = match existing_nonce {
+            Some(n) => n,
+            None => {
+                let mut generated = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut generated);
+                generated
+            }
+        };
 
         Ok(EncodedWalrusBlob {
             blob_id,
@@ -1223,7 +1253,9 @@ pub async fn post_blob_to_upload_relay(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         let safe_body = crate::sui::enoki::sanitize_upstream_error_for_logging(&body);
-        return Err(format!("Walrus upload relay returned {status}: {safe_body}"));
+        return Err(format!(
+            "Walrus upload relay returned {status}: {safe_body}"
+        ));
     }
 
     let parsed: RelayUploadResponse = resp
@@ -1351,10 +1383,13 @@ async fn append_seal_persistence_fence(
         .parse()
         .map_err(|e| format!("invalid account_id '{account_id}': {e}"))?;
 
-    let (acct_ver, reg_ver) =
-        crate::storage::seal_native::fetch_shared_object_versions(grpc_url, account_id, registry_id)
-            .await
-            .unwrap_or((1, 1));
+    let (acct_ver, reg_ver) = crate::storage::seal_native::fetch_shared_object_versions(
+        grpc_url,
+        account_id,
+        registry_id,
+    )
+    .await
+    .unwrap_or((1, 1));
 
     let id_arg = builder.pure(&enc_obj.id);
     let reg_arg = builder.object(ObjectInput::shared(reg_addr, reg_ver, false));
@@ -1411,20 +1446,657 @@ pub async fn build_certify_ptb(
 // High-Level In-Process Upload & Durable Upload Step State Machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NativeFlowState {
-    step: String,
-    blob_id: String,
-    blob_id_bytes: [u8; 32],
-    root_hash_bytes: [u8; 32],
-    unencoded_length: u64,
-    encoded_size: u64,
-    nonce: [u8; 32],
-    blob_digest: [u8; 32],
-    blob_object_id: Option<String>,
-    register_tx_digest: Option<String>,
-    confirmation_certificate: Option<ConfirmationCertificate>,
-    end_epoch: Option<i32>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct NativeFlowState {
+    pub(crate) step: String,
+    pub(crate) blob_id: String,
+    pub(crate) blob_id_bytes: [u8; 32],
+    pub(crate) root_hash_bytes: [u8; 32],
+    pub(crate) unencoded_length: u64,
+    pub(crate) encoded_size: u64,
+    pub(crate) nonce: [u8; 32],
+    pub(crate) blob_digest: [u8; 32],
+    pub(crate) blob_object_id: Option<String>,
+    pub(crate) register_tx_digest: Option<String>,
+    pub(crate) confirmation_certificate: Option<ConfirmationCertificate>,
+    pub(crate) end_epoch: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ParsedResumeStep {
+    Encoded {
+        blob_id: String,
+        #[allow(dead_code)]
+        root_hash: String,
+        #[allow(dead_code)]
+        unencoded_size: u64,
+        nonce: Option<[u8; 32]>,
+        register_rebuild: String,
+        #[allow(dead_code)]
+        native_flow: Option<NativeFlowState>,
+    },
+    Registered {
+        blob_id: String,
+        blob_object_id: String,
+        tx_digest: String,
+        nonce: Option<[u8; 32]>,
+        end_epoch: Option<i32>,
+        native_flow: Option<NativeFlowState>,
+    },
+    Uploaded {
+        blob_id: String,
+        blob_object_id: String,
+        certificate: ConfirmationCertificate,
+        end_epoch: Option<i32>,
+    },
+    Certified {
+        step_json: serde_json::Value,
+    },
+}
+
+fn decode_optional_32_byte_nonce(val: Option<&serde_json::Value>) -> Option<[u8; 32]> {
+    let v = val?;
+    match v {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(trimmed)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+                .ok()?;
+            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+        }
+        serde_json::Value::Array(arr) if arr.len() == 32 => {
+            let mut out = [0u8; 32];
+            for (idx, item) in arr.iter().enumerate() {
+                out[idx] = u8::try_from(item.as_u64()?).ok()?;
+            }
+            Some(out)
+        }
+        serde_json::Value::Object(map) if map.len() == 32 => {
+            let mut out = [0u8; 32];
+            for (idx, slot) in out.iter_mut().enumerate() {
+                let b = map.get(&idx.to_string())?.as_u64()?;
+                *slot = u8::try_from(b).ok()?;
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn parse_confirmation_certificate_value(
+    val: &serde_json::Value,
+) -> Result<ConfirmationCertificate, String> {
+    if let Ok(cert) = serde_json::from_value::<ConfirmationCertificate>(val.clone()) {
+        return Ok(cert);
+    }
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+            .map_err(|e| format!("invalid base64 certificate in resumeStep: {e}"))?;
+        if let Ok(cert) = bcs::from_bytes::<ConfirmationCertificate>(&bytes) {
+            return Ok(cert);
+        }
+        if let Ok(cert) = serde_json::from_slice::<ConfirmationCertificate>(&bytes) {
+            return Ok(cert);
+        }
+    }
+    Err(
+        "resumeStep.certificate could not be decoded as a Walrus ConfirmationCertificate"
+            .to_owned(),
+    )
+}
+
+/// Validates and parses `journal.resume_step`, supporting both sidecar-formatted steps
+/// (`step = "encoded" | "registered" | "uploaded" | "certified"`) and Rust `nativeFlowState`
+/// journals, and failing closed with `AppError::BadRequest` on any malformed or unrecognized
+/// `resumeStep` instead of falling back to fresh registration.
+pub(crate) fn parse_resume_step_json(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<ParsedResumeStep>, AppError> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let obj = val
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("resumeStep must be an object".into()))?;
+
+    let step = obj
+        .get("step")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("Invalid resumeStep.step: undefined".into()))?;
+
+    let blob_id = obj
+        .get("blobId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("resumeStep.blobId is required".into()))?
+        .to_owned();
+
+    let native_flow: Option<NativeFlowState> = obj
+        .get("nativeFlowState")
+        .and_then(|fs| serde_json::from_value(fs.clone()).ok());
+
+    let register_rebuild = obj
+        .get("registerRebuild")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+
+    let end_epoch = obj
+        .get("endEpoch")
+        .and_then(serde_json::Value::as_i64)
+        .map(|e| e as i32)
+        .or_else(|| native_flow.as_ref().and_then(|nf| nf.end_epoch));
+
+    match step {
+        "encoded" => {
+            let root_hash = obj
+                .get("rootHash")
+                .and_then(|v| match v {
+                    serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+                    serde_json::Value::Array(arr) if arr.len() == 32 => {
+                        Some(format!("array:{}", arr.len()))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    native_flow.as_ref().map(|nf| {
+                        base64::engine::general_purpose::STANDARD.encode(nf.root_hash_bytes)
+                    })
+                })
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "encoded resumeStep requires rootHash and unencodedSize".into(),
+                    )
+                })?;
+
+            let unencoded_size = obj
+                .get("unencodedSize")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| native_flow.as_ref().map(|nf| nf.unencoded_length))
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "encoded resumeStep requires rootHash and unencodedSize".into(),
+                    )
+                })?;
+
+            let nonce = decode_optional_32_byte_nonce(obj.get("nonce"))
+                .or_else(|| native_flow.as_ref().map(|nf| nf.nonce));
+
+            Ok(Some(ParsedResumeStep::Encoded {
+                blob_id,
+                root_hash,
+                unencoded_size,
+                nonce,
+                register_rebuild,
+                native_flow,
+            }))
+        }
+        "registered" => {
+            let blob_object_id = obj
+                .get("blobObjectId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    native_flow
+                        .as_ref()
+                        .and_then(|nf| nf.blob_object_id.clone())
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .ok_or_else(|| {
+                    AppError::BadRequest("registered resumeStep requires blobObjectId".into())
+                })?;
+
+            let tx_digest = obj
+                .get("txDigest")
+                .or_else(|| obj.get("registerTxDigest"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    native_flow
+                        .as_ref()
+                        .and_then(|nf| nf.register_tx_digest.clone())
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .ok_or_else(|| {
+                    AppError::BadRequest("registered resumeStep requires txDigest".into())
+                })?;
+
+            let nonce = decode_optional_32_byte_nonce(obj.get("nonce"))
+                .or_else(|| native_flow.as_ref().map(|nf| nf.nonce));
+
+            Ok(Some(ParsedResumeStep::Registered {
+                blob_id,
+                blob_object_id,
+                tx_digest,
+                nonce,
+                end_epoch,
+                native_flow,
+            }))
+        }
+        "uploaded" => {
+            let blob_object_id = obj
+                .get("blobObjectId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    native_flow
+                        .as_ref()
+                        .and_then(|nf| nf.blob_object_id.clone())
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "uploaded resumeStep requires blobObjectId and certificate".into(),
+                    )
+                })?;
+
+            let certificate = if let Some(cert_val) = obj.get("certificate") {
+                parse_confirmation_certificate_value(cert_val).map_err(AppError::BadRequest)?
+            } else if let Some(cert) = native_flow
+                .as_ref()
+                .and_then(|nf| nf.confirmation_certificate.clone())
+            {
+                cert
+            } else {
+                return Err(AppError::BadRequest(
+                    "uploaded resumeStep requires blobObjectId and certificate".into(),
+                ));
+            };
+
+            Ok(Some(ParsedResumeStep::Uploaded {
+                blob_id,
+                blob_object_id,
+                certificate,
+                end_epoch,
+            }))
+        }
+        "certified" => {
+            let _blob_object_id = obj
+                .get("blobObjectId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest("certified resumeStep requires blobObjectId".into())
+                })?;
+            Ok(Some(ParsedResumeStep::Certified {
+                step_json: val.clone(),
+            }))
+        }
+        other => Err(AppError::BadRequest(format!(
+            "Invalid resumeStep.step: {other}"
+        ))),
+    }
+}
+
+/// Computes a deterministic `u32` `ValidDuring` nonce from `Sha256(tx_kind_bytes || register_rebuild)[0..4]`,
+/// matching `walrus-upload-journal.ts` (`sha256(concat([txKindBytes, utf8(rebuildSalt)])).readUInt32BE(0)`).
+pub(crate) fn compute_deterministic_register_nonce(
+    tx_kind_bytes: &[u8],
+    register_rebuild: &str,
+) -> u32 {
+    let mut hasher = Sha256::default();
+    hasher.update(tx_kind_bytes);
+    if !register_rebuild.is_empty() {
+        hasher.update(register_rebuild.as_bytes());
+    }
+    let digest = hasher.finalize().digest;
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+}
+
+/// Validates a persisted `PreparedRegisterTransaction` against `expected_sender` and its own
+/// signature before reconciling or submitting it on-chain.
+///
+/// Mirrors `validatePreparedRegisterTransaction` in `walrus-upload-journal.ts`.
+pub(crate) fn validate_prepared_register_transaction(
+    prepared: &PreparedRegisterTransaction,
+    expected_sender: Address,
+    raw_private_key: &str,
+) -> Result<(Transaction, UserSignature), String> {
+    let tx_b64 = prepared.transaction_bytes.trim();
+    if tx_b64.is_empty() {
+        return Err("Prepared register transaction bytes are empty".to_owned());
+    }
+    let tx_bytes = base64::engine::general_purpose::STANDARD
+        .decode(tx_b64)
+        .map_err(|e| format!("Prepared register transaction bytes are not valid base64: {e}"))?;
+    if base64::engine::general_purpose::STANDARD.encode(&tx_bytes) != tx_b64 {
+        return Err("Prepared register transaction bytes are not canonical base64".to_owned());
+    }
+    let tx: Transaction = bcs::from_bytes(&tx_bytes)
+        .map_err(|e| format!("Prepared register transaction BCS is invalid: {e}"))?;
+    if tx.sender != expected_sender {
+        return Err(format!(
+            "Prepared register transaction sender mismatch: expected {expected_sender}, got {}",
+            tx.sender
+        ));
+    }
+    let computed_digest = tx.digest().to_string();
+    if computed_digest != prepared.digest.trim() {
+        return Err(format!(
+            "Prepared register transaction digest mismatch: expected {}, got {computed_digest}",
+            prepared.digest
+        ));
+    }
+    let user_sig = UserSignature::from_base64(prepared.signature.trim())
+        .map_err(|e| format!("Prepared register transaction signature is invalid: {e}"))?;
+    let key = parse_sui_private_key(raw_private_key)?;
+    key.verifying_key()
+        .verify_transaction(&tx, &user_sig)
+        .map_err(|e| format!("Prepared register transaction signature verification failed: {e}"))?;
+    Ok((tx, user_sig))
+}
+
+/// Builds and signs a `PreparedRegisterTransaction` (via Enoki sponsorship when enabled, or
+/// deterministic `ValidDuring` address-balance transaction) **without** executing it on-chain,
+/// so the caller can checkpoint `journal.register_transaction` via `before_register_submit` first.
+pub(crate) async fn prepare_register_transaction_in_process(
+    http: &reqwest::Client,
+    grpc_url: &str,
+    network: &str,
+    raw_private_key: &str,
+    ptb: ProgrammableTransaction,
+    allowed_addresses: Vec<String>,
+    register_rebuild: &str,
+) -> Result<PreparedRegisterTransaction, String> {
+    let key = parse_sui_private_key(raw_private_key)?;
+    let sender_addr: Address = key.public_key().derive_address();
+    let sender = sender_addr.to_string();
+
+    let tx_kind = TransactionKind::ProgrammableTransaction(ptb.clone());
+    let tx_kind_bytes =
+        bcs::to_bytes(&tx_kind).map_err(|e| format!("failed to BCS-encode PTB kind: {e}"))?;
+
+    if enoki_is_enabled() {
+        let tx_kind_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_kind_bytes);
+        match enoki_sponsor_transaction_kind_with_addresses(
+            http,
+            network,
+            &sender,
+            &tx_kind_b64,
+            None,
+            Some(allowed_addresses),
+        )
+        .await
+        {
+            Ok(sponsored) => {
+                let sponsored_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(sponsored.bytes.trim())
+                    .map_err(|e| format!("invalid base64 from Enoki sponsor: {e}"))?;
+                verify_sponsored_transaction_matches_ptb(&sponsored_bytes, sender_addr, &ptb)?;
+                let (sig_b64, computed_digest) =
+                    sign_transaction_bytes(raw_private_key, &sponsored_bytes)?;
+                if !sponsored.digest.trim().is_empty() && sponsored.digest.trim() != computed_digest
+                {
+                    return Err(format!(
+                        "Enoki sponsor digest mismatch: Enoki reported {}, Transaction bytes hashed to {computed_digest}",
+                        sponsored.digest
+                    ));
+                }
+                return Ok(PreparedRegisterTransaction {
+                    transaction_bytes: base64::engine::general_purpose::STANDARD
+                        .encode(&sponsored_bytes),
+                    signature: sig_b64,
+                    digest: computed_digest,
+                    sponsor_digest: Some(sponsored.digest),
+                });
+            }
+            Err(err) if err.is_fallback_eligible() => {
+                tracing::warn!(
+                    sender = %sender,
+                    error = %err,
+                    "Enoki sponsor failed during register prepare with fallback-eligible error; falling back to direct address-balance transaction"
+                );
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    let client = shared_sui_grpc_client(grpc_url)?;
+    let mut epoch_client = client.clone();
+    let mut info_client = client;
+    let mut epoch_ledger = epoch_client.ledger_client();
+    let mut info_ledger = info_client.ledger_client();
+
+    let (epoch_res, info_res) = tokio::join!(
+        epoch_ledger.get_epoch(
+            GetEpochRequest::latest()
+                .with_read_mask(FieldMask::from_paths(["epoch", "reference_gas_price"])),
+        ),
+        info_ledger.get_service_info(GetServiceInfoRequest::default()),
+    );
+
+    let epoch_info = epoch_res
+        .map_err(|e| format!("GetEpoch gRPC failed: {e}"))?
+        .into_inner()
+        .epoch
+        .ok_or_else(|| "GetEpoch response omitted epoch".to_owned())?;
+    let current_epoch = epoch_info.epoch.unwrap_or(0);
+    let gas_price = epoch_info.reference_gas_price.unwrap_or(1_000).max(1);
+
+    let chain_id_str = info_res
+        .map_err(|e| format!("GetServiceInfo gRPC failed: {e}"))?
+        .into_inner()
+        .chain_id
+        .ok_or_else(|| "GetServiceInfo omitted chain_id".to_owned())?;
+    let chain_digest: Digest = chain_id_str
+        .parse()
+        .map_err(|e| format!("invalid chain_id digest '{chain_id_str}': {e}"))?;
+
+    let nonce = compute_deterministic_register_nonce(&tx_kind_bytes, register_rebuild);
+    let transaction = Transaction {
+        kind: TransactionKind::ProgrammableTransaction(ptb),
+        sender: sender_addr,
+        gas_payment: GasPayment {
+            objects: Vec::new(),
+            owner: sender_addr,
+            price: gas_price,
+            budget: 50_000_000,
+        },
+        expiration: TransactionExpiration::ValidDuring {
+            min_epoch: Some(current_epoch),
+            max_epoch: Some(current_epoch),
+            min_timestamp: None,
+            max_timestamp: None,
+            chain: chain_digest,
+            nonce,
+        },
+    };
+
+    let tx_bytes = bcs::to_bytes(&transaction)
+        .map_err(|e| format!("failed to BCS-encode Transaction: {e}"))?;
+    let (sig_b64, digest) = sign_transaction_bytes(raw_private_key, &tx_bytes)?;
+
+    Ok(PreparedRegisterTransaction {
+        transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&tx_bytes),
+        signature: sig_b64,
+        digest,
+        sponsor_digest: None,
+    })
+}
+
+enum ReconciledRegisterStatus {
+    NotFound,
+    Succeeded(WalletTxOutcome),
+    CongestionCancelled(String),
+    Failed(String),
+}
+
+fn is_congestion_cancellation_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("congestedobjects")
+        || lower.contains("executioncancelledduetosharedobjectcongestion")
+        || lower.contains("shared object congestion")
+}
+
+async fn lookup_finalized_register_transaction(
+    grpc_url: &str,
+    digest: &str,
+) -> Result<ReconciledRegisterStatus, String> {
+    let mut client = shared_sui_grpc_client(grpc_url)?;
+    let parsed_digest: Digest = digest
+        .parse()
+        .map_err(|e| format!("invalid prepared transaction digest '{digest}': {e}"))?;
+    let req = GetTransactionRequest::new(&parsed_digest)
+        .with_read_mask(FieldMask::from_paths(["digest", "effects", "objects"]));
+    match client.ledger_client().get_transaction(req).await {
+        Ok(resp) => {
+            let Some(tx) = resp.into_inner().transaction else {
+                return Ok(ReconciledRegisterStatus::NotFound);
+            };
+            if let Some(effects_proto) = &tx.effects {
+                if let Ok(effects) = TransactionEffects::try_from(effects_proto) {
+                    if let ExecutionStatus::Failure { error, command } = effects.status() {
+                        let err_msg = format!(
+                            "transaction {digest} failed at command {command:?}: {error:?}"
+                        );
+                        if is_congestion_cancellation_error(&err_msg) {
+                            return Ok(ReconciledRegisterStatus::CongestionCancelled(err_msg));
+                        }
+                        return Ok(ReconciledRegisterStatus::Failed(err_msg));
+                    }
+                }
+            }
+            let created_objects = extract_created_objects_from_executed(&tx);
+            Ok(ReconciledRegisterStatus::Succeeded(WalletTxOutcome {
+                digest: digest.to_owned(),
+                created_objects,
+                used_enoki: false,
+            }))
+        }
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            Ok(ReconciledRegisterStatus::NotFound)
+        }
+        Err(status) => Err(format!(
+            "failed to query prepared register transaction {digest} via gRPC: {status}"
+        )),
+    }
+}
+
+fn extract_created_objects_from_executed(tx: &ExecutedTransaction) -> Vec<CreatedObjectInfo> {
+    let mut type_map = HashMap::new();
+    if let Some(obj_set) = &tx.objects {
+        for obj in &obj_set.objects {
+            if let (Some(id), Some(ty)) = (&obj.object_id, &obj.object_type) {
+                type_map.insert(id.clone(), ty.clone());
+            }
+        }
+    }
+    let mut created = Vec::new();
+    if let Some(effects) = &tx.effects {
+        for changed in &effects.changed_objects {
+            if changed.id_operation == Some(changed_object::IdOperation::Created as i32) {
+                if let Some(id) = &changed.object_id {
+                    let object_type = changed
+                        .object_type
+                        .clone()
+                        .or_else(|| type_map.get(id).cloned());
+                    created.push(CreatedObjectInfo {
+                        object_id: id.clone(),
+                        version: changed.output_version.unwrap_or(1),
+                        digest: changed.output_digest.clone().unwrap_or_default(),
+                        object_type,
+                    });
+                }
+            }
+        }
+    }
+    created
+}
+
+async fn execute_prepared_register_transaction(
+    http: &reqwest::Client,
+    grpc_url: &str,
+    prepared: &PreparedRegisterTransaction,
+    tx: &Transaction,
+    user_sig: &UserSignature,
+) -> Result<WalletTxOutcome, String> {
+    if let Some(sponsor_digest) = prepared
+        .sponsor_digest
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let executed =
+            enoki_execute_sponsored_transaction(http, sponsor_digest, &prepared.signature)
+                .await
+                .map_err(|e| e.to_string())?;
+        let final_digest = if executed.digest.trim().is_empty() {
+            &prepared.digest
+        } else {
+            &executed.digest
+        };
+        return fetch_executed_transaction_outcome(grpc_url, final_digest, true).await;
+    }
+
+    let mut client = shared_sui_grpc_client(grpc_url)?;
+    let mut exec_req = ExecuteTransactionRequest::default();
+    exec_req.transaction = Some(tx.clone().into());
+    exec_req.signatures = vec![user_sig.clone().into()];
+    exec_req.read_mask = Some(FieldMask::from_paths(["digest", "effects", "objects"]));
+
+    let executed = client
+        .execution_client()
+        .execute_transaction(exec_req)
+        .await
+        .map_err(|e| format!("ExecuteTransaction gRPC failed: {e}"))?
+        .into_inner()
+        .transaction
+        .ok_or_else(|| "ExecuteTransaction response omitted transaction".to_owned())?;
+
+    if let Some(effects_proto) = &executed.effects {
+        if let Ok(effects) = TransactionEffects::try_from(effects_proto) {
+            if let ExecutionStatus::Failure { error, command } = effects.status() {
+                return Err(format!(
+                    "transaction {} failed at command {command:?}: {error:?}",
+                    prepared.digest
+                ));
+            }
+        }
+    }
+
+    Ok(WalletTxOutcome {
+        digest: prepared.digest.clone(),
+        created_objects: extract_created_objects_from_executed(&executed),
+        used_enoki: false,
+    })
+}
+
+async fn check_blob_already_certified(grpc_url: &str, blob_object_id: &str) -> bool {
+    let Ok(mut client) = shared_sui_grpc_client(grpc_url) else {
+        return false;
+    };
+    let mut req = GetObjectRequest::default();
+    req.object_id = Some(blob_object_id.to_owned());
+    req.read_mask = Some(FieldMask::from_paths(["json"]));
+    let Ok(resp) = client.ledger_client().get_object(req).await else {
+        return false;
+    };
+    let Some(obj) = resp.into_inner().object else {
+        return false;
+    };
+    let Some(json_proto) = obj.json.as_deref() else {
+        return false;
+    };
+    let json_val = prost_to_json(json_proto);
+    json_val
+        .get("certified_epoch")
+        .is_some_and(|v| !v.is_null())
 }
 
 fn find_created_blob_object_id(outcome: &WalletTxOutcome) -> Option<String> {
@@ -1581,8 +2253,13 @@ pub async fn upload_blob_in_process(
     })
 }
 
-/// Advances the durable Walrus upload state machine by one step in-process in Rust,
-/// returning `DurableUploadAdvance::Step` with `step = "registered" -> "uploaded" -> "certified"`.
+/// Advances the durable Walrus upload state machine by one step in-process in Rust:
+/// - Validates `journal.resume_step` upfront (rejecting malformed or unknown steps with 400).
+/// - Checkpoints a signed `PreparedRegisterTransaction` via `DurableUploadAdvance::Prepared`
+///   **before** submitting `register_blob` on-chain, and reconciles `prepared.digest` on-chain
+///   first on retry so an interrupted submit never double-registers or strands WAL.
+/// - Resumes `"encoded"`, `"registered"`, `"uploaded"`, and `"certified"` journals across
+///   both sidecar-created and Rust-created journal formats.
 #[allow(clippy::too_many_arguments)]
 pub async fn advance_durable_upload_in_process(
     http: &reqwest::Client,
@@ -1594,12 +2271,43 @@ pub async fn advance_durable_upload_in_process(
     job_id: &str,
     mut journal: UploadJournal,
 ) -> Result<DurableUploadAdvance, AppError> {
+    // 1. Validate `resume_step` and `register_transaction` invariants BEFORE any RPC calls.
+    let parsed_resume = parse_resume_step_json(journal.resume_step.as_ref())?;
+    if journal.register_transaction.is_some()
+        && !matches!(parsed_resume, Some(ParsedResumeStep::Encoded { .. }))
+    {
+        return Err(AppError::BadRequest(
+            "registerTransaction is valid only with an encoded resumeStep".into(),
+        ));
+    }
+
+    if let Some(ParsedResumeStep::Certified { step_json }) = parsed_resume {
+        journal.register_transaction = None;
+        return Ok(DurableUploadAdvance::Step {
+            journal,
+            step: step_json,
+        });
+    }
+
     let runtime = get_native_runtime_config();
     let private_key = runtime
         .key_for_slot(journal.wallet_index)
         .map_err(AppError::Internal)?;
     let key = parse_sui_private_key(private_key).map_err(AppError::Internal)?;
     let sender = key.public_key().derive_address();
+    let sender_str = sender.to_string();
+
+    if let Some(ref existing_wallet) = journal.wallet_address {
+        if !existing_wallet.trim().is_empty()
+            && !existing_wallet.trim().eq_ignore_ascii_case(&sender_str)
+        {
+            return Err(AppError::Conflict(
+                "keyIndex no longer maps to the journaled wallet".into(),
+            ));
+        }
+    } else {
+        journal.wallet_address = Some(sender_str.clone());
+    }
 
     let system = resolve_walrus_system_snapshot(
         &runtime.grpc_url,
@@ -1613,9 +2321,6 @@ pub async fn advance_durable_upload_in_process(
     let epochs_u32 = (epochs as u32).clamp(1, 53);
     let end_epoch = (system.epoch + epochs_u32) as i32;
 
-    if journal.wallet_address.is_none() {
-        journal.wallet_address = Some(sender.to_string());
-    }
     if journal.execution_identity.is_none() {
         journal.execution_identity = Some(UploadExecutionIdentity {
             chain_identifier: runtime.sui_network.clone(),
@@ -1623,74 +2328,205 @@ pub async fn advance_durable_upload_in_process(
         });
     }
 
-    let flow_state: Option<NativeFlowState> = journal
-        .resume_step
-        .as_ref()
-        .and_then(|v| v.get("nativeFlowState"))
-        .and_then(|fs| serde_json::from_value(fs.clone()).ok());
-
-    match flow_state {
-        None => {
-            // Step 1: RS2 encode + register_blob on-chain (stamping initial memwal_* attributes).
-            let encoded = encode_walrus_blob_rs2(data.to_vec(), system.n_shards)
-                .await
-                .map_err(AppError::Internal)?;
-            let tip_config = fetch_relay_tip_config(http, &runtime.walrus_publisher_url)
-                .await
-                .map_err(AppError::Internal)?;
-
-            let mut attrs = vec![
-                ("memwal_namespace", namespace.to_owned()),
-                ("memwal_owner", owner.to_owned()),
-            ];
-            if !package_id.trim().is_empty() {
-                attrs.push(("memwal_package_id", package_id.to_owned()));
-            }
-            if !job_id.trim().is_empty() {
-                attrs.push(("memwal_job_id", job_id.to_owned()));
-            }
-
-            let register_ptb = build_register_blob_ptb(
-                &runtime.grpc_url,
-                &runtime.sui_network,
-                sender,
-                &system,
-                &encoded,
-                epochs_u32,
-                &tip_config,
-                &attrs,
-            )
-            .await
-            .map_err(AppError::Internal)?;
-
-            let mut allowed_addrs = vec![sender.to_string()];
-            if let Some((tip_recipient, _)) =
-                tip_config.calculate_tip(system.n_shards, encoded.unencoded_length)
-            {
-                let tip_str = tip_recipient.to_string();
-                if !allowed_addrs.contains(&tip_str) {
-                    allowed_addrs.push(tip_str);
-                }
-            }
-
-            let outcome = match submit_wallet_ptb_with_allowed_addresses(
-                http,
-                &runtime.grpc_url,
-                &runtime.sui_network,
-                private_key,
-                register_ptb,
-                Some(allowed_addrs),
-                false,
-                true,
-            )
-            .await
-            {
-                Ok(out) => out,
-                Err(err) => {
-                    invalidate_walrus_system_snapshot_cache().await;
-                    return Err(AppError::Internal(err));
-                }
+    match parsed_resume {
+        None | Some(ParsedResumeStep::Encoded { .. }) => {
+            let (existing_nonce, expected_blob_id, register_rebuild) = match &parsed_resume {
+                Some(ParsedResumeStep::Encoded {
+                    blob_id,
+                    nonce,
+                    register_rebuild,
+                    ..
+                }) => (*nonce, Some(blob_id.as_str()), register_rebuild.clone()),
+                _ => (None, None, String::new()),
             };
+
+            let encoded =
+                encode_walrus_blob_rs2_with_nonce(data.to_vec(), system.n_shards, existing_nonce)
+                    .await
+                    .map_err(AppError::Internal)?;
+
+            if let Some(expected_id) = expected_blob_id {
+                if encoded.blob_id_str != expected_id {
+                    journal.resume_step = None;
+                    journal.register_transaction = None;
+                    return Ok(DurableUploadAdvance::Reset {
+                        journal,
+                        reason: format!(
+                            "NO_SIDE_EFFECT: resume blobId mismatch: expected {expected_id}, got {}",
+                            encoded.blob_id_str
+                        ),
+                    });
+                }
+            }
+
+            let encoded_flow = NativeFlowState {
+                step: "encoded".to_owned(),
+                blob_id: encoded.blob_id_str.clone(),
+                blob_id_bytes: encoded.blob_id.0,
+                root_hash_bytes: encoded.root_hash_bytes,
+                unencoded_length: encoded.unencoded_length,
+                encoded_size: encoded.encoded_size,
+                nonce: encoded.nonce,
+                blob_digest: encoded.blob_digest,
+                blob_object_id: None,
+                register_tx_digest: None,
+                confirmation_certificate: None,
+                end_epoch: Some(end_epoch),
+            };
+            let mut encoded_step_json = serde_json::json!({
+                "step": "encoded",
+                "blobId": encoded.blob_id_str,
+                "rootHash": base64::engine::general_purpose::STANDARD.encode(encoded.root_hash_bytes),
+                "unencodedSize": encoded.unencoded_length,
+                "nonce": base64::engine::general_purpose::STANDARD.encode(encoded.nonce),
+                "nativeFlowState": encoded_flow,
+            });
+            if !register_rebuild.is_empty() {
+                encoded_step_json["registerRebuild"] = serde_json::json!(register_rebuild);
+            }
+
+            // Phase 1a: No prepared transaction yet -> build and sign `PreparedRegisterTransaction`
+            // and return `DurableUploadAdvance::Prepared(journal)` BEFORE submitting to Sui.
+            let Some(prepared) = journal.register_transaction.clone() else {
+                let tip_config = fetch_relay_tip_config(http, &runtime.walrus_publisher_url)
+                    .await
+                    .map_err(AppError::Internal)?;
+
+                let mut attrs = vec![
+                    ("memwal_namespace", namespace.to_owned()),
+                    ("memwal_owner", owner.to_owned()),
+                ];
+                if !package_id.trim().is_empty() {
+                    attrs.push(("memwal_package_id", package_id.to_owned()));
+                }
+                if !job_id.trim().is_empty() {
+                    attrs.push(("memwal_job_id", job_id.to_owned()));
+                }
+
+                let register_ptb = build_register_blob_ptb(
+                    &runtime.grpc_url,
+                    &runtime.sui_network,
+                    sender,
+                    &system,
+                    &encoded,
+                    epochs_u32,
+                    &tip_config,
+                    &attrs,
+                )
+                .await
+                .map_err(AppError::Internal)?;
+
+                let mut allowed_addrs = vec![sender_str];
+                if let Some((tip_recipient, _)) =
+                    tip_config.calculate_tip(system.n_shards, encoded.unencoded_length)
+                {
+                    let tip_str = tip_recipient.to_string();
+                    if !allowed_addrs.contains(&tip_str) {
+                        allowed_addrs.push(tip_str);
+                    }
+                }
+
+                let prepared_tx = match prepare_register_transaction_in_process(
+                    http,
+                    &runtime.grpc_url,
+                    &runtime.sui_network,
+                    private_key,
+                    register_ptb,
+                    allowed_addrs,
+                    &register_rebuild,
+                )
+                .await
+                {
+                    Ok(tx) => tx,
+                    Err(err) => {
+                        invalidate_walrus_system_snapshot_cache().await;
+                        return Err(AppError::Internal(err));
+                    }
+                };
+
+                journal.resume_step = Some(encoded_step_json);
+                journal.register_transaction = Some(prepared_tx);
+                return Ok(DurableUploadAdvance::Prepared(journal));
+            };
+
+            // Phase 1b: We have a checkpointed `PreparedRegisterTransaction`.
+            // Validate its bytes/digest/sender/signature, reconcile on-chain first, and only
+            // execute if not yet finalized.
+            let (tx, user_sig) =
+                match validate_prepared_register_transaction(&prepared, sender, private_key) {
+                    Ok(valid) => valid,
+                    Err(err) => {
+                        journal.resume_step = Some(encoded_step_json);
+                        journal.register_transaction = None;
+                        return Ok(DurableUploadAdvance::Reset {
+                            journal,
+                            reason: format!("INVALID_PREPARED_REGISTER_TRANSACTION: {err}"),
+                        });
+                    }
+                };
+
+            let outcome =
+                match lookup_finalized_register_transaction(&runtime.grpc_url, &prepared.digest)
+                    .await
+                    .map_err(AppError::Internal)?
+                {
+                    ReconciledRegisterStatus::Succeeded(out) => out,
+                    ReconciledRegisterStatus::CongestionCancelled(reason) => {
+                        encoded_step_json["registerRebuild"] = serde_json::json!(prepared.digest);
+                        journal.resume_step = Some(encoded_step_json);
+                        journal.register_transaction = None;
+                        return Ok(DurableUploadAdvance::Reset {
+                            journal,
+                            reason: format!("CONGESTION_CANCELLED: {reason}"),
+                        });
+                    }
+                    ReconciledRegisterStatus::Failed(err) => {
+                        return Err(AppError::Internal(err));
+                    }
+                    ReconciledRegisterStatus::NotFound => {
+                        if let TransactionExpiration::ValidDuring {
+                            max_epoch: Some(max_ep),
+                            ..
+                        } = tx.expiration
+                        {
+                            if u64::from(system.epoch) > max_ep {
+                                journal.resume_step = Some(encoded_step_json);
+                                journal.register_transaction = None;
+                                return Ok(DurableUploadAdvance::Reset {
+                                    journal,
+                                    reason: "NO_SIDE_EFFECT: prepared register transaction expired"
+                                        .to_owned(),
+                                });
+                            }
+                        }
+
+                        match execute_prepared_register_transaction(
+                            http,
+                            &runtime.grpc_url,
+                            &prepared,
+                            &tx,
+                            &user_sig,
+                        )
+                        .await
+                        {
+                            Ok(out) => out,
+                            Err(err) if is_congestion_cancellation_error(&err) => {
+                                encoded_step_json["registerRebuild"] =
+                                    serde_json::json!(prepared.digest);
+                                journal.resume_step = Some(encoded_step_json);
+                                journal.register_transaction = None;
+                                return Ok(DurableUploadAdvance::Reset {
+                                    journal,
+                                    reason: format!("CONGESTION_CANCELLED: {err}"),
+                                });
+                            }
+                            Err(err) => {
+                                invalidate_walrus_system_snapshot_cache().await;
+                                return Err(AppError::Internal(err));
+                            }
+                        }
+                    }
+                };
 
             let blob_object_id = find_created_blob_object_id(&outcome).ok_or_else(|| {
                 AppError::Internal(format!(
@@ -1717,7 +2553,9 @@ pub async fn advance_durable_upload_in_process(
                 "step": "registered",
                 "blobId": encoded.blob_id_str,
                 "blobObjectId": blob_object_id,
+                "txDigest": outcome.digest,
                 "registerTxDigest": outcome.digest,
+                "nonce": base64::engine::general_purpose::STANDARD.encode(encoded.nonce),
                 "endEpoch": end_epoch,
                 "nativeFlowState": next_flow,
             });
@@ -1729,59 +2567,105 @@ pub async fn advance_durable_upload_in_process(
                 step: step_json,
             })
         }
-        Some(mut st) if st.step == "registered" => {
-            // Step 2: Upload raw blob bytes to Walrus Upload Relay -> ConfirmationCertificate.
-            let blob_object_id = st.blob_object_id.clone().ok_or_else(|| {
-                AppError::Internal("missing blob_object_id in registered state".into())
-            })?;
-            let register_tx_digest = st.register_tx_digest.clone().ok_or_else(|| {
-                AppError::Internal("missing register_tx_digest in registered state".into())
-            })?;
+        Some(ParsedResumeStep::Registered {
+            blob_id,
+            blob_object_id,
+            tx_digest,
+            nonce,
+            end_epoch: resumed_end_epoch,
+            native_flow,
+        }) => {
+            if check_blob_already_certified(&runtime.grpc_url, &blob_object_id).await {
+                let step_json = serde_json::json!({
+                    "step": "certified",
+                    "blobId": blob_id,
+                    "blobObjectId": blob_object_id,
+                    "endEpoch": resumed_end_epoch.unwrap_or(end_epoch),
+                });
+                journal.resume_step = Some(step_json.clone());
+                journal.register_transaction = None;
+                return Ok(DurableUploadAdvance::Step {
+                    journal,
+                    step: step_json,
+                });
+            }
+
+            let resolved_nonce = match nonce {
+                Some(n) => n,
+                None => {
+                    let encoded = encode_walrus_blob_rs2(data.to_vec(), system.n_shards)
+                        .await
+                        .map_err(AppError::Internal)?;
+                    encoded.nonce
+                }
+            };
 
             let cert = post_blob_to_upload_relay(
                 http,
                 &runtime.walrus_publisher_url,
-                &st.blob_id,
+                &blob_id,
                 &blob_object_id,
-                &register_tx_digest,
-                &st.nonce,
+                &tx_digest,
+                &resolved_nonce,
                 data.to_vec(),
             )
             .await
             .map_err(AppError::Internal)?;
 
-            st.step = "uploaded".to_owned();
-            st.confirmation_certificate = Some(cert);
+            let cert_b64 = bcs::to_bytes(&cert)
+                .or_else(|_| serde_json::to_vec(&cert))
+                .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+                .unwrap_or_default();
+
+            let updated_flow = native_flow.map(|mut nf| {
+                nf.step = "uploaded".to_owned();
+                nf.confirmation_certificate = Some(cert.clone());
+                nf
+            });
 
             let step_json = serde_json::json!({
                 "step": "uploaded",
-                "blobId": st.blob_id,
+                "blobId": blob_id,
                 "blobObjectId": blob_object_id,
-                "endEpoch": st.end_epoch,
-                "nativeFlowState": st,
+                "certificate": cert_b64,
+                "endEpoch": resumed_end_epoch.unwrap_or(end_epoch),
+                "nativeFlowState": updated_flow,
             });
             journal.resume_step = Some(step_json.clone());
+            journal.register_transaction = None;
 
             Ok(DurableUploadAdvance::Step {
                 journal,
                 step: step_json,
             })
         }
-        Some(st) => {
-            // Step 3: Certify blob on-chain.
-            let blob_object_id = st.blob_object_id.clone().ok_or_else(|| {
-                AppError::Internal("missing blob_object_id in uploaded state".into())
-            })?;
-            let cert = st.confirmation_certificate.as_ref().ok_or_else(|| {
-                AppError::Internal("missing confirmation_certificate in uploaded state".into())
-            })?;
+        Some(ParsedResumeStep::Uploaded {
+            blob_id,
+            blob_object_id,
+            certificate,
+            end_epoch: resumed_end_epoch,
+        }) => {
+            if check_blob_already_certified(&runtime.grpc_url, &blob_object_id).await {
+                let step_json = serde_json::json!({
+                    "step": "certified",
+                    "blobId": blob_id,
+                    "blobObjectId": blob_object_id,
+                    "endEpoch": resumed_end_epoch.unwrap_or(end_epoch),
+                });
+                journal.resume_step = Some(step_json.clone());
+                journal.register_transaction = None;
+                return Ok(DurableUploadAdvance::Step {
+                    journal,
+                    step: step_json,
+                });
+            }
 
             let certify_ptb = build_certify_ptb(
                 &runtime.grpc_url,
                 sender,
                 &system,
                 &blob_object_id,
-                cert,
+                &certificate,
             )
             .await
             .map_err(AppError::Internal)?;
@@ -1806,13 +2690,21 @@ pub async fn advance_durable_upload_in_process(
 
             let step_json = serde_json::json!({
                 "step": "certified",
-                "blobId": st.blob_id,
+                "blobId": blob_id,
                 "blobObjectId": blob_object_id,
                 "certifyTxDigest": outcome.digest,
-                "endEpoch": st.end_epoch.unwrap_or(end_epoch),
+                "endEpoch": resumed_end_epoch.unwrap_or(end_epoch),
             });
             journal.resume_step = Some(step_json.clone());
+            journal.register_transaction = None;
 
+            Ok(DurableUploadAdvance::Step {
+                journal,
+                step: step_json,
+            })
+        }
+        Some(ParsedResumeStep::Certified { step_json }) => {
+            journal.register_transaction = None;
             Ok(DurableUploadAdvance::Step {
                 journal,
                 step: step_json,
@@ -2019,8 +2911,8 @@ async fn read_blob_metadata_map(
     // Fast path: derive the `vector<u8>` dynamic child ID for `b"metadata"` directly (`1` gRPC GetObject).
     if let Ok(blob_addr) = blob_object_id.parse::<Address>() {
         if let Ok(key_bcs) = bcs::to_bytes(b"metadata".as_slice()) {
-            let metadata_field_id =
-                blob_addr.derive_dynamic_child_id(&TypeTag::Vector(Box::new(TypeTag::U8)), &key_bcs);
+            let metadata_field_id = blob_addr
+                .derive_dynamic_child_id(&TypeTag::Vector(Box::new(TypeTag::U8)), &key_bcs);
             let mut obj_req = GetObjectRequest::default();
             obj_req.object_id = Some(metadata_field_id.to_string());
             obj_req.read_mask = Some(FieldMask::from_paths(["json", "bcs"]));
@@ -2082,6 +2974,325 @@ fn collect_vec_map_entries(val: &serde_json::Value, out: &mut HashMap<String, St
     }
 }
 
+const MAX_PROVENANCE_CACHE_ENTRIES: usize = 10_000;
+
+static BLOB_PROVENANCE_CACHE: OnceLock<StdRwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn get_cached_blob_provenance(object_id: &str) -> Option<String> {
+    let cache = BLOB_PROVENANCE_CACHE.get_or_init(|| StdRwLock::new(HashMap::new()));
+    cache.read().ok()?.get(object_id).cloned()
+}
+
+fn set_cached_blob_provenance(object_id: String, uploader: String) {
+    let cache = BLOB_PROVENANCE_CACHE.get_or_init(|| StdRwLock::new(HashMap::new()));
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= MAX_PROVENANCE_CACHE_ENTRIES && !guard.contains_key(&object_id) {
+            if let Some(first_key) = guard.keys().next().cloned() {
+                guard.remove(&first_key);
+            }
+        }
+        guard.insert(object_id, uploader);
+    }
+}
+
+fn default_sui_graphql_url(network: &str) -> Option<String> {
+    if let Ok(explicit) = std::env::var("SUI_GRAPHQL_URL") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => Some("https://graphql.mainnet.sui.io/graphql".to_owned()),
+        "testnet" => Some("https://graphql.testnet.sui.io/graphql".to_owned()),
+        "devnet" => Some("https://graphql.devnet.sui.io/graphql".to_owned()),
+        _ => None,
+    }
+}
+
+async fn query_creation_sender_via_graphql(
+    http: &reqwest::Client,
+    graphql_url: &str,
+    canonical_object_id: &str,
+) -> Result<Option<String>, String> {
+    const CREATION_TX_QUERY: &str = r#"
+        query FindBlobCreationTx($id: SuiAddress!) {
+            object(address: $id, version: 1) {
+                previousTransactionBlock {
+                    digest
+                    sender {
+                        address
+                    }
+                    effects {
+                        status
+                        objectChanges {
+                            nodes {
+                                address
+                                idCreated
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    "#;
+
+    let resp = http
+        .post(graphql_url)
+        .json(&serde_json::json!({
+            "query": CREATION_TX_QUERY,
+            "variables": { "id": canonical_object_id },
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("Sui GraphQL provenance request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Sui GraphQL returned HTTP {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid Sui GraphQL JSON: {e}"))?;
+
+    if let Some(errs) = body.get("errors").and_then(serde_json::Value::as_array) {
+        if !errs.is_empty() {
+            let msg = errs[0]
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("GraphQL error");
+            return Err(format!("Sui GraphQL provenance query error: {msg}"));
+        }
+    }
+
+    let Some(prev_tx) = body
+        .pointer("/data/object/previousTransactionBlock")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(None);
+    };
+
+    let status = prev_tx
+        .pointer("/effects/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if status != "SUCCESS" {
+        return Ok(None);
+    }
+
+    let created_match = prev_tx
+        .pointer("/effects/objectChanges/nodes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                let id_created = node
+                    .get("idCreated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let addr = node
+                    .get("address")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .map(|a| a.to_string());
+                id_created && addr.as_deref() == Some(canonical_object_id)
+            })
+        });
+    if !created_match {
+        return Ok(None);
+    }
+
+    let sender = prev_tx
+        .pointer("/sender/address")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<Address>().ok())
+        .map(|a| a.to_string());
+
+    Ok(sender)
+}
+
+/// Resolves the canonical Sui address (`0x` + 64 lowercase hex) that executed the immutable
+/// version-1 creation transaction for `object_id`.
+///
+/// Mirrors `findBlobCreationSender` in `services/server/scripts/sidecar/routes/walrus-query.ts`:
+/// - Uses a bounded process cache (`MAX_PROVENANCE_CACHE_ENTRIES = 10_000`) because creation
+///   provenance is immutable for the lifetime of a Sui object ID.
+/// - Queries gRPC `GetObject(version = 1)` + `GetTransaction` first (fast and works on localnet
+///   and fullnodes), falling back to archival Sui GraphQL (`object(address, version: 1)`) when
+///   version 1 has been pruned from the gRPC fullnode.
+/// - Returns `Err` if provenance cannot be verified due to RPC/GraphQL failures so the caller
+///   fails closed instead of trusting unverified third-party blobs.
+pub(crate) async fn find_blob_creation_sender(
+    grpc_url: &str,
+    sui_network: &str,
+    object_id: &str,
+) -> Result<Option<String>, String> {
+    let canonical_object_id = object_id
+        .trim()
+        .parse::<Address>()
+        .map_err(|e| format!("invalid blob object_id '{object_id}': {e}"))?
+        .to_string();
+
+    if let Some(cached) = get_cached_blob_provenance(&canonical_object_id) {
+        return Ok(Some(cached));
+    }
+
+    let mut grpc_err: Option<String> = None;
+
+    // 1. Try Sui gRPC `GetObject(id, version = 1)` -> `previous_transaction` -> `GetTransaction`.
+    match shared_sui_grpc_client(grpc_url) {
+        Ok(mut client) => {
+            let mut obj_req = GetObjectRequest::default();
+            obj_req.object_id = Some(canonical_object_id.clone());
+            obj_req.version = Some(1);
+            obj_req.read_mask = Some(FieldMask::from_paths(["previous_transaction"]));
+
+            match client.ledger_client().get_object(obj_req).await {
+                Ok(resp) => {
+                    if let Some(prev_tx_digest) = resp
+                        .into_inner()
+                        .object
+                        .and_then(|o| o.previous_transaction)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        if let Ok(parsed_digest) = prev_tx_digest.parse::<Digest>() {
+                            let tx_req = GetTransactionRequest::new(&parsed_digest).with_read_mask(
+                                FieldMask::from_paths(["digest", "transaction", "effects"]),
+                            );
+                            match client.ledger_client().get_transaction(tx_req).await {
+                                Ok(tx_resp) => {
+                                    if let Some(tx) = tx_resp.into_inner().transaction {
+                                        let succeeded = tx
+                                            .effects
+                                            .as_ref()
+                                            .and_then(|eff| TransactionEffects::try_from(eff).ok())
+                                            .is_some_and(|eff| {
+                                                matches!(eff.status(), ExecutionStatus::Success)
+                                            });
+                                        let created_this_blob =
+                                            extract_created_objects_from_executed(&tx).iter().any(
+                                                |c| {
+                                                    c.object_id
+                                                        .parse::<Address>()
+                                                        .map(|a| a.to_string())
+                                                        .ok()
+                                                        .as_deref()
+                                                        == Some(canonical_object_id.as_str())
+                                                },
+                                            );
+                                        let sender = tx
+                                            .transaction
+                                            .as_ref()
+                                            .and_then(|t| t.sender.as_deref())
+                                            .and_then(|s| s.parse::<Address>().ok())
+                                            .map(|a| a.to_string());
+
+                                        if succeeded && created_this_blob {
+                                            if let Some(valid_sender) = sender {
+                                                set_cached_blob_provenance(
+                                                    canonical_object_id,
+                                                    valid_sender.clone(),
+                                                );
+                                                return Ok(Some(valid_sender));
+                                            }
+                                        }
+                                        return Ok(None);
+                                    }
+                                }
+                                Err(e) => {
+                                    grpc_err = Some(format!(
+                                        "GetTransaction({prev_tx_digest}) failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    grpc_err = Some(format!("GetObject({canonical_object_id}, v1) failed: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            grpc_err = Some(e);
+        }
+    }
+
+    // 2. Fallback to archival Sui GraphQL (`object(address: $id, version: 1)`).
+    if let Some(graphql_url) = default_sui_graphql_url(sui_network) {
+        let http = reqwest::Client::new();
+        match query_creation_sender_via_graphql(&http, &graphql_url, &canonical_object_id).await {
+            Ok(Some(sender)) => {
+                set_cached_blob_provenance(canonical_object_id, sender.clone());
+                return Ok(Some(sender));
+            }
+            Ok(None) => return Ok(None),
+            Err(gql_err) => {
+                let combined = match grpc_err {
+                    Some(ge) => format!("{ge}; GraphQL fallback failed: {gql_err}"),
+                    None => gql_err,
+                };
+                return Err(combined);
+            }
+        }
+    }
+
+    if let Some(err) = grpc_err {
+        return Err(err);
+    }
+    Ok(None)
+}
+
+/// Filters `(object_id, blob_id)` candidates down to blobs whose immutable version-1 creation
+/// transaction was sent by one of the configured `trusted_uploaders` (`SERVER_SUI_PRIVATE_KEYS`).
+///
+/// Fails closed (`Err(AppError::Internal)`) if provenance resolution errors for any candidate.
+pub(crate) async fn filter_trusted_blob_candidates_with_resolver<F, Fut>(
+    owner: &str,
+    candidates: Vec<(String, String)>,
+    trusted_uploaders: &std::collections::HashSet<String>,
+    mut resolve_sender: F,
+) -> Result<Vec<(String, String)>, AppError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    let mut trusted = Vec::with_capacity(candidates.len());
+    let mut excluded_untrusted = 0usize;
+
+    for (object_id, blob_id) in candidates {
+        let sender_opt = resolve_sender(object_id.clone()).await.map_err(|err| {
+            AppError::Internal(format!(
+                "unable to verify creation provenance for Walrus Blob {object_id}: {err}"
+            ))
+        })?;
+
+        let is_trusted = sender_opt
+            .as_deref()
+            .and_then(|s| s.trim().parse::<Address>().ok())
+            .map(|a| a.to_string())
+            .is_some_and(|canonical_sender| trusted_uploaders.contains(&canonical_sender));
+
+        if is_trusted {
+            trusted.push((object_id, blob_id));
+        } else {
+            excluded_untrusted += 1;
+        }
+    }
+
+    if excluded_untrusted > 0 {
+        tracing::warn!(
+            owner = %owner,
+            excluded_untrusted,
+            kept = trusted.len(),
+            "walrus_query_blobs_untrusted_candidates_excluded"
+        );
+    }
+
+    Ok(trusted)
+}
+
 pub async fn query_blobs_by_owner_in_process(
     owner_address: &str,
     namespace: Option<&str>,
@@ -2089,8 +3300,11 @@ pub async fn query_blobs_by_owner_in_process(
     limit: Option<usize>,
 ) -> Result<(Vec<OnChainBlob>, bool), AppError> {
     let runtime = get_native_runtime_config();
-    let mut client = shared_sui_grpc_client(&runtime.grpc_url)
-        .map_err(AppError::UpstreamUnavailable)?;
+    let trusted_uploaders = runtime
+        .trusted_uploader_addresses()
+        .map_err(AppError::Internal)?;
+    let mut client =
+        shared_sui_grpc_client(&runtime.grpc_url).map_err(AppError::UpstreamUnavailable)?;
 
     let canonical_owner = owner_address
         .trim()
@@ -2147,7 +3361,7 @@ pub async fn query_blobs_by_owner_in_process(
     let source_capped = probed.len() > cap;
     probed.truncate(cap);
 
-    let mut candidates: Vec<(String, String)> = Vec::with_capacity(probed.len());
+    let mut raw_candidates: Vec<(String, String)> = Vec::with_capacity(probed.len());
     for obj in probed {
         let Some(object_id) = obj.object_id else {
             continue;
@@ -2166,8 +3380,24 @@ pub async fn query_blobs_by_owner_in_process(
             continue;
         }
         let blob_id = decimal_u256_to_blob_id(&raw_blob_id);
-        candidates.push((object_id, blob_id));
+        raw_candidates.push((object_id, blob_id));
     }
+
+    // Verify immutable creation-transaction provenance for every candidate Blob and filter out
+    // any third-party blobs transferred to `owner_address` (failing closed on lookup errors).
+    let grpc_url_ref = runtime.grpc_url.clone();
+    let sui_network_ref = runtime.sui_network.clone();
+    let candidates = filter_trusted_blob_candidates_with_resolver(
+        &canonical_owner,
+        raw_candidates,
+        &trusted_uploaders,
+        move |obj_id| {
+            let grpc = grpc_url_ref.clone();
+            let net = sui_network_ref.clone();
+            async move { find_blob_creation_sender(&grpc, &net, &obj_id).await }
+        },
+    )
+    .await?;
 
     // Batch-fetch derived `b"metadata"` dynamic-field objects via `BatchGetObjectsRequest`
     // (chunks of 50) instead of issuing N sequential `GetObject` gRPC calls.
@@ -2198,9 +3428,9 @@ pub async fn query_blobs_by_owner_in_process(
                     .into_iter()
                     .zip(batch_resp.into_inner().objects)
                 {
-                    if let Some(
-                        sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(obj),
-                    ) = obj_res.result
+                    if let Some(sui_rpc::proto::sui::rpc::v2::get_object_result::Result::Object(
+                        obj,
+                    )) = obj_res.result
                     {
                         let mut map = HashMap::new();
                         parse_metadata_from_proto_object(&obj, &mut map);
@@ -2229,7 +3459,10 @@ pub async fn query_blobs_by_owner_in_process(
                 continue;
             }
         }
-        let blob_pkg = metadata.get("memwal_package_id").cloned().unwrap_or_default();
+        let blob_pkg = metadata
+            .get("memwal_package_id")
+            .cloned()
+            .unwrap_or_default();
         if let Some(expected_pkg) = package_id {
             if !blob_pkg.eq_ignore_ascii_case(expected_pkg) {
                 continue;
@@ -2388,8 +3621,7 @@ pub async fn find_blob_by_job_in_process(
                     continue;
                 };
                 let metadata = read_blob_metadata_map(&mut client, &object_id).await;
-                let job_matches =
-                    metadata.get("memwal_job_id").map(String::as_str) == Some(job_id);
+                let job_matches = metadata.get("memwal_job_id").map(String::as_str) == Some(job_id);
                 let owner_matches = metadata
                     .get("memwal_owner")
                     .and_then(|v| v.trim().parse::<Address>().ok())
@@ -2485,10 +3717,9 @@ mod tests {
                 .to_owned(),
             kind: RelayTipKind::Const(5_000),
         };
-        let sender: Address =
-            "0x00000000000000000000000000000000000000000000000000000000000000cc"
-                .parse()
-                .unwrap();
+        let sender: Address = "0x00000000000000000000000000000000000000000000000000000000000000cc"
+            .parse()
+            .unwrap();
 
         let ptb = build_register_blob_ptb(
             "http://127.0.0.1:1",
@@ -2505,7 +3736,11 @@ mod tests {
 
         match ptb.inputs.first() {
             Some(sui_sdk_types::Input::Pure(bytes)) => {
-                assert_eq!(bytes.len(), 72, "HashedAuthPackage BCS must be 32+32+8=72 bytes");
+                assert_eq!(
+                    bytes.len(),
+                    72,
+                    "HashedAuthPackage BCS must be 32+32+8=72 bytes"
+                );
                 let decoded: HashedAuthPackage = bcs::from_bytes(bytes).unwrap();
                 assert_eq!(decoded.blob_digest, encoded.blob_digest);
                 assert_eq!(decoded.unencoded_length, encoded.unencoded_length);
@@ -2517,7 +3752,9 @@ mod tests {
     #[test]
     fn validate_seal_persistence_ciphertext_rejects_package_mismatch() {
         use fastcrypto::groups::Scalar as _;
-        use seal_crypto::{ibe, seal_encrypt as crypto_seal_encrypt, EncryptionInput, IBEPublicKeys};
+        use seal_crypto::{
+            ibe, seal_encrypt as crypto_seal_encrypt, EncryptionInput, IBEPublicKeys,
+        };
 
         let mut rng = rand::thread_rng();
         let msk = ibe::MasterKey::rand(&mut rng);
@@ -2545,7 +3782,9 @@ mod tests {
         let enc_bytes = bcs::to_bytes(&enc_obj).unwrap();
 
         // Matching package_id and policy_package_id succeeds.
-        assert!(validate_seal_persistence_ciphertext(&enc_bytes, pkg_a, policy_pkg, policy_pkg).is_ok());
+        assert!(
+            validate_seal_persistence_ciphertext(&enc_bytes, pkg_a, policy_pkg, policy_pkg).is_ok()
+        );
 
         // Mismatched immutable package_id fails closed.
         let err = validate_seal_persistence_ciphertext(&enc_bytes, pkg_b, policy_pkg, policy_pkg)
@@ -2553,8 +3792,8 @@ mod tests {
         assert!(err.contains("Ciphertext packageId does not match packageId"));
 
         // Mismatched policy_package_id fails closed.
-        let err_pol = validate_seal_persistence_ciphertext(&enc_bytes, pkg_a, pkg_b, policy_pkg)
-            .unwrap_err();
+        let err_pol =
+            validate_seal_persistence_ciphertext(&enc_bytes, pkg_a, pkg_b, policy_pkg).unwrap_err();
         assert!(err_pol.contains("policyPackageId does not match"));
     }
 
@@ -2681,5 +3920,271 @@ mod tests {
         let existing = "abcDEF_123-xyz";
         assert_eq!(decimal_u256_to_blob_id(existing), existing);
     }
-}
 
+    #[test]
+    fn validate_prepared_register_transaction_and_deterministic_nonce_match_checkpoint_contract() {
+        let raw_key = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let other_key = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let key = parse_sui_private_key(raw_key).unwrap();
+        let sender = key.public_key().derive_address();
+
+        let tx_kind = TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
+            inputs: vec![sui_sdk_types::Input::Pure(vec![7, 8, 9])],
+            commands: Vec::new(),
+        });
+        let tx_kind_bytes = bcs::to_bytes(&tx_kind).unwrap();
+
+        // Deterministic nonce is stable for identical (tx_kind_bytes, rebuild_salt) and changes when salt changes.
+        let nonce_initial = compute_deterministic_register_nonce(&tx_kind_bytes, "");
+        assert_eq!(
+            nonce_initial,
+            compute_deterministic_register_nonce(&tx_kind_bytes, "")
+        );
+        let nonce_rebuilt = compute_deterministic_register_nonce(
+            &tx_kind_bytes,
+            "11111111111111111111111111111111",
+        );
+        assert_ne!(nonce_initial, nonce_rebuilt);
+
+        let tx = Transaction {
+            kind: tx_kind,
+            sender,
+            gas_payment: GasPayment {
+                objects: Vec::new(),
+                owner: sender,
+                price: 1_000,
+                budget: 50_000_000,
+            },
+            expiration: TransactionExpiration::ValidDuring {
+                min_epoch: Some(450),
+                max_epoch: Some(450),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain: Digest::ZERO,
+                nonce: nonce_initial,
+            },
+        };
+        let tx_bytes = bcs::to_bytes(&tx).unwrap();
+        let (sig_b64, digest) = sign_transaction_bytes(raw_key, &tx_bytes).unwrap();
+        let prepared = PreparedRegisterTransaction {
+            transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&tx_bytes),
+            signature: sig_b64,
+            digest,
+            sponsor_digest: None,
+        };
+
+        // Valid prepared transaction passes validation.
+        let (parsed_tx, _) =
+            validate_prepared_register_transaction(&prepared, sender, raw_key).unwrap();
+        assert_eq!(parsed_tx.sender, sender);
+
+        // Wrong sender fails validation.
+        let other_sender = parse_sui_private_key(other_key)
+            .unwrap()
+            .public_key()
+            .derive_address();
+        assert!(
+            validate_prepared_register_transaction(&prepared, other_sender, raw_key)
+                .unwrap_err()
+                .contains("sender mismatch")
+        );
+
+        // Wrong signing key fails signature verification.
+        assert!(
+            validate_prepared_register_transaction(&prepared, sender, other_key)
+                .unwrap_err()
+                .contains("signature verification failed")
+        );
+
+        // Tampered digest fails validation.
+        let mut bad_digest = prepared.clone();
+        bad_digest.digest = Digest::ZERO.to_string();
+        assert!(
+            validate_prepared_register_transaction(&bad_digest, sender, raw_key)
+                .unwrap_err()
+                .contains("digest mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_resume_step_json_resumes_sidecar_and_rust_journals_and_rejects_malformed_steps()
+    {
+        // 1. None -> Ok(None)
+        assert!(parse_resume_step_json(None).unwrap().is_none());
+
+        // 2. Sidecar-formatted "encoded" step (without `nativeFlowState`) parses cleanly.
+        let nonce_bytes = [0x5au8; 32];
+        let sidecar_encoded = serde_json::json!({
+            "step": "encoded",
+            "blobId": "blob-123",
+            "rootHash": base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]),
+            "unencodedSize": 1024,
+            "nonce": base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
+            "registerRebuild": "prev-digest-1"
+        });
+        match parse_resume_step_json(Some(&sidecar_encoded)).unwrap() {
+            Some(ParsedResumeStep::Encoded {
+                blob_id,
+                unencoded_size,
+                nonce,
+                register_rebuild,
+                ..
+            }) => {
+                assert_eq!(blob_id, "blob-123");
+                assert_eq!(unencoded_size, 1024);
+                assert_eq!(nonce, Some(nonce_bytes));
+                assert_eq!(register_rebuild, "prev-digest-1");
+            }
+            other => panic!("expected ParsedResumeStep::Encoded, got {other:?}"),
+        }
+
+        // 3. Sidecar-formatted "registered" step (using `txDigest` and no `nativeFlowState`) parses cleanly.
+        let sidecar_registered = serde_json::json!({
+            "step": "registered",
+            "blobId": "blob-123",
+            "blobObjectId": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+            "txDigest": "11111111111111111111111111111111",
+            "nonce": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes),
+            "endEpoch": 460
+        });
+        match parse_resume_step_json(Some(&sidecar_registered)).unwrap() {
+            Some(ParsedResumeStep::Registered {
+                blob_id,
+                blob_object_id,
+                tx_digest,
+                nonce,
+                end_epoch,
+                ..
+            }) => {
+                assert_eq!(blob_id, "blob-123");
+                assert_eq!(
+                    blob_object_id,
+                    "0x00000000000000000000000000000000000000000000000000000000000000aa"
+                );
+                assert_eq!(tx_digest, "11111111111111111111111111111111");
+                assert_eq!(nonce, Some(nonce_bytes));
+                assert_eq!(end_epoch, Some(460));
+            }
+            other => panic!("expected ParsedResumeStep::Registered, got {other:?}"),
+        }
+
+        // 4. Sidecar-formatted "certified" step returns Certified and short-circuits in `advance_durable_upload_in_process`.
+        let sidecar_certified = serde_json::json!({
+            "step": "certified",
+            "blobId": "blob-123",
+            "blobObjectId": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+            "endEpoch": 462
+        });
+        let journal = UploadJournal {
+            wallet_index: 0,
+            wallet_address: None,
+            execution_identity: None,
+            resume_step: Some(sidecar_certified.clone()),
+            register_transaction: None,
+        };
+        let http = reqwest::Client::new();
+        match advance_durable_upload_in_process(
+            &http,
+            b"test",
+            5,
+            "0x00000000000000000000000000000000000000000000000000000000000000bb",
+            "default",
+            "",
+            "job-1",
+            journal,
+        )
+        .await
+        .expect("certified resumeStep should short-circuit without RPC")
+        {
+            DurableUploadAdvance::Step { step, .. } => {
+                assert_eq!(step["step"], "certified");
+                assert_eq!(step["blobId"], "blob-123");
+            }
+            _ => panic!("expected DurableUploadAdvance::Step"),
+        }
+
+        // 5. Unknown or malformed `resumeStep` fails closed with `AppError::BadRequest` (never falls back to fresh registration).
+        for invalid in [
+            serde_json::json!("not-an-object"),
+            serde_json::json!({"blobId": "blob-123"}),
+            serde_json::json!({"step": "unknown_step", "blobId": "blob-123"}),
+            serde_json::json!({"step": "encoded", "blobId": "blob-123"}),
+            serde_json::json!({"step": "registered", "blobId": "blob-123"}),
+            serde_json::json!({"step": "uploaded", "blobId": "blob-123", "blobObjectId": "0x1"}),
+            serde_json::json!({"step": "certified", "blobId": "blob-123"}),
+        ] {
+            assert!(
+                matches!(
+                    parse_resume_step_json(Some(&invalid)),
+                    Err(AppError::BadRequest(_))
+                ),
+                "expected BadRequest for invalid resumeStep: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_trusted_blob_candidates_enforces_uploader_provenance_and_fails_closed_on_lookup_error(
+    ) {
+        let trusted_wallet =
+            "0x0000000000000000000000000000000000000000000000000000000000000011".to_owned();
+        let untrusted_wallet =
+            "0x0000000000000000000000000000000000000000000000000000000000000099".to_owned();
+        let owner = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+
+        let mut trusted_set = std::collections::HashSet::new();
+        trusted_set.insert(trusted_wallet.clone());
+
+        let obj_trusted =
+            "0x0000000000000000000000000000000000000000000000000000000000000101".to_owned();
+        let obj_spoofed =
+            "0x0000000000000000000000000000000000000000000000000000000000000202".to_owned();
+
+        let candidates = vec![
+            (obj_trusted.clone(), "blob-trusted".to_owned()),
+            (obj_spoofed.clone(), "blob-spoofed".to_owned()),
+        ];
+
+        // 1. Trusted blob is kept; third-party transferred blob (`untrusted_wallet`) is excluded.
+        let trusted_wallet_clone = trusted_wallet.clone();
+        let untrusted_wallet_clone = untrusted_wallet.clone();
+        let obj_trusted_clone = obj_trusted.clone();
+        let filtered = filter_trusted_blob_candidates_with_resolver(
+            owner,
+            candidates.clone(),
+            &trusted_set,
+            move |obj_id| {
+                let tw = trusted_wallet_clone.clone();
+                let uw = untrusted_wallet_clone.clone();
+                let ot = obj_trusted_clone.clone();
+                async move {
+                    if obj_id == ot {
+                        Ok(Some(tw))
+                    } else {
+                        Ok(Some(uw))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("provenance filter should succeed");
+
+        assert_eq!(
+            filtered,
+            vec![(obj_trusted.clone(), "blob-trusted".to_owned())]
+        );
+
+        // 2. Provenance lookup failure fails closed with `AppError::Internal` rather than accepting or skipping.
+        let err = filter_trusted_blob_candidates_with_resolver(
+            owner,
+            candidates,
+            &trusted_set,
+            |_obj_id| async move { Err("Sui archival provenance lookup timed out".to_owned()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Internal(ref msg) if msg.contains("unable to verify creation provenance"))
+        );
+    }
+}
