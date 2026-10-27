@@ -144,6 +144,18 @@ struct MoveKeyServerV1 {
 }
 
 #[derive(Deserialize)]
+struct MovePartialKeyServer {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    url: String,
+    #[allow(dead_code)]
+    partial_pk: Vec<u8>,
+    #[allow(dead_code)]
+    party_id: u16,
+}
+
+#[derive(Deserialize)]
 enum MoveServerTypeV2 {
     Independent {
         url: String,
@@ -153,6 +165,8 @@ enum MoveServerTypeV2 {
         version: u32,
         #[allow(dead_code)]
         threshold: u16,
+        #[allow(dead_code)]
+        partial_key_servers: Vec<MovePartialKeyServer>,
     },
 }
 
@@ -1269,7 +1283,7 @@ pub async fn seal_decrypt_batch_in_process(
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .header("Client-Sdk-Type", "typescript")
-                .header("Client-Sdk-Version", "0.9.6")
+                .header("Client-Sdk-Version", "1.1.0")
                 .header("Request-Id", &req_id);
             if let (Some(header_name), Some(header_val)) = (&srv.api_key_name, &srv.api_key) {
                 req_builder = req_builder.header(header_name.as_str(), header_val.as_str());
@@ -1676,6 +1690,73 @@ mod tests {
 
         // Package mismatch is rejected
         assert!(import_exported_session_key(&exported_b64, other_pkg).is_err());
+    }
+
+    #[test]
+    fn v2_committee_key_server_bcs_deserializes_with_partial_key_servers() {
+        #[derive(Serialize)]
+        struct PartialKs {
+            name: String,
+            url: String,
+            partial_pk: Vec<u8>,
+            party_id: u16,
+        }
+        #[derive(Serialize)]
+        enum ServerTypeV2 {
+            #[allow(dead_code)]
+            Independent { url: String },
+            Committee {
+                version: u32,
+                threshold: u16,
+                partial_key_servers: Vec<PartialKs>,
+            },
+        }
+        #[derive(Serialize)]
+        struct KsV2 {
+            name: String,
+            key_type: u8,
+            pk: Vec<u8>,
+            server_type: ServerTypeV2,
+        }
+        #[derive(Serialize)]
+        struct FieldU64<V> {
+            id: Address,
+            name: u64,
+            value: V,
+        }
+
+        let raw = FieldU64 {
+            id: Address::ZERO,
+            name: 2,
+            value: KsV2 {
+                name: "testnet-committee".to_owned(),
+                key_type: 0,
+                pk: vec![0xab; 96],
+                server_type: ServerTypeV2::Committee {
+                    version: 0,
+                    threshold: 3,
+                    partial_key_servers: vec![PartialKs {
+                        name: "member-0".to_owned(),
+                        url: "https://member-0.example.com".to_owned(),
+                        partial_pk: vec![0xcd; 96],
+                        party_id: 0,
+                    }],
+                },
+            },
+        };
+        let encoded = bcs::to_bytes(&raw).expect("serialize v2 committee dynamic field");
+        let decoded: MoveField<u64, MoveKeyServerV2> =
+            bcs::from_bytes(&encoded).expect("deserialize v2 committee dynamic field");
+        assert_eq!(decoded.value.name, "testnet-committee");
+        assert_eq!(decoded.value.pk.len(), 96);
+        assert!(matches!(
+            decoded.value.server_type,
+            MoveServerTypeV2::Committee {
+                version: 0,
+                threshold: 3,
+                ..
+            }
+        ));
     }
 
     #[test]
