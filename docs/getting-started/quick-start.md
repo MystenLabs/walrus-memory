@@ -152,7 +152,7 @@ The fastest way to get Walrus Memory running is through the TypeScript SDK.
     | **Network** | **Relayer URL** |
     | --- | --- |
     | **Production** (mainnet) | `https://relayer.memory.walrus.xyz` |
-    | **Staging** (testnet) | `https://relayer-staging.memory.walrus.xyz` |
+    | **Staging** (testnet) | `https://relayer.dev.memwal.ai` |
   </Step>
 
   <Step>

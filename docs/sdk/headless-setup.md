@@ -38,7 +38,7 @@ A server or agent runtime has no human to click through a wallet or paste a key 
 The SDK authenticates every request with an Ed25519 delegate key tied to a `MemWalAccount` object on Sui. Generate the account ID and delegate key once through the dashboard, then store them as secrets:
 
 - **Mainnet:** [memory.walrus.xyz](https://memory.walrus.xyz)
-- **Testnet:** [staging.memory.walrus.xyz](https://staging.memory.walrus.xyz)
+- **Testnet:** [dev.memwal.ai](https://dev.memwal.ai)
 
 This is the only step that involves a browser. Your runtime never opens one.
 
@@ -58,7 +58,7 @@ function requireEnv(name: string): string {
 const memwal = MemWal.create({
   key: requireEnv("MEMWAL_PRIVATE_KEY"),
   accountId: requireEnv("MEMWAL_ACCOUNT_ID"),
-  // Mainnet relayer. Use https://relayer-staging.memory.walrus.xyz for Testnet.
+  // Mainnet relayer. Use https://relayer.dev.memwal.ai for Testnet.
   serverUrl: "https://relayer.memory.walrus.xyz",
   namespace: "service-memory",
 });

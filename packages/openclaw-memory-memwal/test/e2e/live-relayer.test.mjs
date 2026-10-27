@@ -20,7 +20,7 @@ import { registerHooks } from "../../dist/hooks/index.js";
 
 const KEY = process.env.MEMWAL_PRIVATE_KEY ?? "";
 const ACCOUNT = process.env.MEMWAL_ACCOUNT_ID ?? "";
-const SERVER = process.env.MEMWAL_SERVER_URL ?? "https://relayer-staging.memory.walrus.xyz";
+const SERVER = process.env.MEMWAL_SERVER_URL ?? "https://relayer.dev.memwal.ai";
 const WRITES_ENABLED = process.env.MEMWAL_E2E_WRITE === "1";
 
 const missingCreds = !/^[0-9a-fA-F]{64}$/.test(KEY) || !/^0x[0-9a-fA-F]{10,}$/.test(ACCOUNT);

@@ -79,7 +79,7 @@ Before wiring the SDK into your app:
 
 - Generate a Walrus Memory account ID and delegate private key for your client using the hosted endpoint:
   - Production (mainnet): `https://memory.walrus.xyz`
-  - Staging (testnet): `https://staging.memory.walrus.xyz`
+  - Staging (testnet): `https://dev.memwal.ai`
 - Choose a relayer:
   - Use the [managed relayer](/relayer/public-relayer), selected with the `env` preset
   - Or pass an explicit `server_url` to your own relayer
@@ -101,7 +101,7 @@ Instead of hardcoding a URL, pass `env`. The public docs and Colab example use `
 | `env` | Relayer URL |
 | --- | --- |
 | `prod` | `https://relayer.memory.walrus.xyz` |
-| `staging` | `https://relayer-staging.memory.walrus.xyz` |
+| `staging` | `https://relayer.dev.memwal.ai` |
 
 Precedence: any explicit `server_url` wins, including the hosted default. `env` applies only when `server_url` is omitted (`None`). An unknown preset raises `ValueError`.
 

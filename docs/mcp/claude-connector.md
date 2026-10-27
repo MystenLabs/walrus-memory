@@ -67,7 +67,7 @@ The OAuth path and the header path reach the same tools through the same relayer
 
 | **Environment** | **Connector URL** | **OAuth status** |
 | --- | --- | --- |
-| Staging (Testnet) | `https://relayer-staging.memory.walrus.xyz/api/mcp` | Discovery routes serve traffic |
+| Staging (Testnet) | `https://relayer.dev.memwal.ai/api/mcp` | Discovery routes serve traffic |
 | Dev | `https://relayer.dev.memwal.ai/api/mcp` | Discovery routes serve traffic |
 | Production (Mainnet) | `https://relayer.memory.walrus.xyz/api/mcp` | OAuth is live and the discovery routes serve traffic |
 

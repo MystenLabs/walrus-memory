@@ -45,7 +45,7 @@ This section covers credential and authorization errors.
 | The delegate key is not registered onchain yet, or its registration transaction is not indexed | Confirm the key appears under your account in the dashboard, and that any `addDelegateKey` call succeeded. | Register the public key onchain through the dashboard or `addDelegateKey`, then wait a few seconds for indexing and retry. |
 | The account ID does not match the account that owns the key | Compare the `accountId` in your configuration against the account that lists this delegate key in the dashboard. A stale value in `localStorage` is a common source. | Use the account ID that you generated and that owns this delegate key, and do not reuse an account ID copied from another project. |
 | `accountId` is a Sui wallet address | A wallet address and a MemWal account ID are both `0x` plus 64 hex characters. The relayer returns this same 401 when the id is not a MemWal account, so the error text names the case instead of distinguishing it from a bad key. | Copy the account ID from the Walrus Memory dashboard. Do not paste the connected wallet address. |
-| The client points at a different network than the one where the account lives | Confirm your `serverUrl` or environment preset matches where you created the account. Production is `https://relayer.memory.walrus.xyz` and staging is `https://relayer-staging.memory.walrus.xyz`. | Point the client at the relayer for the correct network, or recreate the account and key in the environment you intend to use. |
+| The client points at a different network than the one where the account lives | Confirm your `serverUrl` or environment preset matches where you created the account. Production is `https://relayer.memory.walrus.xyz` and staging is `https://relayer.dev.memwal.ai`. | Point the client at the relayer for the correct network, or recreate the account and key in the environment you intend to use. |
 | The system clock is outside the 5-minute signing window | Confirm the machine clock is accurate and synchronized using the Network Time Protocol (NTP). | Synchronize the clock and retry. |
 | The delegate key is revoked, or the account is deactivated | Confirm the key is present and the account is active in the dashboard. | Re-add the delegate key, or reactivate the account, which only the owner can do. |
 
@@ -140,7 +140,7 @@ Use these values for quick configuration and triage:
 | **Item** | **Value** |
 | --- | --- |
 | Production relayer | `https://relayer.memory.walrus.xyz` |
-| Staging relayer (Testnet) | `https://relayer-staging.memory.walrus.xyz` |
+| Staging relayer (Testnet) | `https://relayer.dev.memwal.ai` |
 | Dashboard for accounts and delegate keys | `https://memory.walrus.xyz` |
 | MCP environment presets | `--prod`, `--staging`, `--local` |
 | Local credentials file | `~/.memwal/credentials.json` |

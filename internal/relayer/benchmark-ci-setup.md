@@ -66,7 +66,7 @@ deployment.
 | Target | Public relayer URL | Sui network |
 | --- | --- | --- |
 | dev | `https://relayer.dev.memwal.ai` | `testnet` |
-| staging | `https://relayer-staging.memory.walrus.xyz` | `testnet` |
+| staging | `https://relayer.dev.memwal.ai` | `testnet` |
 
 ## Benchmark Test Accounts
 
@@ -85,7 +85,7 @@ For each environment, set this Variable:
 
 | Variable | dev | staging |
 | --- | --- | --- |
-| `BENCH_SERVER_URL` | `https://relayer.dev.memwal.ai` | `https://relayer-staging.memory.walrus.xyz` |
+| `BENCH_SERVER_URL` | `https://relayer.dev.memwal.ai` | `https://relayer.dev.memwal.ai` |
 
 For each environment, set these Secrets:
 
@@ -102,7 +102,7 @@ Remember and recall against staging:
 cd services/server/scripts
 
 ./node_modules/.bin/tsx bench-recall-latency.ts \
-  --server-url https://relayer-staging.memory.walrus.xyz \
+  --server-url https://relayer.dev.memwal.ai \
   --account-id "$BENCH_ACCOUNT_ID" \
   --delegate-key "$BENCH_DELEGATE_KEY" \
   --namespace benchmark \

@@ -42,7 +42,7 @@ The loop has four stages:
 
 ## Set up in an agent runtime
 
-An agent runtime has no human to click through a wallet or paste a key at a prompt. Generate the account ID and delegate key once at [staging.memory.walrus.xyz](https://staging.memory.walrus.xyz) for Testnet, store them as secrets, and load them from the environment at startup.
+An agent runtime has no human to click through a wallet or paste a key at a prompt. Generate the account ID and delegate key once at [dev.memwal.ai](https://dev.memwal.ai) for Testnet, store them as secrets, and load them from the environment at startup.
 
 ```ts agent.ts
 import { MemWal } from "@mysten-incubation/memwal";
@@ -57,7 +57,7 @@ const memwal = MemWal.create({
   key: requireEnv("MEMWAL_KEY"),
   accountId: requireEnv("MEMWAL_ACCOUNT_ID"),
   // Testnet relayer. Use https://relayer.memory.walrus.xyz for Mainnet.
-  serverUrl: "https://relayer-staging.memory.walrus.xyz",
+  serverUrl: "https://relayer.dev.memwal.ai",
   namespace: "agent-state",
 });
 
@@ -116,7 +116,7 @@ const manual = MemWalManual.create({
   accountId: requireEnv("MEMWAL_ACCOUNT_ID"),
   packageId: requireEnv("MEMWAL_PACKAGE_ID"),
   registryId: requireEnv("MEMWAL_REGISTRY_ID"),
-  serverUrl: "https://relayer-staging.memory.walrus.xyz",
+  serverUrl: "https://relayer.dev.memwal.ai",
   // The agent signs SEAL and Walrus operations with its own Sui key, no wallet popup.
   suiPrivateKey: requireEnv("SUI_PRIVATE_KEY"),
   embeddingApiKey: requireEnv("OPENAI_API_KEY"),
@@ -192,7 +192,7 @@ async function main() {
   const memwal = MemWal.create({
     key: requireEnv("MEMWAL_KEY"),
     accountId: requireEnv("MEMWAL_ACCOUNT_ID"),
-    serverUrl: "https://relayer-staging.memory.walrus.xyz",
+    serverUrl: "https://relayer.dev.memwal.ai",
     namespace: "agent-state",
   });
   await memwal.health();

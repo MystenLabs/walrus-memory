@@ -15,7 +15,7 @@ import { createMcpServer } from "../server.js";
 // loopback whenever an operator did not override it. Only an operator-supplied
 // public origin reaches `publicRelayerUrl`, and only that is printed.
 
-const PUBLIC_ORIGIN = "https://relayer-staging.memory.walrus.xyz";
+const PUBLIC_ORIGIN = "https://relayer.dev.memwal.ai";
 const LOOPBACK = "http://127.0.0.1:8000";
 
 const TOKEN = "test-sidecar-token-0123456789";

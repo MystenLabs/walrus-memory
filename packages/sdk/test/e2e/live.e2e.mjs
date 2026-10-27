@@ -24,7 +24,7 @@ import * as ed from "@noble/ed25519";
 import { MemWal, MemWalCompatibilityError } from "../../dist/index.js";
 import { bytesToHex, sha256hex } from "../../dist/utils.js";
 
-const SERVER_URL = (process.env.MEMWAL_SERVER_URL ?? "https://relayer-staging.memory.walrus.xyz").replace(/\/$/, "");
+const SERVER_URL = (process.env.MEMWAL_SERVER_URL ?? "https://relayer.dev.memwal.ai").replace(/\/$/, "");
 const PRIVATE_KEY_HEX = process.env.MEMWAL_PRIVATE_KEY ?? "";
 const ACCOUNT_ID = process.env.MEMWAL_ACCOUNT_ID ?? "";
 

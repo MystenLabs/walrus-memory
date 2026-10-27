@@ -77,7 +77,7 @@ You need a **delegate key** (Ed25519 private key) and **account ID** (Walrus Mem
 
 Generate them at:
 - Production: https://memory.walrus.xyz
-- Staging: https://staging.memory.walrus.xyz
+- Staging: https://dev.memwal.ai
 
 ### 2. Initialize the SDK
 
@@ -463,7 +463,7 @@ const relevant = memories.results.filter((memory) => memory.distance < 0.8);
 | Network | Relayer URL |
 |---|---|
 | **Production** (mainnet) | `https://relayer.memory.walrus.xyz` |
-| **Staging** (testnet) | `https://relayer-staging.memory.walrus.xyz` |
+| **Staging** (testnet) | `https://relayer.dev.memwal.ai` |
 
 ### Framework and Key Handling
 

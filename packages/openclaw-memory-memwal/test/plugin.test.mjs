@@ -22,7 +22,7 @@ const manifest = JSON.parse(
 const VALID = {
   privateKey: "a".repeat(64),
   accountId: "0x" + "1".repeat(40),
-  serverUrl: "https://relayer-staging.memory.walrus.xyz",
+  serverUrl: "https://relayer.dev.memwal.ai",
 };
 
 function makeApi(ctx) {
