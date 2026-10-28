@@ -58,6 +58,10 @@ const memories = await memwal.recall({
   topK: 10,
   maxDistance: 0.8,
 });
+const asked = await memwal.ask({
+  question: "What are the user's preferences?",
+  limit: 5,
+});
 await memwal.restore("demo");
 ```
 
@@ -81,7 +85,7 @@ const result = await memwal.recall({ query: "display preference" });
 expect(result.results[0].text).toContain("dark mode");
 ```
 
-The mock supports remember/job polling, bulk remember, recall, analyze, embed, health, restore, `forget(blobId)`, and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
+The mock supports remember/job polling, bulk remember, recall, ask, analyze, embed, health, restore, `forget(blobId)`, and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
 
 ## Exports
 
