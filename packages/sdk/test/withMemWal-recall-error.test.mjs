@@ -194,3 +194,37 @@ test("all-dropped recall invokes onRecallError and does not cache an empty memor
         console.warn = originalWarn;
     }
 });
+
+test("withMemWal forwards maxTokens to recall() when configured", async () => {
+    const originalRecall = MemWal.prototype.recall;
+    const recallCalls = [];
+
+    MemWal.prototype.recall = async (params) => {
+        recallCalls.push(params);
+        return { results: [], total: 0 };
+    };
+
+    try {
+        const model = withMemWal(fakeLanguageModel(), {
+            key: TEST_KEY,
+            accountId: TEST_ACCOUNT_ID,
+            autoSave: false,
+            maxMemories: 7,
+            maxTokens: 256,
+        });
+
+        await generateText({
+            model,
+            prompt: "Summarize my preferences",
+        });
+
+        assert.equal(recallCalls.length, 1);
+        assert.deepEqual(recallCalls[0], {
+            query: "Summarize my preferences",
+            limit: 7,
+            maxTokens: 256,
+        });
+    } finally {
+        MemWal.prototype.recall = originalRecall;
+    }
+});

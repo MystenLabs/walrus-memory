@@ -58,14 +58,24 @@ const result = await generateText({
 Before generation:
 
 - Reads the last user message
-- Runs `recall()` against Walrus Memory
-- Filters by relevance
+- Runs `recall()` against Walrus Memory (bounded by `maxMemories` and optional `maxTokens`)
+- Filters by minimum similarity (`minRelevance`, default `0.3`)
 - Injects memory context into the prompt
 
 After generation:
 
-- Optionally runs `analyze()` on the user message
+- Optionally runs `analyze()` on the user message (`autoSave`, default `true`)
 - Saves extracted facts asynchronously
+
+## Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `maxMemories` | `5` | Maximum number of memories to recall and inject per request (top-K limit) |
+| `maxTokens` | `undefined` | Optional token budget cap on recalled memories injected into the prompt (forwarded to `recall({ maxTokens })`) |
+| `minRelevance` | `0.3` | Minimum similarity score (`0`–`1`) required for a recalled memory to be injected |
+| `autoSave` | `true` | Automatically run `analyze()` after generation to extract and store new facts |
+| `debug` | `false` | Log recall and auto-save activity to `console.warn` |
 
 Set a namespace explicitly for each product surface that uses the middleware. Otherwise recalled
 and auto-saved memories fall back to `"default"`.
