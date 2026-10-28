@@ -39,6 +39,20 @@ The Walrus Memory MCP package exposes the tools, flags, environment variables, a
 
 The MCP server exposes **eight tools**: six **relayer tools** (memory operations plus a health check) and two **session tools** served locally by the stdio package. For the lifecycle hooks that drive these tools automatically, see [Claude Code](/mcp/claude-code) or [Codex](/mcp/codex).
 
+**Core tools** — available in every session once credentials are present:
+`memwal_remember`, `memwal_recall`, `memwal_restore`, `memwal_forget`, `memwal_health`
+
+**Optional / Advanced tools** — for bulk ingestion, analysis, session management, and bulk storage:
+`memwal_remember_bulk`, `memwal_analyze`, `memwal_login`, `memwal_logout`
+
+<Note>
+**Slush zkLogin**: When using MemWal with [Slush wallet](https://slush.app), zkLogin-derived addresses are fully supported as account owners. Use the Slush-provided address as your `accountId`.
+</Note>
+
+<Warning>
+**Burst writes**: Sending many `memwal_remember` calls in rapid succession may hit the per-account rate limit. Space writes ≥ 200 ms apart, or use the bulk remember endpoint (`memwal_remember_bulk`) when available.
+</Warning>
+
 ## First-run behavior
 
 When no credentials file is found (see [Credential locations](#credential-locations)), the stdio package does **not** exit immediately if an MCP host launched it.
