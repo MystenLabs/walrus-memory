@@ -788,6 +788,14 @@ export class MemWal {
 
     /**
      * Remember something and wait for the background job to complete.
+     *
+     * When `idempotencyKey` is omitted, derives a deterministic key (`r1-<sha256>`)
+     * from `(30-minute UTC bucket, resolvedNamespace, text)` (or `dedupe:<sha256>`
+     * when `dedupe: true`) and retains it in `pendingRememberKeys` until the job
+     * settles terminally or `destroy()` is called. Retrying `rememberAndWait` with
+     * the same `(text, namespace)` after a polling timeout reuses the key so the
+     * relayer collapses the retry onto the existing `job_id` without appending a
+     * duplicate memory.
      */
     async rememberAndWait(
         text: string,

@@ -84,6 +84,8 @@ HTTP 426 throws `MemWalCompatibilityError`.
 
 Submit one memory and poll until the background job completes. Accepts `{ idempotencyKey?: string; dedupe?: boolean; pollIntervalMs?: number; timeoutMs?: number }` in `opts` (or in the `namespace` position when using the client default namespace).
 
+> **Retry and idempotency collapse**: When `idempotencyKey` is omitted, the SDK derives a deterministic key (`r1-<sha256>`) from `(30-minute UTC bucket, resolvedNamespace, text)` (or a bucket-less `dedupe:<sha256>` key when `dedupe: true`) and caches it in the instance's in-memory `pendingRememberKeys` map until `waitForRememberJob()` completes terminally or `destroy()` is called. If `rememberAndWait()` times out or hits a transport error during polling, retrying `rememberAndWait(sameText, sameNamespace)` on the same client instance reuses that cached key (even across a 30-minute bucket boundary), and the relayer collapses the submission onto the existing job (`job_id`) without appending a duplicate memory. After a process restart, `pendingRememberKeys` is empty, so retries within the same 30-minute UTC bucket still collapse onto the existing job, while retries across a bucket boundary require an explicit `idempotencyKey` (or `dedupe: true`).
+
 **Returns:**
 
 ```ts
@@ -462,6 +464,7 @@ Wraps a Vercel AI SDK model with automatic memory recall and save.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `maxMemories` | `5` | Max memories to inject per request |
+| `maxTokens` | `undefined` | Optional token budget for recalled memories injected per request (forwarded to `recall({ maxTokens })`) |
 | `autoSave` | `true` | Auto-save new facts from conversation |
 | `minRelevance` | `0.3` | Minimum similarity score (0–1) to include a memory |
 | `debug` | `false` | Enable debug logging |

@@ -48,6 +48,8 @@ Upgrade from 0.1.8 for bulk idempotency; its bulk methods send no key even if a 
 
 The bucket is not a rolling 30-minute guarantee: 2 attempts a few seconds apart can cross its boundary. Changing batch order, content, or namespaces also changes the automatic key.
 
+Within a single `MemWal` instance, `rememberAndWait()` also retains the generated key in an in-memory `pendingRememberKeys` map until the job reaches a terminal state (`done` or terminal failure) or `destroy()` is called. If `rememberAndWait(sameText, sameNamespace)` times out while polling, an immediate retry on the same client instance reuses the retained key from `pendingRememberKeys` (even across a 30-minute bucket boundary), so the relayer collapses the retry onto the original `job_id` instead of appending a second fact. A process restart clears `pendingRememberKeys` and falls back to the 30-minute time-bucket calculation.
+
 For a durable queue, or any retry that can cross a bucket boundary or a process restart, persist one operation key with the payload. Reuse it on every submission attempt.
 
 ```ts
