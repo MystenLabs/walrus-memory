@@ -195,7 +195,7 @@ The owner wallet (used for `createAccount` / `addDelegateKey` / `removeDelegateK
 
 ## 5. For demos and submissions
 
-Your `MemWalAccount` is a regular Sui object. Share its object ID and view it on a Sui explorer (for example, [Suiscan](https://suiscan.xyz) or [SuiVision](https://suivision.xyz)) to prove memory is really onchain, not just in a local cache. Pair it with a live `health()` check (see the [API Reference](/sdk/api-reference)) so judges can confirm the relayer is reachable.
+Your `MemWalAccount` is a regular Sui object that records account ownership and delegate authorizations (`owner`, `delegate_keys`, `active`) — it does **not** store memory blobs or a memory count onchain. Share its object ID and view it on a Sui explorer (for example, [Suiscan](https://suiscan.xyz) or [SuiVision](https://suivision.xyz)) to verify account ownership and registered delegate keys, and inspect the `blob_id` returned by `rememberAndWait` or `recall` on [Walrus Scan](https://walruscan.com) to verify the stored encrypted memory blobs on Walrus. Pair both with a live `health()` check (see the [API Reference](/sdk/api-reference)) so judges can confirm the relayer is reachable.
 
 ## See Also
 
