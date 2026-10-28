@@ -120,10 +120,14 @@ The command opens your browser, asks you to connect your Sui wallet, and saves c
 ```sh
 memwal-mcp
 memwal-mcp login
+memwal-mcp status
+memwal-mcp whoami
 memwal-mcp auto-save on|off
 memwal-mcp --logout
 memwal-mcp --help
 ```
+
+`memwal-mcp status` (alias `whoami`) prints the active `Account`, `Delegate` address, `Wallet` address, key `Label`, effective `Relayer` URL (highlighting any `--relayer` override or `MEMWAL_SERVER_URL` mismatch), resolved `Namespace`, and `Creds` path without requiring a TTY, and exits `1` when not logged in.
 
 ## Options
 
