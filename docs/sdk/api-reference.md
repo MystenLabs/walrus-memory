@@ -136,7 +136,7 @@ Search for memories matching a natural language query, scoped to `owner + namesp
   recall throws `MemWalRequestTimeout` (status 504). `isTimeoutError(err)` is true for that error
   and for a preflight `TimeoutError` whose `phase` names the stalled round-trip.
 
-> **Timeout and retry behaviour**: `recall()` times out after `recallTimeoutMs` milliseconds (default: 5 000 ms, configurable in `MemWalConfig`). On network errors, the call throws immediately without internal retries — callers that need retry logic should wrap `recall()` in their own retry loop or configure a higher `recallTimeoutMs` for slow networks.
+> **Timeout and retry behaviour**: `recall()` times out after `recallTimeoutMs` milliseconds (default: 15 000 ms, configurable in `MemWalConfig`). On network errors, the call throws immediately without internal retries — callers that need retry logic should wrap `recall()` in their own retry loop or configure a higher `recallTimeoutMs` for slow networks.
 
 **Returns:**
 
