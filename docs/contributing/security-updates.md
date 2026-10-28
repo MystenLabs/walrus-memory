@@ -43,13 +43,13 @@ Rust TLS validation and root certificates also require updates: rebuild relayer/
 
 After staging validation, deploy rebuilt images through the normal release process. Record the commit, image digest, `node -v`, and applicable Python/package versions from the running environment. Check health, MCP login and requests, remember/recall, and SEAL/Walrus operations. A merged PR, a restarted container, or a passing dependency audit is not evidence that production has been patched.
 
-Credential rotation for the Railway incident remains a separate operational task. Never restore potentially exposed credentials as a rollback.
+If credentials may have been exposed, rotate them separately from runtime updates. Never restore potentially exposed credentials as a rollback.
 
 ## Prepare package releases
 
-This update manually bumps the MCP package and all plugin/marketplace manifests to 0.0.16, and the Python SDK to 0.2.0. Both package and website changelogs must start with the matching version. The TypeScript SDK and OpenClaw package do not need a version bump for changes confined to consuming apps and build tooling.
+When manually releasing a package, update its version, the applicable plugin/marketplace manifests, and both package and website changelogs together. Changes confined to consuming apps and build tooling do not require a TypeScript SDK or OpenClaw package version bump.
 
-Run `node scripts/verify-manual-sdk-release.mjs` to check manifest/changelog agreement, and `node scripts/check-mcp-pin.mjs` to check that the launcher target is published. Keep an explicit override pointing to the previous published MCP release while the new one is unavailable. After the release workflow successfully publishes the new package, verify that exact version on npm and retarget the override. A source version bump alone does not update existing plugin installs. This PR removes its consumed changeset so the stable workflow cannot bump the manual MCP version twice.
+Run `node scripts/verify-manual-sdk-release.mjs` to check manifest/changelog agreement, and `node scripts/check-mcp-pin.mjs` to check that the launcher target is published. Keep an explicit override pointing to the previous published MCP release while the new one is unavailable. After the release workflow successfully publishes the new package, verify that exact version on npm and retarget the override. A source version bump alone does not update existing plugin installs. Remove a consumed changeset after a manual release so the stable workflow cannot bump the package version twice.
 
 ## Upstream advisories
 
