@@ -861,3 +861,56 @@ test("the word pass is ordinary English, not a credential (#1052)", () => {
         assert.equal(out.changed, false);
     }
 });
+
+test("suiprivkey1... Bech32 Sui private keys are always caught without a label (#435)", () => {
+    const REPRO_KEY =
+        "suiprivkey1qzfake0000000000000000000000000000000000000000000000000000";
+    const VALID_ED25519 =
+        "suiprivkey1qqtac0q7an7dcq2vp6axts0c0zt6hw7jznar94qp3ayxdx6axlzpxcetm48";
+    const VALID_SECP256K1 =
+        "suiprivkey1qytac0q7an7dcq2vp6axts0c0zt6hw7jznar94qp3ayxdx6axlzpxzx7yks";
+
+    // Bare key: refused outright as credential-only, never stored as a placeholder.
+    for (const key of [REPRO_KEY, VALID_ED25519, VALID_SECP256K1, REPRO_KEY.toUpperCase()]) {
+        const bare = sanitizeFact(key);
+        assert.equal(bare.refusal, "credential-only", `bare key was not refused: ${key}`);
+        assert.equal(bare.text, "");
+        assert.ok(bare.kinds.includes("vendor-api-key"));
+    }
+
+    // Embedded in prose (even without a credential label): redacted as vendor-api-key.
+    for (const key of [REPRO_KEY, VALID_ED25519, VALID_SECP256K1]) {
+        assertRedacted(
+            `My Sui wallet key is ${key} on testnet`,
+            key,
+            "vendor-api-key",
+            ["My Sui wallet key is", "on testnet"],
+        );
+        assertRedacted(
+            `Use ${key} when deploying the testnet contract`,
+            key,
+            "vendor-api-key",
+            ["when deploying the testnet contract"],
+        );
+    }
+
+    // Labelled sui.keystore base64 Ed25519 key (44 chars) is caught as labelled-key-material.
+    const KEYSTORE_B64 = "AD7xQ9mKp2vN8rT4wY1bC5dF0gH3jL6nP9qS2uV5xZ8=";
+    assertRedacted(
+        `From sui.keystore: ${KEYSTORE_B64} for the localnet validator`,
+        KEYSTORE_B64,
+        "labelled-key-material",
+        ["From sui.keystore", "localnet validator"],
+    );
+
+    // Legitimate Sui / Walrus identifiers remain untouched.
+    for (const clean of [
+        "My account id is 0x7f3a9c2e5b8d1f4a6c9e2b5d8f1a4c7e0b3d6f9a2c5e8b1d4f7a0c3e6b9d2f5a",
+        "The blob landed as blob_id=Xj9vKq2mP7nR4tW8yB1cE5gH0dF3sA6uZ2xN8qL4kM7",
+        "Pin the build to commit 4f2b8c1e9d7a3f5b6c0e2d4a8b1f3c5e7d9a0b2c",
+    ]) {
+        const out = sanitizeFact(clean);
+        assert.equal(out.text, clean);
+        assert.equal(out.changed, false);
+    }
+});

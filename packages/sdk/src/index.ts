@@ -27,7 +27,20 @@ export {
     MemWalRememberJobFailedError,
     MemWalRememberJobNotFoundError,
     MemWalRememberJobTimeoutError,
+    MemWalValidationError,
 } from "./errors.js";
+export {
+    MAX_REMEMBER_TEXT_BYTES,
+    validateRemember,
+    assertValidRememberText,
+} from "./validation.js";
+export type {
+    SecretPatternKind,
+    RememberValidationCode,
+    RememberValidationIssue,
+    RememberValidationResult,
+    ValidateRememberOptions,
+} from "./validation.js";
 
 // Delegate key utilities (no @mysten/sui dependency)
 export { delegateKeyToSuiAddress, delegateKeyToPublicKey } from "./utils.js";

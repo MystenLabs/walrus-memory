@@ -28,6 +28,12 @@ import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js
 import { resolveRecallCall } from "./recall-args.js";
 import { derivedBulkIdempotencyKey } from "./utils.js";
 import { MemWalRememberJobNotFoundError } from "./errors.js";
+import {
+    assertValidRememberText,
+    validateRemember,
+    type RememberValidationResult,
+    type ValidateRememberOptions,
+} from "./validation.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
 const MAX_BULK_ITEMS = 20;
@@ -232,13 +238,25 @@ export class MemWalMock {
         this.dedupe.clear();
     }
 
+    validateRemember(
+        text: string,
+        options?: ValidateRememberOptions,
+    ): RememberValidationResult {
+        return validateRemember(text, options);
+    }
+
     async rememberAsync(
         text: string,
         namespaceOrOptions?: string | RememberOptions,
         options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         requireRememberText(text);
+        validateText(text);
         const split = splitRememberArgs(namespaceOrOptions, options);
+        assertValidRememberText(text, split.options);
+        if (split.options.dryRun === true) {
+            return { job_id: "dry-run", status: "dry_run" };
+        }
         const memory = this.store(
             text,
             split.namespace,
@@ -288,7 +306,19 @@ export class MemWalMock {
         const accepted = await this.rememberAsync(text, split.namespace, {
             idempotencyKey: split.options.idempotencyKey,
             dedupe: split.options.dedupe,
+            allowSecrets: split.options.allowSecrets,
+            skipValidation: split.options.skipValidation,
+            dryRun: split.options.dryRun,
         });
+        if (split.options.dryRun === true) {
+            return {
+                id: "dry-run",
+                job_id: "dry-run",
+                blob_id: "",
+                owner: this.owner,
+                namespace: split.namespace ?? this.namespace,
+            };
+        }
         return this.waitForRememberJob(accepted.job_id, split.options);
     }
 
@@ -306,9 +336,17 @@ export class MemWalMock {
         }
         items.forEach((item, i) => {
             validateText(item?.text, `items[${i}].text`);
+            assertValidRememberText(item.text, options, `items[${i}].text`);
         });
 
         validateIdempotencyKey(options.idempotencyKey);
+        if (options.dryRun === true) {
+            return {
+                job_ids: items.map((_, i) => `dry-run-${i + 1}`),
+                total: items.length,
+                status: "dry_run",
+            };
+        }
         const normalised = items.map((item) => ({
             text: item.text,
             namespace: item.namespace ?? this.namespace,
@@ -391,6 +429,19 @@ export class MemWalMock {
         const namespaces = items.map(
             (item) => item.namespace ?? this.namespace
         );
+        if (opts.dryRun === true) {
+            return {
+                results: accepted.job_ids.map((id, i) => ({
+                    id,
+                    blob_id: "",
+                    status: "done",
+                    namespace: namespaces[i],
+                })),
+                total: accepted.job_ids.length,
+                succeeded: accepted.job_ids.length,
+                failed: 0,
+            };
+        }
         return this.waitForRememberJobs(accepted.job_ids, namespaces, opts);
     }
 

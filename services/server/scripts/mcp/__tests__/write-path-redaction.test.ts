@@ -494,3 +494,38 @@ test("an ordinary URL is not mangled on the way to the SDK", async (t) => {
     assert.deepEqual(forwarded.remember, [fact]);
     assert.doesNotMatch(textOf(result), /redacted|credential span/i);
 });
+
+test("memwal_analyze post-extraction screen redacts secrets returned in extracted facts (#435)", async (t) => {
+    const REPRO_KEY =
+        "suiprivkey1qzfake0000000000000000000000000000000000000000000000000000";
+    const session = {
+        oauthScope: "memwal:read memwal:write",
+        namespace: "default",
+        memwal: {
+            async analyze(_text: string) {
+                return {
+                    job_ids: ["analyze-job-1", "analyze-job-2"],
+                    facts: [
+                        { text: `User deploys on testnet with ${REPRO_KEY}` },
+                        { text: "User prefers pnpm on every repo" },
+                    ],
+                    fact_count: 2,
+                    status: "accepted",
+                    owner: "0xowner",
+                };
+            },
+        },
+    } as unknown as MemWalSession;
+
+    const client = await clientFor(session, t);
+    const result = await client.callTool({
+        name: "memwal_analyze",
+        arguments: { text: "User deploys on testnet and prefers pnpm on every repo." },
+    });
+
+    const output = textOf(result);
+    assert.ok(!output.includes(REPRO_KEY), "post-extraction secret leaked in analyze output");
+    assert.match(output, /\[redacted:vendor-api-key\]/);
+    assert.match(output, /credential span\(s\) were removed/);
+    assert.match(output, /User prefers pnpm on every repo/);
+});

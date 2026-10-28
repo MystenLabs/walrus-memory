@@ -78,6 +78,21 @@ export interface RememberOptions {
      * retry-window behavior.
      */
     dedupe?: boolean;
+    /**
+     * Allow storing text that matches client-side secret detection patterns (#435).
+     * Defaults to `false` (secret patterns are rejected before signing).
+     */
+    allowSecrets?: boolean;
+    /**
+     * Alias for `allowSecrets`: skip client-side secret pattern screening
+     * while still enforcing non-empty and max-byte-length checks (#435).
+     */
+    skipValidation?: boolean;
+    /**
+     * Validate the input locally without signing or sending a request to the relayer (#435).
+     * When `true`, throws on invalid input and resolves with `{ job_id: "dry-run", status: "dry_run" }` when valid.
+     */
+    dryRun?: boolean;
 }
 
 /** Options for `rememberAndWait()`. */
@@ -312,6 +327,20 @@ export interface RememberBulkItem {
 export interface RememberBulkAsyncOptions {
     /** Optional caller-supplied idempotency key (defaults to derived key based on items) */
     idempotencyKey?: string;
+    /**
+     * Allow storing items that match client-side secret detection patterns (#435).
+     * Defaults to `false` (secret patterns are rejected before signing).
+     */
+    allowSecrets?: boolean;
+    /**
+     * Alias for `allowSecrets`: skip client-side secret pattern screening
+     * while still enforcing non-empty and max-byte-length checks (#435).
+     */
+    skipValidation?: boolean;
+    /**
+     * Validate all items locally without signing or sending a request to the relayer (#435).
+     */
+    dryRun?: boolean;
 }
 
 /** Options for remember bulk polling behaviour */

@@ -22,12 +22,395 @@ use std::sync::Arc;
 
 use crate::jobs::WalletOperation;
 use crate::rate_limit;
-use crate::services::extractor::MAX_ANALYZE_FACTS;
+use crate::services::extractor::{ExtractedFact, MAX_ANALYZE_FACTS};
 use crate::types::*;
 
 use super::{collect_bounded_results, enqueue_wallet_job};
 
 const ANALYZE_CONCURRENCY: usize = 5;
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_base64url_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn take_while_len<F: Fn(u8) -> bool>(bytes: &[u8], f: F) -> usize {
+    bytes.iter().take_while(|&&b| f(b)).count()
+}
+
+fn match_pem_header(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix("-----BEGIN ")?;
+    let end_idx = rest.find("PRIVATE KEY-----")?;
+    let label = &rest[..end_idx];
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+    {
+        Some("-----BEGIN ".len() + end_idx + "PRIVATE KEY-----".len())
+    } else {
+        None
+    }
+}
+
+fn match_pem_footer(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix("-----END ")?;
+    let end_idx = rest.find("PRIVATE KEY-----")?;
+    let label = &rest[..end_idx];
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+    {
+        Some("-----END ".len() + end_idx + "PRIVATE KEY-----".len())
+    } else {
+        None
+    }
+}
+
+fn redact_pem_blocks(input: &str, count: &mut usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(begin_pos) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..begin_pos]);
+        let candidate = &rest[begin_pos..];
+        let Some(header_len) = match_pem_header(candidate) else {
+            out.push_str("-----BEGIN ");
+            rest = &candidate["-----BEGIN ".len()..];
+            continue;
+        };
+        let after_header = &candidate[header_len..];
+        let mut search_offset = 0;
+        let mut closed_end = None;
+        while let Some(rel_end) = after_header[search_offset..].find("-----END ") {
+            let idx = search_offset + rel_end;
+            if let Some(footer_len) = match_pem_footer(&after_header[idx..]) {
+                closed_end = Some(header_len + idx + footer_len);
+                break;
+            }
+            search_offset = idx + "-----END ".len();
+        }
+        *count += 1;
+        out.push_str("[redacted:private-key-block]");
+        if let Some(total_len) = closed_end {
+            rest = &candidate[total_len..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_url_userinfo_user_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'/' | b'@' | b':' | b'?' | b'=' | b'&')
+}
+
+fn is_url_userinfo_pass_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'/' | b'@' | b'?' | b'=' | b'&')
+}
+
+fn redact_url_userinfo(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"://" {
+            // Confirm preceded by a valid 1..=31 byte scheme.
+            let mut scheme_start = i;
+            while scheme_start > 0
+                && (i - scheme_start) < 31
+                && (bytes[scheme_start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[scheme_start - 1], b'+' | b'.' | b'-'))
+            {
+                scheme_start -= 1;
+            }
+            let valid_scheme =
+                scheme_start < i && bytes[scheme_start].is_ascii_alphabetic();
+            if valid_scheme {
+                let after_scheme = i + 3;
+                let user_len =
+                    take_while_len(&bytes[after_scheme..], is_url_userinfo_user_byte);
+                let colon_pos = after_scheme + user_len;
+                if user_len > 0 && colon_pos < bytes.len() && bytes[colon_pos] == b':' {
+                    let pass_start = colon_pos + 1;
+                    let pass_len = take_while_len(&bytes[pass_start..], is_url_userinfo_pass_byte);
+                    let at_pos = pass_start + pass_len;
+                    if pass_len > 0 && at_pos < bytes.len() && bytes[at_pos] == b'@' {
+                        out.push_str("://[redacted:url-credentials]@");
+                        *count += 1;
+                        i = at_pos + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Match a high-confidence vendor key or JWT at the start of `s`, returning
+/// `(matched_byte_len, placeholder)`. Caller guarantees left word boundary.
+fn match_secret_token_at_start(s: &str) -> Option<(usize, &'static str)> {
+    let bytes = s.as_bytes();
+
+    // 1. Bech32 Sui private key: suiprivkey1[0-9a-z]{16,} (case-insensitive) (#435)
+    if bytes.len() >= 27 && bytes[..11].eq_ignore_ascii_case(b"suiprivkey1") {
+        let body_len = take_while_len(&bytes[11..], |b| b.is_ascii_alphanumeric());
+        let total = 11 + body_len;
+        if body_len >= 16 && (total == bytes.len() || !is_word_byte(bytes[total])) {
+            return Some((total, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 2. Anthropic / OpenAI keys
+    for prefix in [b"sk-ant-" as &[u8], b"sk-proj-"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[prefix.len()..], is_base64url_byte);
+            if body_len >= 16 {
+                return Some((prefix.len() + body_len, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+    if bytes.starts_with(b"sk-") {
+        let body_len = take_while_len(&bytes[3..], |b| b.is_ascii_alphanumeric());
+        if body_len >= 20 {
+            return Some((3 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 3. GitHub tokens
+    for prefix in [b"ghp_" as &[u8], b"gho_", b"ghu_", b"ghs_", b"ghr_"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[4..], |b| b.is_ascii_alphanumeric());
+            if body_len >= 20 {
+                return Some((4 + body_len, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+    if bytes.starts_with(b"github_pat_") {
+        let body_len = take_while_len(&bytes[11..], is_word_byte);
+        if body_len >= 20 {
+            return Some((11 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 4. AWS access key ID: (AKIA|ASIA)[0-9A-Z]{16}\b
+    if bytes.starts_with(b"AKIA") || bytes.starts_with(b"ASIA") {
+        let body_len = take_while_len(&bytes[4..], |b| {
+            b.is_ascii_uppercase() || b.is_ascii_digit()
+        });
+        if body_len == 16 && (bytes.len() == 20 || !is_word_byte(bytes[20])) {
+            return Some((20, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 5. Slack: xox[baprs]-[A-Za-z0-9-]{10,}
+    if bytes.len() >= 15
+        && bytes.starts_with(b"xox")
+        && matches!(bytes[3], b'b' | b'a' | b'p' | b'r' | b's')
+        && bytes[4] == b'-'
+    {
+        let body_len = take_while_len(&bytes[5..], |b| b.is_ascii_alphanumeric() || b == b'-');
+        if body_len >= 10 {
+            return Some((5 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 6. Google API: AIza[0-9A-Za-z_-]{35}\b
+    if bytes.starts_with(b"AIza") {
+        let body_len = take_while_len(&bytes[4..], is_base64url_byte);
+        if body_len == 35 && (bytes.len() == 39 || !is_word_byte(bytes[39])) {
+            return Some((39, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 7. GitLab: glpat-[A-Za-z0-9_-]{16,}
+    if bytes.starts_with(b"glpat-") {
+        let body_len = take_while_len(&bytes[6..], is_base64url_byte);
+        if body_len >= 16 {
+            return Some((6 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 8. npm: npm_[A-Za-z0-9]{36}\b
+    if bytes.starts_with(b"npm_") {
+        let body_len = take_while_len(&bytes[4..], |b| b.is_ascii_alphanumeric());
+        if body_len == 36 && (bytes.len() == 40 || !is_word_byte(bytes[40])) {
+            return Some((40, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 9. SendGrid: SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
+    if bytes.starts_with(b"SG.") {
+        let seg1 = take_while_len(&bytes[3..], is_base64url_byte);
+        let dot_pos = 3 + seg1;
+        if seg1 >= 16 && dot_pos < bytes.len() && bytes[dot_pos] == b'.' {
+            let seg2 = take_while_len(&bytes[dot_pos + 1..], is_base64url_byte);
+            if seg2 >= 16 {
+                return Some((dot_pos + 1 + seg2, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+
+    // 10. Stripe: [sprk]k_(live|test)_[A-Za-z0-9]{16,}
+    if bytes.len() >= 24
+        && matches!(bytes[0], b's' | b'p' | b'r' | b'k')
+        && bytes[1] == b'k'
+        && bytes[2] == b'_'
+    {
+        for mode in [b"live_" as &[u8], b"test_"] {
+            if bytes[3..].starts_with(mode) {
+                let prefix_len = 3 + mode.len();
+                let body_len = take_while_len(&bytes[prefix_len..], |b| b.is_ascii_alphanumeric());
+                if body_len >= 16 {
+                    return Some((prefix_len + body_len, "[redacted:vendor-api-key]"));
+                }
+            }
+        }
+    }
+
+    // 11. Shopify: shp(at|ss|ca|pa)_[a-fA-F0-9]{32}\b
+    for prefix in [b"shpat_" as &[u8], b"shpss_", b"shpca_", b"shppa_"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[6..], |b| b.is_ascii_hexdigit());
+            if body_len == 32 && (bytes.len() == 38 || !is_word_byte(bytes[38])) {
+                return Some((38, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+
+    // 12. DigitalOcean: dop_v1_[a-f0-9]{64}\b
+    if bytes.starts_with(b"dop_v1_") {
+        let body_len = take_while_len(&bytes[7..], |b| {
+            b.is_ascii_digit() || matches!(b, b'a'..=b'f')
+        });
+        if body_len == 64 && (bytes.len() == 71 || !is_word_byte(bytes[71])) {
+            return Some((71, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 13. Hugging Face: hf_[A-Za-z0-9]{30,}\b
+    if bytes.starts_with(b"hf_") {
+        let body_len = take_while_len(&bytes[3..], |b| b.is_ascii_alphanumeric());
+        let total = 3 + body_len;
+        if body_len >= 30 && (total == bytes.len() || !is_word_byte(bytes[total])) {
+            return Some((total, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 14. JWT: eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}
+    if bytes.starts_with(b"eyJ") {
+        let seg1 = 3 + take_while_len(&bytes[3..], is_base64url_byte);
+        if seg1 >= 11 && seg1 < bytes.len() && bytes[seg1] == b'.' {
+            let seg2_len = take_while_len(&bytes[seg1 + 1..], is_base64url_byte);
+            let dot2 = seg1 + 1 + seg2_len;
+            if seg2_len >= 8 && dot2 < bytes.len() && bytes[dot2] == b'.' {
+                let seg3_len = take_while_len(&bytes[dot2 + 1..], is_base64url_byte);
+                if seg3_len >= 8 {
+                    return Some((dot2 + 1 + seg3_len, "[redacted:jwt]"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn redact_token_secrets(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_word_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+        if at_word_boundary {
+            if let Some((matched_len, replacement)) = match_secret_token_at_start(&input[i..]) {
+                out.push_str(replacement);
+                *count += 1;
+                i += matched_len;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn has_salvageable_fact_content(text: &str) -> bool {
+    // Strip `[redacted:...]` placeholders before counting words >= 2 chars.
+    let mut without_placeholders = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[redacted:") {
+        without_placeholders.push_str(&rest[..start]);
+        let after = &rest[start + "[redacted:".len()..];
+        if let Some(end) = after.find(']') {
+            without_placeholders.push(' ');
+            rest = &after[end + 1..];
+        } else {
+            without_placeholders.push_str(&rest[start..]);
+            rest = "";
+            break;
+        }
+    }
+    without_placeholders.push_str(rest);
+
+    let mut word_count = 0usize;
+    let mut current_word_chars = 0usize;
+    for ch in without_placeholders.chars() {
+        if ch.is_alphanumeric() {
+            current_word_chars += 1;
+        } else {
+            if current_word_chars >= 2 {
+                word_count += 1;
+                if word_count >= 3 {
+                    return true;
+                }
+            }
+            current_word_chars = 0;
+        }
+    }
+    if current_word_chars >= 2 {
+        word_count += 1;
+    }
+    word_count >= 3
+}
+
+/// Post-extraction secret screen for a single extracted fact (#435).
+///
+/// Returns `Some(fact_text)` when the fact is clean or still carries a
+/// salvageable fact after redacting secret spans, or `None` when the fact was
+/// purely credential material with no surrounding fact.
+fn screen_fact_text(input: &str) -> Option<String> {
+    let mut count = 0usize;
+    let text = redact_pem_blocks(input, &mut count);
+    let text = redact_url_userinfo(&text, &mut count);
+    let text = redact_token_secrets(&text, &mut count);
+    if count == 0 {
+        return Some(input.to_string());
+    }
+    if !has_salvageable_fact_content(&text) {
+        return None;
+    }
+    Some(text)
+}
+
+/// Screen all extracted facts before embedding and SEAL encryption (#435).
+fn screen_extracted_facts(facts: Vec<ExtractedFact>) -> Vec<ExtractedFact> {
+    facts
+        .into_iter()
+        .filter_map(|mut fact| {
+            let screened = screen_fact_text(&fact.text)?;
+            fact.text = screened;
+            Some(fact)
+        })
+        .collect()
+}
 
 /// Stable per-fact key so an HTTP retry of `/api/analyze` collapses onto the
 /// in-flight or completed upload instead of minting a second Walrus blob.
@@ -430,7 +813,10 @@ pub async fn analyze(
         .extract_with_context(&body.text, &related_texts, body.occurred_at)
         .await?;
     let raw_fact_count = extracted.raw_count;
-    let facts = extracted.facts;
+    // Screen extracted facts before embedding or SEAL encryption (#435) so any
+    // credential material emitted or re-assembled by the extractor LLM is
+    // redacted or dropped before reaching append-only Walrus storage.
+    let facts = screen_extracted_facts(extracted.facts);
     let reserved_additional_weight = rate_limit::analyze_additional_weight(facts.len());
     tracing::info!(
         "  → Extracted {} facts (accepted={} cap={})",
@@ -1163,5 +1549,66 @@ mod tests {
         // Additional weight is exactly fact_count
         assert_eq!(analyze_additional_weight(0), 0);
         assert_eq!(analyze_additional_weight(20), 20);
+    }
+
+    // ── Post-extraction secret screening (#435) ───────────────────
+
+    #[test]
+    fn post_extraction_redacts_suiprivkey_and_vendor_keys_while_keeping_surrounding_fact() {
+        use super::{screen_extracted_facts, screen_fact_text};
+        use crate::services::extractor::ExtractedFact;
+
+        let repro_key = "suiprivkey1qzfake0000000000000000000000000000000000000000000000000000";
+        let valid_key = "suiprivkey1qqtac0q7an7dcq2vp6axts0c0zt6hw7jznar94qp3ayxdx6axlzpxcetm48";
+
+        // Bare credential with no surrounding fact is dropped completely.
+        assert_eq!(screen_fact_text(repro_key), None);
+        assert_eq!(screen_fact_text(valid_key), None);
+        assert_eq!(
+            screen_fact_text("sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"),
+            None
+        );
+
+        // Fact carrying a credential keeps the surrounding words and redacts the secret.
+        let mixed = format!("User deploys on testnet using {repro_key} from laptop");
+        let screened = screen_fact_text(&mixed).expect("fact around secret should survive");
+        assert!(!screened.contains(repro_key));
+        assert!(screened.contains("[redacted:vendor-api-key]"));
+        assert!(screened.contains("User deploys on testnet"));
+
+        // URL credentials keep host/path and strip userinfo.
+        let url_fact =
+            "Staging database lives at postgres://admin:hunter2@db.internal:5432/app for testing";
+        let screened_url = screen_fact_text(url_fact).expect("url fact should survive");
+        assert!(!screened_url.contains("hunter2"));
+        assert!(screened_url.contains("postgres://[redacted:url-credentials]@db.internal:5432/app"));
+
+        // PEM private key block is redacted.
+        let pem_fact = "User's old box key -----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY----- was rotated";
+        let screened_pem = screen_fact_text(pem_fact).expect("pem fact should survive");
+        assert!(!screened_pem.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(screened_pem.contains("[redacted:private-key-block]"));
+
+        // Batch screening drops credential-only facts and preserves clean/redacted facts.
+        let batch = vec![
+            ExtractedFact {
+                text: "User prefers dark mode".to_string(),
+                importance: 0.5,
+            },
+            ExtractedFact {
+                text: repro_key.to_string(),
+                importance: 0.9,
+            },
+            ExtractedFact {
+                text: "User's Sui package id is 0xe80f2feec1c139616a86c9f71210152e2a7ca552b20841f2e192f99f75864437".to_string(),
+                importance: 0.5,
+            },
+        ];
+        let kept = screen_extracted_facts(batch);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "User prefers dark mode");
+        assert!(kept[1]
+            .text
+            .contains("0xe80f2feec1c139616a86c9f71210152e2a7ca552b20841f2e192f99f75864437"));
     }
 }

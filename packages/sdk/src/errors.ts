@@ -1,4 +1,34 @@
 import type { RememberJobStatus } from "./types.js";
+import type {
+    RememberValidationCode,
+    RememberValidationIssue,
+    SecretPatternKind,
+} from "./validation.js";
+
+/**
+ * Thrown by `remember*` when client-side write validation rejects input text
+ * (e.g. `text_too_long` above 1 MiB or `secret_pattern_detected` when
+ * `allowSecrets` is not set) (#435).
+ */
+export class MemWalValidationError extends Error {
+    readonly status = 400 as const;
+    readonly code: RememberValidationCode;
+    readonly issues: RememberValidationIssue[];
+    readonly kinds: SecretPatternKind[];
+
+    constructor(
+        message: string,
+        code: RememberValidationCode,
+        issues: RememberValidationIssue[],
+        kinds: SecretPatternKind[] = [],
+    ) {
+        super(message);
+        this.name = "MemWalValidationError";
+        this.code = code;
+        this.issues = issues;
+        this.kinds = kinds;
+    }
+}
 
 /**
  * Thrown by `waitForRememberJobs` (and `rememberBulkAndWait`, which calls it)
