@@ -279,19 +279,40 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // `memwal-mcp status` / `memwal-mcp whoami` — print credential info and exit.
     // Works without a TTY so scripts and CI can query the active account.
     if (args.status) {
+        const resolution = resolveCreds();
+        const projectNotice = formatProjectCredsNotice(resolution);
+        if (projectNotice) {
+            note(projectNotice);
+        }
         const creds = loadCreds();
         if (!creds) {
             note("Not logged in. Run `memwal-mcp login` to authenticate.");
             process.exitCode = 1;
             return;
         }
-        const resolution = resolveCreds();
-        const addr = creds.walletAddress;
-        const truncated = `${addr.slice(0, 10)}...${addr.slice(-6)}`;
-        note(`Logged in as ${truncated}`);
-        note(`  Account:  ${creds.accountId}`);
-        note(`  Relayer:  ${creds.relayerUrl}`);
-        note(`  Creds:    ${resolution.path} (${resolution.source})`);
+        const effectiveRelayerUrl = args.relayerUrl ?? creds.relayerUrl;
+        const envRelayerUrl = process.env.MEMWAL_SERVER_URL;
+        const relayerNote =
+            args.relayerUrl && args.relayerUrl !== creds.relayerUrl
+                ? `${effectiveRelayerUrl} (overrides saved ${creds.relayerUrl} via --relayer)`
+                : !args.relayerUrl && envRelayerUrl && envRelayerUrl !== creds.relayerUrl
+                  ? `${effectiveRelayerUrl} (saved; MEMWAL_SERVER_URL=${envRelayerUrl} is ignored when signed in — pass --relayer to override)`
+                  : effectiveRelayerUrl;
+        const effectiveLabel =
+            args.label || process.env.MEMWAL_CLIENT_LABEL || creds.label || "MCP Client";
+        const effectiveNamespace = args.namespace
+            ? `${args.namespace} (via --namespace)`
+            : process.env.MEMWAL_NAMESPACE
+              ? `${process.env.MEMWAL_NAMESPACE} (via MEMWAL_NAMESPACE)`
+              : "default (relayer default)";
+        note(`Logged in as ${creds.walletAddress}`);
+        note(`  Account:   ${creds.accountId}`);
+        note(`  Delegate:  ${creds.delegateAddress}`);
+        note(`  Wallet:    ${creds.walletAddress}`);
+        note(`  Label:     ${effectiveLabel}`);
+        note(`  Relayer:   ${relayerNote}`);
+        note(`  Namespace: ${effectiveNamespace}`);
+        note(`  Creds:     ${resolution.path} (${resolution.source})`);
         note(autoSaveSummary());
         return;
     }
