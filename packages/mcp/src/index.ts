@@ -56,6 +56,8 @@ interface ParsedArgs {
     namespace?: string;
     /** `auto-save on|off|status` — the automatic-memory opt-in (WALM-642). */
     autoSave?: "on" | "off" | "status";
+    /** `status` / `whoami` — print current credential info and exit. */
+    status: boolean;
     /** Args parseArgs did not recognise, in the order seen. For a flag
      *  written `--key=value`, only `--key` is recorded — see parseArgs. */
     unknown: string[];
@@ -72,7 +74,7 @@ const ENV_PRESETS: Record<string, { relayer: string; web: string }> = {
 
 /** Bare words that are commands rather than values. An unknown flag must not
  *  swallow one as its argument. */
-const POSITIONALS = new Set(["login", "approve-project", "revoke-project", "auto-save", "on", "off", "status"]);
+const POSITIONALS = new Set(["login", "approve-project", "revoke-project", "auto-save", "on", "off", "status", "whoami"]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
     const out: ParsedArgs = {
@@ -81,6 +83,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
         forceLogin: false,
         approveProject: false,
         revokeProject: false,
+        status: false,
         unknown: [],
     };
     for (let i = 0; i < argv.length; i++) {
@@ -105,6 +108,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
             case "--revoke-project":
             case "revoke-project":
                 out.revokeProject = true;
+                break;
+            case "--status":
+            case "status":
+            case "--whoami":
+            case "whoami":
+                out.status = true;
                 break;
             case "auto-save":
             case "--auto-save": {
@@ -264,6 +273,26 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
                     `to sign out everywhere.`,
             );
         }
+        return;
+    }
+
+    // `memwal-mcp status` / `memwal-mcp whoami` — print credential info and exit.
+    // Works without a TTY so scripts and CI can query the active account.
+    if (args.status) {
+        const creds = loadCreds();
+        if (!creds) {
+            note("Not logged in. Run `memwal-mcp login` to authenticate.");
+            process.exitCode = 1;
+            return;
+        }
+        const resolution = resolveCreds();
+        const addr = creds.walletAddress;
+        const truncated = `${addr.slice(0, 10)}...${addr.slice(-6)}`;
+        note(`Logged in as ${truncated}`);
+        note(`  Account:  ${creds.accountId}`);
+        note(`  Relayer:  ${creds.relayerUrl}`);
+        note(`  Creds:    ${resolution.path} (${resolution.source})`);
+        note(autoSaveSummary());
         return;
     }
 
@@ -664,6 +693,9 @@ export function helpText(): string {
         "                                   settings.json next to",
         "                                   credentials.json.",
         "  memwal-mcp auto-save             Report the current setting.",
+        "  memwal-mcp status                Print current account, relayer URL,",
+        "                                   and credential path. Alias: whoami.",
+        "                                   Exits 1 when not logged in.",
         "  memwal-mcp --help                Show this help.",
         "",
         "Options:",
