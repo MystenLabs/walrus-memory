@@ -373,6 +373,20 @@ export function assertNonBlankText(text: string, message = "Text cannot be empty
     }
 }
 
+const MAX_IDEMPOTENCY_KEY_BYTES = 255;
+
+export function validateIdempotencyKey(key: string | undefined): void {
+    if (key === undefined) return;
+    if (key.length === 0) {
+        throw new Error("idempotency_key cannot be empty (omit it instead)");
+    }
+    if (new TextEncoder().encode(key).length > MAX_IDEMPOTENCY_KEY_BYTES) {
+        throw new Error(
+            `idempotency_key exceeds maximum length of ${MAX_IDEMPOTENCY_KEY_BYTES} bytes`,
+        );
+    }
+}
+
 // ============================================================
 // Error Sanitization (LOW-26)
 // ============================================================
