@@ -263,21 +263,38 @@ class TestListNamespaces:
     """list_namespaces() against live server. Read-only; writes nothing."""
 
     def test_walks_every_page_on_has_more(self) -> None:
-        # limit=1 forces a cursor into the signed query string on every page
-        # after the first, which is what the relayer verifies the signature over.
+        # Step 1: verify signed cursor pagination with limit=1 across the first
+        # two pages (2 requests = 4 rate-limit points) so we prove the relayer
+        # accepts a signed query string containing `updated_after=<cursor>&limit=1`.
+        # Walking all 200+ historical namespaces on the shared benchmark account
+        # with limit=1 would exceed the 200 weighted-requests/min read_delegate_key
+        # budget on its own (each read is weight 2 -> 100 calls/min).
         mw = _sync_client()
+        first_page = mw.list_namespaces(limit=1)
+        assert len(first_page.namespaces) <= 1
+        assert first_page.snapshot_version >= 1
+        if first_page.has_more:
+            assert first_page.next_cursor is not None
+            second_page = mw.list_namespaces(cursor=first_page.next_cursor, limit=1)
+            assert len(second_page.namespaces) <= 1
+            assert second_page.snapshot_version >= 1
+            if first_page.namespaces and second_page.namespaces:
+                assert first_page.namespaces[0].name != second_page.namespaces[0].name
+
+        # Step 2: walk the full namespace rollup using the default page size
+        # (100 per page) to assert has_more termination and uniqueness without
+        # burning the per-key read budget.
         names: list[str] = []
         cursor = None
-        for _ in range(1000):
-            page = mw.list_namespaces(cursor=cursor, limit=1)
-            assert len(page.namespaces) <= 1
+        for _ in range(100):
+            page = mw.list_namespaces(cursor=cursor)
             assert page.snapshot_version >= 1
             names.extend(ns.name for ns in page.namespaces)
             cursor = page.next_cursor
             if not page.has_more:
                 break
         else:
-            pytest.fail("namespace walk did not finish in 1000 pages")
+            pytest.fail("namespace walk did not finish in 100 pages")
         assert len(names) == len(set(names)), "a single walk must not repeat a namespace"
         print(f"\n  namespaces={len(names)}")
 
