@@ -30,27 +30,27 @@ questions:
   - How do I configure the MemWal MCP CLI flags and environment variables?
   - How do I set up Streamable HTTP transport for Walrus Memory MCP?
 answer: >-
-  The MemWal MCP reference documents eight tools (memwal_remember, memwal_remember_bulk, memwal_recall, memwal_analyze, memwal_restore, memwal_health, memwal_login, memwal_logout) with full parameter details. It covers CLI flags such as --relayer, --namespace, and --label, environment presets (prod, staging, local), two transport modes (stdio and Streamable HTTP), credential file format, default namespace precedence, self-hosting configuration, and runtime safety notes for 401 handling and relayer overrides.
+  The MemWal MCP reference documents nine tools (memwal_remember, memwal_remember_bulk, memwal_remember_status, memwal_recall, memwal_analyze, memwal_restore, memwal_health, memwal_login, memwal_logout) with full parameter details. It covers CLI flags such as --relayer, --namespace, and --label, environment presets (prod, staging, local), two transport modes (stdio and Streamable HTTP), credential file format, default namespace precedence, self-hosting configuration, and runtime safety notes for 401 handling and relayer overrides.
 ---
 
 The Walrus Memory MCP package exposes the tools, flags, environment variables, and transport routes below. For per-client setup, start with the [MCP overview](/mcp/overview).
 
 ## Tools
 
-The MCP server exposes **eight tools**: six **relayer tools** (memory operations plus a health check) and two **session tools** served locally by the stdio package. For the lifecycle hooks that drive these tools automatically, see [Claude Code](/mcp/claude-code) or [Codex](/mcp/codex).
+The MCP server exposes **nine tools**: seven **relayer tools** (memory operations, job status polling, plus a health check) and two **session tools** served locally by the stdio package. For the lifecycle hooks that drive these tools automatically, see [Claude Code](/mcp/claude-code) or [Codex](/mcp/codex).
 
-**Core tools** — available in every session once credentials are present:
-`memwal_remember`, `memwal_recall`, `memwal_restore`, `memwal_analyze`, `memwal_health`
+**Core tools** — primary memory and sign-in workflows:
+`memwal_remember`, `memwal_recall`, `memwal_analyze`, `memwal_restore`, `memwal_login`
 
-**Optional / Advanced tools** — for bulk ingestion, analysis, session management, and bulk storage:
-`memwal_remember_bulk`, `memwal_analyze`, `memwal_login`, `memwal_logout`
+**Optional / Operational tools** — bulk writes, background job polling, liveness check, and sign-out:
+`memwal_remember_bulk`, `memwal_remember_status`, `memwal_health`, `memwal_logout`
 
 <Note>
-**Slush zkLogin**: When using MemWal with [Slush wallet](https://slush.app), zkLogin-derived addresses are fully supported as account owners. However, the `accountId` field must be set to your **on-chain MemWalAccount object ID** (found on the [Walrus Memory dashboard](https://memory.walrus.xyz) under your account settings), not the Slush wallet address. The wallet address identifies the account owner; the `accountId` identifies the MemWalAccount object that holds your memories.
+**Slush Google zkLogin**: When signing in with a [Slush](https://slush.app) Google zkLogin wallet on the `/connect/mcp` approval page, unlock and sign in with Google in the Slush extension **before** opening the `/connect/mcp` link so the approval popup does not hang waiting for wallet unlock. Also ensure `accountId` is your onchain `MemWalAccount` object ID (which stores account ownership and delegate authorizations on Sui), not the Slush wallet address.
 </Note>
 
 <Warning>
-**Burst writes**: Sending many `memwal_remember` calls in rapid succession may hit the per-account rate limit. Space writes ≥ 200 ms apart, or use the bulk remember endpoint (`memwal_remember_bulk`) when available.
+**Burst writes and rate-limit budgets**: The relayer enforces a two-layer sliding-window rate limit per 60 seconds: **Layer 1** (`300 points / 60s` per IP or per delegate key) and **Layer 2** (`600 points / 60s` per `MemWalAccount`), with tool weights `recall` = 2, `remember` = 5, `analyze` = 10, `restore` = 15, and `remember_bulk` = 15. When saving multiple facts at once, prefer `memwal_remember_bulk` (up to 20 facts for a single 15-point call instead of 5 points per `memwal_remember`), space rapid writes apart, and honor `Retry-After` / `retry_after_seconds` on HTTP 429 responses.
 </Warning>
 
 ## First-run behavior

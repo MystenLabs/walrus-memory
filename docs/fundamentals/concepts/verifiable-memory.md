@@ -69,8 +69,8 @@ The encrypted blobs live on Walrus, which stores data across a decentralized net
 You can check all three properties yourself. Inspect each one directly:
 
 - **Availability:** Call `health()` to confirm the relayer is reachable before you rely on it. This is an unauthenticated liveness check, not a validation of your credentials.
-- **Integrity:** Read the `blob_id` off a `recall` result. It is a content-addressed handle to the exact stored ciphertext, so a blob ID that resolves confirms that encrypted blob is intact and unchanged. This is blob-level integrity, and the plaintext inside is protected by Seal encryption, not by content-addressing.
-- **Ownership:** Take your `MemWalAccount` object ID and open it in a Sui explorer. The account, its owner, and its delegate authorizations are public onchain state that anyone can inspect, independent of the relayer.
+- **Integrity:** Read the `blob_id` off a `rememberAndWait` or `recall` result and look it up on [Walrus Scan](https://walruscan.com). Because `blob_id` is a content-addressed handle to the exact stored ciphertext on Walrus, a blob ID that resolves on Walrus Scan confirms that encrypted memory blob is stored on Walrus and unchanged. This is blob-level integrity, and the plaintext inside is protected by Seal encryption, not by content-addressing.
+- **Ownership:** Take your `MemWalAccount` object ID and open it in a Sui explorer ([Suiscan](https://suiscan.xyz) or [SuiVision](https://suivision.xyz)). The `MemWalAccount` object holds identity and access-control state (`owner`, `delegate_keys`, `active`) — not individual memory blobs or a memory count — so anyone can verify who owns the account and which delegate keys are authorized, independent of the relayer.
 
 <Note>
 A dedicated `verify()` helper that reconstructs a memory from its onchain blob object is on the roadmap. Until it ships, verifiability comes from the three properties above: content-addressed blob IDs, onchain-enforced ownership you can inspect on a Sui explorer, and durability backed by Walrus. It is a property of the architecture, not a single SDK call.

@@ -80,7 +80,7 @@ yarn add @mysten/walrus
 </Note>
 
 <Warning>
-**Do not embed ciphertexts directly**: Saving an already-encrypted blob via `remember()` will encrypt it a second time, making it unrecoverable. Always pass the original plaintext to `remember()`; Walrus Memory handles encryption transparently. See [MemWalManual mode](/sdk/api-reference#manual-mode) only if you need to manage keys yourself.
+**Do not pass pre-encrypted ciphertext to `remember()`**: In the default `MemWal` client, the relayer generates embeddings from the `text` you pass before encrypting it with Seal. Passing client-encrypted ciphertext to `remember(text)` causes the relayer to embed ciphertext bytes, which silently breaks semantic `recall()`. Always pass plaintext to `remember()`, or use [`MemWalManual`](/sdk/usage/memwal-manual) (`rememberManual` / `recallManual`) when you need client-side encryption and client-computed embeddings.
 </Warning>
 
 For `withMemWal`, you also need:
@@ -135,7 +135,7 @@ const memwal = MemWal.create({
   // Load your own credentials from the environment; never hardcode a shared example ID.
   key: process.env.MEMWAL_KEY ?? "<your-ed25519-private-key>",
   accountId: process.env.MEMWAL_ACCOUNT_ID ?? "<your-memwal-account-id>",
-  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.dev.memwal.ai",
+  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.memory.walrus.xyz", // or "https://relayer.dev.memwal.ai" for testnet/dev
   namespace: "demo",
 });
 
@@ -150,4 +150,5 @@ console.log(result.results);
 ## Next Steps
 
 - [Usage](/sdk/usage) — all three clients in detail, namespace rules, and restore
+- [Ownership & Delegates](/fundamentals/concepts/ownership-and-access#delegate-key-vs-on-chain-sender) — how `accountId`, delegate keys, and onchain transaction senders relate
 - [API Reference](/sdk/api-reference) — full method signatures and config fields
