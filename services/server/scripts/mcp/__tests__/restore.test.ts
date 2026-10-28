@@ -134,3 +134,25 @@ test("memwal_restore still tells agents to raise limit for WALM-431 cap truncati
     assert.match(text, /increase limit and call again/);
     assert.doesNotMatch(text, /download\/embed blip/);
 });
+
+test("memwal_restore states 0 on-chain blobs and suggests close namespaces when namespace is empty", () => {
+    const text = formatRestoreResult(
+        {
+            namespace: "pcl301",
+            total: 0,
+            restored: 0,
+            skipped: 0,
+            failed: 0,
+            truncated: false,
+        },
+        10,
+        [
+            { name: "pcl302", memory_count: 15, storage_used: 4096 },
+            { name: "work", memory_count: 8, storage_used: 2048 },
+        ],
+    );
+
+    assert.match(text, /Namespace "pcl301" holds 0 on-chain blobs\./);
+    assert.match(text, /Did you mean namespace "pcl302" \(15 memories\)\?/);
+    assert.match(text, /Existing namespaces: "pcl302" \(15\), "work" \(8\)\./);
+});

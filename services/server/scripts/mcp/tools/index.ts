@@ -8,6 +8,7 @@ import { registerRecallTool } from "./recall.js";
 import { registerAnalyzeTool } from "./analyze.js";
 import { registerRestoreTool } from "./restore.js";
 import { registerHealthTool } from "./health.js";
+import { registerNamespacesTool } from "./namespaces.js";
 
 /**
  * Register every non-manual MemWal tool on the given server. Manual-mode
@@ -34,6 +35,7 @@ export function registerTools(server: McpServer, session: MemWalSession): void {
     }
     if (canRead) {
         registerRecallTool(server, session);
+        registerNamespacesTool(server, session);
         registerHealthTool(server, session);
     }
 }
@@ -45,5 +47,6 @@ export {
     registerRecallTool,
     registerAnalyzeTool,
     registerRestoreTool,
+    registerNamespacesTool,
     registerHealthTool,
 };
