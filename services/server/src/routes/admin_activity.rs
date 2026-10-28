@@ -419,8 +419,15 @@ pub async fn get_admin_activity(
     let uploader_sui_points = column_points(&samples, |row| row.uploader_sui_mist);
     let sponsor_points = column_points(&samples, |row| row.sponsor_sui_mist);
 
-    let actions =
-        load_actions(&state, prior_start, current_start, now, utc_offset_minutes, hours).await?;
+    let actions = load_actions(
+        &state,
+        prior_start,
+        current_start,
+        now,
+        utc_offset_minutes,
+        hours,
+    )
+    .await?;
 
     Ok(Json(ActivityResponse {
         generated_at: stamp(now),

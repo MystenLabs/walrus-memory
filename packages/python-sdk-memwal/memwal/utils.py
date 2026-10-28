@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple, Union
 
 import nacl.signing
 
@@ -51,7 +52,7 @@ def hex_to_bytes(hex_str: str) -> bytes:
     return bytes.fromhex(clean)
 
 
-def bytes_to_hex(b: bytes) -> str:
+def bytes_to_hex(b: Union[bytes, bytearray]) -> str:
     """Convert bytes to a lowercase hex string (no ``0x`` prefix).
 
     Args:
@@ -75,11 +76,14 @@ def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def build_signing_key(private_key_hex: str) -> nacl.signing.SigningKey:
-    """Build a PyNaCl ``SigningKey`` from an Ed25519 private key hex string.
+def build_signing_key(
+    private_key: Union[str, bytes, bytearray]
+) -> nacl.signing.SigningKey:
+    """Build a PyNaCl ``SigningKey`` from an Ed25519 private key hex string or 32-byte buffer.
 
     Args:
-        private_key_hex: 32-byte Ed25519 seed as hex (64 hex chars), optionally ``0x``-prefixed.
+        private_key: 32-byte Ed25519 seed as hex (64 hex chars, optionally ``0x``-prefixed)
+            or raw 32-byte ``bytes`` / ``bytearray``.
 
     Returns:
         A ``nacl.signing.SigningKey`` instance.
@@ -87,7 +91,10 @@ def build_signing_key(private_key_hex: str) -> nacl.signing.SigningKey:
     Raises:
         ValueError: If the decoded seed is not exactly 32 bytes.
     """
-    seed_bytes = hex_to_bytes(private_key_hex)
+    if isinstance(private_key, (bytes, bytearray)):
+        seed_bytes = bytes(private_key)
+    else:
+        seed_bytes = hex_to_bytes(private_key)
     if len(seed_bytes) != 32:
         raise ValueError(
             f"Ed25519 seed must be exactly 32 bytes, got {len(seed_bytes)}"
@@ -290,12 +297,19 @@ def decode_sui_private_key(encoded: str) -> bytes:
     return seed
 
 
-def normalize_private_key(key: str) -> str:
-    """Accept either a hex seed or a Sui ``suiprivkey1...`` string, return hex.
+def normalize_private_key(key: Union[str, bytes, bytearray]) -> str:
+    """Accept a hex seed, ``suiprivkey1...`` string, or 32-byte ``bytes``/``bytearray``; return hex.
 
-    The TypeScript SDK takes both, and the dashboard hands out the bech32 form,
-    so hex-only input would reject a key a user reasonably expects to work.
+    The TypeScript SDK accepts hex, ``suiprivkey1...``, and 32-byte ``Uint8Array``.
     """
+    if isinstance(key, (bytes, bytearray)):
+        if len(key) != 32:
+            raise ValueError(f"Ed25519 seed must be exactly 32 bytes, got {len(key)}")
+        return bytes_to_hex(key)
+    if not isinstance(key, str):
+        raise TypeError(
+            f"key must be str, bytes, or bytearray, got {type(key).__name__}"
+        )
     candidate = key.strip()
     if candidate.lower().startswith("suiprivkey1"):
         return bytes_to_hex(decode_sui_private_key(candidate))
@@ -360,3 +374,23 @@ def sign_sui_personal_message(
     public_key_bytes = bytes(signing_key.verify_key)
     serialized = bytes([_SUI_ED25519_SCHEME_FLAG]) + signature_bytes + public_key_bytes
     return base64.b64encode(serialized).decode("ascii")
+
+
+def validate_max_distance(max_distance: Optional[float]) -> None:
+    """Reject a ``max_distance`` that would silently drop every hit (#1248).
+
+    The recall filter keeps ``distance < max_distance``. Every comparison with
+    NaN is False and real distances are never negative, so NaN or a negative
+    threshold returns an empty page that looks like an empty namespace.
+    Mirrors the TypeScript ``maxDistance`` guard (#1227).
+    """
+
+    if max_distance is None:
+        return
+    if (
+        isinstance(max_distance, bool)
+        or not isinstance(max_distance, (int, float))
+        or not math.isfinite(max_distance)
+        or max_distance < 0
+    ):
+        raise ValueError("max_distance must be a non-negative finite number")

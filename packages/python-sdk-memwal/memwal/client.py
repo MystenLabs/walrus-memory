@@ -51,6 +51,7 @@ from .types import (
     AskMemory,
     AskResult,
     EmbedResult,
+    ForgetResult,
     HealthResult,
     MemWalConfig,
     NamespacesResult,
@@ -86,6 +87,7 @@ from .utils import (
     sha256_hex,
     sign_message,
     sign_sui_personal_message,
+    validate_max_distance,
 )
 
 T = TypeVar("T")
@@ -140,6 +142,36 @@ def _reject_blank_text(text: object, message: str = "Text cannot be empty") -> N
 
     if not isinstance(text, str) or not text.strip():
         raise ValueError(message)
+
+
+def _require(data: object, field: str, endpoint: str) -> Any:
+    """``data[field]`` from a parsed 2xx body, or a ``MemWalError`` naming both.
+
+    A bare ``KeyError`` is not a ``MemWalError``, carries only the field name,
+    and is raised far from the response that caused it (#1250). Optional
+    fields keep using ``.get()`` with a documented default.
+    """
+
+    if not isinstance(data, dict):
+        raise MemWalError(
+            f"{endpoint} response was {type(data).__name__}, expected an object "
+            f"with {field!r}"
+        )
+    if field not in data:
+        raise MemWalError(f"{endpoint} response missing {field!r}")
+    return data[field]
+
+
+def _require_positive_int(value: object, name: str) -> None:
+    """Reject anything but a positive ``int`` before it is signed (#1249).
+
+    ``json.dumps`` writes ``float("nan")`` as a bare ``NaN`` token, which is
+    not valid JSON, and negative or fractional values were forwarded as-is.
+    ``bool`` is an ``int`` subclass and is rejected explicitly.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
 
 
 IDEMPOTENCY_BUCKET_MS = 30 * 60 * 1000
@@ -437,6 +469,12 @@ def _check_vector(vector: Any) -> None:
     ):
         raise ValueError("vector must be a non-empty list of finite numbers")
 
+def _destroyed_client_error() -> "MemWalError":
+    return MemWalError(
+        "Walrus Memory client was destroyed; its keys are zeroed. Create a new one."
+    )
+
+
 class MemWal:
     """Async-native Walrus Memory client.
 
@@ -445,8 +483,13 @@ class MemWal:
     """
 
     def __init__(self, config: MemWalConfig) -> None:
-        self._private_key_hex = normalize_private_key(config.key)
-        self._signing_key = build_signing_key(self._private_key_hex)
+        self._destroyed: bool = False
+        self._private_key_hex: str = normalize_private_key(config.key)
+        signing_key = build_signing_key(self._private_key_hex)
+        self._signing_key: Optional[nacl.signing.SigningKey] = signing_key
+        # Mutable copy of the 32-byte seed so destroy() can zero-fill it in
+        # place without mutating any caller-supplied bytearray (#975).
+        self._private_key_bytes: bytearray = bytearray(bytes(signing_key))
         self._account_id = config.account_id
         self._server_url = normalize_server_url(config.server_url)
         self._namespace = config.namespace
@@ -473,7 +516,7 @@ class MemWal:
     @classmethod
     def create(
         cls,
-        key: str,
+        key: Union[str, bytes, bytearray],
         account_id: str,
         server_url: Optional[str] = None,
         namespace: str = "default",
@@ -482,7 +525,10 @@ class MemWal:
         """Create a new Walrus Memory client instance.
 
         Args:
-            key: Ed25519 private key hex string (the delegate key).
+            key: Ed25519 private key (hex string, ``suiprivkey1...``, or 32-byte
+                ``bytes`` / ``bytearray``). When passed as ``bytearray``, the
+                bytes are copied into an internal buffer so :meth:`destroy`
+                zeroes only the client's copy and leaves the caller's buffer intact.
             account_id: Walrus Memory account object ID on Sui.
             server_url: Server URL (default: ``https://relayer.memory.walrus.xyz``).
             namespace: Default namespace for memory isolation (default: ``"default"``).
@@ -510,8 +556,65 @@ class MemWal:
             self._client = httpx.AsyncClient(timeout=60.0)
         return self._client
 
-    async def close(self) -> None:
-        """Close the underlying HTTP client."""
+    def destroy(self) -> None:
+        """Wipe internal key buffers, drop signing credentials, and invalidate the client.
+
+        Provides parity with the TypeScript SDK's ``destroy()`` method (#975):
+
+        - Zeroes ``_private_key_bytes`` (the client's internal ``bytearray`` seed
+          copy) in place.
+        - Clears ``_private_key_hex``, drops the ``_signing_key`` reference, and
+          clears cached SEAL session tokens, server config, owner address, and
+          pending idempotency keys.
+        - Marks the client as destroyed so any subsequent or in-flight operation
+          raises :class:`MemWalError`.
+
+        Note on CPython memory semantics:
+            Python ``str`` and ``bytes`` objects (and PyNaCl's internal C-level
+            ``SigningKey`` buffers) are immutable in CPython and cannot be zeroed
+            in place from pure Python. ``destroy()`` zeroes the client's mutable
+            ``bytearray`` seed copy in place and drops all references to immutable
+            key objects so they become eligible for garbage collection once the
+            caller also releases its references. Callers that want to minimize
+            long-lived plaintext ``str`` keys in memory should pass ``key`` as a
+            32-byte ``bytearray`` and zero their own buffer after ``create()``.
+        """
+        self._destroyed = True
+        if self._private_key_bytes:
+            self._private_key_bytes[:] = b"\x00" * len(self._private_key_bytes)
+        self._private_key_hex = ""
+        self._signing_key = None
+        self._session_cache = None
+        self._server_config = None
+        self._relayer_version_metadata = None
+        self._owner_address = None
+        self._pending_remember_keys.clear()
+        for attr in ("_session_build_task", "_owner_task"):
+            task = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+
+    async def close(self, clear_keys: bool = False) -> None:
+        """Close the underlying HTTP client and cancel any in-flight initialization tasks.
+
+        Args:
+            clear_keys: If ``True``, also call :meth:`destroy` to wipe internal
+                key buffers, drop signing credentials, and invalidate the client.
+        """
+        for attr in ("_session_build_task", "_owner_task"):
+            task = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    # Ignore cancellation or transport errors from in-flight
+                    # session tasks during teardown.
+                    pass
+        if clear_keys:
+            self.destroy()
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
@@ -573,7 +676,7 @@ class MemWal:
         if generated_key:
             self._pending_remember_keys.pop(request_identity, None)
         return RememberAcceptedResult(
-            job_id=data["job_id"],
+            job_id=_require(data, "job_id", "POST /api/remember"),
             status=data.get("status", "pending"),
         )
 
@@ -615,6 +718,10 @@ class MemWal:
                 # Status is metadata. No SEAL decrypt, so no session. Matches TS.
                 include_seal_session=False,
             )
+        except MemWalJsonBodyError as err:
+            if err.status != 404:
+                raise
+            data = None
         except (json.JSONDecodeError, UnicodeDecodeError):
             data = None
         if not isinstance(data, dict):
@@ -698,6 +805,10 @@ class MemWal:
                         )
                     else:
                         raise
+            except MemWalJsonBodyError as err:
+                if err.status == 404:
+                    raise MemWalRememberJobNotFound(job_id) from None
+                raise
             except (json.JSONDecodeError, UnicodeDecodeError):
                 raise MemWalRememberJobNotFound(job_id) from None
             except _HttpStatusError as err:
@@ -1105,7 +1216,9 @@ class MemWal:
             sort = params.sort
         else:
             query_text = query
+        _reject_blank_text(query_text, "query cannot be empty")
         _check_limit(limit)
+        validate_max_distance(max_distance)
         body = {
             "query": query_text,
             "limit": limit,
@@ -1118,9 +1231,9 @@ class MemWal:
         data = await self._signed_request("POST", "/api/recall", body)
         memories = [
             RecallMemory(
-                blob_id=m["blob_id"],
-                text=m["text"],
-                distance=m["distance"],
+                blob_id=_require(m, "blob_id", "POST /api/recall"),
+                text=_require(m, "text", "POST /api/recall"),
+                distance=_require(m, "distance", "POST /api/recall"),
                 score=m.get("score"),
                 created_at=m.get("created_at"),
             )
@@ -1139,6 +1252,30 @@ class MemWal:
             total=total_count,
             dropped_count=dropped,
         )
+
+    async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Delete this owner's index rows for ``namespace``.
+
+        Wraps ``POST /api/forget``. Walrus blobs persist; the rows stop being
+        retrievable. Defaults to the client namespace.
+        """
+        resolved_namespace = self._resolve_namespace(namespace)
+        data = await self._signed_request(
+            "POST",
+            "/api/forget",
+            {"namespace": resolved_namespace},
+            include_seal_session=False,
+        )
+        endpoint = "POST /api/forget"
+        return ForgetResult(
+            deleted=int(_require(data, "deleted", endpoint)),
+            namespace=_require(data, "namespace", endpoint),
+            owner=_require(data, "owner", endpoint),
+        )
+
+    async def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Alias for :meth:`forget` matching :meth:`MemWalMock.forget_namespace`."""
+        return await self.forget(namespace)
 
     async def analyze(
         self,
@@ -1282,18 +1419,24 @@ class MemWal:
         Returns:
             :class:`AskResult` with answer, memories_used count, and memories list.
         """
+        _reject_blank_text(question, "question cannot be empty")
+        _require_positive_int(limit, "limit")
         data = await self._signed_request("POST", "/api/ask", {
             "question": question,
             "limit": limit,
             "namespace": self._resolve_namespace(namespace),
         })
         memories = [
-            AskMemory(blob_id=m["blob_id"], text=m["text"], distance=m["distance"])
+            AskMemory(
+                blob_id=_require(m, "blob_id", "POST /api/ask"),
+                text=_require(m, "text", "POST /api/ask"),
+                distance=_require(m, "distance", "POST /api/ask"),
+            )
             for m in data.get("memories", [])
         ]
         return AskResult(
-            answer=data["answer"],
-            memories_used=data["memories_used"],
+            answer=_require(data, "answer", "POST /api/ask"),
+            memories_used=_require(data, "memories_used", "POST /api/ask"),
             memories=memories,
         )
 
@@ -1353,12 +1496,13 @@ class MemWal:
             "namespace": namespace,
             "limit": limit,
         })
+        endpoint = "POST /api/restore"
         return RestoreResult(
-            restored=data["restored"],
-            skipped=data["skipped"],
-            total=data["total"],
-            namespace=data["namespace"],
-            owner=data["owner"],
+            restored=_require(data, "restored", endpoint),
+            skipped=_require(data, "skipped", endpoint),
+            total=_require(data, "total", endpoint),
+            namespace=_require(data, "namespace", endpoint),
+            owner=_require(data, "owner", endpoint),
             # Relayers older than WALM-319 omit `truncated` entirely --
             # treat "not present" as "not known to be truncated" rather
             # than require every relayer version to send it.
@@ -1421,20 +1565,21 @@ class MemWal:
         # against `path_and_query`, not `path`.
         path = f"/v1/owners/{owner}/namespaces" + (f"?{query}" if query else "")
         data = await self._signed_request("GET", path, {}, include_seal_session=False)
+        endpoint = "GET /v1/owners/{owner}/namespaces"
         return NamespacesResult(
             namespaces=[
                 NamespaceSummary(
-                    id=ns["id"],
-                    name=ns["name"],
-                    memory_count=ns["memory_count"],
-                    storage_used=ns["storage_used"],
-                    updated_at=ns["updated_at"],
+                    id=_require(ns, "id", endpoint),
+                    name=_require(ns, "name", endpoint),
+                    memory_count=_require(ns, "memory_count", endpoint),
+                    storage_used=_require(ns, "storage_used", endpoint),
+                    updated_at=_require(ns, "updated_at", endpoint),
                 )
-                for ns in data["namespaces"]
+                for ns in _require(data, "namespaces", endpoint)
             ],
             next_cursor=data.get("next_cursor"),
-            has_more=data["has_more"],
-            snapshot_version=data["snapshot_version"],
+            has_more=_require(data, "has_more", endpoint),
+            snapshot_version=_require(data, "snapshot_version", endpoint),
         )
 
     async def health(self) -> HealthResult:
@@ -1443,13 +1588,17 @@ class MemWal:
         Returns:
             :class:`HealthResult` with status and version.
         """
+        if self._destroyed:
+            raise _destroyed_client_error()
         response = await self._http.get(f"{self._server_url}/health")
+        if self._destroyed:
+            raise _destroyed_client_error()
         if response.status_code != 200:
             raise MemWalError(f"Health check failed: {response.status_code}")
-        data = response.json()
+        data = _parse_json_response(response, "GET /health")
         return HealthResult(
-            status=data["status"],
-            version=data["version"],
+            status=_require(data, "status", "GET /health"),
+            version=_require(data, "version", "GET /health"),
             relayer_version=data.get("relayerVersion"),
             api_version=data.get("apiVersion"),
             min_supported_sdk=data.get("minSupportedSdk"),
@@ -1462,7 +1611,8 @@ class MemWal:
 
     async def compatibility(self) -> Dict[str, Any]:
         """Fetch and validate the relayer compatibility contract."""
-
+        if self._destroyed:
+            raise _destroyed_client_error()
         return await self._ensure_compatible_relayer()
 
     # ============================================================
@@ -1493,11 +1643,12 @@ class MemWal:
             },
             include_seal_session=False,
         )
+        endpoint = "POST /api/remember/manual"
         return RememberManualResult(
-            id=data["id"],
-            blob_id=data["blob_id"],
-            owner=data["owner"],
-            namespace=data["namespace"],
+            id=_require(data, "id", endpoint),
+            blob_id=_require(data, "blob_id", endpoint),
+            owner=_require(data, "owner", endpoint),
+            namespace=_require(data, "namespace", endpoint),
         )
 
     async def recall_manual(self, opts: RecallManualOptions) -> RecallManualResult:
@@ -1545,6 +1696,8 @@ class MemWal:
         Returns:
             Public key hex string.
         """
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
         return bytes_to_hex(bytes(self._signing_key.verify_key))
 
     # ============================================================
@@ -1552,6 +1705,8 @@ class MemWal:
     # ============================================================
 
     async def _ensure_compatible_relayer(self) -> Dict[str, Any]:
+        if self._destroyed:
+            raise _destroyed_client_error()
         if self._relayer_version_metadata is not None:
             return self._relayer_version_metadata
 
@@ -1559,21 +1714,27 @@ class MemWal:
             self._compatibility_lock = asyncio.Lock()
 
         async with self._compatibility_lock:
+            if self._destroyed:
+                raise _destroyed_client_error()
             if self._relayer_version_metadata is not None:
                 return self._relayer_version_metadata
 
             version_response = await self._http.get(f"{self._server_url}/version")
+            if self._destroyed:
+                raise _destroyed_client_error()
             if version_response.status_code == 200:
-                metadata = version_response.json()
+                metadata = _parse_json_response(version_response, "GET /version")
             elif version_response.status_code in (404, 405):
                 health_response = await self._http.get(f"{self._server_url}/health")
+                if self._destroyed:
+                    raise _destroyed_client_error()
                 if health_response.status_code != 200:
                     raise MemWalError(
                         "Walrus Memory compatibility check failed: "
                         f"GET /version returned {version_response.status_code}, "
                         f"and GET /health returned {health_response.status_code}"
                     )
-                metadata = health_response.json()
+                metadata = _parse_json_response(health_response, "GET /health")
             else:
                 raise MemWalError(
                     "Walrus Memory compatibility check failed: "
@@ -1595,7 +1756,11 @@ class MemWal:
         if response.status_code != 200:
             raise MemWalError(f"GET /config returned {response.status_code}")
 
-        data = response.json()
+        data = _parse_json_response(response, "GET /config")
+        if not isinstance(data, dict):
+            raise MemWalError(
+                f"GET /config response was {type(data).__name__}, expected an object"
+            )
         package_id = data.get("packageId")
         network = data.get("network")
         sui_rpc_url = data.get("suiRpcUrl")
@@ -1630,8 +1795,9 @@ class MemWal:
         )
         if response.status_code != 200:
             raise MemWalError(f"Sui GraphQL returned {response.status_code}")
-        body = response.json()
-        obj = (body.get("data") or {}).get("object")
+        body = _parse_json_response(response, f"POST {graphql_url}")
+        data = body.get("data") if isinstance(body, dict) else None
+        obj = data.get("object") if isinstance(data, dict) else None
         if not isinstance(obj, dict) or obj.get("version") is None:
             raise MemWalError(f"Sui GraphQL could not resolve package {package_id}")
         return obj["version"]
@@ -1652,8 +1818,8 @@ class MemWal:
         if response.status_code != 200:
             raise MemWalError(f"sui_getObject returned {response.status_code}")
 
-        body = response.json()
-        result = body.get("result", {})
+        body = _parse_json_response(response, f"POST {sui_rpc_url}")
+        result = body.get("result", {}) if isinstance(body, dict) else {}
         version = None
         if isinstance(result, dict):
             data = result.get("data")
@@ -1684,10 +1850,16 @@ class MemWal:
             )
 
     async def _build_seal_session_inner(self) -> str:
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
         cfg = await self._fetch_server_config()
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
         await self._assert_first_package_version(
             cfg["network"], cfg["suiRpcUrl"], cfg["packageId"]
         )
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
 
         session_signing_key = nacl.signing.SigningKey.generate()
         session_public_key = bytes(session_signing_key.verify_key)
@@ -1716,6 +1888,8 @@ class MemWal:
             separators=(",", ":"),
         )
         session_bytes = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+        if self._destroyed:
+            raise _destroyed_client_error()
         self._session_cache = (
             session_bytes,
             int(time.time() * 1000) + SEAL_SESSION_TTL_MIN * 60_000 - SEAL_SESSION_SAFETY_MARGIN_MS,
@@ -1723,22 +1897,40 @@ class MemWal:
         return session_bytes
 
     async def _build_seal_session(self) -> str:
+        if self._destroyed:
+            raise _destroyed_client_error()
         now_ms = int(time.time() * 1000)
         if self._session_cache is not None:
             cached_bytes, expires_at_ms = self._session_cache
             if now_ms < expires_at_ms:
                 return cached_bytes
 
-        if self._session_build_task is not None:
-            return await self._session_build_task
+        task = self._session_build_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._build_seal_session_inner())
+            self._session_build_task = task
 
-        self._session_build_task = asyncio.create_task(self._build_seal_session_inner())
+            def _on_session_build_done(done_task: "asyncio.Task[str]") -> None:
+                if self._session_build_task is done_task:
+                    self._session_build_task = None
+                if not done_task.cancelled():
+                    done_task.exception()
+
+            task.add_done_callback(_on_session_build_done)
+
         try:
-            return await self._session_build_task
-        finally:
-            self._session_build_task = None
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if self._destroyed:
+                raise _destroyed_client_error() from None
+            raise
+        if self._destroyed:
+            raise _destroyed_client_error()
+        return result
 
     async def _resolve_owner_inner(self) -> str:
+        if self._destroyed:
+            raise _destroyed_client_error()
         # POST /api/stats authenticates with the same delegate scheme and
         # returns the owner the relayer resolved from our key. Same approach
         # as the TypeScript SDK's resolveOwner().
@@ -1748,7 +1940,9 @@ class MemWal:
             {"namespace": self._namespace},
             include_seal_session=False,
         )
-        owner = data.get("owner")
+        if self._destroyed:
+            raise _destroyed_client_error()
+        owner = data.get("owner") if isinstance(data, dict) else None
         if not owner:
             raise MemWalError(
                 "Walrus Memory could not resolve this account's owner address "
@@ -1763,17 +1957,33 @@ class MemWal:
         The owner-scoped read routes take the address in the path, but the
         client is configured with only a delegate key and account id.
         """
+        if self._destroyed:
+            raise _destroyed_client_error()
         if self._owner_address is not None:
             return self._owner_address
 
-        if self._owner_task is not None:
-            return await self._owner_task
+        task = self._owner_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._resolve_owner_inner())
+            self._owner_task = task
 
-        self._owner_task = asyncio.create_task(self._resolve_owner_inner())
+            def _on_owner_done(done_task: "asyncio.Task[str]") -> None:
+                if self._owner_task is done_task:
+                    self._owner_task = None
+                if not done_task.cancelled():
+                    done_task.exception()
+
+            task.add_done_callback(_on_owner_done)
+
         try:
-            return await self._owner_task
-        finally:
-            self._owner_task = None
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if self._destroyed:
+                raise _destroyed_client_error() from None
+            raise
+        if self._destroyed:
+            raise _destroyed_client_error()
+        return result
 
     async def _signed_request(
         self,
@@ -1803,8 +2013,12 @@ class MemWal:
             - ``x-account-id``: Walrus Memory account object ID
             - ``Content-Type``: application/json
         """
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
 
         await self._ensure_compatible_relayer()
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
 
         method_upper = method.upper()
         timestamp = str(int(time.time()))
@@ -1838,6 +2052,8 @@ class MemWal:
         }
         if include_seal_session:
             headers["x-seal-session"] = await self._build_seal_session()
+            if self._destroyed or self._signing_key is None:
+                raise _destroyed_client_error()
 
         response = await self._http.request(
             method=method_upper,
@@ -1846,6 +2062,8 @@ class MemWal:
             content=None if method_upper == "GET" else body_str,
             timeout=timeout,
         )
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
 
         if response.status_code not in accepted_statuses:
             err_text = response.text
@@ -1872,7 +2090,15 @@ class MemWal:
                 retry_after=response.headers.get("retry-after"),
             )
 
-        return response.json()
+        endpoint = f"{method_upper} {path}"
+        data = _parse_json_response(response, endpoint)
+        if response.status_code != 404 and not isinstance(data, dict):
+            raise MemWalJsonBodyError(
+                status=response.status_code,
+                endpoint=endpoint,
+                body=response.text,
+            )
+        return data
 
 
 class MemWalError(Exception):
@@ -1894,6 +2120,71 @@ class MemWalClockDriftError(MemWalError):
     relative to the relayer; sync via NTP or widen the relayer's window."""
 
     pass
+
+
+class MemWalJsonBodyError(MemWalError):
+    """Raised when an HTTP response that should carry JSON has an empty or non-JSON body."""
+
+    def __init__(
+        self,
+        status: int,
+        endpoint: str,
+        body: str,
+        *,
+        empty: bool = False,
+    ) -> None:
+        redacted = _redact_internal_urls(body.strip()[:200]) if body else ""
+        if empty:
+            message = (
+                f"MemWal ({endpoint}): HTTP {status} response had an empty body; "
+                "expected JSON"
+            )
+        elif redacted:
+            message = (
+                f"MemWal ({endpoint}): HTTP {status} response was not JSON: "
+                f"{redacted}"
+            )
+        else:
+            message = f"MemWal ({endpoint}): HTTP {status} response was not JSON"
+        super().__init__(message)
+        self.status = status
+        self.endpoint = endpoint
+        self.body = body
+
+
+def _parse_json_response(response: httpx.Response, endpoint: str) -> Any:
+    """Decode a JSON response body or raise :class:`MemWalJsonBodyError` (#1219).
+
+    Mirrors the TypeScript SDK's ``jsonBodyError`` guard (#1201 / #1207): an
+    empty or non-JSON 2xx response from a relayer or proxy in front of one
+    surfaces as a :class:`MemWalError` naming the endpoint and HTTP status
+    rather than Python's raw :class:`json.JSONDecodeError` or
+    :class:`UnicodeDecodeError`.
+    """
+    try:
+        return response.json()
+    except UnicodeDecodeError as exc:
+        raise MemWalJsonBodyError(
+            status=response.status_code,
+            endpoint=endpoint,
+            body="",
+        ) from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        doc = getattr(exc, "doc", None)
+        if isinstance(doc, str):
+            raw = doc
+        else:
+            try:
+                raw = response.text
+            except UnicodeDecodeError:
+                raw = ""
+        is_empty = not raw or not raw.strip()
+        raise MemWalJsonBodyError(
+            status=response.status_code,
+            endpoint=endpoint,
+            body=raw,
+            empty=is_empty,
+        ) from exc
 
 
 def _redact_internal_urls(text: str) -> str:
@@ -2073,7 +2364,7 @@ class MemWalSync:
     @classmethod
     def create(
         cls,
-        key: str,
+        key: Union[str, bytes, bytearray],
         account_id: str,
         server_url: Optional[str] = None,
         namespace: str = "default",
@@ -2216,6 +2507,14 @@ class MemWalSync:
         :class:`RecallParams` for the recommended object-style call)."""
         return self._run(self._inner.recall(query, limit, namespace, max_distance))
 
+    def forget(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget`."""
+        return self._run(self._inner.forget(namespace))
+
+    def forget_namespace(self, namespace: Optional[str] = None) -> ForgetResult:
+        """Synchronous version of :meth:`MemWal.forget_namespace`."""
+        return self._run(self._inner.forget_namespace(namespace))
+
     def analyze(
         self,
         text: str,
@@ -2278,9 +2577,18 @@ class MemWalSync:
         """Synchronous version of :meth:`MemWal.get_public_key_hex`."""
         return self._run(self._inner.get_public_key_hex())
 
-    def close(self) -> None:
-        """Close the underlying HTTP client."""
-        self._run(self._inner.close())
+    def destroy(self) -> None:
+        """Synchronous version of :meth:`MemWal.destroy`."""
+        self._inner.destroy()
+
+    def close(self, clear_keys: bool = False) -> None:
+        """Close the underlying HTTP client.
+
+        Args:
+            clear_keys: If ``True``, also call :meth:`destroy` to wipe internal
+                key buffers, drop signing credentials, and invalidate the client.
+        """
+        self._run(self._inner.close(clear_keys=clear_keys))
 
     def __enter__(self) -> "MemWalSync":
         return self

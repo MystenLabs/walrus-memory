@@ -31,7 +31,7 @@ COPY --from=builder /app/apps/status/server.mjs ./server.mjs
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV STATUS_RELAYER_PRODUCTION_URL=https://relayer.memory.walrus.xyz
-ENV STATUS_RELAYER_STAGING_URL=https://relayer-staging.memory.walrus.xyz
+ENV STATUS_RELAYER_STAGING_URL=https://relayer.dev.memwal.ai
 ENV STATUS_POLL_INTERVAL_MS=60000
 ENV STATUS_HISTORY_DAYS=90
 EXPOSE 3000

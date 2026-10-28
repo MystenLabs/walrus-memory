@@ -3,6 +3,7 @@
  * Shared by hooks, tools, and CLI.
  */
 
+import { createHash } from "node:crypto";
 import {
   MIN_EXTRACTED_TEXT_LENGTH,
   DEFAULT_RETRY_COUNT,
@@ -91,6 +92,84 @@ export function stripMemoryTags(text: string): string {
 }
 
 /**
+ * Parse a timestamp value (Date, ISO-8601 string, or epoch seconds/ms) into a valid Date.
+ */
+export function parseMessageTimestamp(raw: unknown): Date | undefined {
+  if (raw instanceof Date) {
+    return Number.isNaN(raw.getTime()) ? undefined : new Date(raw.getTime());
+  }
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    const ms = raw < 1e11 ? raw * 1000 : raw;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  }
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const trimmed = raw.trim();
+    if (/^\d+(\.\d+)?$/.test(trimmed)) {
+      return parseMessageTimestamp(Number(trimmed));
+    }
+    const d = new Date(trimmed);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  }
+  return undefined;
+}
+
+export interface ExtractedMessage {
+  role: string;
+  text: string;
+  key: string;
+  occurredAt?: Date;
+}
+
+/**
+ * Extract structured messages (with content hash key and creation timestamp)
+ * from an OpenClaw messages array.
+ */
+export function extractMessages(
+  messages: any[],
+  maxCount: number,
+  roles: string[] = ["user", "assistant"],
+): ExtractedMessage[] {
+  const extracted: ExtractedMessage[] = [];
+  for (const msg of messages.slice(-maxCount)) {
+    if (!msg || typeof msg !== "object") continue;
+    if (!roles.includes(msg.role)) continue;
+
+    let text = "";
+    if (typeof msg.content === "string") {
+      text = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block?.type === "text" && typeof block.text === "string") {
+          text += block.text + "\n";
+        }
+      }
+    }
+
+    text = stripMemoryTags(text).trim();
+    if (text.length > MIN_EXTRACTED_TEXT_LENGTH) {
+      const msgId =
+        typeof msg.id === "string" && msg.id.trim().length > 0
+          ? msg.id.trim()
+          : typeof msg.messageId === "string" && msg.messageId.trim().length > 0
+            ? msg.messageId.trim()
+            : "";
+      const key = createHash("sha256")
+        .update(`${msg.role}\0${msgId}\0${text}`)
+        .digest("hex");
+      const occurredAt =
+        parseMessageTimestamp(msg.occurredAt) ??
+        parseMessageTimestamp(msg.createdAt) ??
+        parseMessageTimestamp(msg.created_at) ??
+        parseMessageTimestamp(msg.timestamp) ??
+        parseMessageTimestamp(msg.date);
+      extracted.push({ role: msg.role, text, key, occurredAt });
+    }
+  }
+  return extracted;
+}
+
+/**
  * Extract text content from OpenClaw messages array.
  *
  * Handles both string content and content blocks array format.
@@ -107,33 +186,7 @@ export function extractMessageTexts(
   maxCount: number,
   roles: string[] = ["user", "assistant"],
 ): string[] {
-  const texts: string[] = [];
-  // Take the most recent messages (negative slice = from the end)
-  for (const msg of messages.slice(-maxCount)) {
-    if (!msg || typeof msg !== "object") continue;
-    if (!roles.includes(msg.role)) continue;
-
-    // OpenClaw messages use either `content: string` or
-    // `content: [{type: "text", text: "..."}]` depending on the LLM provider
-    let text = "";
-    if (typeof msg.content === "string") {
-      text = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block?.type === "text" && typeof block.text === "string") {
-          text += block.text + "\n";
-        }
-      }
-    }
-
-    // Strip our injected memory tags to prevent feedback loops, then drop
-    // anything that's empty or trivially short after stripping
-    text = stripMemoryTags(text).trim();
-    if (text.length > MIN_EXTRACTED_TEXT_LENGTH) {
-      texts.push(text);
-    }
-  }
-  return texts;
+  return extractMessages(messages, maxCount, roles).map((m) => m.text);
 }
 
 /** Standard error response for tool failures. */
@@ -144,46 +197,45 @@ export function toolError(message: string, err: unknown) {
   };
 }
 
+/** Whether an error represents a deadline / abort timeout that must not be retried blindly. */
+export function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; code?: string; message?: string };
+  if (e.name === "TimeoutError" || e.name === "AbortError") return true;
+  if (e.code === "ETIMEDOUT" || e.code === "ABORT_ERR") return true;
+  if (typeof e.message === "string" && /timed out after \d+ms/i.test(e.message)) {
+    return true;
+  }
+  return false;
+}
+
 /**
- * Retry an async operation with delay between attempts.
+ * Race an async operation against a deadline and abort its `AbortSignal` on expiry.
  *
- * @param fn - Async function to execute
- * @param retries - Remaining retry attempts (default: 1, so 2 total tries)
- * @param delayMs - Milliseconds to wait between retries
- * @returns Result of `fn` on first success
- * @throws Last error if all attempts fail
- */
-/**
- * Race an async operation against a deadline.
- *
- * SDK coverage is uneven: `recall()` aborts itself after 15s, but `analyze()`
- * goes through `signedRequest` with no signal, and the compatibility preflight
- * (`GET /version`, falling back to `/health`) that runs ahead of every
- * protected request is unguarded. So a relayer that accepts the socket and then
- * goes silent stalls in the preflight before `recall()`'s own abort can apply,
- * and blocks the agent turn. An unreachable host fails fast at DNS; a hung one
- * does not. This bounds the whole call regardless of which leg stalls.
- *
- * @param fn - Async function to execute
+ * @param fn - Async function to execute (receives an `AbortSignal` aborted on deadline)
  * @param ms - Deadline in milliseconds
  * @param label - Operation name, used in the timeout error message
  * @returns Result of `fn` if it settles before the deadline
  * @throws {Error} `<label> timed out after <ms>ms` if the deadline passes first
  */
 export async function withTimeout<T>(
-  fn: () => Promise<T>,
+  fn: (signal: AbortSignal) => Promise<T>,
   ms: number,
   label: string,
 ): Promise<T> {
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      fn(),
+      fn(controller.signal),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`${label} timed out after ${ms}ms`)),
-          ms,
-        );
+        timer = setTimeout(() => {
+          const err = new Error(`${label} timed out after ${ms}ms`);
+          err.name = "TimeoutError";
+          (err as Error & { code?: string }).code = "ETIMEDOUT";
+          controller.abort(err);
+          reject(err);
+        }, ms);
       }),
     ]);
   } finally {
@@ -192,6 +244,11 @@ export async function withTimeout<T>(
   }
 }
 
+/**
+ * Retry an async operation with delay between attempts.
+ * Timeouts / aborts are not retried so a slow in-flight extraction is not
+ * duplicated on the server (GH #1095).
+ */
 export async function withRetry<T>(
   fn: () => Promise<T>,
   retries: number = DEFAULT_RETRY_COUNT,
@@ -200,7 +257,7 @@ export async function withRetry<T>(
   try {
     return await fn();
   } catch (err) {
-    if (retries <= 0) throw err;
+    if (retries <= 0 || isTimeoutError(err)) throw err;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return withRetry(fn, retries - 1, delayMs);
   }

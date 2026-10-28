@@ -59,6 +59,8 @@ export type {
 // Types for the default client, including its lightweight manual endpoints.
 export type {
     MemWalConfig,
+    RememberOptions,
+    RememberWaitOptions,
     RememberAcceptedResult,
     RememberJobStatus,
     RememberResult,

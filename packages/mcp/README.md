@@ -322,7 +322,7 @@ You can also pass explicit URLs:
         "-y",
         "@mysten-incubation/memwal-mcp",
         "--relayer",
-        "https://relayer-staging.memory.walrus.xyz"
+        "https://relayer.dev.memwal.ai"
       ]
     }
   }

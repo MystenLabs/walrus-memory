@@ -125,6 +125,44 @@ export function sponsorFailureMessage(err: unknown): string {
     return err instanceof Error ? err.message : 'Transaction sponsorship failed. Please try again.'
 }
 
+function packageIdFromConfig(body: unknown): string {
+    if (typeof body !== 'object' || body === null || !('packageId' in body)) return ''
+    const id = (body as { packageId: unknown }).packageId
+    return typeof id === 'string' ? id.trim() : ''
+}
+
+/** Null when the baked-in package id matches GET /config. */
+export function relayerPackageMismatch(localPackageId: string, body: unknown): string | null {
+    const remote = packageIdFromConfig(body)
+    if (!remote) return 'Relayer /config did not include a packageId.'
+    if (localPackageId.trim().toLowerCase() !== remote.toLowerCase()) {
+        return `This dashboard is built for package ${localPackageId}, but the relayer is on ${remote}. Set VITE_MEMWAL_PACKAGE_ID to the relayer package id and rebuild.`
+    }
+    return null
+}
+
+/** Throws before a transaction kind is built when the relayer package id differs. */
+export async function assertRelayerPackageId(serverUrl: string, localPackageId: string): Promise<void> {
+    const base = serverUrl.replace(/\/$/, '')
+    let response: Response
+    try {
+        response = await fetch(`${base}/config`)
+    } catch {
+        throw new Error('Could not reach the relayer /config before building a transaction.')
+    }
+    if (!response.ok) {
+        throw new Error(`Relayer /config returned ${response.status} before a transaction was built.`)
+    }
+    let body: unknown
+    try {
+        body = await response.json()
+    } catch {
+        throw new Error('Relayer /config did not return JSON before a transaction was built.')
+    }
+    const mismatch = relayerPackageMismatch(localPackageId, body)
+    if (mismatch) throw new Error(mismatch)
+}
+
 export function useSponsoredTransaction() {
     const currentAccount = useCurrentAccount()
     const suiClient = useSuiClient()
@@ -134,6 +172,10 @@ export function useSponsoredTransaction() {
     const mutateAsync = async ({ transaction }: { transaction: Transaction }): Promise<{ digest: string }> => {
         const sender = currentAccount?.address
         if (!sender) throw new Error('No wallet connected')
+
+        // The relayer only sponsors its own package. A stale baked-in id
+        // otherwise fails later as "Transaction kind is not permitted".
+        await assertRelayerPackageId(config.memwalServerUrl, config.memwalPackageId)
 
         // TransactionKind bytes never change across retries — build once.
         const kindBytes = await transaction.build({

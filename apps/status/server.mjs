@@ -13,7 +13,7 @@ const port = Number(process.env.PORT || 3000)
 const host = process.env.HOST || '0.0.0.0'
 
 const DEFAULT_RELAYER_PRODUCTION_URL = 'https://relayer.memory.walrus.xyz'
-const DEFAULT_RELAYER_STAGING_URL = 'https://relayer-staging.memory.walrus.xyz'
+const DEFAULT_RELAYER_STAGING_URL = 'https://relayer.dev.memwal.ai'
 const DEFAULT_HEALTH_PATH = '/health'
 const DEFAULT_TIMEOUT_MS = 8000
 const DEFAULT_POLL_INTERVAL_MS = 60_000

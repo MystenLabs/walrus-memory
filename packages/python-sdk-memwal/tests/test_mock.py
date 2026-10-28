@@ -121,7 +121,18 @@ async def test_mock_supports_jobs_bulk_analyze_forget_and_clear():
 
     assert mock.forget("mock-blob-000001") is True
     assert mock.forget("missing") is False
-    assert mock.clear("one") == 1
+    assert (await mock.recall("single fact")).total == 0
+    assert (await mock.recall("bulk", namespace="one")).total == 1
+    assert (await mock.recall("bulk", namespace="two")).total == 1
+    assert (await mock.recall("durable analyzed fact", namespace="analysis")).total == 1
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        await mock.forget_namespace("")
+    forgotten = await mock.forget_namespace("one")
+    assert forgotten.namespace == "one"
+    assert forgotten.deleted == 1
+    assert (await mock.recall("bulk", namespace="two")).total == 1
+    assert (await mock.recall("durable analyzed fact", namespace="analysis")).total == 1
+    assert mock.clear("one") == 0
     assert (await mock.recall("bulk", namespace="one")).total == 0
 
 
@@ -171,6 +182,17 @@ def test_sync_mock_wraps_core_flows_and_accepts_production_options():
     assert analyzed_wait.succeeded == 1
     assert recalled.results[0].text == "sync memory"
 
+    assert recalled.total == 5
+    assert mock.forget(stored.blob_id) is True
+    assert mock.forget("missing-blob") is False
+    assert mock.recall("sync").total == 4
+    with pytest.raises(ValueError, match="namespace cannot be empty"):
+        mock.forget_namespace("")
+    forgotten = mock.forget_namespace("sync")
+    assert forgotten.namespace == "sync"
+    assert forgotten.deleted == 4
+    assert mock.recall("sync").total == 0
+
 
 def test_sync_mock_polling_and_analyze_signatures_match_production():
     methods = (
@@ -182,6 +204,7 @@ def test_sync_mock_polling_and_analyze_signatures_match_production():
         "remember_bulk_and_wait",
         "analyze",
         "analyze_and_wait",
+        "forget_namespace",
     )
 
     def parameter_contract(method):

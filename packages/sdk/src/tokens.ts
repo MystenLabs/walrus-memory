@@ -223,8 +223,14 @@ export function applyTokenBudget(
     }));
 
     const byRelevance = [...indexed].sort((a, b) => {
-        const distA = a.memory.distance ?? 0;
-        const distB = b.memory.distance ?? 0;
+        const distA =
+            typeof a.memory.distance === "number" && Number.isFinite(a.memory.distance)
+                ? Math.max(0, a.memory.distance)
+                : Number.POSITIVE_INFINITY;
+        const distB =
+            typeof b.memory.distance === "number" && Number.isFinite(b.memory.distance)
+                ? Math.max(0, b.memory.distance)
+                : Number.POSITIVE_INFINITY;
         if (distA !== distB) return distA - distB;
         return a.index - b.index;
     });

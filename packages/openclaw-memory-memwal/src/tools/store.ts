@@ -91,32 +91,173 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
 
         try {
           const result = await withTimeout(
-            () => client.analyze(text.trim(), { namespace: ns, occurredAt }),
+            (signal) =>
+              client.analyze(text.trim(), {
+                namespace: ns,
+                occurredAt,
+                ...(signal ? { signal } : {}),
+              }),
             config.requestTimeoutMs,
             "memory_store",
           );
 
-          const factCount = result.facts?.length ?? 0;
-          // Show first 3 extracted facts as confirmation, or raw text truncation as fallback
-          const preview = result.facts
-            ?.map((f: any) => f.text)
-            .slice(0, MAX_FACT_PREVIEW_COUNT)
-            .join("; ") ?? text.slice(0, MAX_TEXT_PREVIEW_LENGTH);
+          const facts = Array.isArray(result?.facts) ? result.facts : [];
+          const factCount = facts.length;
+          if (factCount === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "No memorable facts extracted from the input.",
+                },
+              ],
+              details: {
+                action: "none",
+                status: result?.status ?? "done",
+                namespace: ns,
+                factCount: 0,
+                facts: [],
+              },
+            };
+          }
 
+          // Show first 3 extracted facts as confirmation, or raw text truncation as fallback
+          const preview =
+            facts
+              .map((f: any) => f.text)
+              .slice(0, MAX_FACT_PREVIEW_COUNT)
+              .join("; ") || text.slice(0, MAX_TEXT_PREVIEW_LENGTH);
+
+          const jobIds: string[] = Array.isArray(result?.job_ids)
+            ? result.job_ids.filter((id: any): id is string => typeof id === "string" && id.length > 0)
+            : facts
+                .map((f: any) => f?.job_id ?? f?.id)
+                .filter((id: any): id is string => typeof id === "string" && id.length > 0);
+
+          const allFactsHaveBlobId = facts.every(
+            (f: any) => typeof f?.blob_id === "string" && f.blob_id.length > 0,
+          );
+          const isAlreadyDone = result?.status === "done" || allFactsHaveBlobId;
+
+          if (isAlreadyDone) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Stored ${factCount} fact${factCount === 1 ? "" : "s"}: ${preview}`,
+                },
+              ],
+              details: {
+                action: "created",
+                status: "done",
+                namespace: ns,
+                factCount,
+                jobIds,
+                facts,
+              },
+            };
+          }
+
+          // When the client provides `waitForRememberJobs`, poll the queued
+          // jobs within `requestTimeoutMs` so post-acceptance upload failures
+          // are surfaced and "Stored" is only reported once jobs reach `done`
+          // (GH #1101).
+          const waitFn = (client as any).waitForRememberJobs;
+          if (jobIds.length > 0 && typeof waitFn === "function") {
+            const settled = await waitFn.call(
+              client,
+              jobIds,
+              jobIds.map(() => ns),
+              { timeoutMs: config.requestTimeoutMs },
+            );
+            const itemResults: any[] = Array.isArray(settled?.results)
+              ? settled.results
+              : Array.isArray(settled?.jobs)
+                ? settled.jobs
+                : [];
+            const byId = new Map<string, any>();
+            for (const item of itemResults) {
+              if (item && typeof item.id === "string") {
+                byId.set(item.id, item);
+              }
+            }
+
+            const settledFacts = facts.map((f: any, idx: number) => {
+              const jid = f?.job_id ?? f?.id ?? jobIds[idx];
+              const settledItem = jid ? byId.get(jid) : undefined;
+              if (settledItem?.blob_id) {
+                return { ...f, blob_id: settledItem.blob_id };
+              }
+              return f;
+            });
+
+            const failedItems = itemResults.filter((r) => r?.status === "failed");
+            if (failedItems.length > 0) {
+              const errorSummary = failedItems
+                .map((r) => `${r.id}: ${r.error ?? "upload failed"}`)
+                .join("; ");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `Failed to store ${failedItems.length} of ${factCount} ` +
+                      `fact${factCount === 1 ? "" : "s"} after acceptance (${errorSummary}).`,
+                  },
+                ],
+                details: {
+                  action: "failed",
+                  status: "failed",
+                  error: errorSummary,
+                  namespace: ns,
+                  factCount,
+                  succeeded: settled?.succeeded ?? 0,
+                  failed: failedItems.length,
+                  jobIds,
+                  facts: settledFacts,
+                },
+              };
+            }
+
+            const allSettledDone =
+              itemResults.length >= jobIds.length &&
+              itemResults.every((r) => r?.status === "done");
+            if (allSettledDone) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Stored ${factCount} fact${factCount === 1 ? "" : "s"}: ${preview}`,
+                  },
+                ],
+                details: {
+                  action: "created",
+                  status: "done",
+                  namespace: ns,
+                  factCount,
+                  jobIds,
+                  facts: settledFacts,
+                },
+              };
+            }
+          }
+
+          // Jobs are accepted (`status: "pending"`) and not yet stored on Walrus.
+          const jobIdSuffix = jobIds.length > 0 ? ` (not stored yet; job_ids=${jobIds.join(",")})` : " (not stored yet)";
           return {
             content: [
               {
                 type: "text",
-                text: factCount > 0
-                  ? `Stored ${factCount} fact${factCount === 1 ? "" : "s"}: ${preview}`
-                  : `No memorable facts extracted from the input.`,
+                text: `Accepted ${factCount} fact${factCount === 1 ? "" : "s"}${jobIdSuffix}: ${preview}`,
               },
             ],
             details: {
-              action: "created",
+              action: "accepted",
+              status: result?.status ?? "pending",
               namespace: ns,
               factCount,
-              facts: result.facts,
+              jobIds,
+              facts,
             },
           };
         } catch (err) {

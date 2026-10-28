@@ -9,76 +9,224 @@
 import type { MemWal } from "@mysten-incubation/memwal";
 import { resolveAgent } from "../config.js";
 import { shouldCapture } from "../capture.js";
-import { extractMessageTexts, withRetry, withTimeout } from "../format.js";
+import {
+  extractMessages,
+  parseMessageTimestamp,
+  withRetry,
+  withTimeout,
+  type ExtractedMessage,
+} from "../format.js";
 import type { PluginConfig } from "../types.js";
+
+const MAX_TRACKED_MESSAGES_PER_SCOPE = 1_000;
+const MAX_TRACKED_SCOPES = 1_000;
+const SCOPE_IDLE_TTL_MS = 30 * 60_000;
+
+interface ScopeCaptureState {
+  /** Message keys already sent to a successful `analyze()` call. */
+  capturedKeys: Set<string>;
+  /** Creation / first-seen timestamp per message key so retries across midnight keep their original date. */
+  firstSeenAt: Map<string, Date>;
+  /** Currently running `analyze()` promise for this scope, if any. */
+  inFlight: Promise<unknown> | null;
+  /** Protect the whole hook, including retry delays between analyze calls. */
+  activeHook: boolean;
+  lastUsedAt: number;
+}
+
+function rememberBoundedKey<T>(setOrMap: Set<string> | Map<string, T>, key: string, value?: T): void {
+  if (setOrMap instanceof Set) {
+    if (!setOrMap.has(key) && setOrMap.size >= MAX_TRACKED_MESSAGES_PER_SCOPE) {
+      const oldest = setOrMap.values().next().value;
+      if (oldest !== undefined) setOrMap.delete(oldest);
+    }
+    setOrMap.add(key);
+  } else {
+    if (!setOrMap.has(key) && setOrMap.size >= MAX_TRACKED_MESSAGES_PER_SCOPE) {
+      const oldest = setOrMap.keys().next().value;
+      if (oldest !== undefined) setOrMap.delete(oldest);
+    }
+    setOrMap.set(key, value as T);
+  }
+}
 
 /** Register the agent_end hook for auto-capture. */
 export function registerCaptureHook(api: any, client: MemWal, config: PluginConfig): void {
+  const stateByScope = new Map<string, ScopeCaptureState>();
+
+  function touchScope(scopeKey: string, state: ScopeCaptureState): void {
+    state.lastUsedAt = Date.now();
+    stateByScope.delete(scopeKey);
+    stateByScope.set(scopeKey, state);
+  }
+
+  function isActive(state: ScopeCaptureState): boolean {
+    return state.activeHook || state.inFlight !== null;
+  }
+
+  function getScopeState(scopeKey: string): ScopeCaptureState | undefined {
+    const now = Date.now();
+    // In access order, only the oldest entries can have expired. Active work
+    // stays tracked even after a timeout so another turn cannot duplicate it.
+    for (const [key, state] of stateByScope) {
+      if (now - state.lastUsedAt < SCOPE_IDLE_TTL_MS) break;
+      if (!isActive(state)) stateByScope.delete(key);
+    }
+
+    let state = stateByScope.get(scopeKey);
+    if (!state) {
+      if (stateByScope.size >= MAX_TRACKED_SCOPES) {
+        for (const [key, candidate] of stateByScope) {
+          if (!isActive(candidate)) {
+            stateByScope.delete(key);
+            break;
+          }
+        }
+        // All slots are busy: skip a new scope instead of losing its guard
+        // or letting a burst of sessions grow the cache without a bound.
+        if (stateByScope.size >= MAX_TRACKED_SCOPES) return undefined;
+      }
+      state = {
+        capturedKeys: new Set<string>(),
+        firstSeenAt: new Map<string, Date>(),
+        inFlight: null,
+        activeHook: false,
+        lastUsedAt: now,
+      };
+    }
+    touchScope(scopeKey, state);
+    return state;
+  }
+
   api.on("agent_end", async (event: any, ctx: any) => {
     if (!event.success || !event.messages?.length) return;
 
     const { namespace, agentName } = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
+    const scopeKey = `${namespace}\0${ctx?.sessionKey ?? ""}`;
+    const state = getScopeState(scopeKey);
+    if (!state) {
+      api.logger.debug?.("memory-memwal: auto-capture skipped — capture scopes are busy");
+      return;
+    }
+    if (state.activeHook) return;
+    state.activeHook = true;
 
     try {
       // Extract both user and assistant messages — the server LLM on analyze()
       // decides what's worth keeping. Assistant messages can contain user
       // commitments, decisions, and summaries that are valuable as memories.
-      const texts = extractMessageTexts(
+      const extracted = extractMessages(
         event.messages,
         config.captureMaxMessages,
       );
 
-      if (!texts.length) return;
+      if (!extracted.length) return;
 
-      // Filter individual messages — skip if none are worth capturing
-      const capturable = texts.filter((t) => shouldCapture(t));
+      const eventTimestamp =
+        parseMessageTimestamp(event.occurredAt) ??
+        parseMessageTimestamp(event.createdAt) ??
+        parseMessageTimestamp(event.created_at) ??
+        parseMessageTimestamp(event.timestamp);
+
+      // Record creation / first-seen timestamp for every message in the window
+      // before filtering or network calls, so any later retry after midnight
+      // still anchors to when the message was created rather than hook retry time.
+      const now = new Date();
+      for (const msg of extracted) {
+        if (!state.firstSeenAt.has(msg.key)) {
+          rememberBoundedKey(
+            state.firstSeenAt,
+            msg.key,
+            msg.occurredAt ?? eventTimestamp ?? now,
+          );
+        }
+      }
+
+      // Filter individual messages for capturable content and skip messages
+      // already captured on an earlier turn (GH #1106).
+      const capturable = extracted.filter((m) => shouldCapture(m.text));
       if (!capturable.length) {
         api.logger.debug?.(
           `memory-memwal: auto-capture skipped — no capturable content ` +
-          `(agent: ${agentName}, ${texts.length} messages checked)`,
+          `(agent: ${agentName}, ${extracted.length} messages checked)`,
         );
         return;
       }
 
-      // Numbered list helps the server LLM distinguish separate messages
-      // during fact extraction (vs one big wall of text)
-      const conversation = capturable
-        .map((t, i) => `${i + 1}. ${t}`)
-        .join("\n\n");
+      const uncaptured = capturable.filter((m) => !state.capturedKeys.has(m.key));
+      if (!uncaptured.length) {
+        api.logger.debug?.(
+          `memory-memwal: auto-capture skipped — all ${capturable.length} capturable messages already captured ` +
+          `(agent: ${agentName}, namespace: ${namespace})`,
+        );
+        return;
+      }
 
-      // analyze() calls the server LLM for fact extraction — retry once
-      // since transient failures are common with remote LLM calls.
-      //
-      // Pass `occurredAt: new Date()` so the server extractor can
-      // resolve in-turn relative references ("yesterday", "last
-      // Friday") into absolute dates inside the fact text before
-      // encryption.
-      //
-      // Caveat: this is hook-fire time, not strictly per-message
-      // time. The hook fires on agent_end — *after* the LLM finishes
-      // responding — and `event.messages` may carry the last N turns
-      // (captureMaxMessages) spanning a longer window. All extracted
-      // facts share this one anchor. For coarse relative references
-      // ("yesterday", "last Friday") this is accurate enough; for
-      // fine-grained ones ("an hour ago", "this morning") the anchor
-      // can be off by minutes-to-hours. Acceptable for an opt-in
-      // auto-capture path where the alternative is no anchor at all.
-      // (The "no silent now() fallback" rule is about the server
-      // defaulting for callers that passed nothing; here the caller
-      // IS passing, with real-ish knowledge of when the event happened.)
-      // Timeout sits inside the retry so each attempt gets its own deadline,
-      // rather than one deadline spanning the whole retry budget.
-      const result = await withRetry(() =>
-        withTimeout(
-          () => client.analyze(conversation, { namespace, occurredAt: new Date() }),
-          config.requestTimeoutMs,
-          "auto-capture",
-        ),
-      );
+      // Do not start a second paid extraction for a scope whose previous
+      // extraction is still running on the server after a timeout (GH #1095).
+      if (state.inFlight) {
+        api.logger.debug?.(
+          `memory-memwal: auto-capture skipped — previous analyze() still in flight ` +
+          `(agent: ${agentName}, namespace: ${namespace})`,
+        );
+        return;
+      }
 
-      if (result.facts?.length) {
+      // Group uncaptured messages by their UTC calendar date so messages
+      // created on different days never share a single shifted occurredAt anchor.
+      const batches = new Map<string, { occurredAt: Date; items: ExtractedMessage[] }>();
+      for (const msg of uncaptured) {
+        const msgTime = msg.occurredAt ?? state.firstSeenAt.get(msg.key) ?? eventTimestamp ?? now;
+        const dayKey = msgTime.toISOString().slice(0, 10);
+        let batch = batches.get(dayKey);
+        if (!batch) {
+          batch = { occurredAt: msgTime, items: [] };
+          batches.set(dayKey, batch);
+        }
+        batch.items.push(msg);
+      }
+
+      let totalFacts = 0;
+      for (const batch of batches.values()) {
+        // Numbered list helps the server LLM distinguish separate messages
+        // during fact extraction (vs one big wall of text)
+        const conversation = batch.items
+          .map((m, i) => `${i + 1}. ${m.text}`)
+          .join("\n\n");
+
+        const result = await withRetry(() =>
+          withTimeout(
+            (signal) => {
+              const p = client.analyze(conversation, {
+                namespace,
+                occurredAt: batch.occurredAt,
+                ...(signal ? { signal } : {}),
+              });
+              state.inFlight = p;
+              p.then(
+                () => {
+                  if (state.inFlight === p) state.inFlight = null;
+                },
+                () => {
+                  if (state.inFlight === p) state.inFlight = null;
+                },
+              );
+              return p;
+            },
+            config.requestTimeoutMs,
+            "auto-capture",
+          ),
+        );
+
+        for (const msg of batch.items) {
+          rememberBoundedKey(state.capturedKeys, msg.key);
+        }
+        totalFacts += result?.facts?.length ?? 0;
+      }
+
+      if (totalFacts > 0) {
         api.logger.info(
-          `memory-memwal: auto-captured ${result.facts.length} facts ` +
+          `memory-memwal: auto-captured ${totalFacts} facts ` +
           `(agent: ${agentName}, namespace: ${namespace})`,
         );
       }
@@ -86,6 +234,9 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       api.logger.warn(
         `memory-memwal: auto-capture failed: ${String(err)}`,
       );
+    } finally {
+      state.activeHook = false;
+      touchScope(scopeKey, state);
     }
   });
 }

@@ -267,7 +267,8 @@ async fn finish_connect_episode(state: &AppState, headers: &HeaderMap) {
         return;
     };
     let started = state.mcp_connect_episodes.write().await.remove(id);
-    let Some(started) = started.filter(|s| crate::observability::connect_episode_is_fresh(*s)) else {
+    let Some(started) = started.filter(|s| crate::observability::connect_episode_is_fresh(*s))
+    else {
         return;
     };
     let waited = started.elapsed();
@@ -342,7 +343,12 @@ async fn legacy_delegate_registered(
         return refuse(HandshakeRejection::NoAccountHeader, route, headers, None);
     };
     let Some(pk) = public_key_from_delegate_hex(token) else {
-        return refuse(HandshakeRejection::MalformedDelegateKey, route, headers, None);
+        return refuse(
+            HandshakeRejection::MalformedDelegateKey,
+            route,
+            headers,
+            None,
+        );
     };
     // Cached: this runs on the SSE handshake and on every JSON-RPC envelope,
     // so an uncached read here is one fullnode call per envelope.
@@ -492,6 +498,43 @@ fn apply_internal_headers(
     Ok(())
 }
 
+/// Stable per-tenant id for the MCP rate limit: `{account_id}:{delegate
+/// public key hex}`. Legacy callers are already verified on chain by
+/// `legacy_delegate_registered`; OAuth callers use the grant's resolved
+/// account and delegate, never client headers. `None` only when the key
+/// cannot be parsed, which `classify_and_resolve` already refused.
+fn mcp_tenant_id(
+    headers: &HeaderMap,
+    identity: Option<&crate::oauth::ResolvedOAuthIdentity>,
+) -> Option<String> {
+    let (account, secret) = match identity {
+        Some(identity) => (
+            identity.account_id.as_str(),
+            identity.delegate_private_key.as_str(),
+        ),
+        None => (account_id_header(headers)?, bearer_token(headers)?),
+    };
+    let pk = public_key_from_delegate_hex(secret)?;
+    Some(format!(
+        "{}:{}",
+        account.to_ascii_lowercase(),
+        hex::encode(pk)
+    ))
+}
+
+/// GH #1050: meter authenticated MCP traffic per tenant, not per IP or
+/// one shared bucket. `Some` is the response to send instead of proxying.
+async fn enforce_tenant_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&crate::oauth::ResolvedOAuthIdentity>,
+) -> Option<Response> {
+    let Some(tenant) = mcp_tenant_id(headers, identity) else {
+        return Some(oauth_unauthorized_response(state, None));
+    };
+    crate::rate_limit::check_mcp_tenant_rate_limit(state, &tenant).await
+}
+
 /// RFC 9728 401 challenge when OAuth is configured; plain 401 otherwise.
 fn oauth_unauthorized_response(
     state: &AppState,
@@ -554,6 +597,9 @@ pub async fn sse_proxy(
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
+    if let Some(resp) = enforce_tenant_rate_limit(&state, &headers, identity.as_deref()).await {
+        return resp;
+    }
     if let Err(code) = apply_internal_headers(
         &mut forwarded,
         state.config.sidecar_secret.as_deref(),
@@ -595,11 +641,7 @@ pub async fn sse_proxy(
             // Dropping it here left the client with no ETA and the wrong
             // remediation, since it could not tell a timed cap from a
             // concurrency one.
-            "content-type"
-                | "cache-control"
-                | "www-authenticate"
-                | "connection"
-                | "retry-after"
+            "content-type" | "cache-control" | "www-authenticate" | "connection" | "retry-after"
         ) {
             if let (Ok(n), Ok(v)) = (
                 HeaderName::from_bytes(name.as_str().as_bytes()),
@@ -681,6 +723,9 @@ pub async fn messages_proxy(
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
+    if let Some(resp) = enforce_tenant_rate_limit(&state, &headers, identity.as_deref()).await {
+        return resp;
+    }
     if let Err(code) = apply_internal_headers(
         &mut forwarded,
         state.config.sidecar_secret.as_deref(),
@@ -818,6 +863,9 @@ pub async fn streamable_proxy(
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
+    if let Some(resp) = enforce_tenant_rate_limit(&state, &headers, identity.as_deref()).await {
+        return resp;
+    }
     if let Err(code) = apply_internal_headers(
         &mut forwarded,
         state.config.sidecar_secret.as_deref(),
@@ -893,6 +941,29 @@ pub async fn streamable_proxy(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mcp_tenant_id_separates_delegate_keys() {
+        let key_a = "11".repeat(32);
+        let key_b = "22".repeat(32);
+        let mut h = HeaderMap::new();
+        h.insert("x-memwal-account-id", HeaderValue::from_static("0xABC"));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {key_a}")).unwrap(),
+        );
+        let a = mcp_tenant_id(&h, None).unwrap();
+        assert!(a.starts_with("0xabc:"), "{a}");
+        assert!(!a.contains(&key_a), "tenant id must not carry the secret");
+
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {key_b}")).unwrap(),
+        );
+        assert_ne!(mcp_tenant_id(&h, None).unwrap(), a);
+        assert!(mcp_tenant_id(&HeaderMap::new(), None).is_none());
+    }
+
     use super::*;
     use axum::http::HeaderName as AxumHeaderName;
 
@@ -947,9 +1018,9 @@ mod tests {
             ]
         );
         assert!(
-            codes.iter().all(|c| c
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch == '_')),
+            codes
+                .iter()
+                .all(|c| c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')),
             "low-cardinality snake_case only — never a token or an account"
         );
     }

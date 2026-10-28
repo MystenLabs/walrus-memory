@@ -97,4 +97,69 @@ test("an explicit idempotency key still wins", async () => {
     await newClient().rememberAndWait("a fact", undefined, { idempotencyKey: "caller-owned" });
 
     assert.equal(posted[0].body.idempotency_key, "caller-owned");
+    assert.equal("dedupe" in posted[0].body, false);
 });
+
+test("dedupe: true sends dedupe flag and derives a bucket-less content-hash key across 30-minute windows (#769)", async () => {
+    const posted = [];
+    stubRelayer({ onStatus: () => DONE, posted });
+
+    const originalNow = Date.now;
+    let fakeNow = 1_700_000_000_000;
+    Date.now = () => fakeNow;
+    try {
+        await newClient().remember("User is allergic to peanuts", "health", { dedupe: true });
+        // Advance 31 minutes past the 30-minute idempotency bucket boundary.
+        fakeNow += 31 * 60 * 1000;
+        await newClient().rememberAndWait("User is allergic to peanuts", "health", { dedupe: true });
+        // Shorthand options in the namespace slot also works.
+        fakeNow += 31 * 60 * 1000;
+        await newClient().remember("User is allergic to peanuts", { dedupe: true });
+    } finally {
+        Date.now = originalNow;
+    }
+
+    assert.equal(posted.length, 3);
+    assert.equal(posted[0].body.dedupe, true);
+    assert.equal(posted[1].body.dedupe, true);
+    assert.equal(posted[2].body.dedupe, true);
+    assert.match(posted[0].body.idempotency_key, /^dedupe:[0-9a-f]{64}$/);
+    assert.equal(
+        posted[0].body.idempotency_key,
+        posted[1].body.idempotency_key,
+        "dedupe: true must reuse the same content-hash key across 30-minute bucket boundaries",
+    );
+    assert.notEqual(
+        posted[0].body.idempotency_key,
+        posted[2].body.idempotency_key,
+        "different namespaces must produce distinct content-hash keys",
+    );
+});
+
+test("default remember omits dedupe and rotates derived keys across 30-minute windows (#769)", async () => {
+    const posted = [];
+    stubRelayer({ onStatus: () => DONE, posted });
+
+    const originalNow = Date.now;
+    let fakeNow = 1_700_000_000_000;
+    Date.now = () => fakeNow;
+    try {
+        await newClient().remember("User is allergic to peanuts", "health");
+        fakeNow += 31 * 60 * 1000;
+        await newClient().remember("User is allergic to peanuts", "health", { dedupe: false });
+    } finally {
+        Date.now = originalNow;
+    }
+
+    assert.equal(posted.length, 2);
+    assert.equal("dedupe" in posted[0].body, false);
+    assert.equal("dedupe" in posted[1].body, false);
+    assert.match(posted[0].body.idempotency_key, /^r1-[0-9a-f]{64}$/);
+    assert.match(posted[1].body.idempotency_key, /^r1-[0-9a-f]{64}$/);
+    assert.notEqual(
+        posted[0].body.idempotency_key,
+        posted[1].body.idempotency_key,
+        "without dedupe: true, calls in separate 30-minute buckets get distinct keys",
+    );
+});
+

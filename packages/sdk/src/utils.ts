@@ -41,6 +41,15 @@ export async function derivedIdempotencyKey(requestIdentity: string): Promise<st
     return `r1-${await sha256hex(`${bucket}\0${requestIdentity}`)}`;
 }
 
+/**
+ * Bucket-less content-hash idempotency key for opt-in `dedupe: true` (#769).
+ * Resolves identical `(namespace, text)` writes on the same client to one key
+ * across 30-minute time-bucket boundaries.
+ */
+export async function derivedContentDedupeKey(requestIdentity: string): Promise<string> {
+    return `dedupe:${await sha256hex(requestIdentity)}`;
+}
+
 export async function derivedBulkIdempotencyKey(requestIdentity: string): Promise<string> {
     const bucket = Math.floor(Date.now() / IDEMPOTENCY_BUCKET_MS);
     return `b1-${await sha256hex(`${bucket}\0${requestIdentity}`)}`;
@@ -130,6 +139,29 @@ export function scoringWeightsToWire(weights?: ScoringWeights): object | undefin
         recency_half_life_days: weights.recencyHalfLifeDays,
         importance: weights.importance,
     };
+}
+
+/**
+ * Manual-mode vectors are signed as JSON, where NaN/Infinity and sparse-array
+ * holes become null and a missing vector is dropped, so check them before
+ * signing (#1211).
+ */
+export function assertFiniteVector(vector: unknown): void {
+    if (
+        !Array.isArray(vector) ||
+        vector.length === 0 ||
+        !Array.from(vector).every((v) => typeof v === "number" && Number.isFinite(v))
+    ) {
+        throw new TypeError(
+            "vector must be a non-empty array of finite numbers",
+        );
+    }
+}
+
+export function assertNonEmptyEncryptedData(encryptedData: unknown): void {
+    if (typeof encryptedData !== "string" || encryptedData.trim() === "") {
+        throw new TypeError("encryptedData must be a non-empty base64 string");
+    }
 }
 
 // ============================================================

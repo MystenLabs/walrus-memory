@@ -240,15 +240,18 @@ pub(crate) async fn query_owner_namespaces(
         ) w ON l.namespace = w.namespace
     ";
 
-    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> =
-        if let Some((cursor_updated_at, cursor_namespace)) = after.clone() {
-            let sql = format!(
-                "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> = if let Some((
+        cursor_updated_at,
+        cursor_namespace,
+    )) = after.clone()
+    {
+        let sql = format!(
+            "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
                  WHERE (last_updated_at, namespace) > ($2, $3) AND last_updated_at <= $4
                  ORDER BY last_updated_at, namespace
                  LIMIT $5",
-            );
-            sqlx::query_as(&sql)
+        );
+        sqlx::query_as(&sql)
             .bind(owner)
             .bind(cursor_updated_at)
             .bind(cursor_namespace)
@@ -256,21 +259,21 @@ pub(crate) async fn query_owner_namespaces(
             .bind(limit + 1)
             .fetch_all(pool)
             .await
-        } else {
-            let sql = format!(
-                "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+    } else {
+        let sql = format!(
+            "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
                  WHERE last_updated_at <= $2
                  ORDER BY last_updated_at, namespace
                  LIMIT $3",
-            );
-            sqlx::query_as(&sql)
+        );
+        sqlx::query_as(&sql)
             .bind(owner)
             .bind(snapshot_at)
             .bind(limit + 1)
             .fetch_all(pool)
             .await
-        }
-        .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
+    }
+    .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
 
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
@@ -593,10 +596,7 @@ pub(crate) async fn query_owner_memories(
 
     // Never pin a missing live watermark to snapshot_at: a tombstone-only
     // first page would skip in-flight inserts with updated_at < snapshot_at.
-    let live_mark = rows
-        .last()
-        .map(|r| (r.4, r.0.clone()))
-        .or(after.clone());
+    let live_mark = rows.last().map(|r| (r.4, r.0.clone())).or(after.clone());
     let next_cursor = match live_mark {
         Some((ts, id)) => Some(encode_cursor_ex(
             ts,
@@ -938,7 +938,10 @@ mod tests {
         let res = query_owner_memories(&pool, &owner, Some(cursor), 100)
             .await
             .unwrap();
-        assert!(res.must_resync, "a cursor older than retention must force a resync");
+        assert!(
+            res.must_resync,
+            "a cursor older than retention must force a resync"
+        );
         assert!(res.memories.is_empty());
         assert!(res.next_cursor.is_none());
 
@@ -1067,7 +1070,11 @@ mod tests {
         let after = query_owner_namespaces(&pool, &owner, Some(cursor.clone()), 100)
             .await
             .unwrap();
-        assert_eq!(after.namespaces.len(), 1, "deleted watermark must still resurface");
+        assert_eq!(
+            after.namespaces.len(),
+            1,
+            "deleted watermark must still resurface"
+        );
         assert_eq!(after.namespaces[0].memory_count, 1);
         assert!(after.namespaces[0].updated_at > ts(120));
 
@@ -1075,7 +1082,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            memories.memories.iter().all(|m| !m.memory_id.ends_with("-gone")),
+            memories
+                .memories
+                .iter()
+                .all(|m| !m.memory_id.ends_with("-gone")),
             "deleted row must not appear in memories[]",
         );
         assert!(

@@ -595,3 +595,80 @@ test("MemWalMock.remember rejects zero-width text instead of storing it", async 
     const stored = await mock.remember("hello\u200Bworld");
     assert.equal(typeof stored.job_id, "string");
 });
+
+test("MemWalMock.remember with dedupe: true collapses identical text per namespace and rewrites after forget/clear (#769)", async () => {
+    const mock = MemWalMock.create();
+
+    const first = await mock.rememberAndWait("User is allergic to peanuts", "health", {
+        dedupe: true,
+    });
+    const second = await mock.rememberAndWait("User is allergic to peanuts", "health", {
+        dedupe: true,
+    });
+    assert.equal(second.id, first.id);
+    assert.equal(second.blob_id, first.blob_id);
+
+    const recalledHealth = await mock.recall({ query: "peanuts", namespace: "health" });
+    assert.equal(recalledHealth.results.length, 1);
+
+    // Same text in a different namespace is stored separately.
+    const otherNs = await mock.rememberAndWait("User is allergic to peanuts", "work", {
+        dedupe: true,
+    });
+    assert.notEqual(otherNs.blob_id, first.blob_id);
+
+    // Default remember (without dedupe: true) still writes a second copy.
+    const withoutDedupe = await mock.rememberAndWait("User is allergic to peanuts", "health");
+    assert.notEqual(withoutDedupe.blob_id, first.blob_id);
+    assert.equal((await mock.recall({ query: "peanuts", namespace: "health" })).results.length, 2);
+
+    // Forgetting the deduped blob in "health" allows dedupe: true to write fresh
+    // even while the non-dedupe copy remains live, matching the relayer's
+    // dedupe:<sha256> job lookup.
+    assert.equal(mock.forget(first.blob_id), true);
+    const rewritten = await mock.rememberAndWait("User is allergic to peanuts", "health", {
+        dedupe: true,
+    });
+    assert.notEqual(rewritten.blob_id, first.blob_id);
+    assert.notEqual(rewritten.blob_id, withoutDedupe.blob_id);
+    assert.equal((await mock.recall({ query: "peanuts", namespace: "health" })).results.length, 2);
+
+    // Clearing the namespace also allows a fresh dedupe write, including shorthand options.
+    assert.equal(mock.clear("default"), 0);
+    const defFirst = await mock.remember("Default fact", { dedupe: true });
+    const defSecond = await mock.remember("Default fact", { dedupe: true });
+    assert.equal(defSecond.job_id, defFirst.job_id);
+    assert.equal(mock.clear("default"), 1);
+    const defAfterClear = await mock.remember("Default fact", { dedupe: true });
+    assert.notEqual(defAfterClear.job_id, defFirst.job_id);
+});
+
+test("MemWalMock.remember with dedupe: true does not collapse onto a prior normal write (#769)", async () => {
+    const mock = MemWalMock.create({
+        initialMemories: [{ text: "Seeded fact", namespace: "ns", blobId: "seed-blob" }],
+    });
+
+    // Opting into dedupe after a seeded or normal (non-dedupe) write creates a
+    // new dedupe-keyed job, matching the relayer where normal writes use an r1-*
+    // key and dedupe: true looks up dedupe:<sha256>.
+    const afterSeed = await mock.rememberAndWait("Seeded fact", "ns", { dedupe: true });
+    assert.notEqual(afterSeed.blob_id, "seed-blob");
+    const afterSeedRepeat = await mock.rememberAndWait("Seeded fact", "ns", { dedupe: true });
+    assert.equal(afterSeedRepeat.id, afterSeed.id);
+    assert.equal(afterSeedRepeat.blob_id, afterSeed.blob_id);
+
+    const normalWrite = await mock.rememberAndWait("User prefers dark mode", "ns");
+    const firstDedupe = await mock.rememberAndWait("User prefers dark mode", "ns", {
+        dedupe: true,
+    });
+    assert.notEqual(firstDedupe.id, normalWrite.id);
+    assert.notEqual(firstDedupe.blob_id, normalWrite.blob_id);
+
+    const secondDedupe = await mock.rememberAndWait("User prefers dark mode", "ns", {
+        dedupe: true,
+    });
+    assert.equal(secondDedupe.id, firstDedupe.id);
+    assert.equal(secondDedupe.blob_id, firstDedupe.blob_id);
+});
+
+

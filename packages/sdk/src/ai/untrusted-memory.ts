@@ -14,6 +14,18 @@ function randomBoundaryNonce(): string {
 }
 
 /**
+ * Compute clamped similarity relevance in `[0, 1]` from a cosine distance.
+ * Returns `null` when `distance` is not a finite number (`undefined`, `NaN`,
+ * `Infinity`, `-Infinity`, or non-number values) so callers drop malformed records.
+ */
+export function memoryRelevance(distance: unknown): number | null {
+    if (typeof distance !== "number" || !Number.isFinite(distance)) {
+        return null;
+    }
+    return Math.min(1, Math.max(0, 1 - distance));
+}
+
+/**
  * Serialize recalled text as untrusted data behind a fresh, unpredictable
  * request boundary. JSON encoding prevents memory-controlled newlines from
  * changing the surrounding record structure. The nonce is generated only
@@ -29,12 +41,18 @@ export function formatUntrustedMemories(
 
     const begin = `BEGIN_UNTRUSTED_WALRUS_MEMORY_${nonce}`;
     const end = `END_UNTRUSTED_WALRUS_MEMORY_${nonce}`;
-    const records = memories.map((memory) =>
-        JSON.stringify({
-            text: memory.text,
-            relevance: (1 - memory.distance).toFixed(2),
-        })
-    );
+    const records: string[] = [];
+    for (const memory of memories) {
+        if (!memory || typeof memory !== "object") continue;
+        const relevance = memoryRelevance(memory.distance);
+        if (relevance === null) continue;
+        records.push(
+            JSON.stringify({
+                text: memory.text,
+                relevance: relevance.toFixed(2),
+            })
+        );
+    }
 
     return [
         `Boundary nonce: ${nonce}`,

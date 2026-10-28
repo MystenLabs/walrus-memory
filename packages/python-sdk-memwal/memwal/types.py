@@ -9,7 +9,7 @@ the Walrus Memory Rust server (TEE).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 # ============================================================
 # Config
@@ -24,7 +24,7 @@ DEFAULT_SERVER_URL = "https://relayer.memory.walrus.xyz"
 ENV_PRESETS = {
     "prod": "https://relayer.memory.walrus.xyz",
     "dev": "https://relayer.dev.memwal.ai",
-    "staging": "https://relayer-staging.memory.walrus.xyz",
+    "staging": "https://relayer.dev.memwal.ai",
     "local": "http://127.0.0.1:8000",
 }
 
@@ -34,8 +34,11 @@ class MemWalConfig:
     """Configuration for creating a Walrus Memory client.
 
     Attributes:
-        key: Ed25519 private key (hex string). This is the delegate key from the
-            Walrus Memory dashboard.
+        key: Ed25519 private key (hex string, ``suiprivkey1...``, or 32-byte
+            ``bytes`` / ``bytearray``). This is the delegate key from the
+            Walrus Memory dashboard. When passed as ``bytearray``, the client
+            copies the bytes into its own internal buffer so :meth:`MemWal.destroy`
+            zeroes only the client's copy.
         account_id: Walrus Memory account object ID on Sui.
         server_url: Server URL. ``None`` means omitted. Any explicit URL,
             including the hosted default, wins over ``env``.
@@ -46,7 +49,7 @@ class MemWalConfig:
             > ``DEFAULT_SERVER_URL``.
     """
 
-    key: str
+    key: Union[str, bytes, bytearray]
     account_id: str
     server_url: Optional[str] = None
     namespace: str = "default"
@@ -80,6 +83,14 @@ class RememberResult:
     owner: str
     namespace: str
 
+
+@dataclass
+class ForgetResult:
+    """Result from POST /api/forget. Walrus blobs are not deleted."""
+
+    deleted: int
+    namespace: str
+    owner: str
 
 @dataclass
 class RecallMemory:

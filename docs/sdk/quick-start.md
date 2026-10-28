@@ -104,9 +104,9 @@ Before wiring the SDK into your app:
 - These hosted endpoints are provided by Walrus Foundation.
 - Generate a Walrus Memory account ID and delegate private key for your client using the hosted endpoint:
   - Production (mainnet): `https://memory.walrus.xyz`
-  - Staging (testnet): `https://staging.memory.walrus.xyz`
+  - Staging (testnet): `https://dev.memwal.ai`
 - Choose a relayer:
-  - Use the hosted relayer at `https://relayer.memory.walrus.xyz` (mainnet) or `https://relayer-staging.memory.walrus.xyz` (testnet)
+  - Use the hosted relayer at `https://relayer.memory.walrus.xyz` (mainnet) or `https://relayer.dev.memwal.ai` (testnet)
   - Or deploy your own relayer with access to a wallet funded with WAL and SUI
 
 `MemWal.create` takes a config object with the following fields:
@@ -115,7 +115,7 @@ Before wiring the SDK into your app:
 | --- | --- | --- | --- |
 | `key` | `string` | Yes | Ed25519 private key in hex |
 | `accountId` | `string` | Yes | MemWalAccount object ID on Sui |
-| `serverUrl` | `string` | No | Relayer URL — use `https://relayer.memory.walrus.xyz` (mainnet) or `https://relayer-staging.memory.walrus.xyz` (testnet) for the [managed relayer](/relayer/public-relayer) |
+| `serverUrl` | `string` | No | Relayer URL — use `https://relayer.memory.walrus.xyz` (mainnet) or `https://relayer.dev.memwal.ai` (testnet) for the [managed relayer](/relayer/public-relayer) |
 | `namespace` | `string` | No | Default namespace — falls back to `"default"` |
 
 ## First Memory

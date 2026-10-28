@@ -111,6 +111,47 @@ fn redact_hex_addresses(msg: &str) -> String {
     out
 }
 
+fn is_upstream_inference_job_error(msg: &str) -> bool {
+    msg.starts_with("Embedding Provider Unavailable:")
+        || msg.starts_with("Upstream Unavailable: Embedding API")
+        || msg.starts_with("Internal Error: Embedding API")
+        || msg.starts_with("Upstream Unavailable: Summarization API")
+        || msg.starts_with("Internal Error: Summarization API")
+        || msg.starts_with("Upstream Unavailable: Failed to parse embedding response")
+        || msg.starts_with("Upstream Unavailable: Embedding response contained no vectors")
+        || msg.starts_with("Upstream Unavailable: Failed to parse summarization response")
+        || msg.starts_with("Upstream Unavailable: Summarization returned empty result")
+        || msg.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE)
+}
+
+fn format_embedding_provider_unavailable_job_error() -> String {
+    let trace_id = crate::observability::current_request_id()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    format!(
+        "Embedding provider temporarily unavailable (code={}, traceId={}). The memory was not stored; retry shortly.",
+        EMBEDDING_PROVIDER_UNAVAILABLE_CODE, trace_id
+    )
+}
+
+fn format_remember_preparation_error(err: &AppError) -> String {
+    match err {
+        AppError::EmbeddingProviderUnavailable(_) => {
+            format_embedding_provider_unavailable_job_error()
+        }
+        AppError::UpstreamUnavailable(detail)
+            if detail.starts_with("Embedding API")
+                || detail.starts_with("Summarization API")
+                || detail.starts_with("Failed to parse embedding response")
+                || detail.starts_with("Embedding response contained no vectors")
+                || detail.starts_with("Failed to parse summarization response")
+                || detail.starts_with("Summarization returned empty result") =>
+        {
+            format_embedding_provider_unavailable_job_error()
+        }
+        _ => err.to_string(),
+    }
+}
+
 /// Map a stored `error_msg` to what the caller should see, given the job's
 /// current `status`. Infrastructure failures collapse to fixed copy, chosen by
 /// whether the job has stopped retrying. Everything else keeps its text with
@@ -126,6 +167,15 @@ pub(crate) fn sanitize_job_error_for_client(
         } else {
             INFRA_JOB_RETRYING_MESSAGE.to_string()
         });
+    }
+    if is_upstream_inference_job_error(&msg) {
+        if msg.contains("traceId=")
+            && !msg.contains("Embedding API")
+            && !msg.contains("Summarization API")
+        {
+            return Some(msg);
+        }
+        return Some(format_embedding_provider_unavailable_job_error());
     }
     Some(redact_hex_addresses(&msg))
 }
@@ -296,14 +346,20 @@ fn spawn_prepare_remember_job(
             .await;
 
             if let Err(e) = result {
-                let msg = e.to_string();
-                tracing::error!("remember preparation failed: job_id={} {}", job_id, msg);
+                let raw_msg = e.to_string();
+                let client_msg = format_remember_preparation_error(&e);
+                tracing::error!("remember preparation failed: job_id={} {}", job_id, raw_msg);
                 // The job never reached the queue, so nothing downstream will
                 // release its reservation. No-op when the failure was the
                 // quota rejection itself (nothing was reserved).
                 rate_limit::release_storage_quota_one(&state, &job_id).await;
-                mark_remember_job_failed(&state, &job_id, prepare_claim_token.as_deref(), &msg)
-                    .await;
+                mark_remember_job_failed(
+                    &state,
+                    &job_id,
+                    prepare_claim_token.as_deref(),
+                    &client_msg,
+                )
+                .await;
             }
         };
 
@@ -456,12 +512,13 @@ fn spawn_prepare_bulk_remember_job(
             .await;
 
             if let Err(e) = result {
-                let msg = e.to_string();
-                tracing::error!("remember_bulk preparation failed: {}", msg);
+                let raw_msg = e.to_string();
+                let client_msg = format_remember_preparation_error(&e);
+                tracing::error!("remember_bulk preparation failed: {}", raw_msg);
                 // Same reasoning as the single path: nothing downstream will
                 // release these, because the batch never reached the queue.
                 rate_limit::release_storage_quota(&state, &job_ids).await;
-                mark_remember_jobs_failed(&state, &job_ids, &msg).await;
+                mark_remember_jobs_failed(&state, &job_ids, &client_msg).await;
             }
         };
 
@@ -580,7 +637,7 @@ async fn summarize_with_prompt(
             "transport_error",
             started.elapsed(),
         );
-        AppError::Internal(format!("Summarization API request failed: {}", e))
+        AppError::EmbeddingProviderUnavailable(format!("Summarization API request failed: {}", e))
     })?;
     let status_label = resp.status().as_u16().to_string();
     crate::observability::observe_external(
@@ -593,6 +650,18 @@ async fn summarize_with_prompt(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::PAYMENT_REQUIRED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            return Err(AppError::EmbeddingProviderUnavailable(format!(
+                "Summarization API upstream error ({}): {}",
+                status, body
+            )));
+        }
         return Err(AppError::Internal(format!(
             "Summarization API error ({}): {}",
             status, body
@@ -600,7 +669,10 @@ async fn summarize_with_prompt(
     }
 
     let api_resp: ChatCompletionResponse = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("Failed to parse summarization response: {}", e))
+        AppError::EmbeddingProviderUnavailable(format!(
+            "Failed to parse summarization response: {}",
+            e
+        ))
     })?;
 
     // `content` is `Option<String>` — `None` on upstream null-content
@@ -614,7 +686,7 @@ async fn summarize_with_prompt(
         .unwrap_or_default();
 
     if summary.is_empty() {
-        return Err(AppError::Internal(
+        return Err(AppError::EmbeddingProviderUnavailable(
             "Summarization returned empty result".into(),
         ));
     }
@@ -777,15 +849,28 @@ pub async fn remember(
     let namespace_owned = namespace.clone();
     let text = body.text;
 
+    // `dedupe: true` derives the key from the content itself, so a second
+    // remember of identical text collapses onto the first job — and its blob —
+    // instead of paying for another Walrus write plus embedding call (#769).
+    // Absent the flag this is just the caller's key, so default behaviour is unchanged.
+    let effective_key = effective_idempotency_key(
+        body.dedupe,
+        body.idempotency_key.as_deref(),
+        owner,
+        namespace,
+        &text,
+    );
+
     // Idempotent retry: if this owner already has a job under the same key in this
     // namespace, return it instead of minting a new (paid) write. Insert-then-check
     // under the partial unique index (owner, namespace, idempotency_key) so two
     // concurrent requests with the same key can't both create a job — the loser's
     // insert conflicts and it reads back the winner's row.
     let fingerprint = request_fingerprint(&text, namespace);
-    if let Some(ref key) = body.idempotency_key {
+    if let Some(ref key) = effective_key {
         if let Some((existing_id, existing_status, existing_blob_id, existing_fingerprint)) =
-            find_remember_job_by_key(state.db.pool(), owner, namespace, key).await?
+            find_collapsible_remember_job(state.db.pool(), owner, namespace, key, body.dedupe)
+                .await?
         {
             // Same key, different content → the caller reused an idempotency key
             // for a different write. Reject rather than silently collapsing onto
@@ -794,10 +879,7 @@ pub async fn remember(
             // prove a mismatch, so we don't 409.
             if let Some(ref stored) = existing_fingerprint {
                 if stored != &fingerprint {
-                    return Err(AppError::Conflict(
-                        "idempotency_key was already used for a request with different content"
-                            .into(),
-                    ));
+                    return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
                 }
             }
             return collapse_onto_existing_job(
@@ -823,19 +905,20 @@ pub async fn remember(
     // stays `pending` → the guard takes the plain Upload path, no on-chain
     // reconcile round-trip on the happy path. (The 202 response is still
     // "running" for API compatibility — see below.)
-    let inserted = match sqlx::query(
-        "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, request_fingerprint) VALUES ($1, $2, $3, 'pending', $4, $5)
-         ON CONFLICT (owner, namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
+    let inserted = match insert_remember_job_row(
+        state.db.pool(),
+        &job_id,
+        owner,
+        namespace,
+        effective_key.as_deref(),
+        effective_key.as_ref().map(|_| fingerprint.as_str()),
     )
-    .bind(&job_id)
-    .bind(owner)
-    .bind(namespace)
-    .bind(body.idempotency_key.as_deref())
-    .bind(body.idempotency_key.as_ref().map(|_| fingerprint.as_str()))
-    .execute(state.db.pool())
     .await
     {
         Ok(inserted) => inserted,
+        Err(e) if is_idempotency_key_unique_violation(&e) => {
+            return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
+        }
         Err(e) => {
             crate::alerts::maybe_alert_sqlx_postgres_storage_exhausted(
                 &state.alerts,
@@ -843,14 +926,17 @@ pub async fn remember(
                 &e,
             )
             .await;
-            return Err(AppError::Internal(format!("Failed to create job row: {}", e)));
+            return Err(AppError::Internal(format!(
+                "Failed to create job row: {}",
+                e
+            )));
         }
     };
 
     // Lost the race against a concurrent same-key request — return the winner's
     // job rather than spawning a duplicate write.
-    if inserted.rows_affected() == 0 {
-        if let Some(key) = body.idempotency_key.as_deref() {
+    if inserted == 0 {
+        if let Some(key) = effective_key.as_deref() {
             if let Some((existing_id, existing_status, existing_blob_id, existing_fingerprint)) =
                 find_remember_job_by_key(state.db.pool(), owner, namespace, key).await?
             {
@@ -858,10 +944,7 @@ pub async fn remember(
                 // content → reject, same as the pre-lookup path.
                 if let Some(ref stored) = existing_fingerprint {
                     if stored != &fingerprint {
-                        return Err(AppError::Conflict(
-                            "idempotency_key was already used for a request with different content"
-                                .into(),
-                        ));
+                        return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
                     }
                 }
                 tracing::info!(
@@ -881,6 +964,9 @@ pub async fn remember(
                     namespace_owned,
                 )
                 .await;
+            }
+            if has_remember_job_for_owner_key(state.db.pool(), owner, key).await? {
+                return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
             }
         }
         return Err(AppError::Internal(
@@ -1049,6 +1135,7 @@ async fn collapse_onto_existing_job(
 /// double-reset yields exactly one spawn — the loser sees 0 rows affected and
 /// must not spawn a duplicate (paid) write. Pure so the exactly-once rule is
 /// unit-testable without the handler.
+#[cfg(test)]
 fn should_spawn_after_reset(rows_affected: u64) -> bool {
     rows_affected == 1
 }
@@ -1280,6 +1367,197 @@ fn request_fingerprint(text: &str, namespace: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Stable content-derived idempotency key for an opt-in `dedupe` write (#769),
+/// so a second `remember` of identical text collapses onto the first job
+/// instead of minting a second Walrus blob. Mirrors `/api/analyze`'s per-fact key.
+///
+/// The `dedupe:` prefix keeps derived keys in their own space: one can never be
+/// confused with an `analyze:` fact key over the same text, and a caller-
+/// supplied key would have to be hand-crafted to collide (which the fingerprint
+/// check below still catches as a 409, within that caller's own owner+namespace
+/// scope). `forget` NULLs this key, so a re-remember after delete is a fresh
+/// write rather than a silent no-op.
+fn content_dedupe_key(owner: &str, namespace: &str, text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(owner.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(namespace.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(text.as_bytes());
+    format!("dedupe:{}", hex::encode(hasher.finalize()))
+}
+
+/// Which key this write is stored under. `dedupe` deliberately OVERRIDES a
+/// caller-supplied `idempotency_key`: both first-party SDKs mint an idempotency
+/// key on every call, so honouring the supplied key would leave the flag
+/// unreachable from every first-party client.
+fn effective_idempotency_key(
+    dedupe: bool,
+    supplied: Option<&str>,
+    owner: &str,
+    namespace: &str,
+    text: &str,
+) -> Option<String> {
+    if dedupe {
+        Some(content_dedupe_key(owner, namespace, text))
+    } else {
+        supplied.map(str::to_owned)
+    }
+}
+
+/// Whether a `dedupe` hit may only collapse once its memory is confirmed live.
+/// A completed job that minted a blob is the sole case: everything else is
+/// either still in flight or paid-but-not-indexed, where writing again would
+/// discard a blob the owner already paid for.
+fn dedupe_hit_needs_live_memory(status: &str, blob_id: Option<&str>) -> bool {
+    status == "done" && blob_id.is_some()
+}
+
+/// Is the memory a completed remember job produced still indexed? The vector
+/// row is keyed by the job id (see `insert_vector_and_mark_remember_done`).
+async fn remember_memory_is_live(
+    pool: &sqlx::PgPool,
+    job_id: &str,
+    owner: &str,
+    namespace: &str,
+) -> Result<bool, AppError> {
+    let row: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM vector_entries WHERE id = $1 AND owner = $2 AND namespace = $3",
+    )
+    .bind(job_id)
+    .bind(owner)
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to look up dedupe memory: {}", e)))?;
+    Ok(row.is_some())
+}
+
+/// Free a job's idempotency key so a fresh write can claim it. Mirrors the
+/// rewrite path in `/api/analyze`.
+async fn release_remember_idempotency_key(
+    pool: &sqlx::PgPool,
+    job_id: &str,
+    owner: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE remember_jobs SET idempotency_key = NULL, updated_at = NOW() WHERE id = $1 AND owner = $2",
+    )
+    .bind(job_id)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to release dedupe key: {}", e)))?;
+    Ok(())
+}
+
+/// The job a keyed write should collapse onto, if any.
+///
+/// A `dedupe` write additionally requires a completed job to still HAVE its
+/// memory. `delete_by_blob_id` (reactive Walrus-expiry cleanup) and the
+/// security-delete path drop the vector row without clearing the job's
+/// idempotency key, so collapsing blindly would answer 202 for a memory that no
+/// longer exists and silently lose the write. Free the stale key instead and
+/// let the caller write fresh — the rule `/api/analyze` calls
+/// `RewriteForgotten`. Caller-supplied keys keep their existing semantics: a
+/// retry of the same request, live memory or not.
+async fn find_collapsible_remember_job(
+    pool: &sqlx::PgPool,
+    owner: &str,
+    namespace: &str,
+    key: &str,
+    dedupe: bool,
+) -> Result<Option<(String, String, Option<String>, Option<String>)>, AppError> {
+    let Some((job_id, status, blob_id, fingerprint)) =
+        find_remember_job_by_key(pool, owner, namespace, key).await?
+    else {
+        return Ok(None);
+    };
+    if dedupe
+        && dedupe_hit_needs_live_memory(&status, blob_id.as_deref())
+        && !remember_memory_is_live(pool, &job_id, owner, namespace).await?
+    {
+        release_remember_idempotency_key(pool, &job_id, owner).await?;
+        tracing::info!(
+            "remember dedupe rewrite (memory forgotten): job_id={} owner={} ns={}",
+            job_id,
+            owner,
+            namespace,
+        );
+        return Ok(None);
+    }
+    Ok(Some((job_id, status, blob_id, fingerprint)))
+}
+
+pub(super) const IDEMPOTENCY_KEY_CONFLICT_MESSAGE: &str =
+    "idempotency_key was already used for a request with different content";
+
+/// Detect a PostgreSQL unique-violation (`23505`) on an `idempotency_key` index
+/// — notably the legacy account-wide `uq_remember_jobs_owner_idempotency_key`
+/// `(owner, idempotency_key)` index if present before migration 026 completes
+/// (#1170, #1225, #1312). When `INSERT ... ON CONFLICT (owner, namespace, idempotency_key) DO NOTHING`
+/// hits that wider index because the caller reused the same `idempotency_key`
+/// under a different `namespace`, Postgres raises `23505` instead of taking the
+/// `DO NOTHING` branch.
+pub(super) fn is_idempotency_key_unique_violation(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    if db_err.code().as_deref() != Some("23505") {
+        return false;
+    }
+    db_err
+        .constraint()
+        .is_some_and(|c| c.contains("idempotency_key"))
+        || db_err.message().contains("idempotency_key")
+}
+
+/// Look up whether any `remember_jobs` row exists for `(owner, idempotency_key)`
+/// regardless of namespace, so an insert that affected 0 rows (or collided across
+/// namespaces) can distinguish a cross-namespace key reuse (`409 Conflict`) from
+/// an unexpected empty insert (`500 Internal Server Error`).
+pub(super) async fn has_remember_job_for_owner_key(
+    pool: &sqlx::PgPool,
+    owner: &str,
+    key: &str,
+) -> Result<bool, AppError> {
+    let row: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM remember_jobs WHERE owner = $1 AND idempotency_key = $2 LIMIT 1",
+    )
+    .bind(owner)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to look up owner idempotency key: {}", e)))?;
+    Ok(row.is_some())
+}
+
+/// Insert a `pending` row into `remember_jobs` for `remember` or `remember_bulk`.
+/// Extracted so both handlers share the exact `ON CONFLICT` query and unit tests
+/// can exercise cross-namespace `idempotency_key` collisions directly against Postgres.
+async fn insert_remember_job_row(
+    pool: &sqlx::PgPool,
+    job_id: &str,
+    owner: &str,
+    namespace: &str,
+    idempotency_key: Option<&str>,
+    request_fingerprint: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, request_fingerprint) VALUES ($1, $2, $3, 'pending', $4, $5)
+         ON CONFLICT (owner, namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(owner)
+    .bind(namespace)
+    .bind(idempotency_key)
+    .bind(request_fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Look up an existing remember job for `(owner, namespace, idempotency_key)`. Returns
 /// `(job_id, status, blob_id, request_fingerprint)` when one exists, so a retry
 /// can collapse onto it — or be rejected if its content fingerprint differs.
@@ -1411,22 +1689,23 @@ pub async fn remember_bulk(
             .map(|key| format!("bulk:{}:{}", key, i));
         let fingerprint = request_fingerprint(&item.text, &item.namespace);
 
-        let inserted = match sqlx::query(
-            // `pending` (not `running`) so a fresh job takes the plain Upload
-            // path; only a retry of an in-flight job (worker-set `running`)
-            // triggers the crash-window reconcile. See the single-remember insert.
-            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, request_fingerprint) VALUES ($1, $2, $3, 'pending', $4, $5)
-             ON CONFLICT (owner, namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
+        // `pending` (not `running`) so a fresh job takes the plain Upload
+        // path; only a retry of an in-flight job (worker-set `running`)
+        // triggers the crash-window reconcile. See the single-remember insert.
+        let inserted = match insert_remember_job_row(
+            state.db.pool(),
+            &job_id,
+            owner,
+            &item.namespace,
+            item_key.as_deref(),
+            item_key.as_ref().map(|_| fingerprint.as_str()),
         )
-        .bind(&job_id)
-        .bind(owner)
-        .bind(&item.namespace)
-        .bind(item_key.as_deref())
-        .bind(item_key.as_ref().map(|_| fingerprint.as_str()))
-        .execute(state.db.pool())
         .await
         {
             Ok(inserted) => inserted,
+            Err(e) if is_idempotency_key_unique_violation(&e) => {
+                return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
+            }
             Err(e) => {
                 crate::alerts::maybe_alert_sqlx_postgres_storage_exhausted(
                     &state.alerts,
@@ -1441,21 +1720,33 @@ pub async fn remember_bulk(
             }
         };
 
-        if inserted.rows_affected() == 0 {
+        if inserted == 0 {
             let existing = match item_key.as_deref() {
-                Some(key) => find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?,
+                Some(key) => {
+                    find_remember_job_by_key(state.db.pool(), owner, &item.namespace, key).await?
+                }
                 None => None,
             };
-            let (existing_id, _, _, existing_fingerprint) = existing.ok_or_else(|| {
-                AppError::Internal("Failed to create bulk job row: insert affected no rows".into())
-            })?;
+            let (existing_id, _, _, existing_fingerprint) = match existing {
+                Some(row) => row,
+                None => {
+                    if let Some(key) = item_key.as_deref() {
+                        if has_remember_job_for_owner_key(state.db.pool(), owner, key).await? {
+                            return Err(AppError::Conflict(
+                                IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into(),
+                            ));
+                        }
+                    }
+                    return Err(AppError::Internal(
+                        "Failed to create bulk job row: insert affected no rows".into(),
+                    ));
+                }
+            };
             if existing_fingerprint
                 .as_deref()
                 .is_some_and(|stored| stored != fingerprint)
             {
-                return Err(AppError::Conflict(
-                    "idempotency_key was already used for a request with different content".into(),
-                ));
+                return Err(AppError::Conflict(IDEMPOTENCY_KEY_CONFLICT_MESSAGE.into()));
             }
             if claim_remember_preparation(state.db.pool(), &existing_id)
                 .await?
@@ -1687,17 +1978,20 @@ pub async fn remember_manual(
 mod tests {
     use super::{
         batch_summary_inputs, build_bulk_status_results, claim_paid_recovery,
-        claim_remember_preparation, existing_job_action, find_remember_job_by_key,
-        paid_recovery_operation, read_job_status, redact_hex_addresses, release_paid_recovery,
-        request_fingerprint, sanitize_job_error_for_client, should_spawn_after_reset,
-        split_text_chunks, summarize_for_embedding, validate_idempotency_key, ExistingJobAction,
+        claim_remember_preparation, content_dedupe_key, dedupe_hit_needs_live_memory,
+        effective_idempotency_key, existing_job_action, find_collapsible_remember_job,
+        find_remember_job_by_key, has_remember_job_for_owner_key, insert_remember_job_row,
+        is_idempotency_key_unique_violation, paid_recovery_operation, read_job_status,
+        redact_hex_addresses, release_paid_recovery, remember_memory_is_live, request_fingerprint,
+        sanitize_job_error_for_client, should_spawn_after_reset, split_text_chunks,
+        summarize_for_embedding, validate_idempotency_key, ExistingJobAction,
         INFRA_JOB_ERROR_MESSAGE, INFRA_JOB_RETRYING_MESSAGE, MAX_IDEMPOTENCY_KEY_BYTES,
         MAX_REMEMBER_TEXT_BYTES, SUMMARIZE_BATCH_INPUT_BYTES, SUMMARIZE_CHUNK_BYTES,
     };
     use crate::jobs::WalletOperation;
     use crate::types::AppError;
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     // ── Idempotency key (GH #477) ────────────────────────────────
@@ -2091,6 +2385,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/026_drop_owner_idempotency_key_index.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
     }
 
@@ -2119,7 +2419,9 @@ mod tests {
         .unwrap();
 
         // Lookup now finds it (this is what a retry hits → collapse, no new write).
-        let found = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let found = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             found,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2143,7 +2445,9 @@ mod tests {
         );
 
         // Original row is still the one that survives.
-        let still = find_remember_job_by_key(&pool, &owner, "ns", key).await.unwrap();
+        let still = find_remember_job_by_key(&pool, &owner, "ns", key)
+            .await
+            .unwrap();
         assert_eq!(
             still,
             Some((job_id.clone(), "running".to_string(), None, None))
@@ -2196,7 +2500,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(insert_b.rows_affected(), 1, "same key in different namespace must succeed");
+        assert_eq!(
+            insert_b.rows_affected(),
+            1,
+            "same key in different namespace must succeed"
+        );
 
         // 3. Retry within ns-a collides and collapses (insert DO NOTHING).
         let retry_a = sqlx::query(
@@ -2210,13 +2518,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(retry_a.rows_affected(), 0, "retry within namespace must collapse");
+        assert_eq!(
+            retry_a.rows_affected(),
+            0,
+            "retry within namespace must collapse"
+        );
 
         // 4. Lookup returns the respective job per namespace.
-        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key).await.unwrap();
+        let found_a = find_remember_job_by_key(&pool, &owner, "ns-a", key)
+            .await
+            .unwrap();
         assert_eq!(found_a.unwrap().0, job_a);
 
-        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key).await.unwrap();
+        let found_b = find_remember_job_by_key(&pool, &owner, "ns-b", key)
+            .await
+            .unwrap();
         assert_eq!(found_b.unwrap().0, job_b);
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
@@ -2423,10 +2739,11 @@ mod tests {
 
         // Retry #2 while that restart is in flight: same row, no new claim, and
         // the insert path cannot mint a second job for the key.
-        let (again_id, again_status, again_blob, _) = find_remember_job_by_key(&pool, &owner, "ns", key)
-            .await
-            .unwrap()
-            .unwrap();
+        let (again_id, again_status, again_blob, _) =
+            find_remember_job_by_key(&pool, &owner, "ns", key)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(again_id, job_id);
         assert_eq!(
             existing_job_action(&again_status, again_blob.is_some()),
@@ -2867,5 +3184,696 @@ mod tests {
             sanitize_job_error_for_client("failed", Some(GAS_SELECTION_ERR.to_string())).unwrap(),
             INFRA_JOB_ERROR_MESSAGE
         );
+    }
+
+    #[test]
+    fn remember_job_embedder_failure_sanitizes_provider_response_text() {
+        use super::format_remember_preparation_error;
+        use crate::types::EMBEDDING_PROVIDER_UNAVAILABLE_CODE;
+
+        let err = AppError::EmbeddingProviderUnavailable(
+            r#"Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#
+                .to_string(),
+        );
+        let stored = format_remember_preparation_error(&err);
+        assert!(
+            stored.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE),
+            "stored={}",
+            stored
+        );
+        assert!(stored.contains("traceId="), "stored={}", stored);
+        assert!(!stored.contains("User not found"), "stored={}", stored);
+        assert!(!stored.contains("401 Unauthorized"), "stored={}", stored);
+
+        let sanitized = sanitize_job_error_for_client("failed", Some(stored.clone()))
+            .expect("failed job keeps sanitized error");
+        assert_eq!(sanitized, stored);
+        assert!(!sanitized.contains("User not found"));
+
+        // Also verify pre-existing or raw DB error strings are sanitized on read.
+        for raw in [
+            r#"Upstream Unavailable: Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#,
+            r#"Internal Error: Embedding API error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#,
+            r#"Upstream Unavailable: Summarization API upstream error (402 Payment Required): {"error":{"message":"Insufficient credits","code":402}}"#,
+        ] {
+            let client_out = sanitize_job_error_for_client("failed", Some(raw.to_string()))
+                .expect("failed job keeps sanitized error");
+            assert!(
+                client_out.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE),
+                "raw={raw} -> {client_out}"
+            );
+            assert!(client_out.contains("traceId="), "raw={raw} -> {client_out}");
+            assert!(
+                !client_out.contains("User not found"),
+                "raw={raw} -> {client_out}"
+            );
+            assert!(
+                !client_out.contains("Insufficient credits"),
+                "raw={raw} -> {client_out}"
+            );
+        }
+    }
+
+    // ── Content-hash dedupe (GH #769) ────────────────────────────
+
+    #[test]
+    fn content_dedupe_key_is_stable_and_owner_namespace_scoped() {
+        let key_a = content_dedupe_key("0xowner", "profile", "User is allergic to peanuts");
+        let key_b = content_dedupe_key("0xowner", "profile", "User is allergic to peanuts");
+        assert_eq!(key_a, key_b);
+        assert!(key_a.starts_with("dedupe:"));
+        assert!(validate_idempotency_key(Some(&key_a)).is_ok());
+
+        assert_ne!(
+            key_a,
+            content_dedupe_key("0xowner", "profile", "User is allergic to almonds")
+        );
+        assert_ne!(
+            key_a,
+            content_dedupe_key("0xowner", "health", "User is allergic to peanuts")
+        );
+        assert_ne!(
+            key_a,
+            content_dedupe_key("0xother", "profile", "User is allergic to peanuts")
+        );
+        // Newline separators keep ("a\nb", "c") distinct from ("a", "b\nc").
+        assert_ne!(
+            content_dedupe_key("0xowner", "a\nb", "c"),
+            content_dedupe_key("0xowner", "a", "b\nc")
+        );
+    }
+
+    #[test]
+    fn content_dedupe_key_is_prefixed_out_of_the_analyze_key_space() {
+        let key = content_dedupe_key("0xowner", "default", "User lives in Ho Chi Minh City");
+        // analyze derives a bare 64-char hex digest over the same inputs; the
+        // `dedupe:` prefix keeps the two spaces disjoint unless the caller
+        // explicitly opts in via `dedupe: true`.
+        let bare = key.strip_prefix("dedupe:").expect("prefixed");
+        assert_eq!(bare.len(), 64);
+        assert!(bare.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn dedupe_overrides_a_supplied_idempotency_key() {
+        let derived = effective_idempotency_key(
+            true,
+            Some("r1-bucket-key-from-sdk"),
+            "0xowner",
+            "default",
+            "User is allergic to peanuts",
+        )
+        .expect("dedupe always produces a key");
+        assert_eq!(
+            derived,
+            content_dedupe_key("0xowner", "default", "User is allergic to peanuts")
+        );
+
+        // Two calls in different 30-minute SDK windows resolve to the same key.
+        let later = effective_idempotency_key(
+            true,
+            Some("r1-next-bucket-key-from-sdk"),
+            "0xowner",
+            "default",
+            "User is allergic to peanuts",
+        )
+        .unwrap();
+        assert_eq!(derived, later);
+    }
+
+    #[test]
+    fn without_dedupe_the_supplied_key_passes_through_untouched() {
+        assert_eq!(
+            effective_idempotency_key(false, Some("client-key"), "0xowner", "default", "text")
+                .as_deref(),
+            Some("client-key")
+        );
+        assert_eq!(
+            effective_idempotency_key(false, None, "0xowner", "default", "text"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_done_job_with_a_blob_needs_a_liveness_check() {
+        assert!(dedupe_hit_needs_live_memory("done", Some("blob-1")));
+        assert!(!dedupe_hit_needs_live_memory("done", None));
+        for in_flight in ["pending", "running", "uploaded", "failed"] {
+            assert!(
+                !dedupe_hit_needs_live_memory(in_flight, Some("blob-1")),
+                "status={in_flight} must not check vector_entries yet"
+            );
+            assert!(
+                !dedupe_hit_needs_live_memory(in_flight, None),
+                "status={in_flight} without blob must not check vector_entries"
+            );
+        }
+    }
+
+    static DEDUPE_VECTOR_SCHEMA_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn dedupe_test_pool() -> sqlx::PgPool {
+        let pool = idem_test_pool().await;
+        let _guard = DEDUPE_VECTOR_SCHEMA_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        // When pgvector is installed (CI and production), run the canonical
+        // vector migrations so test execution order never leaves a partial
+        // table behind; fall back to the minimal columns only when local
+        // Postgres lacks the pgvector extension.
+        let pgvector_ready = sqlx::raw_sql(include_str!("../../migrations/001_init.sql"))
+            .execute(&pool)
+            .await
+            .is_ok();
+        if pgvector_ready {
+            sqlx::raw_sql(include_str!("../../migrations/002_add_namespace.sql"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::raw_sql(
+                "CREATE TABLE IF NOT EXISTS vector_entries (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    blob_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT 'default'
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    async fn seed_dedupe_vector_entry(
+        pool: &sqlx::PgPool,
+        job_id: &str,
+        owner: &str,
+        blob_id: &str,
+        namespace: &str,
+    ) {
+        let has_embedding: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'vector_entries'
+                  AND column_name = 'embedding'
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if has_embedding {
+            sqlx::query(
+                "INSERT INTO vector_entries (id, owner, blob_id, namespace, embedding)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(job_id)
+            .bind(owner)
+            .bind(blob_id)
+            .bind(namespace)
+            .bind(pgvector::Vector::from(vec![0.0_f32; 1536]))
+            .execute(pool)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "INSERT INTO vector_entries (id, owner, blob_id, namespace)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(job_id)
+            .bind(owner)
+            .bind(blob_id)
+            .bind(namespace)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dedupe_collapses_identical_text_onto_the_live_job() {
+        let pool = dedupe_test_pool().await;
+        let owner = format!("0xowner-{}", uuid::Uuid::new_v4());
+        let text = "User is allergic to peanuts";
+        let fp = request_fingerprint(text, "health");
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        let key = effective_idempotency_key(true, Some("r1-window-1"), &owner, "health", text)
+            .expect("dedupe key");
+
+        // First remember(dedupe=true) finishes and writes its vector entry.
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, idempotency_key, request_fingerprint)
+             VALUES ($1, $2, 'health', 'done', 'blob-peanuts', $3, $4)",
+        )
+        .bind(&job_id)
+        .bind(&owner)
+        .bind(&key)
+        .bind(&fp)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_dedupe_vector_entry(&pool, &job_id, &owner, "blob-peanuts", "health").await;
+
+        // A second remember(dedupe=true) hours later arrives with a different
+        // SDK window key — effective_idempotency_key still resolves to the
+        // content hash and collapses onto the live job + blob_id.
+        let key_later =
+            effective_idempotency_key(true, Some("r1-window-99"), &owner, "health", text).unwrap();
+        assert_eq!(key_later, key);
+        let found = find_collapsible_remember_job(&pool, &owner, "health", &key_later, true)
+            .await
+            .unwrap()
+            .expect("live memory must collapse");
+        assert_eq!(found.0, job_id);
+        assert_eq!(found.1, "done");
+        assert_eq!(found.2.as_deref(), Some("blob-peanuts"));
+        assert_eq!(found.3.as_deref(), Some(fp.as_str()));
+
+        // Same text in a different namespace does not collide.
+        let other_ns_key =
+            effective_idempotency_key(true, None, &owner, "work", text).expect("dedupe key");
+        assert!(
+            find_collapsible_remember_job(&pool, &owner, "work", &other_ns_key, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dedupe_rewrites_when_the_memory_was_forgotten() {
+        let pool = dedupe_test_pool().await;
+        let owner = format!("0xowner-{}", uuid::Uuid::new_v4());
+        let text = "User is allergic to peanuts";
+        let fp = request_fingerprint(text, "health");
+        let old_job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        let new_job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        let key = effective_idempotency_key(true, None, &owner, "health", text).unwrap();
+
+        // The earlier remember job is `done`, but its vector_entries row is
+        // gone (expired blob cleanup or security delete).
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, idempotency_key, request_fingerprint)
+             VALUES ($1, $2, 'health', 'done', 'blob-expired', $3, $4)",
+        )
+        .bind(&old_job_id)
+        .bind(&owner)
+        .bind(&key)
+        .bind(&fp)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let collapsed = find_collapsible_remember_job(&pool, &owner, "health", &key, true)
+            .await
+            .unwrap();
+        assert!(
+            collapsed.is_none(),
+            "a forgotten memory must not swallow a fresh dedupe write"
+        );
+
+        // And the released key lets the new job insert under the same content hash.
+        let inserted = sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, request_fingerprint)
+             VALUES ($1, $2, 'health', 'pending', $3, $4)
+             ON CONFLICT (owner, namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
+        )
+        .bind(&new_job_id)
+        .bind(&owner)
+        .bind(&key)
+        .bind(&fp)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            inserted.rows_affected(),
+            1,
+            "fresh job must take the released dedupe key"
+        );
+
+        let now_bound = find_remember_job_by_key(&pool, &owner, "health", &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now_bound.0, new_job_id);
+
+        // The old job row itself is preserved for job-status history, with its
+        // idempotency_key cleared.
+        let old_key: (Option<String>,) =
+            sqlx::query_as("SELECT idempotency_key FROM remember_jobs WHERE id = $1")
+                .bind(&old_job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old_key.0, None);
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_supplied_key_still_collapses_onto_a_forgotten_job() {
+        // Explicit idempotency_key retries (`dedupe = false`) are transport
+        // replay protection, not content liveness: a retry of the same request
+        // ID still returns its job even if vector_entries has no row for it.
+        let pool = dedupe_test_pool().await;
+        let owner = format!("0xowner-{}", uuid::Uuid::new_v4());
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        let key = "explicit-caller-key";
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, idempotency_key)
+             VALUES ($1, $2, 'ns', 'done', 'blob-1', $3)",
+        )
+        .bind(&job_id)
+        .bind(&owner)
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let found = find_collapsible_remember_job(&pool, &owner, "ns", key, false)
+            .await
+            .unwrap()
+            .expect("explicit idempotency_key must still collapse");
+        assert_eq!(found.0, job_id);
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn identical_text_without_dedupe_still_writes_twice() {
+        let pool = dedupe_test_pool().await;
+        let owner = format!("0xowner-{}", uuid::Uuid::new_v4());
+        let text = "User is allergic to peanuts";
+
+        // Default behavior (`dedupe = false`): two calls in different SDK
+        // time buckets carry distinct keys (or None), and both insert.
+        for bucket_key in [Some("r1-bucket-1"), Some("r1-bucket-2"), None] {
+            let eff = effective_idempotency_key(false, bucket_key, &owner, "health", text);
+            let inserted = sqlx::query(
+                "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key)
+                 VALUES ($1, $2, 'health', 'pending', $3)
+                 ON CONFLICT (owner, namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
+            )
+            .bind(format!("remember-job-{}", uuid::Uuid::new_v4()))
+            .bind(&owner)
+            .bind(eff.as_deref())
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                inserted.rows_affected(),
+                1,
+                "default remember must not content-dedupe across buckets ({bucket_key:?})"
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn remember_memory_is_live_is_owner_and_namespace_scoped() {
+        let pool = dedupe_test_pool().await;
+        let owner = format!("0xowner-{}", uuid::Uuid::new_v4());
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+
+        seed_dedupe_vector_entry(&pool, &job_id, &owner, "blob-1", "health").await;
+
+        assert!(remember_memory_is_live(&pool, &job_id, &owner, "health")
+            .await
+            .unwrap());
+        assert!(!remember_memory_is_live(&pool, &job_id, &owner, "other-ns")
+            .await
+            .unwrap());
+        assert!(
+            !remember_memory_is_live(&pool, &job_id, "0xsomeone-else", "health")
+                .await
+                .unwrap()
+        );
+
+        let _ = sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    // GH #1312: While the legacy account-wide `uq_remember_jobs_owner_idempotency_key`
+    // index `(owner, idempotency_key) WHERE idempotency_key IS NOT NULL` remains
+    // active on `dev` / `production` (retained for rolling-deploy safety in #1225),
+    // reusing an `idempotency_key` under a different `namespace` bypasses the
+    // `(owner, namespace, idempotency_key)` pre-lookup and `ON CONFLICT` target,
+    // raising SQLSTATE `23505` on the wider index. Both `/api/remember` and
+    // `/api/remember/bulk` must classify that unique violation (and any 0-row
+    // cross-namespace collision) as `409 Conflict` rather than `500 Internal Server Error`.
+    #[tokio::test]
+    async fn cross_namespace_idempotency_key_collision_on_legacy_owner_index_is_detected_as_conflict(
+    ) {
+        let pool = idem_test_pool().await;
+        let owner_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("0xowner-{}", owner_suffix);
+        let legacy_index = format!("uq_remember_jobs_owner_idempotency_key_{}", owner_suffix);
+
+        // Create an owner-scoped partial unique index on (owner, idempotency_key)
+        // mirroring `uq_remember_jobs_owner_idempotency_key` in deployed databases
+        // without interfering with parallel tests for other owners.
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX {legacy_index}
+             ON remember_jobs (owner, idempotency_key)
+             WHERE idempotency_key IS NOT NULL AND owner = '{owner}'"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let key = "shared-key-across-namespaces";
+        let fp_a = request_fingerprint("alpha", "ns-a");
+        let fp_b = request_fingerprint("alpha", "ns-b");
+
+        // 1. First write in ns-a inserts 1 row.
+        let inserted_a = insert_remember_job_row(
+            &pool,
+            &format!("job-a-{}", uuid::Uuid::new_v4()),
+            &owner,
+            "ns-a",
+            Some(key),
+            Some(&fp_a),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted_a, 1);
+
+        // 2. Pre-lookup in ns-b returns None because it filters by namespace.
+        assert!(find_remember_job_by_key(&pool, &owner, "ns-b", key)
+            .await
+            .unwrap()
+            .is_none());
+
+        // 3. Owner-wide lookup sees the existing key across namespaces.
+        assert!(has_remember_job_for_owner_key(&pool, &owner, key)
+            .await
+            .unwrap());
+        assert!(!has_remember_job_for_owner_key(&pool, &owner, "unused-key")
+            .await
+            .unwrap());
+
+        // 4. Inserting the same key in ns-b hits the legacy `(owner, idempotency_key)`
+        // unique index with SQLSTATE 23505, which `is_idempotency_key_unique_violation`
+        // classifies as an idempotency conflict (mapped to 409 Conflict by both
+        // `remember` and `remember_bulk`).
+        let err = insert_remember_job_row(
+            &pool,
+            &format!("job-b-{}", uuid::Uuid::new_v4()),
+            &owner,
+            "ns-b",
+            Some(key),
+            Some(&fp_b),
+        )
+        .await
+        .expect_err("legacy owner-wide index must reject cross-namespace key reuse");
+        assert!(
+            is_idempotency_key_unique_violation(&err),
+            "expected 23505 on idempotency_key index to be classified as conflict, got: {err:?}"
+        );
+
+        // 5. Same goes for bulk-derived keys (`bulk:<key>:<i>`) reused across item namespaces.
+        let bulk_key = "bulk:shared-batch:0";
+        let inserted_bulk_a = insert_remember_job_row(
+            &pool,
+            &format!("bulk-a-{}", uuid::Uuid::new_v4()),
+            &owner,
+            "ns-a",
+            Some(bulk_key),
+            Some(&fp_a),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted_bulk_a, 1);
+
+        let bulk_err = insert_remember_job_row(
+            &pool,
+            &format!("bulk-b-{}", uuid::Uuid::new_v4()),
+            &owner,
+            "ns-b",
+            Some(bulk_key),
+            Some(&fp_b),
+        )
+        .await
+        .expect_err("legacy owner-wide index must reject cross-namespace bulk item key reuse");
+        assert!(
+            is_idempotency_key_unique_violation(&bulk_err),
+            "expected bulk 23505 on idempotency_key index to be classified as conflict, got: {bulk_err:?}"
+        );
+
+        // Non-unique-violation errors are never misclassified as 409 Conflict.
+        assert!(!is_idempotency_key_unique_violation(
+            &sqlx::Error::RowNotFound
+        ));
+
+        let _ = sqlx::query(&format!("DROP INDEX IF EXISTS {legacy_index}"))
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    // GH #1170, #1225, #1312: On a database that had the legacy 2-column
+    // `uq_remember_jobs_owner_idempotency_key` index created before migration 013,
+    // running `026_drop_owner_idempotency_key_index.sql` drops the legacy index
+    // while keeping `uq_remember_jobs_owner_namespace_idempotency_key`, so all 5
+    // rows of the reproduction table in #1312 succeed as intended.
+    #[tokio::test]
+    async fn migration_026_drops_legacy_owner_index_and_allows_cross_namespace_key_reuse() {
+        let pool = idem_test_pool().await;
+        let owner_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("0xowner-{}", owner_suffix);
+
+        {
+            let _guard = IDEM_SCHEMA_SETUP_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
+            sqlx::query(&format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_remember_jobs_owner_idempotency_key
+                 ON remember_jobs (owner, idempotency_key)
+                 WHERE idempotency_key IS NOT NULL AND owner = '{owner}'"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            sqlx::raw_sql(include_str!(
+                "../../migrations/026_drop_owner_idempotency_key_index.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let key = "shared-key-k";
+        let fresh_key = "fresh-key-k2";
+        let t1 = "fact-t1";
+        let t2 = "fact-t2";
+        let fp_t1_nsa = request_fingerprint(t1, "nsA");
+        let fp_t2_nsa = request_fingerprint(t2, "nsA");
+        let fp_t1_nsb = request_fingerprint(t1, "nsB");
+
+        // Row 1: remember(T1, nsA, key=K) -> first use inserts 1 row (202 OK).
+        let job_nsa_id = format!("job-nsa-{}", uuid::Uuid::new_v4());
+        let row1 = insert_remember_job_row(
+            &pool,
+            &job_nsa_id,
+            &owner,
+            "nsA",
+            Some(key),
+            Some(&fp_t1_nsa),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row1, 1, "row 1 (nsA, K, T1) must insert a new job");
+
+        // Row 2: remember(T1, nsA, key=K) -> repeat in nsA collapses idempotently (202 OK).
+        let row2 = find_collapsible_remember_job(&pool, &owner, "nsA", key, false)
+            .await
+            .unwrap()
+            .expect("row 2 (nsA, K, T1 repeat) must find existing job");
+        assert_eq!(row2.0, job_nsa_id);
+        assert_eq!(row2.3.as_deref(), Some(fp_t1_nsa.as_str()));
+
+        // Row 3: remember(T2, nsA, key=K) -> different text in nsA mismatches fingerprint (409 Conflict).
+        let row3 = find_collapsible_remember_job(&pool, &owner, "nsA", key, false)
+            .await
+            .unwrap()
+            .expect("row 3 (nsA, K, T2) must find existing job in nsA");
+        assert_ne!(
+            row3.3.as_deref(),
+            Some(fp_t2_nsa.as_str()),
+            "row 3 must detect content fingerprint mismatch in nsA -> 409 Conflict"
+        );
+
+        // Row 4: remember(T1, nsB, key=K) -> same text, other namespace succeeds (202 OK).
+        assert!(
+            find_collapsible_remember_job(&pool, &owner, "nsB", key, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "row 4 pre-lookup in nsB must not match nsA's row"
+        );
+        let job_nsb_id = format!("job-nsb-{}", uuid::Uuid::new_v4());
+        let row4 = insert_remember_job_row(
+            &pool,
+            &job_nsb_id,
+            &owner,
+            "nsB",
+            Some(key),
+            Some(&fp_t1_nsb),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            row4, 1,
+            "row 4 (nsB, K, T1) must insert cleanly once migration 026 drops the legacy index"
+        );
+
+        // Row 5: remember(T1, nsB, fresh key) -> control succeeds (202 OK).
+        let job_nsb_fresh_id = format!("job-nsb-fresh-{}", uuid::Uuid::new_v4());
+        let row5 = insert_remember_job_row(
+            &pool,
+            &job_nsb_fresh_id,
+            &owner,
+            "nsB",
+            Some(fresh_key),
+            Some(&fp_t1_nsb),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row5, 1, "row 5 (nsB, fresh key, T1) must insert cleanly");
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
     }
 }

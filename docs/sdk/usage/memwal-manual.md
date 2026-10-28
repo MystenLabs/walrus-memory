@@ -147,7 +147,7 @@ const manual = MemWalManual.create({
   packageId: process.env.MEMWAL_PACKAGE_ID!,
   sealPolicyPackageId: process.env.MEMWAL_SEAL_POLICY_PACKAGE_ID,
   registryId: process.env.MEMWAL_REGISTRY_ID!,
-  serverUrl: "https://relayer-staging.memory.walrus.xyz",
+  serverUrl: "https://relayer.dev.memwal.ai",
   suiPrivateKey: process.env.SUI_PRIVATE_KEY!,
   embeddingApiKey: process.env.OPENAI_API_KEY!,
   suiNetwork: "testnet",

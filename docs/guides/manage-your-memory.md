@@ -16,7 +16,7 @@ Connect your wallet to open the dashboard:
 | **Network** | **Dashboard** |
 | --- | --- |
 | Mainnet | [memory.walrus.xyz](https://memory.walrus.xyz) |
-| Testnet | [staging.memory.walrus.xyz](https://staging.memory.walrus.xyz) |
+| Testnet | [dev.memwal.ai](https://dev.memwal.ai) |
 
 ## Browse and search
 

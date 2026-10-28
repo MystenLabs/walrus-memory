@@ -399,6 +399,57 @@ mod cors_tests {
         );
     }
 
+    // #1119: the main relayer CORS layer is an allowlist (deny-all when
+    // ALLOWED_ORIGINS is unset), while the emergency security-delete routes
+    // merged after the main layer deliberately emit Access-Control-Allow-Origin: *
+    // so browser-based recovery/deletion tools can call them directly without a proxy.
+    #[tokio::test]
+    async fn relayer_cors_allows_only_listed_origins() {
+        let listed = "https://app.memwal.test";
+        let app = Router::new()
+            .route("/config", get(|| async {}))
+            .layer(relayer_cors(vec![listed.parse().unwrap()]))
+            .merge(
+                Router::new()
+                    .route("/api/security-deletable-blobs", get(|| async {}))
+                    .route("/api/security-delete", post(|| async {}))
+                    .layer(security_delete_cors()),
+            );
+
+        for (origin, allowed) in [(listed, true), ("https://example.com", false)] {
+            let preflight = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/config")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(preflight).await.unwrap();
+            let allow = response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            if allowed {
+                assert_eq!(allow.unwrap(), origin);
+            } else {
+                assert!(allow.is_none(), "unlisted origin {origin} was allowed");
+            }
+
+            let sec_delete_preflight = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/security-deletable-blobs")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap();
+            let sec_delete_response = app.clone().oneshot(sec_delete_preflight).await.unwrap();
+            assert_eq!(
+                sec_delete_response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn relayer_cors_exposes_x_auth_error_and_retry_after() {
         let origin = "https://app.memwal.test";
@@ -614,6 +665,7 @@ mod mcp_rate_limit_tests {
         let db = Arc::new(VectorDb::from_pool(pool.clone()));
         let http_client = reqwest::Client::new();
         let config = Arc::new(rate_limit_test_config());
+        let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
         Arc::new(AppState {
             db: Arc::clone(&db),
             wallet_lock_pool: pool.clone(),
@@ -635,14 +687,14 @@ mod mcp_rate_limit_tests {
             delegate_verify_cache: storage::sui::new_delegate_verify_cache(),
             delegate_reject_cache: storage::sui::new_delegate_reject_cache(),
             mcp_connect_episodes: observability::new_mcp_connect_episodes(),
-            alerts: Arc::new(AlertManager::from_env(http_client.clone())),
+            alerts: Arc::clone(&alerts),
             key_pool: Arc::new(KeyPool::new(Vec::new())),
             engine: Arc::new(PlaintextEngine::new(db)),
-            embedder: Arc::new(OpenAiEmbedder::new(
-                http_client.clone(),
-                Arc::clone(&config),
-            )),
-            extractor: Arc::new(LlmExtractor::new(http_client, config)),
+            embedder: Arc::new(
+                OpenAiEmbedder::new(http_client.clone(), Arc::clone(&config))
+                    .with_alerts(Arc::clone(&alerts)),
+            ),
+            extractor: Arc::new(LlmExtractor::new(http_client, config).with_alerts(alerts)),
             ranker: Arc::new(CompositeRanker),
             redis,
             fallback_rate_limit: tokio::sync::Mutex::new(rate_limit::InMemoryFallback::default()),
@@ -1695,12 +1747,14 @@ async fn main() {
     // implementations can be swapped at startup. Both wrap the same
     // http_client + config; behaviour is identical to the inline
     // generate_embedding / extract_facts_llm they replace.
-    let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::new(
-        http_client.clone(),
-        Arc::clone(&config),
-    ));
-    let extractor: Arc<dyn Extractor> =
-        Arc::new(LlmExtractor::new(http_client.clone(), Arc::clone(&config)));
+    let embedder: Arc<dyn Embedder> = Arc::new(
+        OpenAiEmbedder::new(http_client.clone(), Arc::clone(&config))
+            .with_alerts(Arc::clone(&alerts)),
+    );
+    let extractor: Arc<dyn Extractor> = Arc::new(
+        LlmExtractor::new(http_client.clone(), Arc::clone(&config))
+            .with_alerts(Arc::clone(&alerts)),
+    );
     // CompositeRanker is stateless — one shared instance is fine.
     let ranker: Arc<dyn Ranker> = Arc::new(CompositeRanker);
 

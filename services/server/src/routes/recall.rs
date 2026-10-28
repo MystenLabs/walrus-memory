@@ -500,13 +500,18 @@ mod tests {
 0x8d3c1f0a9b2e4d6c7a5f8e1b0d4c9a2f3e6b7d8c1a0f9e2b3c4d5a6f7e8b9c0d. Required: 64367730, \
 Available: 10708877";
 
-        let out = crate::routes::remember::sanitize_job_error_for_client("failed", Some(raw.to_string()))
-            .expect("a failed job keeps an error");
+        let out =
+            crate::routes::remember::sanitize_job_error_for_client("failed", Some(raw.to_string()))
+                .expect("a failed job keeps an error");
 
         // The operator's hot wallet and its shortfall are not the tenant's
         // business, and reading them as "top this address up" is the exact
         // confusion INFRA_JOB_ERROR_MESSAGE exists to prevent.
-        assert!(!out.contains("0x8d3c1f0a"), "wallet address leaked: {}", out);
+        assert!(
+            !out.contains("0x8d3c1f0a"),
+            "wallet address leaked: {}",
+            out
+        );
         assert!(!out.contains("Available"), "balance leaked: {}", out);
         assert!(!out.contains("10708877"), "shortfall leaked: {}", out);
     }

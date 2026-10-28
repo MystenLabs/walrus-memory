@@ -19,7 +19,7 @@ ACCOUNT = "0x" + "ab" * 32
     [
         ("prod", "https://relayer.memory.walrus.xyz"),
         ("dev", "https://relayer.dev.memwal.ai"),
-        ("staging", "https://relayer-staging.memory.walrus.xyz"),
+        ("staging", "https://relayer.dev.memwal.ai"),
         ("local", "http://127.0.0.1:8000"),
     ],
 )
@@ -52,7 +52,7 @@ def test_unknown_env_raises():
 
 def test_create_threads_env_through_to_client():
     client = MemWal.create(key=KEY, account_id=ACCOUNT, env="staging")
-    assert client._server_url == "https://relayer-staging.memory.walrus.xyz"
+    assert client._server_url == "https://relayer.dev.memwal.ai"
 
 
 def test_sync_create_threads_env_through():

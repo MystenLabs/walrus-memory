@@ -15,7 +15,7 @@
 //   routes        services/server/src/main.rs
 //   versions      services/server/src/compatibility.rs, Cargo.toml
 //   limits        services/server/src/types.rs, routes/admin.rs
-//   testnet IDs   apps/app/src/config.ts (defaults)
+//   testnet IDs   apps/app/.env.example (active testnet block)
 //   mainnet IDs   apps/app/.env.example (mainnet block)
 //   relayer URLs  packages/mcp/src/index.ts (env presets)
 
@@ -62,7 +62,6 @@ const typesRs = read("services/server/src/types.rs");
 const adminRs = read("services/server/src/routes/admin.rs");
 const compatibilityRs = read("services/server/src/compatibility.rs");
 const serverCargo = read("services/server/Cargo.toml");
-const appConfig = read("apps/app/src/config.ts");
 const appEnvExample = read("apps/app/.env.example");
 const mcpIndex = read("packages/mcp/src/index.ts");
 
@@ -192,8 +191,8 @@ for (const doc of docs) {
 }
 
 // ── 3. Package and registry IDs, wherever docs assign them ──────────
-const testnetPackageId = capture("testnet package ID", appConfig, /memwalPackageId[\s\S]*?'(0x[0-9a-f]{64})'/);
-const testnetRegistryId = capture("testnet registry ID", appConfig, /memwalRegistryId[\s\S]*?'(0x[0-9a-f]{64})'/);
+const testnetPackageId = capture("testnet package ID", appEnvExample, /^VITE_MEMWAL_PACKAGE_ID=(0x[0-9a-f]{64})\s*$/m);
+const testnetRegistryId = capture("testnet registry ID", appEnvExample, /^VITE_MEMWAL_REGISTRY_ID=(0x[0-9a-f]{64})\s*$/m);
 const mainnetPackageId = capture("mainnet package ID", appEnvExample, /#\s*VITE_MEMWAL_PACKAGE_ID=(0x[0-9a-f]{64})/);
 const mainnetRegistryId = capture("mainnet registry ID", appEnvExample, /#\s*VITE_MEMWAL_REGISTRY_ID=(0x[0-9a-f]{64})/);
 

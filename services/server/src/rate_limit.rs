@@ -19,7 +19,7 @@ use crate::{
 // Sponsor Rate Limit Result
 // ============================================================
 
-/// Result of a per-sender (or per-IP) sponsor rate limit check.
+/// Result of a per-sender (or per-IP / global) sponsor rate limit check.
 #[derive(Debug, PartialEq)]
 pub enum SponsorRlResult {
     /// Request is within limits — proceed.
@@ -28,6 +28,8 @@ pub enum SponsorRlResult {
     MinuteLimitExceeded,
     /// Per-hour bucket exhausted.
     HourLimitExceeded,
+    /// Per-day cumulative bucket exhausted.
+    DayLimitExceeded,
 }
 
 // ============================================================
@@ -969,14 +971,33 @@ pub(crate) async fn check_restore_call_rate_limit(
 // Sponsor — deployment-wide budget limit
 // ============================================================
 
+pub const SPONSOR_GLOBAL_MIN_KEY: &str = "rate:sponsor:global:min";
+pub const SPONSOR_GLOBAL_HR_KEY: &str = "rate:sponsor:global:hr";
+pub const SPONSOR_GLOBAL_DAY_KEY: &str = "rate:sponsor:global:day";
+
+pub const SPONSOR_MIN_WINDOW_MS: f64 = 60_000.0;
+pub const SPONSOR_HR_WINDOW_MS: f64 = 3_600_000.0;
+pub const SPONSOR_DAY_WINDOW_MS: f64 = 86_400_000.0;
+
+pub const SPONSOR_MIN_TTL_SECS: i64 = 120;
+pub const SPONSOR_HR_TTL_SECS: i64 = 3_700;
+pub const SPONSOR_DAY_TTL_SECS: i64 = 86_500;
+
 /// Check whether the deployment has exceeded its sponsor budget limits.
 ///
 /// Uses a sliding-window counter in Redis just like the authenticated route
 /// middleware, but keyed by fixed server-controlled identifiers. Unlike a
 /// caller-supplied sender address, these keys cannot be rotated by an attacker.
 ///
+/// Enforces three global tiers:
+/// - `rate:sponsor:global:min` (60s rolling window)
+/// - `rate:sponsor:global:hr` (3,600s rolling window)
+/// - `rate:sponsor:global:day` (86,400s rolling window) — prevents multi-IP
+///   rotation from sustaining the hourly ceiling across consecutive hours.
+///
 /// Returns `SponsorRlResult::Allowed` when the request can proceed, or the
-/// appropriate `MinuteLimitExceeded` / `HourLimitExceeded` variant otherwise.
+/// appropriate `MinuteLimitExceeded` / `HourLimitExceeded` / `DayLimitExceeded`
+/// variant otherwise.
 ///
 /// Returns `Err(())` on Redis failure so callers can fail closed. A per-process
 /// fallback would not enforce a deployment-wide cap across replicas.
@@ -984,24 +1005,24 @@ pub async fn check_global_sponsor_rate_limit(
     state: &crate::types::AppState,
     per_minute: i64,
     per_hour: i64,
+    per_day: i64,
 ) -> Result<SponsorRlResult, ()> {
     let now = chrono::Utc::now().timestamp_millis() as f64;
     let mut redis = state.redis.clone();
 
-    let min_key = "rate:sponsor:global:min";
-    let hr_key = "rate:sponsor:global:hr";
-    let min_window_start = now - 60_000.0;
-    let hr_window_start = now - 3_600_000.0;
+    let min_window_start = now - SPONSOR_MIN_WINDOW_MS;
+    let hr_window_start = now - SPONSOR_HR_WINDOW_MS;
+    let day_window_start = now - SPONSOR_DAY_WINDOW_MS;
 
     // --- Atomic check-and-record for minute bucket ---
     match check_and_record_window(
         &mut redis,
-        &min_key,
+        SPONSOR_GLOBAL_MIN_KEY,
         min_window_start,
         now,
         per_minute,
         1, // weight = 1 per sponsor request
-        120,
+        SPONSOR_MIN_TTL_SECS,
     )
     .await
     {
@@ -1022,12 +1043,12 @@ pub async fn check_global_sponsor_rate_limit(
     // --- Atomic check-and-record for hour bucket ---
     match check_and_record_window(
         &mut redis,
-        &hr_key,
+        SPONSOR_GLOBAL_HR_KEY,
         hr_window_start,
         now + 0.1,
         per_hour,
         1, // weight = 1 per sponsor request
-        3700,
+        SPONSOR_HR_TTL_SECS,
     )
     .await
     {
@@ -1037,6 +1058,29 @@ pub async fn check_global_sponsor_rate_limit(
         }
         Err(e) => {
             tracing::error!("check_global_sponsor_rate_limit: Redis error (hour): {}", e);
+            return Err(());
+        }
+        Ok(WindowCheckResult::Allowed) => {}
+    }
+
+    // --- Atomic check-and-record for rolling 24-hour bucket ---
+    match check_and_record_window(
+        &mut redis,
+        SPONSOR_GLOBAL_DAY_KEY,
+        day_window_start,
+        now + 0.2,
+        per_day,
+        1, // weight = 1 per sponsor request
+        SPONSOR_DAY_TTL_SECS,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => {
+            crate::observability::record_rate_limit_denial("sponsor_global_daily");
+            return Ok(SponsorRlResult::DayLimitExceeded);
+        }
+        Err(e) => {
+            tracing::error!("check_global_sponsor_rate_limit: Redis error (day): {}", e);
             return Err(());
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -1156,7 +1200,8 @@ fn rate_limit_peer_addr(request: &Request, trusted_proxy_hops: usize) -> std::ne
 /// Pre-authentication rate limiting middleware for the public `/sponsor` routes.
 ///
 /// Enforces a per-IP sliding-window limit using the same Redis counters as
-/// the authenticated middleware. Defaults: 10 req/min, 30 req/hr per IP.
+/// the authenticated middleware. Defaults: 10 req/min, 30 req/hr per IP, plus
+/// deployment-wide caps of 100/min, 1000/hr, and 2000/day.
 ///
 /// Redis errors return 503. A local fallback cannot provide consistent abuse
 /// protection across replicas, so the sponsor path intentionally fails closed.
@@ -1182,8 +1227,8 @@ pub async fn sponsor_rate_limit_middleware(
 
     let min_key = format!("rate:sponsor:ip:min:{}", ip);
     let hr_key = format!("rate:sponsor:ip:hr:{}", ip);
-    let min_window_start = now - 60_000.0;
-    let hr_window_start = now - 3_600_000.0;
+    let min_window_start = now - SPONSOR_MIN_WINDOW_MS;
+    let hr_window_start = now - SPONSOR_HR_WINDOW_MS;
 
     // --- Atomic check-and-record for minute bucket (IP-based) ---
     match check_and_record_window(
@@ -1193,7 +1238,7 @@ pub async fn sponsor_rate_limit_middleware(
         now,
         config.per_minute,
         1,
-        120,
+        SPONSOR_MIN_TTL_SECS,
     )
     .await
     {
@@ -1223,7 +1268,7 @@ pub async fn sponsor_rate_limit_middleware(
         now + 0.1,
         config.per_hour,
         1,
-        3700,
+        SPONSOR_HR_TTL_SECS,
     )
     .await
     {
@@ -1245,8 +1290,13 @@ pub async fn sponsor_rate_limit_middleware(
         Ok(WindowCheckResult::Allowed) => {}
     }
 
-    match check_global_sponsor_rate_limit(&state, config.global_per_minute, config.global_per_hour)
-        .await
+    match check_global_sponsor_rate_limit(
+        &state,
+        config.global_per_minute,
+        config.global_per_hour,
+        config.global_per_day,
+    )
+    .await
     {
         Ok(SponsorRlResult::MinuteLimitExceeded) => {
             return rate_limit_response(
@@ -1263,6 +1313,14 @@ pub async fn sponsor_rate_limit_middleware(
                 "hour",
                 300,
             );
+        }
+        Ok(SponsorRlResult::DayLimitExceeded) => {
+            tracing::warn!(
+                "sponsor rate limit [global/day]: ip={} denied (limit={})",
+                ip,
+                config.global_per_day
+            );
+            return rate_limit_response("sponsor_global_daily", config.global_per_day, "day", 3600);
         }
         Ok(SponsorRlResult::Allowed) => {}
         Err(()) => return rate_limiter_unavailable_response(),
@@ -1474,7 +1532,7 @@ pub async fn accounts_rate_limit_middleware(
                 60,
             );
         }
-        Ok(SponsorRlResult::HourLimitExceeded) => {
+        Ok(SponsorRlResult::HourLimitExceeded) | Ok(SponsorRlResult::DayLimitExceeded) => {
             return rate_limit_response(
                 "accounts_global_sustained",
                 config.global_per_hour,
@@ -1503,69 +1561,233 @@ fn mcp_ip_rate_keys(ip: std::net::IpAddr) -> (String, String) {
 
 const MCP_GLOBAL_MIN_KEY: &str = "rate:mcp:global:min";
 const MCP_GLOBAL_HR_KEY: &str = "rate:mcp:global:hr";
+const MCP_PREAUTH_GLOBAL_MIN_KEY: &str = "rate:mcp:preauth:global:min";
+const MCP_PREAUTH_GLOBAL_HR_KEY: &str = "rate:mcp:preauth:global:hr";
 
-/// Deployment-wide MCP cap. Same shape as `check_global_accounts_rate_limit`,
-/// but the keys must stay `rate:mcp:global:*` so MCP traffic cannot fill the
-/// accounts-exists windows.
-async fn check_global_mcp_rate_limit(
-    state: &crate::types::AppState,
+/// Pre-authentication deployment-wide MCP cap (`rate:mcp:preauth:global:*`).
+///
+/// Separate from the post-authentication `rate:mcp:global:*` bucket so:
+/// 1. A distributed caller rotating syntactically valid legacy delegate
+///    seeds / account IDs (missing the verify/reject caches) hits a hard
+///    deployment-wide ceiling in `mcp_rate_limit_middleware` before
+///    `classify_and_resolve` performs on-chain Sui fullnode checks.
+/// 2. An authenticated tenant that exceeds its own `tenant_per_minute` /
+///    `tenant_per_hour` bucket is rejected in `check_mcp_tenant_windows`
+///    before touching `rate:mcp:global:*`, while its pre-auth requests
+///     remain bounded by its IP cap and this pre-auth deployment ceiling.
+pub(crate) async fn check_mcp_preauth_global_windows<C>(
+    redis: &mut C,
     per_minute: i64,
     per_hour: i64,
-) -> Result<SponsorRlResult, ()> {
+    global_keys: (&str, &str),
+) -> Result<SponsorRlResult, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
     let now = chrono::Utc::now().timestamp_millis() as f64;
-    let mut redis = state.redis.clone();
     let min_window_start = now - 60_000.0;
     let hr_window_start = now - 3_600_000.0;
 
-    match check_and_record_window(
-        &mut redis,
-        MCP_GLOBAL_MIN_KEY,
+    if check_and_record_window(
+        redis,
+        global_keys.0,
         min_window_start,
         now,
         per_minute,
         1,
         120,
     )
-    .await
+    .await?
+        == WindowCheckResult::Denied
     {
-        Ok(WindowCheckResult::Denied) => return Ok(SponsorRlResult::MinuteLimitExceeded),
-        Err(e) => {
-            tracing::error!("check_global_mcp_rate_limit: Redis error (minute): {}", e);
-            return Err(());
-        }
-        Ok(WindowCheckResult::Allowed) => {}
+        return Ok(SponsorRlResult::MinuteLimitExceeded);
     }
 
-    match check_and_record_window(
-        &mut redis,
-        MCP_GLOBAL_HR_KEY,
+    if check_and_record_window(
+        redis,
+        global_keys.1,
         hr_window_start,
         now + 0.1,
         per_hour,
         1,
         3700,
     )
-    .await
+    .await?
+        == WindowCheckResult::Denied
     {
-        Ok(WindowCheckResult::Denied) => return Ok(SponsorRlResult::HourLimitExceeded),
-        Err(e) => {
-            tracing::error!("check_global_mcp_rate_limit: Redis error (hour): {}", e);
-            return Err(());
-        }
-        Ok(WindowCheckResult::Allowed) => {}
+        return Ok(SponsorRlResult::HourLimitExceeded);
     }
 
     Ok(SponsorRlResult::Allowed)
 }
 
+async fn check_mcp_preauth_global(
+    state: &crate::types::AppState,
+    per_minute: i64,
+    per_hour: i64,
+) -> Result<SponsorRlResult, ()> {
+    let mut redis = state.redis.clone();
+    match check_mcp_preauth_global_windows(
+        &mut redis,
+        per_minute,
+        per_hour,
+        (MCP_PREAUTH_GLOBAL_MIN_KEY, MCP_PREAUTH_GLOBAL_HR_KEY),
+    )
+    .await
+    {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            tracing::error!("check_mcp_preauth_global: Redis error: {}", e);
+            Err(())
+        }
+    }
+}
+
+/// Redis keys for one MCP tenant's own bucket. `tenant` comes from
+/// `mcp_proxy::mcp_tenant_id` (account id + delegate public key), so two
+/// tenants never share a window whatever IPs they connect from (GH #1050).
+fn mcp_tenant_rate_keys(tenant: &str) -> (String, String) {
+    (
+        format!("rate:mcp:tenant:min:{tenant}"),
+        format!("rate:mcp:tenant:hr:{tenant}"),
+    )
+}
+
+/// Which MCP window denied a request, mapped to the 429 `layer`.
+#[derive(Debug, PartialEq)]
+enum McpTenantDenial {
+    TenantBurst,
+    TenantSustained,
+    GlobalBurst,
+    GlobalSustained,
+}
+
+/// Post-authentication MCP budget: the caller's own tenant windows first,
+/// then the deployment-wide ceiling.
+///
+/// The global ceiling is checked only after the tenant windows admit the
+/// request, so a tenant that is already over its own budget is turned away
+/// without recording anything in `rate:mcp:global:*`. One tenant therefore
+/// cannot fill the shared ceiling as long as `tenant_per_minute` and
+/// `tenant_per_hour` stay below the global caps.
+async fn check_mcp_tenant_windows<C>(
+    redis: &mut C,
+    config: &McpRateLimitConfig,
+    tenant: &str,
+    global_keys: (&str, &str),
+) -> Result<Option<McpTenantDenial>, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let min_start = now - 60_000.0;
+    let hr_start = now - 3_600_000.0;
+    let (tenant_min, tenant_hr) = mcp_tenant_rate_keys(tenant);
+
+    let windows: [(&str, f64, f64, i64, i64, McpTenantDenial); 4] = [
+        (
+            &tenant_min,
+            min_start,
+            now,
+            config.tenant_per_minute,
+            120,
+            McpTenantDenial::TenantBurst,
+        ),
+        (
+            &tenant_hr,
+            hr_start,
+            now + 0.1,
+            config.tenant_per_hour,
+            3700,
+            McpTenantDenial::TenantSustained,
+        ),
+        (
+            global_keys.0,
+            min_start,
+            now + 0.2,
+            config.global_per_minute,
+            120,
+            McpTenantDenial::GlobalBurst,
+        ),
+        (
+            global_keys.1,
+            hr_start,
+            now + 0.3,
+            config.global_per_hour,
+            3700,
+            McpTenantDenial::GlobalSustained,
+        ),
+    ];
+    for (key, start, at, limit, ttl, denial) in windows {
+        if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
+            == WindowCheckResult::Denied
+        {
+            return Ok(Some(denial));
+        }
+    }
+    Ok(None)
+}
+
+/// Per-tenant MCP rate limit, called by the MCP proxy handlers once the
+/// bearer has been resolved to a tenant. Returns the 429 (or 503 when Redis
+/// is down) to send instead of proxying, or `None` to proceed. `RATE_LIMIT_DISABLED=1` skips it.
+pub async fn check_mcp_tenant_rate_limit(state: &AppState, tenant: &str) -> Option<Response> {
+    if state.config.rate_limit.bench_bypass_enabled {
+        return None;
+    }
+    let config = &state.config.mcp_rate_limit;
+    let mut redis = state.redis.clone();
+    match check_mcp_tenant_windows(
+        &mut redis,
+        config,
+        tenant,
+        (MCP_GLOBAL_MIN_KEY, MCP_GLOBAL_HR_KEY),
+    )
+    .await
+    {
+        Ok(None) => None,
+        Ok(Some(denial)) => {
+            tracing::warn!(
+                "mcp rate limit [{:?}]: tenant={}... denied",
+                denial,
+                &tenant[..24.min(tenant.len())]
+            );
+            Some(mcp_denial_response(config, denial))
+        }
+        Err(e) => {
+            tracing::error!("check_mcp_tenant_rate_limit: Redis error: {}", e);
+            Some(rate_limiter_unavailable_response())
+        }
+    }
+}
+
+fn mcp_denial_response(config: &McpRateLimitConfig, denial: McpTenantDenial) -> Response {
+    match denial {
+        McpTenantDenial::TenantBurst => {
+            rate_limit_response("mcp_tenant_burst", config.tenant_per_minute, "min", 60)
+        }
+        McpTenantDenial::TenantSustained => {
+            rate_limit_response("mcp_tenant_sustained", config.tenant_per_hour, "hour", 300)
+        }
+        McpTenantDenial::GlobalBurst => {
+            rate_limit_response("mcp_global_burst", config.global_per_minute, "min", 60)
+        }
+        McpTenantDenial::GlobalSustained => {
+            rate_limit_response("mcp_global_sustained", config.global_per_hour, "hour", 300)
+        }
+    }
+}
+
 /// Pre-authentication rate limit for `/api/mcp`, `/api/mcp/sse`, and
 /// `/api/mcp/messages`.
 ///
-/// Every client IP uses the same `per_minute` / `per_hour` pair. There is
-/// no venue allowlist. Each request counts as 1, not a tool weight. The
-/// same request also counts toward the deployment-wide caps, which must
-/// stay higher than the per-IP caps. Bearer tokens are not exempt. Redis
-/// errors return 503, same as the accounts-exists limiter.
+/// Every client IP uses the same `per_minute` / `per_hour` pair, followed by
+/// a deployment-wide pre-authentication ceiling (`rate:mcp:preauth:global:*`)
+/// so distributed callers rotating uncached legacy delegate credentials
+/// cannot trigger unbounded on-chain Sui fullnode lookups before
+/// `classify_and_resolve` completes. Post-authentication per-tenant and
+/// authenticated global windows then run in `check_mcp_tenant_rate_limit`.
+/// Redis errors return 503, same as the accounts-exists limiter.
 /// `RATE_LIMIT_DISABLED=1` skips this, same as every other request-rate
 /// middleware.
 pub async fn mcp_rate_limit_middleware(
@@ -1647,13 +1869,11 @@ pub async fn mcp_rate_limit_middleware(
         Ok(WindowCheckResult::Allowed) => {}
     }
 
-    match check_global_mcp_rate_limit(&state, config.global_per_minute, config.global_per_hour)
-        .await
-    {
+    match check_mcp_preauth_global(&state, config.global_per_minute, config.global_per_hour).await {
         Ok(SponsorRlResult::MinuteLimitExceeded) => {
             return rate_limit_response("mcp_global_burst", config.global_per_minute, "min", 60);
         }
-        Ok(SponsorRlResult::HourLimitExceeded) => {
+        Ok(SponsorRlResult::HourLimitExceeded) | Ok(SponsorRlResult::DayLimitExceeded) => {
             return rate_limit_response(
                 "mcp_global_sustained",
                 config.global_per_hour,
@@ -2583,7 +2803,7 @@ mod tests {
         assert!(!config.bench_bypass_enabled);
     }
 
-    // ---- SponsorRlResult variants ----
+    // ---- SponsorRlResult variants & daily global cap (GH #1031) ----
 
     #[test]
     fn test_sponsor_rl_result_variants() {
@@ -2596,6 +2816,10 @@ mod tests {
             SponsorRlResult::HourLimitExceeded,
             SponsorRlResult::HourLimitExceeded
         );
+        assert_eq!(
+            SponsorRlResult::DayLimitExceeded,
+            SponsorRlResult::DayLimitExceeded
+        );
         assert_ne!(
             SponsorRlResult::Allowed,
             SponsorRlResult::MinuteLimitExceeded
@@ -2604,5 +2828,559 @@ mod tests {
             SponsorRlResult::MinuteLimitExceeded,
             SponsorRlResult::HourLimitExceeded
         );
+        assert_ne!(
+            SponsorRlResult::HourLimitExceeded,
+            SponsorRlResult::DayLimitExceeded
+        );
+    }
+
+    /// In-memory sliding-window simulator matching `SLIDING_WINDOW_LUA`
+    /// (`ZREMRANGEBYSCORE key -inf window_start`, `ZCARD`, `count + weight > limit`, `ZADD`)
+    /// and the exact 5-bucket `/sponsor` rate-limit sequence in
+    /// `sponsor_rate_limit_middleware` + `check_global_sponsor_rate_limit`.
+    #[derive(Default)]
+    struct SponsorSlidingWindowSim {
+        windows: std::collections::HashMap<String, Vec<f64>>,
+    }
+
+    impl SponsorSlidingWindowSim {
+        fn check_and_record(
+            &mut self,
+            key: &str,
+            window_start: f64,
+            now: f64,
+            limit: i64,
+            weight: i64,
+        ) -> WindowCheckResult {
+            let entries = self.windows.entry(key.to_string()).or_default();
+            entries.retain(|score| *score > window_start);
+            if (entries.len() as i64) + weight > limit {
+                return WindowCheckResult::Denied;
+            }
+            for _ in 0..weight {
+                entries.push(now);
+            }
+            WindowCheckResult::Allowed
+        }
+
+        fn check_sponsor_request(
+            &mut self,
+            ip: &str,
+            now: f64,
+            config: &crate::types::SponsorRateLimitConfig,
+        ) -> Option<Response> {
+            let min_key = format!("rate:sponsor:ip:min:{ip}");
+            let hr_key = format!("rate:sponsor:ip:hr:{ip}");
+            if self.check_and_record(
+                &min_key,
+                now - SPONSOR_MIN_WINDOW_MS,
+                now,
+                config.per_minute,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_ip_burst",
+                    config.per_minute,
+                    "min",
+                    60,
+                ));
+            }
+            if self.check_and_record(
+                &hr_key,
+                now - SPONSOR_HR_WINDOW_MS,
+                now + 0.1,
+                config.per_hour,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_ip_sustained",
+                    config.per_hour,
+                    "hour",
+                    300,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_MIN_KEY,
+                now - SPONSOR_MIN_WINDOW_MS,
+                now,
+                config.global_per_minute,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_burst",
+                    config.global_per_minute,
+                    "min",
+                    60,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_HR_KEY,
+                now - SPONSOR_HR_WINDOW_MS,
+                now + 0.1,
+                config.global_per_hour,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_sustained",
+                    config.global_per_hour,
+                    "hour",
+                    300,
+                ));
+            }
+            if self.check_and_record(
+                SPONSOR_GLOBAL_DAY_KEY,
+                now - SPONSOR_DAY_WINDOW_MS,
+                now + 0.2,
+                config.global_per_day,
+                1,
+            ) == WindowCheckResult::Denied
+            {
+                return Some(rate_limit_response(
+                    "sponsor_global_daily",
+                    config.global_per_day,
+                    "day",
+                    3600,
+                ));
+            }
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn sponsor_daily_global_cap_blocks_multi_ip_sustained_drain_across_hours() {
+        // Reproduces GH #1031: 34 source IPs each stay inside
+        // 10/min and 30/hr per IP, pacing 1,000 requests/hour across Hour 0
+        // and Hour 1 (2,000 total). In Hour 2, even though every per-IP bucket
+        // and the rolling 1-hour global bucket have expired, the 24-hour global
+        // cap (`rate:sponsor:global:day`, default 2000) rejects request #2,001
+        // with 429 (`layer: "sponsor_global_daily"`).
+        let config = crate::types::SponsorRateLimitConfig::default();
+        assert_eq!(config.per_minute, 10);
+        assert_eq!(config.per_hour, 30);
+        assert_eq!(config.global_per_minute, 100);
+        assert_eq!(config.global_per_hour, 1000);
+        assert_eq!(config.global_per_day, 2000);
+
+        let mut sim = SponsorSlidingWindowSim::default();
+        let t0 = 1_700_000_000_000.0;
+
+        for hour in 0..2 {
+            let hour_base = t0 + (hour as f64) * (SPONSOR_HR_WINDOW_MS + 1_000.0);
+            let mut sent_in_hour = 0;
+
+            // 30 waves separated by 61s so neither per-IP minute (10/min),
+            // per-IP hour (30/hr), nor global minute (100/min) trips, while
+            // 34 IPs × <=30/hr reaches the 1000/hr global ceiling.
+            for wave in 0..30 {
+                let wave_ts = hour_base + (wave as f64) * 61_000.0;
+                for ip_idx in 0..34 {
+                    if sent_in_hour >= 1000 {
+                        break;
+                    }
+                    let ip = format!("203.0.113.{}", ip_idx + 1);
+                    let denied = sim.check_sponsor_request(&ip, wave_ts + (ip_idx as f64), &config);
+                    assert!(
+                        denied.is_none(),
+                        "request {} in hour {} from {} should be allowed",
+                        sent_in_hour + 1,
+                        hour,
+                        ip
+                    );
+                    sent_in_hour += 1;
+                }
+            }
+            assert_eq!(sent_in_hour, 1000);
+        }
+
+        // Hour 2: all per-IP buckets and `rate:sponsor:global:hr` are now empty,
+        // and the attacker rotates to a brand-new 35th IP.
+        let hour_2_ts = t0 + 2.0 * (SPONSOR_HR_WINDOW_MS + 1_000.0);
+        let denied_resp = sim
+            .check_sponsor_request("198.51.100.250", hour_2_ts, &config)
+            .expect("2001st request within 24h must be rejected by daily global cap");
+
+        assert_eq!(denied_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(denied_resp.headers().get("retry-after").unwrap(), "3600");
+        let body_bytes = axum::body::to_bytes(denied_resp.into_body(), 4096)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error"], "Rate limit exceeded");
+        assert_eq!(body_json["layer"], "sponsor_global_daily");
+        assert_eq!(body_json["limit"], "2000 weighted-requests/day");
+        assert_eq!(body_json["retry_after_seconds"], 3600);
+
+        // After the full 24h rolling window slides past Hour 0, sponsorship recovers.
+        let next_day_ts = t0 + SPONSOR_DAY_WINDOW_MS + 1_000.0;
+        assert!(
+            sim.check_sponsor_request("198.51.100.250", next_day_ts, &config)
+                .is_none(),
+            "requests must be allowed again once the 24h sliding window advances past Hour 0"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL pointing to a real Redis instance"]
+    async fn sponsor_global_daily_cap_denies_past_window_redis() {
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must be set when running Redis integration tests");
+        let client = redis::Client::open(redis_url).expect("valid TEST_REDIS_URL");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect to test Redis");
+
+        const DAILY_LIMIT: i64 = 15;
+        let key = format!("{}:test:{}", SPONSOR_GLOBAL_DAY_KEY, Uuid::new_v4());
+        let t0 = chrono::Utc::now().timestamp_millis() as f64;
+
+        // Spread requests across 3 simulated hours within the same 24h window.
+        for i in 0..DAILY_LIMIT {
+            let now = t0 + (i / 5) as f64 * SPONSOR_HR_WINDOW_MS + (i as f64);
+            let window_start = now - SPONSOR_DAY_WINDOW_MS;
+            let res = check_and_record_window(
+                &mut connection,
+                &key,
+                window_start,
+                now,
+                DAILY_LIMIT,
+                1,
+                SPONSOR_DAY_TTL_SECS,
+            )
+            .await
+            .expect("Redis script failed");
+            assert_eq!(res, WindowCheckResult::Allowed);
+        }
+
+        let hour_3_now = t0 + 3.0 * SPONSOR_HR_WINDOW_MS;
+        let denied = check_and_record_window(
+            &mut connection,
+            &key,
+            hour_3_now - SPONSOR_DAY_WINDOW_MS,
+            hour_3_now,
+            DAILY_LIMIT,
+            1,
+            SPONSOR_DAY_TTL_SECS,
+        )
+        .await
+        .expect("Redis script failed");
+        assert_eq!(denied, WindowCheckResult::Denied);
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("clean test key");
+    }
+
+    // ---- GH #1050: per-tenant MCP bucket ----
+
+    #[test]
+    fn mcp_tenant_keys_are_per_tenant_and_mcp_scoped() {
+        let (min_a, hr_a) = mcp_tenant_rate_keys("0xaa:11");
+        let (min_b, hr_b) = mcp_tenant_rate_keys("0xbb:22");
+        assert_eq!(min_a, "rate:mcp:tenant:min:0xaa:11");
+        assert_eq!(hr_a, "rate:mcp:tenant:hr:0xaa:11");
+        assert_ne!(min_a, min_b);
+        assert_ne!(hr_a, hr_b);
+        assert_ne!(min_a, MCP_GLOBAL_MIN_KEY);
+        assert_ne!(min_a, MCP_PREAUTH_GLOBAL_MIN_KEY);
+        assert_ne!(MCP_GLOBAL_MIN_KEY, MCP_PREAUTH_GLOBAL_MIN_KEY);
+        assert_ne!(MCP_GLOBAL_HR_KEY, MCP_PREAUTH_GLOBAL_HR_KEY);
+    }
+
+    #[tokio::test]
+    async fn mcp_preauth_ceiling_caps_rotating_invalid_legacy_delegates_while_isolating_tenant_quotas(
+    ) {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// In-memory Redis ConnectionLike double that implements the exact
+        /// sliding-window ZREMRANGEBYSCORE + ZCARD + ZADD Lua script used by
+        /// `check_and_record_window`, so this test runs in every CI unit suite
+        /// without requiring an external Redis daemon.
+        #[derive(Clone, Default)]
+        struct SlidingWindowMockRedis {
+            sets: Arc<Mutex<HashMap<String, Vec<(f64, String)>>>>,
+        }
+
+        impl redis::aio::ConnectionLike for SlidingWindowMockRedis {
+            fn req_packed_command<'a>(
+                &'a mut self,
+                cmd: &'a redis::Cmd,
+            ) -> redis::RedisFuture<'a, redis::Value> {
+                let sets = Arc::clone(&self.sets);
+                let args: Vec<String> = cmd
+                    .args_iter()
+                    .map(|a| match a {
+                        redis::Arg::Simple(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                        redis::Arg::Cursor => "0".to_string(),
+                    })
+                    .collect();
+                Box::pin(async move {
+                    // EVAL/EVALSHA <script_or_sha> 1 <key> <window_start> <now> <limit> <weight> <ttl> <request_id>
+                    assert!(matches!(
+                        args.first().map(String::as_str),
+                        Some("EVAL" | "EVALSHA")
+                    ));
+                    let key = &args[3];
+                    let window_start: f64 = args[4].parse().unwrap();
+                    let now: f64 = args[5].parse().unwrap();
+                    let limit: usize = args[6].parse().unwrap();
+                    let weight: usize = args[7].parse().unwrap();
+                    let member_base = &args[9];
+
+                    let mut guard = sets.lock().unwrap();
+                    let entries = guard.entry(key.clone()).or_default();
+                    entries.retain(|(score, _)| *score > window_start);
+                    if entries.len() + weight > limit {
+                        return Ok(redis::Value::Int(0));
+                    }
+                    for i in 0..weight {
+                        entries.push((now, format!("{member_base}:{i}")));
+                    }
+                    Ok(redis::Value::Int(1))
+                })
+            }
+
+            fn req_packed_commands<'a>(
+                &'a mut self,
+                _cmd: &'a redis::Pipeline,
+                _offset: usize,
+                _count: usize,
+            ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn get_db(&self) -> i64 {
+                0
+            }
+        }
+
+        let mut redis = SlidingWindowMockRedis::default();
+        let config = McpRateLimitConfig {
+            per_minute: 20,
+            per_hour: 100,
+            tenant_per_minute: 5,
+            tenant_per_hour: 50,
+            global_per_minute: 12,
+            global_per_hour: 120,
+        };
+
+        // 1. Tenant A and Tenant B have isolated post-auth per-tenant buckets:
+        //    Tenant A sending 10 authenticated requests hits its own tenant_per_minute=5
+        //    cap without exhausting Tenant B's 5-request quota or the post-auth global cap (12).
+        let mut a_allowed = 0;
+        let mut a_tenant_denied = 0;
+        for _ in 0..10 {
+            match check_mcp_tenant_windows(
+                &mut redis,
+                &config,
+                "0xaaa:1111",
+                (MCP_GLOBAL_MIN_KEY, MCP_GLOBAL_HR_KEY),
+            )
+            .await
+            .unwrap()
+            {
+                None => a_allowed += 1,
+                Some(McpTenantDenial::TenantBurst) => a_tenant_denied += 1,
+                Some(other) => panic!("unexpected denial for tenant A: {other:?}"),
+            }
+        }
+        assert_eq!(a_allowed, 5);
+        assert_eq!(a_tenant_denied, 5);
+
+        let mut b_allowed = 0;
+        for _ in 0..5 {
+            assert_eq!(
+                check_mcp_tenant_windows(
+                    &mut redis,
+                    &config,
+                    "0xbbb:2222",
+                    (MCP_GLOBAL_MIN_KEY, MCP_GLOBAL_HR_KEY),
+                )
+                .await
+                .unwrap(),
+                None,
+                "tenant B must retain its full per-tenant quota when tenant A is throttled"
+            );
+            b_allowed += 1;
+        }
+        assert_eq!(b_allowed, 5);
+
+        // 2. Rotating invalid legacy delegate requests across distributed IPs
+        //    are capped by `check_mcp_preauth_global_windows` BEFORE reaching
+        //    `classify_and_resolve` / on-chain Sui fullnode checks.
+        let mut preauth_admitted_to_fullnode = 0;
+        let mut preauth_global_denied = 0;
+        for i in 0..30 {
+            let _rotated_delegate = format!("0xdeadbeef{i:04x}:{i:064x}");
+            match check_mcp_preauth_global_windows(
+                &mut redis,
+                config.global_per_minute,
+                config.global_per_hour,
+                (MCP_PREAUTH_GLOBAL_MIN_KEY, MCP_PREAUTH_GLOBAL_HR_KEY),
+            )
+            .await
+            .unwrap()
+            {
+                SponsorRlResult::Allowed => preauth_admitted_to_fullnode += 1,
+                SponsorRlResult::MinuteLimitExceeded => preauth_global_denied += 1,
+                other => panic!("unexpected pre-auth global result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            preauth_admitted_to_fullnode, config.global_per_minute as usize,
+            "pre-auth global ceiling must cap rotating uncached legacy delegate floods"
+        );
+        assert_eq!(
+            preauth_global_denied,
+            30 - config.global_per_minute as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tenant_denial_is_429_with_retry_after() {
+        let config = McpRateLimitConfig::default();
+        let resp = mcp_denial_response(&config, McpTenantDenial::TenantBurst);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()["retry-after"], "60");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["layer"], "mcp_tenant_burst");
+        assert_eq!(json["limit"], "1000 weighted-requests/min");
+        assert_eq!(json["retry_after_seconds"], 60);
+
+        let resp = mcp_denial_response(&config, McpTenantDenial::TenantSustained);
+        assert_eq!(resp.headers()["retry-after"], "300");
+    }
+
+    #[test]
+    fn mcp_tenant_defaults_stay_below_global_caps() {
+        let c = McpRateLimitConfig::default();
+        assert!(c.tenant_per_minute < c.global_per_minute);
+        assert!(c.tenant_per_hour < c.global_per_hour);
+    }
+
+    /// GH #1050 regression. Tenant A and tenant B send concurrently. A sends
+    /// far more than its bucket; B stays inside its own. A must get
+    /// `mcp_tenant_burst` denials, B must get none, and A's refused requests
+    /// must not be recorded in the shared global window.
+    ///
+    /// Run with:
+    /// TEST_REDIS_URL=redis://127.0.0.1:6379 \
+    ///   cargo test mcp_tenant_a_exhausting_bucket_does_not_throttle_tenant_b -- --ignored
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL pointing to a real Redis instance"]
+    async fn mcp_tenant_a_exhausting_bucket_does_not_throttle_tenant_b() {
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must be set when running Redis integration tests");
+        let client = redis::Client::open(redis_url).expect("valid TEST_REDIS_URL");
+        let connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect to test Redis");
+
+        let run = Uuid::new_v4();
+        let tenant_a = format!("test-1050-{run}:a");
+        let tenant_b = format!("test-1050-{run}:b");
+        let global_min = format!("test:rate:mcp:global:min:{run}");
+        let global_hr = format!("test:rate:mcp:global:hr:{run}");
+
+        const TENANT_LIMIT: i64 = 10;
+        const A_REQUESTS: usize = 200;
+        const B_REQUESTS: usize = 10;
+        let config = Arc::new(McpRateLimitConfig {
+            per_minute: 2000,
+            per_hour: 8000,
+            tenant_per_minute: TENANT_LIMIT,
+            tenant_per_hour: 1000,
+            // Lower than A's request count: under the old shared bucket A
+            // alone would fill it and B would be refused.
+            global_per_minute: 50,
+            global_per_hour: 5000,
+        });
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(A_REQUESTS + B_REQUESTS + 1));
+        let mut tasks = Vec::new();
+        for i in 0..(A_REQUESTS + B_REQUESTS) {
+            let mut conn = connection.clone();
+            let tenant = if i % 21 == 20 && i / 21 < B_REQUESTS {
+                tenant_b.clone()
+            } else {
+                tenant_a.clone()
+            };
+            let (gm, gh, cfg, bar) = (
+                global_min.clone(),
+                global_hr.clone(),
+                config.clone(),
+                barrier.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                bar.wait().await;
+                let r = check_mcp_tenant_windows(&mut conn, &cfg, &tenant, (&gm, &gh))
+                    .await
+                    .expect("Redis script failed");
+                (tenant, r)
+            }));
+        }
+        barrier.wait().await;
+
+        let (mut a_ok, mut a_denied, mut b_ok, mut b_denied) = (0, 0, 0, 0);
+        for task in tasks {
+            let (tenant, result) = task.await.expect("task panicked");
+            match (tenant == tenant_b, result) {
+                (false, None) => a_ok += 1,
+                (false, Some(McpTenantDenial::TenantBurst)) => a_denied += 1,
+                (false, Some(other)) => panic!("tenant A denied by {other:?}"),
+                (true, None) => b_ok += 1,
+                (true, Some(d)) => {
+                    b_denied += 1;
+                    eprintln!("tenant B denied by {d:?}");
+                }
+            }
+        }
+        eprintln!("#1050: A ok={a_ok} denied={a_denied}; B ok={b_ok} denied={b_denied}");
+        assert_eq!(a_ok + a_denied, A_REQUESTS);
+        assert_eq!(b_ok + b_denied, B_REQUESTS);
+        assert_eq!(a_ok, TENANT_LIMIT as usize, "A gets exactly its own bucket");
+        assert_eq!(b_denied, 0, "A exhausting its bucket must not throttle B");
+        assert_eq!(b_ok, B_REQUESTS);
+
+        let mut conn = connection.clone();
+        let global_count: i64 = redis::cmd("ZCARD")
+            .arg(&global_min)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            global_count,
+            TENANT_LIMIT + B_REQUESTS as i64,
+            "A's refused requests must not spend the global window"
+        );
+
+        // A is still refused afterwards, with the 429 + Retry-After shape.
+        let denial =
+            check_mcp_tenant_windows(&mut conn, &config, &tenant_a, (&global_min, &global_hr))
+                .await
+                .unwrap()
+                .expect("A stays over its bucket");
+        let resp = mcp_denial_response(&config, denial);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()["retry-after"], "60");
+
+        let (a_min, a_hr) = mcp_tenant_rate_keys(&tenant_a);
+        let (b_min, b_hr) = mcp_tenant_rate_keys(&tenant_b);
+        let _: i64 = redis::cmd("DEL")
+            .arg(&[a_min, a_hr, b_min, b_hr, global_min, global_hr])
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }

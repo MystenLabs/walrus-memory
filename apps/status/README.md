@@ -31,7 +31,7 @@ pnpm --filter @memwal/status dev:client
 ## Runtime env
 
 - `STATUS_RELAYER_PRODUCTION_URL`: production relayer base URL, default `https://relayer.memory.walrus.xyz`
-- `STATUS_RELAYER_STAGING_URL`: staging relayer base URL, default `https://relayer-staging.memory.walrus.xyz`
+- `STATUS_RELAYER_STAGING_URL`: staging relayer base URL, default `https://relayer.dev.memwal.ai`
 - `STATUS_RELAYER_URL`: backward-compatible fallback for production if `STATUS_RELAYER_PRODUCTION_URL` is unset
 - `STATUS_HEALTH_PATH`: health path, default `/health`
 - `STATUS_REQUEST_TIMEOUT_MS`: probe timeout, default `8000`

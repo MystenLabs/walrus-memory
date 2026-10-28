@@ -27,6 +27,7 @@ from .client import (
     MemWalClockDriftError,
     MemWalCompatibilityError,
     MemWalError,
+    MemWalJsonBodyError,
     MemWalRateLimited,
     MemWalRememberJobFailed,
     MemWalRememberJobNotFound,
@@ -43,6 +44,7 @@ from .types import (
     AskMemory,
     AskResult,
     EmbedResult,
+    ForgetResult,
     HealthResult,
     MemWalConfig,
     NamespacesResult,
@@ -83,6 +85,7 @@ __all__ = [
     "MemWalError",
     "MemWalCompatibilityError",
     "MemWalClockDriftError",
+    "MemWalJsonBodyError",
     "MemWalRateLimited",
     "MemWalRememberJobFailed",
     "MemWalRememberJobNotFound",
@@ -118,6 +121,7 @@ __all__ = [
     "AnalyzedFact",
     "HealthResult",
     "RestoreResult",
+    "ForgetResult",
     "NamespaceSummary",
     "NamespacesResult",
     "ScoringWeights",
@@ -128,4 +132,4 @@ __all__ = [
     "RecallManualResult",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

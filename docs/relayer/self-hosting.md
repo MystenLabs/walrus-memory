@@ -116,6 +116,7 @@ The relayer reads its configuration from environment variables, grouped below by
 
 - `OPENAI_API_KEY`: Enables real embeddings (falls back to mock embeddings without it).
 - `OPENAI_API_BASE`: Point to an OpenAI-compatible provider like OpenRouter.
+- `ALLOWED_ORIGINS`: Comma-separated browser origins allowed to call the main relayer API directly, for example `https://app.example.com`. Unset means deny-all on the main relayer API: no `Access-Control-Allow-Origin` header is sent, so browsers block direct requests there. Server-side callers are unaffected, and the emergency [security-delete routes](/api/security-delete) (`/api/security-deletable-blobs` and `/api/security-delete`) intentionally apply a wildcard (`*`) `Access-Control-Allow-Origin` policy so browser-based recovery and deletion tools can call them directly without a backend proxy.
 
 ### Optional rate limits and storage
 

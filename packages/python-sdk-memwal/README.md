@@ -106,7 +106,7 @@ async def test_memory_flow():
     assert "dark mode" in result.results[0].text
 ```
 
-The mock supports remember/job polling, bulk remember, recall, analyze, embed, ask, health, restore, list_namespaces, `forget(blob_id)`, and `clear(namespace)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
+The mock supports remember/job polling, bulk remember, recall, analyze, embed, ask, health, restore, list_namespaces, `forget(blob_id)` (synchronous per-blob deletion returning `bool`), `forget_namespace(namespace?)` (namespace erasure returning `ForgetResult`), and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
 
 ### Context Manager
 
@@ -140,7 +140,7 @@ memwal = MemWal.create(
 |-------|-------------|
 | `prod` | `https://relayer.memory.walrus.xyz` |
 | `dev` | `https://relayer.dev.memwal.ai` |
-| `staging` | `https://relayer-staging.memory.walrus.xyz` |
+| `staging` | `https://relayer.dev.memwal.ai` |
 
 Precedence: any explicit **`server_url` wins over `env`**, including the hosted
 default. `env` applies only when `server_url` is omitted (`None`). An unknown
@@ -213,11 +213,22 @@ Create a new async client.
 | `await analyze(text, namespace?)` | Extract and store facts |
 | `await ask(question, limit?, namespace?)` | Ask a question answered using memories |
 | `await restore(namespace, limit?)` | Restore a namespace |
+| `await forget(namespace?)` | Delete index rows for the namespace. Walrus blobs stay. Returns `ForgetResult`. |
 | `await list_namespaces(cursor?, limit?)` | List namespaces that hold memories; paginate on `has_more` |
 | `await health()` | Check server health |
 | `await remember_manual(opts)` | Store encrypted payload + pre-computed vector |
 | `await recall_manual(opts)` | Search with pre-computed vector |
 | `await get_public_key_hex()` | Get Ed25519 public key |
+| `destroy()` | Zero internal key seed buffer, drop signing credentials/session cache, and permanently invalidate the client |
+| `await close(clear_keys=False)` | Close the underlying HTTP client (pass `clear_keys=True` to also run `destroy()`) |
+
+### Key Lifecycle & `destroy()`
+
+For parity with the TypeScript SDK's `destroy()`, `MemWal` and `MemWalSync` expose `destroy()` and `close(clear_keys=True)`:
+
+- `key` may be passed as a hex string, `suiprivkey1...` string, or a 32-byte `bytes` / `bytearray`. When passed as `bytearray`, the SDK copies the bytes into its own internal buffer so `destroy()` zeroes only the client's copy and leaves the caller's `bytearray` untouched.
+- Calling `destroy()` (or `await client.close(clear_keys=True)` / `sync_client.close(clear_keys=True)`) zero-fills the client's internal `bytearray` seed copy in place, clears `_private_key_hex`, drops the `_signing_key` and cached SEAL session references, cancels any in-flight initialization tasks, and causes subsequent or in-flight calls to raise `MemWalError`.
+- **CPython memory semantics**: Python `str` and `bytes` objects (and PyNaCl's internal C-level `SigningKey` buffers) are immutable in CPython and cannot be overwritten in place from pure Python. `destroy()` zeroes the mutable `bytearray` copy and drops all references to immutable key objects so they become eligible for garbage collection once the caller also releases its references. To minimize plaintext `str` copies in process memory, pass a 32-byte `bytearray` to `MemWal.create()` and zero your own buffer after creation.
 
 ## Authentication
 

@@ -1471,6 +1471,10 @@ pub struct SponsorRateLimitConfig {
     pub global_per_minute: i64,
     /// Deployment-wide sustained cap that protects the sponsor budget.
     pub global_per_hour: i64,
+    /// Deployment-wide cumulative rolling 24-hour cap (default: 2000) that
+    /// prevents multi-IP rotation from draining the sponsor gas budget across
+    /// consecutive hourly windows.
+    pub global_per_day: i64,
 }
 
 impl Default for SponsorRateLimitConfig {
@@ -1480,6 +1484,7 @@ impl Default for SponsorRateLimitConfig {
             per_hour: 30,
             global_per_minute: 100,
             global_per_hour: 1000,
+            global_per_day: 2000,
         }
     }
 }
@@ -1505,6 +1510,19 @@ impl SponsorRateLimitConfig {
         if let Ok(v) = std::env::var("SPONSOR_GLOBAL_RATE_LIMIT_PER_HOUR") {
             if let Ok(n) = v.parse() {
                 c.global_per_hour = n;
+            }
+        }
+        for key in [
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY",
+            "SPONSOR_RL_GLOBAL_PER_DAY",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                if let Ok(n) = v.parse::<i64>() {
+                    if n > 0 {
+                        c.global_per_day = n;
+                        break;
+                    }
+                }
             }
         }
         c
@@ -1643,6 +1661,13 @@ pub struct McpRateLimitConfig {
     pub per_minute: i64,
     /// Requests per hour for every client IP (default: 8000).
     pub per_hour: i64,
+    /// Requests per minute for one tenant, keyed by account id + delegate
+    /// public key after authentication (default: 1000). Must stay below
+    /// `global_per_minute` so one tenant cannot fill the shared ceiling.
+    pub tenant_per_minute: i64,
+    /// Requests per hour for one tenant (default: 6000). Must stay below
+    /// `global_per_hour`.
+    pub tenant_per_hour: i64,
     /// Deployment-wide cap (default: 2500). Must stay above `per_minute`.
     pub global_per_minute: i64,
     /// Deployment-wide sustained cap (default: 15000). Must stay above `per_hour`.
@@ -1654,6 +1679,8 @@ impl Default for McpRateLimitConfig {
         Self {
             per_minute: 2000,
             per_hour: 8000,
+            tenant_per_minute: 1000,
+            tenant_per_hour: 6000,
             global_per_minute: 2500,
             global_per_hour: 15000,
         }
@@ -1678,6 +1705,14 @@ impl McpRateLimitConfig {
         let config = Self {
             per_minute: env_positive_i64("MCP_RATE_LIMIT_PER_MINUTE", defaults.per_minute),
             per_hour: env_positive_i64("MCP_RATE_LIMIT_PER_HOUR", defaults.per_hour),
+            tenant_per_minute: env_positive_i64(
+                "MCP_TENANT_RATE_LIMIT_PER_MINUTE",
+                defaults.tenant_per_minute,
+            ),
+            tenant_per_hour: env_positive_i64(
+                "MCP_TENANT_RATE_LIMIT_PER_HOUR",
+                defaults.tenant_per_hour,
+            ),
             global_per_minute: env_positive_i64(
                 "MCP_GLOBAL_RATE_LIMIT_PER_MINUTE",
                 defaults.global_per_minute,
@@ -1692,6 +1727,20 @@ impl McpRateLimitConfig {
                 "MCP global per-minute cap {} is not above the per-IP cap {}; one IP can exhaust the deployment",
                 config.global_per_minute,
                 config.per_minute
+            );
+        }
+        if config.global_per_minute <= config.tenant_per_minute {
+            tracing::warn!(
+                "MCP global per-minute cap {} is not above the per-tenant cap {}; one tenant can exhaust the deployment",
+                config.global_per_minute,
+                config.tenant_per_minute
+            );
+        }
+        if config.global_per_hour <= config.tenant_per_hour {
+            tracing::warn!(
+                "MCP global per-hour cap {} is not above the per-tenant cap {}; one tenant can exhaust the deployment",
+                config.global_per_hour,
+                config.tenant_per_hour
             );
         }
         if config.global_per_hour <= config.per_hour {
@@ -1830,6 +1879,15 @@ pub struct RememberRequest {
     /// paid on-chain blob. Omit for the default (each request is independent).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Opt-in content-hash dedupe (#769). When true the server derives the
+    /// idempotency key from `(owner, namespace, text)`, so remembering the
+    /// same text twice returns the first job — and therefore its `blob_id` —
+    /// instead of paying for a second Walrus write and embedding call.
+    /// Overrides `idempotency_key` when both are set, because the first-party
+    /// SDKs always send an auto-generated one. Defaults to false: without it
+    /// every request stays an independent write.
+    #[serde(default)]
+    pub dedupe: bool,
 }
 
 // ============================================================
@@ -2784,6 +2842,10 @@ pub enum AppError {
     /// silently-dropped turn into one retried with exponential backoff —
     /// closing the bench-completion gap diagnosed during the LME v2 run.
     UpstreamUnavailable(String),
+    /// Upstream embedding or LLM provider failure (HTTP 401/402/403/408/429/5xx,
+    /// transport error, or invalid/empty response). Maps to HTTP 503 with
+    /// `code: "EMBEDDING_PROVIDER_UNAVAILABLE"` and `"retryable": true`.
+    EmbeddingProviderUnavailable(String),
     /// Operator write pause (`WRITES_PAUSED`). HTTP 503 with a stable
     /// client-visible message, distinct from transient upstream failures.
     WritesPaused(String),
@@ -2810,6 +2872,9 @@ impl std::fmt::Display for AppError {
             }
             AppError::QuotaExceeded(msg) => write!(f, "Quota Exceeded: {}", msg),
             AppError::UpstreamUnavailable(msg) => write!(f, "Upstream Unavailable: {}", msg),
+            AppError::EmbeddingProviderUnavailable(msg) => {
+                write!(f, "Embedding Provider Unavailable: {}", msg)
+            }
             AppError::WritesPaused(msg) => write!(f, "Writes Paused: {}", msg),
         }
     }
@@ -2867,15 +2932,42 @@ impl axum::response::IntoResponse for AppError {
                 // clients.
                 let trace_id = crate::observability::current_request_id()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let sanitized_msg = sanitize_upstream_error_for_logging(msg);
                 tracing::warn!(
                     request_id = %trace_id,
                     "Upstream unavailable: {}",
-                    msg,
+                    sanitized_msg,
                 );
                 (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     format!("Upstream temporarily unavailable (traceId: {})", trace_id),
                 )
+            }
+            AppError::EmbeddingProviderUnavailable(msg) => {
+                // log the upstream details server-side (scrubbing raw response
+                // bodies so credentials or billing payloads are not emitted to
+                // log sinks), return 503 so the SDK / harness will retry per
+                // their transient-error policy.
+                let trace_id = crate::observability::current_request_id()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let sanitized_msg = sanitize_upstream_error_for_logging(msg);
+                tracing::warn!(
+                    request_id = %trace_id,
+                    "Embedding provider unavailable: {}",
+                    sanitized_msg,
+                );
+                let message = format!("Upstream temporarily unavailable (traceId: {})", trace_id);
+                let body = serde_json::json!({
+                    "error": message,
+                    "code": EMBEDDING_PROVIDER_UNAVAILABLE_CODE,
+                    "retryable": true,
+                    "traceId": trace_id,
+                });
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(body),
+                )
+                    .into_response();
             }
         };
 
@@ -2883,6 +2975,46 @@ impl axum::response::IntoResponse for AppError {
         (status, axum::Json(body)).into_response()
     }
 }
+
+/// Sanitizes upstream provider error strings for server logging telemetry.
+/// Preserves the provider prefix and HTTP status code, while stripping
+/// untrusted raw body payloads that could leak API keys, tokens, or paths.
+pub(crate) fn sanitize_upstream_error_for_logging(msg: &str) -> String {
+    if let Some(pos) = msg.find("): ") {
+        format!("{} [body scrubbed]", &msg[..=pos])
+    } else if let Some(code_pos) = msg.find("(code=") {
+        if let Some(end_paren) = msg[code_pos..].find(')') {
+            let end = code_pos + end_paren;
+            format!("{} [body scrubbed]", &msg[..=end])
+        } else {
+            "OpenRouter upstream error [body scrubbed]".to_string()
+        }
+    } else if msg.starts_with("Failed to read ") {
+        if let Some(colon_pos) = msg.find(':') {
+            format!("{} [transport error]", &msg[..colon_pos])
+        } else {
+            msg.to_string()
+        }
+    } else if msg.starts_with("Embedding API returned no data")
+        || msg.starts_with("Summarization returned empty result")
+        || msg.starts_with("Memory encryption backend is unavailable")
+        || msg.starts_with("Sponsor auth Redis unavailable")
+        || msg.starts_with("security-delete Sui RPC")
+        || msg.starts_with("Embedding API upstream error (")
+        || msg.starts_with("LLM API upstream error (")
+        || msg.starts_with("Summarization API upstream error (")
+        || msg.starts_with("Embedding request failed:")
+        || msg.starts_with("LLM request failed:")
+        || msg.starts_with("Summarization request failed:")
+        || msg.starts_with("Failed to parse ")
+    {
+        msg.to_string()
+    } else {
+        "Upstream provider temporarily unavailable [body scrubbed]".to_string()
+    }
+}
+
+pub const EMBEDDING_PROVIDER_UNAVAILABLE_CODE: &str = "EMBEDDING_PROVIDER_UNAVAILABLE";
 
 impl AppError {
     pub fn kind(&self) -> &'static str {
@@ -2896,6 +3028,7 @@ impl AppError {
             AppError::RateLimited(_) => "rate_limited",
             AppError::QuotaExceeded(_) => "quota_exceeded",
             AppError::UpstreamUnavailable(_) => "upstream_unavailable",
+            AppError::EmbeddingProviderUnavailable(_) => "embedding_provider_unavailable",
             AppError::WritesPaused(_) => "writes_paused",
             AppError::RecallTimeout { .. } => "recall_timeout",
         }
@@ -3627,6 +3760,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn app_error_embedding_provider_unavailable_body_carries_code_retryable_and_trace_id_without_leaking_provider_body(
+    ) {
+        let err = AppError::EmbeddingProviderUnavailable(
+            r#"Embedding API upstream error (401 Unauthorized): {"error":{"message":"User not found.","code":401}}"#.into(),
+        );
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["code"], EMBEDDING_PROVIDER_UNAVAILABLE_CODE);
+        assert_eq!(json["retryable"], true);
+        let trace_id = json["traceId"].as_str().expect("traceId string");
+        assert!(!trace_id.is_empty());
+        let error_text = json["error"].as_str().expect("error string");
+        assert!(error_text.contains(trace_id));
+        assert!(!error_text.contains("User not found"));
+    }
+
+    #[tokio::test]
+    async fn app_error_upstream_unavailable_does_not_emit_embedding_provider_code() {
+        let err = AppError::UpstreamUnavailable("Memory encryption backend is unavailable".into());
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("code").is_none(),
+            "UpstreamUnavailable must not emit EMBEDDING_PROVIDER_UNAVAILABLE for non-inference 503s: {json}"
+        );
+        let error_text = json["error"].as_str().expect("error string");
+        assert!(error_text.contains("Upstream temporarily unavailable"));
+    }
+
     #[test]
     fn app_error_upstream_unavailable_kind_label() {
         let err = AppError::UpstreamUnavailable("test".into());
@@ -3635,6 +3802,8 @@ mod tests {
             "upstream_unavailable",
             "observability label must be stable for grafana/loki queries"
         );
+        let emb_err = AppError::EmbeddingProviderUnavailable("test".into());
+        assert_eq!(emb_err.kind(), "embedding_provider_unavailable");
     }
 
     #[tokio::test]
@@ -3699,6 +3868,8 @@ mod tests {
 
     // ── SponsorRateLimitConfig defaults ─────────────────────────────────
 
+    static SPONSOR_RATE_LIMIT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn sponsor_rate_limit_default_values() {
         let config = SponsorRateLimitConfig::default();
@@ -3706,6 +3877,53 @@ mod tests {
         assert_eq!(config.per_hour, 30);
         assert_eq!(config.global_per_minute, 100);
         assert_eq!(config.global_per_hour, 1000);
+        assert_eq!(config.global_per_day, 2000);
+    }
+
+    #[test]
+    fn sponsor_rate_limit_from_env_parses_daily_cap_and_rejects_non_positive() {
+        let _lock = SPONSOR_RATE_LIMIT_ENV_LOCK.lock().unwrap();
+        let keys = [
+            "SPONSOR_RATE_LIMIT_PER_MINUTE",
+            "SPONSOR_RATE_LIMIT_PER_HOUR",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_MINUTE",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_HOUR",
+            "SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY",
+            "SPONSOR_RL_GLOBAL_PER_DAY",
+        ];
+        let saved: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        struct Restore<'a>(&'a [(&'static str, Option<String>)]);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                for (key, previous) in self.0 {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(&saved);
+
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "0");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2000);
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "-10");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2000);
+
+        std::env::set_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY", "3500");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 3500);
+
+        std::env::remove_var("SPONSOR_GLOBAL_RATE_LIMIT_PER_DAY");
+        std::env::set_var("SPONSOR_RL_GLOBAL_PER_DAY", "2400");
+        assert_eq!(SponsorRateLimitConfig::from_env().global_per_day, 2400);
     }
 
     // ── ReadApiRateLimitConfig defaults ─────────────────────────────────
@@ -4262,5 +4480,35 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], WRITES_PAUSED_ERROR);
+    }
+
+    #[test]
+    fn sanitize_upstream_error_for_logging_scrubs_bodies() {
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                r#"Embedding API upstream error (401 Unauthorized): {"error":"secret"}"#
+            ),
+            "Embedding API upstream error (401 Unauthorized) [body scrubbed]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                "OpenRouter upstream error (code=504): timeout occurred"
+            ),
+            "OpenRouter upstream error (code=504) [body scrubbed]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging(
+                "Failed to read LLM response body: stream closed"
+            ),
+            "Failed to read LLM response body [transport error]"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging("Embedding API upstream error (401)"),
+            "Embedding API upstream error (401)"
+        );
+        assert_eq!(
+            sanitize_upstream_error_for_logging("some untrusted error with secret sk-live-12345"),
+            "Upstream provider temporarily unavailable [body scrubbed]"
+        );
     }
 }

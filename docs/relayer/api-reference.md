@@ -262,11 +262,12 @@ Submit text as an encrypted memory job. The relayer returns after creating a bac
 {
   "text": "User prefers dark mode",
   "namespace": "demo",
-  "idempotency_key": "my-idempotency-key"
+  "idempotency_key": "my-idempotency-key",
+  "dedupe": true
 }
 ```
 
-`namespace` defaults to `"default"` if omitted and is limited to 255 UTF-8 bytes. `idempotency_key` is an optional string (up to 255 UTF-8 bytes); when supplied, repeated calls with the same key collapse onto the existing job row.
+`namespace` defaults to `"default"` if omitted and is limited to 255 UTF-8 bytes. `idempotency_key` is an optional string (up to 255 UTF-8 bytes); when supplied, repeated calls with the same key collapse onto the existing job row. `dedupe` is an optional boolean (default `false`); when `true`, the relayer derives a content-hash key from `(owner, namespace, text)` (overriding `idempotency_key`) and returns the existing job when that memory is still live, or writes a fresh job if the prior memory was deleted or expired.
 
 **Response:** `202 Accepted`
 
@@ -279,7 +280,7 @@ Submit text as an encrypted memory job. The relayer returns after creating a bac
 
 ### `GET /api/remember/:job_id`
 
-Poll a remember job. `status` is one of `pending`, `running`, `uploaded`, `done`, or `failed`. Failed jobs include an `error` message. Unknown job IDs and jobs that belong to another owner return `404`, so callers cannot enumerate job IDs.
+Poll a remember job. `status` is one of `pending`, `running`, `uploaded`, `done`, or `failed`. Failed jobs include an `error` message. When background embedding or summarization fails because the upstream inference provider is unavailable (including provider `401`, `402`, `403`, `429`, `5xx`, transport errors, or invalid JSON), `error` carries a sanitized message with `code=EMBEDDING_PROVIDER_UNAVAILABLE` and `traceId` instead of raw upstream error payloads. Unknown job IDs and jobs that belong to another owner return `404`, so callers cannot enumerate job IDs.
 
 **Response:**
 
@@ -519,6 +520,17 @@ Return an embedding vector for `text` without storing a memory. Uses the same mo
 ```json
 {
   "vector": [0.01, -0.02]
+}
+```
+
+When the upstream embedding or LLM provider fails on `/api/recall`, `/api/embed`, `/api/ask`, or `/api/analyze` (including provider `401`, `402`, `403`, `408`, `429`, `5xx`, transport errors, or malformed/empty provider responses), the relayer responds with `503 Service Unavailable` and never echoes raw upstream provider bodies:
+
+```json
+{
+  "error": "Upstream temporarily unavailable (traceId: 3f6e2b90-8c42-4a2b-9d1a-0c8e7a1f5b3d)",
+  "code": "EMBEDDING_PROVIDER_UNAVAILABLE",
+  "retryable": true,
+  "traceId": "3f6e2b90-8c42-4a2b-9d1a-0c8e7a1f5b3d"
 }
 ```
 

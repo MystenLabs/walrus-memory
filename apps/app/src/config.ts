@@ -1,6 +1,8 @@
 /**
  * App-wide configuration from environment variables
  */
+import { requiredMemwalIds } from './requiredMemwalIds'
+
 const DEFAULT_ANALYTICS_ALLOWED_HOSTS = 'walrus.xyz,www.walrus.xyz'
 
 function parseCsv(value: string | undefined, fallback = '') {
@@ -10,10 +12,10 @@ function parseCsv(value: string | undefined, fallback = '') {
         .filter(Boolean)
 }
 
-const memwalPackageId = import.meta.env.VITE_MEMWAL_PACKAGE_ID as string ||
-    '0x0a625e2db2af6f591a4c80a3d8551ddf11656089cc3a20c5e9e7f8fb75b9265c'
-const memwalRegistryId = import.meta.env.VITE_MEMWAL_REGISTRY_ID as string ||
-    '0x736aef9906798fca4460490ccdf8e8502ef170122dc26ecae32111b78c6b42dd'
+const { memwalPackageId, memwalRegistryId } = requiredMemwalIds({
+    VITE_MEMWAL_PACKAGE_ID: import.meta.env.VITE_MEMWAL_PACKAGE_ID as string | undefined,
+    VITE_MEMWAL_REGISTRY_ID: import.meta.env.VITE_MEMWAL_REGISTRY_ID as string | undefined,
+})
 const sealKeyServers = parseCsv(import.meta.env.VITE_SEAL_KEY_SERVERS as string)
 const legacySealKeyServers = parseCsv(import.meta.env.VITE_LEGACY_SEAL_KEY_SERVERS as string)
 const localE2eJsonRpc = import.meta.env.DEV &&

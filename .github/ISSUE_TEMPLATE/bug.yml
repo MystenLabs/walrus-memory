@@ -37,7 +37,7 @@ body:
       label: Network
       options:
         - Mainnet (relayer.memory.walrus.xyz)
-        - Staging (relayer-staging.memory.walrus.xyz)
+        - Staging (relayer.dev.memwal.ai)
         - Local / self-hosted
         - Not sure
     validations:

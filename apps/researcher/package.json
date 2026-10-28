@@ -17,7 +17,7 @@
         "db:up": "drizzle-kit up",
         "verify:memwal": "tsx ../../scripts/verify-memwal-credentials.ts",
         "test:redis-outage": "node --conditions=react-server --test --import tsx lib/shared-redis.test.ts",
-        "test:unit": "node --test --import tsx 'lib/**/*.unit.test.ts'",
+        "test:unit": "node --experimental-test-module-mocks --test --import tsx 'lib/**/*.unit.test.ts'",
         "test": "pnpm test:e2e",
         "playwright:install": "playwright install --with-deps chromium",
         "test:e2e": "PLAYWRIGHT=True playwright test",

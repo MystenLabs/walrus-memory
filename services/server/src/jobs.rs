@@ -3427,6 +3427,10 @@ async fn maybe_alert_walrus_upload_exhausted(
 /// - Walrus register `0x2::coin::destroy_zero` ENonZero → `Transient` (WAL
 ///   payment over-funded from a stale cached price; the sidecar refreshes the
 ///   client so the retry re-reads the live price and splits the exact amount)
+/// - Landed register `balance::split` whose message contains
+///   `registration transaction was not successful:` → `Transient` (WAL payment
+///   under-funded from a stale cached price). Not an Enoki gas dry-run, so it
+///   must not escalate to `GasPoolExhausted`.
 /// - Enoki dry-run `0x2::balance::split` ENotEnough → `GasPoolExhausted`
 ///   (abort: pool SUI gas coins are fragmented/insufficient; retrying rotates
 ///   to the next starved wallet — needs ops gas consolidation/top-up)
@@ -3522,8 +3526,17 @@ impl WalletJobError {
     /// in `0x2::balance::split` (ENotEnough). A single occurrence only proves the
     /// *selected* pool wallet is gas-starved, not the whole pool — escalation to
     /// `GasPoolExhausted` is gated on pool-level confirmation by the caller.
+    ///
+    /// A landed register keeps MoveAbort text (`registration transaction was not
+    /// successful:`). Its `balance::split` is the WAL payment when the cached
+    /// price is low, not an Enoki gas dry-run. Gas-pool strings are dry-run /
+    /// gas-selection failures and do not use that prefix. Certify and
+    /// metadata-transfer omit it, so this exclusion does not touch them.
     pub fn is_gas_pool_budget_error(msg: &str) -> bool {
         let lower = msg.to_ascii_lowercase();
+        if lower.contains("registration transaction was not successful:") {
+            return false;
+        }
         let move_split = (lower.contains("moveabort") || lower.contains("move abort"))
             && lower.contains("balance")
             && lower.contains("split");
@@ -3535,18 +3548,31 @@ impl WalletJobError {
         move_split || gas_selection || sui_balance
     }
 
-    /// True if `msg` is the Walrus register PTB's `0x2::coin::destroy_zero`
-    /// abort (ENonZero). The `@mysten/walrus` `#withWal` helper splits an exact
-    /// WAL payment from the client's cached storage/write price and asserts the
-    /// coin is empty afterwards; when mainnet price drops between the cached read
-    /// and execution the contract deducts less WAL, leaving change that trips
-    /// `destroy_zero`. Recoverable: retrying against a client that re-read the
-    /// live price splits the correct amount, so this is Transient — never a
-    /// Permanent MoveAbort.
+    /// True if `msg` is a Walrus register payment sized from a stale cached
+    /// price. Two aborts, kept disjoint from the Enoki gas dry-run:
+    ///
+    /// - Price down: `0x2::coin::destroy_zero` (ENonZero). `#withWal` splits an
+    ///   exact WAL amount and asserts the coin is empty; a lower on-chain price
+    ///   leaves change.
+    /// - Price up, after the register has landed: `balance::split` (ENotEnough)
+    ///   on a message that contains `registration transaction was not
+    ///   successful:`. The same helper under-funds the payment. Enoki gas
+    ///   dry-runs abort in `balance::split` too, but they do not use this prefix.
+    ///
+    /// Recoverable: the sidecar refreshes the client and drops that prepare, so
+    /// the retry re-reads the live price. Transient — never Permanent, and never
+    /// `GasPoolExhausted`.
     pub fn is_walrus_wal_payment_price_abort(msg: &str) -> bool {
         let lower = msg.to_ascii_lowercase();
-        (lower.contains("moveabort") || lower.contains("move abort"))
-            && lower.contains("destroy_zero")
+        if !(lower.contains("moveabort") || lower.contains("move abort")) {
+            return false;
+        }
+        if lower.contains("destroy_zero") {
+            return true;
+        }
+        lower.contains("registration transaction was not successful:")
+            && lower.contains("balance")
+            && lower.contains("split")
     }
 
     /// Heuristic classification from the sidecar's error string. The sidecar
@@ -4838,6 +4864,70 @@ the checkpoint it replied about",
         assert!(!WalletJobError::is_gas_pool_budget_error(
             LOW_WAL_BALANCE_ERR
         ));
+    }
+
+    #[test]
+    fn landed_register_wal_price_split_stays_transient() {
+        // Exact landed-register abort. The WAL payment `balance::split` shares
+        // tokens with an Enoki gas dry-run, but this prefix is not a gas-pool
+        // string. It must stay Transient at the pool threshold (attempt 3 of 5,
+        // 3 candidate wallets) and must not become GasPoolExhausted.
+        let register_split = "registration transaction was not successful: MoveAbort(MoveLocation { module: ModuleId { address: 0x2, name: Identifier(\"balance\") }, function: 11, instruction: 9, function_name: Some(\"split\") }, 2) in command 4";
+        assert!(!WalletJobError::is_gas_pool_budget_error(register_split));
+        assert!(WalletJobError::is_walrus_wal_payment_price_abort(
+            register_split
+        ));
+        let classified = WalletJobError::classify_sidecar_error(register_split);
+        assert!(matches!(classified, WalletJobError::Transient(_)));
+        assert!(!classified.aborts_retries());
+        let after = escalate_if_gas_pool_exhausted(classified, 3, 5, 3);
+        assert!(
+            matches!(after, WalletJobError::Transient(_)),
+            "register price abort must not become GasPoolExhausted, got {:?}",
+            after
+        );
+
+        // Same text as it arrives, inside the durable-upload 503 body.
+        let wrapped = format!(
+            "walrus upload failed: Internal Error: durable Walrus upload failed (503 Service Unavailable): {{\"error\":{},\"code\":\"NO_SIDE_EFFECT\"}}",
+            serde_json::to_string(register_split).unwrap(),
+        );
+        assert!(!WalletJobError::is_gas_pool_budget_error(&wrapped));
+        let wrapped_after = escalate_if_gas_pool_exhausted(
+            WalletJobError::classify_sidecar_error(&wrapped),
+            3,
+            5,
+            3,
+        );
+        assert!(
+            matches!(wrapped_after, WalletJobError::Transient(_))
+                && !wrapped_after.aborts_retries(),
+            "wrapped register price abort must stay Transient, got {:?}",
+            wrapped_after
+        );
+
+        // Enoki dry-run still uses the gas-pool path. The two detectors stay disjoint.
+        assert!(WalletJobError::is_gas_pool_budget_error(BALANCE_SPLIT_ERR));
+        assert!(!WalletJobError::is_walrus_wal_payment_price_abort(
+            BALANCE_SPLIT_ERR
+        ));
+
+        // Certify and metadata-transfer omit MoveAbort text. Unchanged.
+        for msg in [
+            "certification transaction 0xabc was not successful",
+            "metadata transfer transaction 0xabc was not successful",
+        ] {
+            assert!(!WalletJobError::is_gas_pool_budget_error(msg));
+            let classified = WalletJobError::classify_sidecar_error(msg);
+            assert!(matches!(classified, WalletJobError::Transient(_)), "{msg}");
+            let after = escalate_if_gas_pool_exhausted(classified, 3, 5, 3);
+            assert!(matches!(after, WalletJobError::Transient(_)), "{msg}");
+        }
+
+        // Not every landed register MoveAbort is a stale price.
+        let other = "registration transaction was not successful: MoveAbort(MoveLocation { module: ModuleId { address: 0x2, name: Identifier(\"coin\") }, function: 1, instruction: 0, function_name: Some(\"join\") }, 1) in command 1";
+        assert!(!WalletJobError::is_gas_pool_budget_error(other));
+        assert!(WalletJobError::classify_sidecar_error(other).is_permanent());
     }
 
     #[test]

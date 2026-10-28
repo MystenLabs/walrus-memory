@@ -319,11 +319,15 @@ export async function withDeadline<T>(
  * underlying request, so when it fires the relayer has usually accepted
  * already. Inviting a blind retry on the bulk path is close to guaranteeing
  * the duplicate.
+ *
+ * `retryNote` replaces the non-idempotent advice when the caller can be more
+ * precise — the bulk tool, whose transport replays reuse a bridge key but
+ * whose agent retries are new calls with new keys.
  */
 export function withAcceptDeadline<T>(
     work: Promise<T>,
     what: string,
-    opts: { idempotent: boolean; deadlineMs?: number },
+    opts: { idempotent: boolean; deadlineMs?: number; retryNote?: string },
 ): Promise<T> {
     const ms = opts.deadlineMs ?? ACCEPT_DEADLINE_MS;
     const shared =
@@ -338,9 +342,11 @@ export function withAcceptDeadline<T>(
             ? `${shared} Retrying is safe: this write carries a content-derived idempotency ` +
               `key, so a retry attaches to the job already in flight instead of queueing a ` +
               `second paid copy.`
-            : `${shared} Do NOT retry blindly — this endpoint carries no idempotency key, so a ` +
-              `re-send stores every fact a SECOND time at full cost. Check with memwal_recall ` +
-              `first, and only re-send what is genuinely missing.`,
+            : opts.retryNote
+              ? `${shared} ${opts.retryNote}`
+              : `${shared} Do NOT retry blindly — this endpoint carries no idempotency key, so a ` +
+                `re-send stores every fact a SECOND time at full cost. Check with memwal_recall ` +
+                `first, and only re-send what is genuinely missing.`,
     );
 }
 

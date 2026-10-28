@@ -21,6 +21,10 @@ const WALLET_BALANCE_LOW_ALERT_DEDUP_SECS_ENV: &str = "WALLET_BALANCE_LOW_ALERT_
 const WALLET_BALANCE_LOW_ALERT_DEDUP_DEFAULT: Duration = Duration::from_secs(43200);
 const POSTGRES_STORAGE_ALERT_DEDUP_SECS_ENV: &str = "POSTGRES_STORAGE_ALERT_DEDUP_SECS";
 const POSTGRES_STORAGE_ALERT_DEDUP_DEFAULT: Duration = Duration::from_secs(1800);
+const EMBEDDING_PROVIDER_ALERT_DEDUP_SECS_ENV: &str = "EMBEDDING_PROVIDER_ALERT_DEDUP_SECS";
+const EMBEDDING_PROVIDER_ALERT_DEDUP_DEFAULT: Duration = Duration::from_secs(600);
+// A failed provider request must not wait for the shared HTTP client's 30s deadline.
+const EMBEDDING_PROVIDER_ALERT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Mirrors the `@mysten/walrus` dep version in
 /// `services/server/scripts/package.json`. Bump this constant in lockstep
@@ -102,13 +106,20 @@ pub struct AlertManager {
     /// Suppresses Postgres disk / Neon project-size-cap spam. The failure is
     /// cluster-wide, so one notification per network per window — not per job.
     postgres_storage_dedup: AlertDedup,
+    /// Suppresses embedding/LLM provider auth or billing alert spam (401/402/403).
+    /// Keyed per network so a revoked or exhausted `OPENAI_API_KEY` pages once
+    /// per dedup window instead of spamming on every recall/embed/remember call.
+    embedding_provider_dedup: AlertDedup,
 }
 
 impl AlertManager {
     pub fn from_env(http_client: reqwest::Client) -> Self {
-        let slack = std::env::var(ALERT_TO_SLACK_ENV)
-            .ok()
-            .and_then(|raw| SlackNotifier::from_env_value(http_client, &raw));
+        let webhook_raw = std::env::var(ALERT_TO_SLACK_ENV).ok();
+        Self::from_webhook_value(http_client, webhook_raw.as_deref())
+    }
+
+    pub fn from_webhook_value(http_client: reqwest::Client, webhook_raw: Option<&str>) -> Self {
+        let slack = webhook_raw.and_then(|raw| SlackNotifier::from_env_value(http_client, raw));
 
         Self {
             slack,
@@ -139,6 +150,10 @@ impl AlertManager {
             postgres_storage_dedup: AlertDedup::new(dedup_window_from_env(
                 POSTGRES_STORAGE_ALERT_DEDUP_SECS_ENV,
                 POSTGRES_STORAGE_ALERT_DEDUP_DEFAULT,
+            )),
+            embedding_provider_dedup: AlertDedup::new(dedup_window_from_env(
+                EMBEDDING_PROVIDER_ALERT_DEDUP_SECS_ENV,
+                EMBEDDING_PROVIDER_ALERT_DEDUP_DEFAULT,
             )),
         }
     }
@@ -293,9 +308,36 @@ impl AlertManager {
         slack.send_payload(&payload).await
     }
 
+    pub async fn notify_embedding_provider_auth_failed(
+        &self,
+        alert: EmbeddingProviderAuthAlert,
+    ) -> Result<(), AlertError> {
+        let Some(slack) = &self.slack else {
+            return Ok(());
+        };
+        if self.should_suppress_embedding_provider_auth(&alert) {
+            return Ok(());
+        }
+        let payload = SlackPayload::for_embedding_provider_auth_failed(&alert);
+        tokio::time::timeout(
+            EMBEDDING_PROVIDER_ALERT_TIMEOUT,
+            slack.send_payload(&payload),
+        )
+        .await
+        .map_err(|_| AlertError::Transport("embedding provider alert delivery timed out".into()))?
+    }
+
     fn should_suppress_wallet_balance_low(&self, alert: &WalletBalanceLowAlert) -> bool {
         self.wallet_balance_low_dedup
             .should_suppress(wallet_balance_low_dedup_key(alert))
+    }
+
+    pub(crate) fn should_suppress_embedding_provider_auth(
+        &self,
+        alert: &EmbeddingProviderAuthAlert,
+    ) -> bool {
+        self.embedding_provider_dedup
+            .should_suppress(embedding_provider_dedup_key(&alert.sui_network))
     }
 }
 
@@ -311,6 +353,13 @@ fn wallet_balance_low_dedup_key(alert: &WalletBalanceLowAlert) -> (String, Strin
 
 fn postgres_storage_dedup_key(sui_network: &str) -> (String, String) {
     (sui_network.to_string(), "postgres-storage".to_string())
+}
+
+fn embedding_provider_dedup_key(sui_network: &str) -> (String, String) {
+    (
+        sui_network.to_string(),
+        "embedding-provider-auth".to_string(),
+    )
 }
 
 /// True when Postgres (or Neon) refused a write because the disk / project
@@ -535,6 +584,16 @@ pub struct WalletBalanceLowAlert {
 #[derive(Debug, Clone)]
 pub struct PostgresStorageExhaustedAlert {
     pub sui_network: String,
+    pub error: String,
+}
+
+/// Fired when the upstream embedding/LLM provider returns HTTP 401, 402, or 403
+/// (invalid/revoked `OPENAI_API_KEY` or exhausted provider credits).
+#[derive(Debug, Clone)]
+pub struct EmbeddingProviderAuthAlert {
+    pub sui_network: String,
+    pub status: u16,
+    pub api_base: String,
     pub error: String,
 }
 
@@ -940,6 +999,42 @@ This is not a per-user storage quota and is not a Walrus/SUI/WAL funding issue."
         let details = format!(
             "*Network:* `{}`\n*Error:* ```{}```",
             alert.sui_network,
+            truncate(&alert.error, MAX_SLACK_ERROR_LEN),
+        );
+
+        Self {
+            text: summary.clone(),
+            blocks: vec![
+                SlackBlock::Header {
+                    text: plain_text(title),
+                },
+                SlackBlock::Section {
+                    text: mrkdwn(summary),
+                },
+                SlackBlock::Section {
+                    text: mrkdwn(action),
+                },
+                SlackBlock::Section {
+                    text: mrkdwn(details),
+                },
+            ],
+        }
+    }
+
+    fn for_embedding_provider_auth_failed(alert: &EmbeddingProviderAuthAlert) -> Self {
+        let title = "MemWal embedding provider credential/quota error".to_string();
+        let summary = format!(
+            "Upstream embedding/LLM provider returned HTTP {} on {}. \
+             Recall, embed, analyze, and remember preparation are returning HTTP 503 (`EMBEDDING_PROVIDER_UNAVAILABLE`).",
+            alert.status, alert.sui_network,
+        );
+        let action = "*Action (ops):* check and rotate `OPENAI_API_KEY` / top up OpenRouter or OpenAI provider credits."
+            .to_string();
+        let details = format!(
+            "*Network:* `{}`\n*HTTP status:* `{}`\n*Provider base:* `{}`\n*Error:* ```{}```",
+            alert.sui_network,
+            alert.status,
+            alert.api_base,
             truncate(&alert.error, MAX_SLACK_ERROR_LEN),
         );
 
@@ -1513,6 +1608,155 @@ mod tests {
         assert!(!dedup.should_suppress(postgres_storage_dedup_key("mainnet")));
         assert!(dedup.should_suppress(postgres_storage_dedup_key("mainnet")));
         assert!(!dedup.should_suppress(postgres_storage_dedup_key("testnet")));
+    }
+
+    #[test]
+    fn embedding_provider_auth_payload_surfaces_status_and_action() {
+        let payload =
+            SlackPayload::for_embedding_provider_auth_failed(&EmbeddingProviderAuthAlert {
+                sui_network: "mainnet".into(),
+                status: 401,
+                api_base: "https://openrouter.ai/api/v1".into(),
+                error: r#"{"error":{"message":"User not found.","code":401}}"#.into(),
+            });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("MemWal embedding provider credential/quota error"));
+        assert!(json.contains("mainnet"));
+        assert!(json.contains("401"));
+        assert!(json.contains("EMBEDDING_PROVIDER_UNAVAILABLE"));
+        assert!(json.contains("OPENAI_API_KEY"));
+        assert!(json.contains("User not found."));
+    }
+
+    #[tokio::test]
+    async fn embedding_provider_auth_alert_sends_once_per_dedup_window() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        let app = axum::Router::new().route(
+            "/slack",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let webhook_url = format!("http://{addr}/slack");
+        let manager = AlertManager::from_webhook_value(reqwest::Client::new(), Some(&webhook_url));
+
+        for status in [401, 402, 403] {
+            manager
+                .notify_embedding_provider_auth_failed(EmbeddingProviderAuthAlert {
+                    sui_network: "mainnet".into(),
+                    status,
+                    api_base: "https://openrouter.ai/api/v1".into(),
+                    error: format!(r#"{{"error":{{"message":"rejected","code":{status}}}}}"#),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            1,
+            "401/402/403 burst on the same network must emit only 1 Slack alert per dedup window"
+        );
+
+        // A separate network is not suppressed by mainnet's dedup entry.
+        manager
+            .notify_embedding_provider_auth_failed(EmbeddingProviderAuthAlert {
+                sui_network: "testnet".into(),
+                status: 401,
+                api_base: "https://openrouter.ai/api/v1".into(),
+                error: r#"{"error":{"message":"User not found.","code":401}}"#.into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn embedding_provider_alert_timeout_does_not_change_shared_client_deadline() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        let app = axum::Router::new()
+            .route(
+                "/slack",
+                axum::routing::post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }),
+            )
+            .route(
+                "/probe",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(
+                        EMBEDDING_PROVIDER_ALERT_TIMEOUT + Duration::from_millis(100),
+                    )
+                    .await;
+                    axum::http::StatusCode::OK
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let manager =
+            AlertManager::from_webhook_value(client.clone(), Some(&format!("http://{addr}/slack")));
+        let alert = || EmbeddingProviderAuthAlert {
+            sui_network: "mainnet".into(),
+            status: 401,
+            api_base: "https://provider.example/v1".into(),
+            error: "provider rejected credentials".into(),
+        };
+
+        // The outer deadline catches a stalled delivery well before the
+        // shared client's timeout. A later alert remains deduplicated.
+        let result = tokio::time::timeout(
+            EMBEDDING_PROVIDER_ALERT_TIMEOUT + Duration::from_secs(2),
+            manager.notify_embedding_provider_auth_failed(alert()),
+        )
+        .await
+        .expect("provider alert must not wait for the shared 30s deadline");
+        assert!(
+            matches!(result, Err(AlertError::Transport(message)) if message.contains("timed out"))
+        );
+        manager
+            .notify_embedding_provider_auth_failed(alert())
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+
+        // Requests using the same client may still exceed the alert deadline.
+        assert!(client
+            .get(format!("http://{addr}/probe"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        server.abort();
     }
 
     #[derive(Debug)]

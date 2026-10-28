@@ -77,7 +77,7 @@
     },
     "serverUrl": {
       "label": "Walrus Memory Server URL",
-      "placeholder": "https://relayer-staging.memory.walrus.xyz"
+      "placeholder": "https://relayer.dev.memwal.ai"
     },
     "defaultNamespace": {
       "label": "Default Namespace",

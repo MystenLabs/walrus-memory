@@ -56,6 +56,36 @@ export interface MemWalConfig {
 // API Types
 // ============================================================
 
+/** Options for `remember()` / `rememberAsync()`. */
+export interface RememberOptions {
+    /**
+     * Optional idempotency key to prevent duplicate writes on retries.
+     * Idempotency keys are scoped per `(owner, namespace)`, so identical
+     * keys across different namespaces will not collide. Retrying within
+     * the same namespace with the same key dedupes, while reusing a key
+     * with different text in the same namespace produces HTTP 409 Conflict.
+     */
+    idempotencyKey?: string;
+    /**
+     * Opt-in content-hash deduplication (#769).
+     *
+     * When `true`, identical `(owner, namespace, text)` writes resolve to the
+     * existing live remember job and `blob_id` without a time window, instead
+     * of minting a duplicate Walrus blob and embedding call. If the existing
+     * memory was later forgotten or deleted, a fresh write is performed.
+     *
+     * Defaults to `false` (or omitted), preserving the standard 30-minute
+     * retry-window behavior.
+     */
+    dedupe?: boolean;
+}
+
+/** Options for `rememberAndWait()`. */
+export interface RememberWaitOptions extends RememberOptions {
+    pollIntervalMs?: number;
+    timeoutMs?: number;
+}
+
 /** Result from remember() / rememberAsync() */
 export interface RememberAcceptedResult {
     job_id: string;
@@ -345,6 +375,12 @@ export interface AnalyzeOptions {
      * no server-readable metadata column for it (Architecture A).
      */
     occurredAt?: string | Date;
+    /**
+     * Optional `AbortSignal` to cancel the `/api/analyze` request. When
+     * aborted before or during the request, the in-flight HTTP call is aborted
+     * immediately and `analyze()` rejects with the signal's abort reason.
+     */
+    signal?: AbortSignal;
 }
 
 /** A fact extracted by analyze() and accepted for background storage. */
