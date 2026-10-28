@@ -420,7 +420,7 @@ async function runBatch(
       console.log(`ok ${ms(result!.latencyMs)} ${formatOk(result!)}`);
     } else {
       failCount++;
-      const errMsg = result!.error ?? `HTTP ${result!.statusCode}`;
+      const errMsg = result!.error?.trim() || `HTTP ${result!.statusCode}`;
       errors.push(errMsg);
       console.log(`FAILED: ${errMsg.slice(0, 120)}`);
     }
