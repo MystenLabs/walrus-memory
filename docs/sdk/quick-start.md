@@ -79,6 +79,10 @@ yarn add @mysten/walrus
 **Version compatibility:** `@mysten/seal` and `@mysten/walrus` must both accept the same `@mysten/sui` major. Known-good versions: `@mysten/sui@^2.16.2`, `@mysten/seal@^1.1.3`, `@mysten/walrus@^1.1.7`. Avoid `@mysten/walrus@0.x` — it bundles `@mysten/sui@1.x` and conflicts with `@mysten/seal@1.x`. If installation fails with `ERESOLVE` on `@mysten/sui`, upgrade `@mysten/walrus` and run `npm why @mysten/sui` to find which dependency still pins sui v1.
 </Note>
 
+<Warning>
+**Do not embed ciphertexts directly**: Saving an already-encrypted blob via `remember()` will encrypt it a second time, making it unrecoverable. Always pass the original plaintext to `remember()`; Walrus Memory handles encryption transparently. See [MemWalManual mode](/sdk/api-reference#manual-mode) only if you need to manage keys yourself.
+</Warning>
+
 For `withMemWal`, you also need:
 
 <CodeGroup>
@@ -131,7 +135,7 @@ const memwal = MemWal.create({
   // Load your own credentials from the environment; never hardcode a shared example ID.
   key: process.env.MEMWAL_KEY ?? "<your-ed25519-private-key>",
   accountId: process.env.MEMWAL_ACCOUNT_ID ?? "<your-memwal-account-id>",
-  serverUrl: "https://your-relayer-url.com",
+  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.dev.memwal.ai",
   namespace: "demo",
 });
 
