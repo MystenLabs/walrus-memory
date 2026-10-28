@@ -456,9 +456,9 @@ impl MemoryEngine for WalrusSealEngine {
             .iter()
             .map(|f| (f.blob_id.clone(), f.ciphertext.clone()))
             .collect();
-        let mut decrypted: Vec<DecryptOutcome> = Vec::with_capacity(batch_input.len());
+        let mut chunk_results = Vec::new();
         for chunk in batch_input.chunks(SEAL_DECRYPT_BATCH_SIZE) {
-            match seal::seal_decrypt_batch(
+            let res = seal::seal_decrypt_batch(
                 &self.http_client,
                 &self.config.seal_sidecar_url,
                 self.config.sidecar_secret.as_deref(),
@@ -469,24 +469,17 @@ impl MemoryEngine for WalrusSealEngine {
                 &self.config.registry_id,
                 &auth.account_id,
             )
-            .await
-            {
-                Ok(outcomes) => decrypted.extend(outcomes),
-                Err(e) => {
-                    tracing::warn!(
-                        "engine.fetch_batch: seal_decrypt_batch failed for {} blobs: {}",
-                        chunk.len(),
-                        e
-                    );
-                    // Nothing decrypted yet: an empty 200 looks like no memories.
-                    // A later chunk must not throw away plaintext already in hand.
-                    if decrypted.is_empty() {
-                        return Err(e);
-                    }
-                    decrypted.extend((0..chunk.len()).map(|_| DecryptOutcome::Missing));
-                }
+            .await;
+            if let Err(ref e) = res {
+                tracing::warn!(
+                    "engine.fetch_batch: seal_decrypt_batch failed for {} blobs: {}",
+                    chunk.len(),
+                    e
+                );
             }
+            chunk_results.push((chunk.len(), res));
         }
+        let decrypted = fold_decrypt_chunk_results(chunk_results)?;
         let seal_ms = seal_start.elapsed().as_millis();
 
         // Step 3: assemble results. Decrypt failures (permanent or
@@ -520,6 +513,44 @@ impl MemoryEngine for WalrusSealEngine {
 // ============================================================
 // Pure decrypt-outcome assembly
 // ============================================================
+
+/// Fold per-chunk `seal_decrypt_batch` results across all chunks.
+///
+/// When one chunk fails with `Err(e)`, we fill `DecryptOutcome::Missing` for
+/// every blob in that chunk and continue attempting remaining chunks so that
+/// chunk 0 failing does not abort chunk 1+ when later chunks can still
+/// succeed. If every non-empty chunk failed, returns `Err` with the last
+/// error so an all-failed recall still surfaces an error instead of an empty
+/// `200 OK`.
+fn fold_decrypt_chunk_results(
+    chunks: Vec<(usize, Result<Vec<DecryptOutcome>, AppError>)>,
+) -> Result<Vec<DecryptOutcome>, AppError> {
+    let total_len: usize = chunks.iter().map(|(len, _)| *len).sum();
+    let mut decrypted = Vec::with_capacity(total_len);
+    let mut any_chunk_succeeded = false;
+    let mut last_err: Option<AppError> = None;
+
+    for (chunk_len, res) in chunks {
+        match res {
+            Ok(outcomes) => {
+                any_chunk_succeeded = true;
+                decrypted.extend(outcomes);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                decrypted.extend((0..chunk_len).map(|_| DecryptOutcome::Missing));
+            }
+        }
+    }
+
+    if !any_chunk_succeeded {
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+    }
+
+    Ok(decrypted)
+}
 
 /// Fold batch-decrypt outcomes into hydrated memories. Returns
 /// `(results, decrypt_drops)`.
@@ -633,11 +664,123 @@ fn write_decision(ciphertext_len: usize, max_bytes: usize, ttl_secs: u64) -> Cac
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_decrypted, read_decision, write_decision, CacheReadDecision, CacheWriteDecision,
-        DecryptOutcome,
+        assemble_decrypted, fold_decrypt_chunk_results, read_decision, write_decision, AppError,
+        CacheReadDecision, CacheWriteDecision, DecryptOutcome,
     };
 
-    // ── decrypt-outcome assembly ───────────────────────────────────
+    // ── decrypt-chunk folding & assembly ───────────────────────────
+
+    #[test]
+    fn fold_chunks_single_chunk_failure_returns_err() {
+        let chunks = vec![(
+            3,
+            Err(AppError::UpstreamUnavailable(
+                "seal decrypt-batch failed: timeout".to_string(),
+            )),
+        )];
+
+        let res = fold_decrypt_chunk_results(chunks);
+        assert!(res.is_err(), "single chunk failure must return Err");
+    }
+
+    #[test]
+    fn fold_chunks_chunk0_fails_chunk1_succeeds_returns_partial_ok() {
+        let fetched = vec![
+            ("blob-0".to_string(), 0.1),
+            ("blob-1".to_string(), 0.2),
+            ("blob-2".to_string(), 0.3),
+            ("blob-3".to_string(), 0.4),
+        ];
+        let chunks = vec![
+            (
+                2,
+                Err(AppError::UpstreamUnavailable(
+                    "seal decrypt-batch failed: chunk 0 timeout".to_string(),
+                )),
+            ),
+            (
+                2,
+                Ok(vec![
+                    DecryptOutcome::Ok(b"gamma".to_vec()),
+                    DecryptOutcome::Ok(b"delta".to_vec()),
+                ]),
+            ),
+        ];
+
+        let outcomes = fold_decrypt_chunk_results(chunks)
+            .expect("chunk 1 succeeded so fold_decrypt_chunk_results should return Ok");
+        assert_eq!(outcomes.len(), 4);
+        assert!(matches!(outcomes[0], DecryptOutcome::Missing));
+        assert!(matches!(outcomes[1], DecryptOutcome::Missing));
+
+        let (results, drops) = assemble_decrypted(&fetched, outcomes);
+        assert_eq!(drops, 2, "chunk 0 items should be counted in decrypt_drops");
+        assert_eq!(results.len(), 2, "chunk 1 items should be hydrated");
+        assert_eq!(results[0].blob_id, "blob-2");
+        assert_eq!(results[0].text, "gamma");
+        assert_eq!(results[1].blob_id, "blob-3");
+        assert_eq!(results[1].text, "delta");
+    }
+
+    #[test]
+    fn fold_chunks_chunk0_succeeds_chunk1_fails_returns_partial_ok() {
+        let fetched = vec![
+            ("blob-0".to_string(), 0.1),
+            ("blob-1".to_string(), 0.2),
+            ("blob-2".to_string(), 0.3),
+            ("blob-3".to_string(), 0.4),
+        ];
+        let chunks = vec![
+            (
+                2,
+                Ok(vec![
+                    DecryptOutcome::Ok(b"alpha".to_vec()),
+                    DecryptOutcome::Ok(b"beta".to_vec()),
+                ]),
+            ),
+            (
+                2,
+                Err(AppError::UpstreamUnavailable(
+                    "seal decrypt-batch failed: chunk 1 timeout".to_string(),
+                )),
+            ),
+        ];
+
+        let outcomes = fold_decrypt_chunk_results(chunks)
+            .expect("chunk 0 succeeded so fold_decrypt_chunk_results should return Ok");
+        assert_eq!(outcomes.len(), 4);
+        assert!(matches!(outcomes[2], DecryptOutcome::Missing));
+        assert!(matches!(outcomes[3], DecryptOutcome::Missing));
+
+        let (results, drops) = assemble_decrypted(&fetched, outcomes);
+        assert_eq!(drops, 2, "chunk 1 items should be counted in decrypt_drops");
+        assert_eq!(results.len(), 2, "chunk 0 items should be hydrated");
+        assert_eq!(results[0].blob_id, "blob-0");
+        assert_eq!(results[0].text, "alpha");
+        assert_eq!(results[1].blob_id, "blob-1");
+        assert_eq!(results[1].text, "beta");
+    }
+
+    #[test]
+    fn fold_chunks_all_chunks_fail_returns_err() {
+        let chunks = vec![
+            (
+                2,
+                Err(AppError::UpstreamUnavailable(
+                    "seal decrypt-batch failed: chunk 0 timeout".to_string(),
+                )),
+            ),
+            (
+                2,
+                Err(AppError::UpstreamUnavailable(
+                    "seal decrypt-batch failed: chunk 1 timeout".to_string(),
+                )),
+            ),
+        ];
+
+        let res = fold_decrypt_chunk_results(chunks);
+        assert!(res.is_err(), "when all chunks fail, must return Err");
+    }
 
     #[test]
     fn assemble_hydrates_ok_outcomes() {
