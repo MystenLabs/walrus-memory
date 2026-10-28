@@ -428,3 +428,26 @@ export async function fetchAdminConfig(
     sponsorSuiLowThresholdMist: BigInt(raw.sponsor_sui_low_threshold_mist),
   }
 }
+
+// Runtime owner policy. Never embed deployment identities in this client.
+export interface OwnerRateLimitPolicy {
+  requests_per_minute: number
+  requests_per_hour: number
+  delegate_key_per_minute: number
+  expires_at: string | null
+}
+export interface OwnerRateLimitResponse {
+  owner: string
+  defaults: OwnerRateLimitPolicy
+  override_policy: OwnerRateLimitPolicy | null
+  effective: OwnerRateLimitPolicy
+}
+export async function fetchOwnerRateLimits(adminKey: string, owner: string): Promise<OwnerRateLimitResponse> {
+  return await makeAdminRequest(`/rate-limits/${encodeURIComponent(owner)}`, adminKey) as OwnerRateLimitResponse
+}
+export async function saveOwnerRateLimits(adminKey: string, owner: string, policy: OwnerRateLimitPolicy): Promise<OwnerRateLimitResponse> {
+  return await makeAdminRequest(`/rate-limits/${encodeURIComponent(owner)}`, adminKey, 'PUT', policy) as OwnerRateLimitResponse
+}
+export async function resetOwnerRateLimits(adminKey: string, owner: string): Promise<OwnerRateLimitResponse> {
+  return await makeAdminRequest(`/rate-limits/${encodeURIComponent(owner)}`, adminKey, 'DELETE') as OwnerRateLimitResponse
+}

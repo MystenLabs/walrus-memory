@@ -403,6 +403,20 @@ fn rate_limiter_unavailable_response() -> Response {
 // Rate Limit Middleware
 // ============================================================
 
+fn effective_owner_config(
+    defaults: &RateLimitConfig,
+    policy: Option<&crate::owner_rate_limits::OwnerRateLimit>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitConfig {
+    let mut effective = defaults.clone();
+    if let Some(policy) = policy.filter(|p| p.active_at(now)) {
+        effective.max_requests_per_minute = policy.requests_per_minute;
+        effective.max_requests_per_hour = policy.requests_per_hour;
+        effective.max_requests_per_delegate_key = policy.delegate_key_per_minute;
+    }
+    effective
+}
+
 /// Multi-layer rate limiting middleware for the write-path authenticated
 /// routes (`/api/*`, mounted on `protected_routes` in `main.rs`).
 ///
@@ -422,8 +436,8 @@ fn rate_limiter_unavailable_response() -> Response {
 ///
 /// Returns 429 Too Many Requests with JSON body if any layer exceeds its limit.
 ///
-/// Returns 503 Service Unavailable (fail-closed) if Redis
-/// is unreachable — previously was fail-open (silently allowed all requests).
+/// Owner policy lookup fails closed with 503; Redis outages use the existing
+/// in-memory fallback with the same effective owner limits.
 ///
 /// Normalizes trailing slash in path before cost weight lookup.
 pub async fn rate_limit_middleware(
@@ -450,7 +464,28 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    let config = &state.config.rate_limit;
+    // Resolve every request from shared durable state: edits and expiry apply
+    // across replicas without a cache invalidation window. A failed lookup
+    // must not silently bypass a restrictive owner policy.
+    let policy_owner = match crate::security_delete_auth::canonical_sui_address(&auth.owner) {
+        Ok(owner) => owner,
+        Err(_) => return rate_limiter_unavailable_response(),
+    };
+    let policy = match tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::owner_rate_limits::load_policy(state.db.pool(), &policy_owner),
+    )
+    .await
+    {
+        Ok(Ok(policy)) => policy,
+        _ => return rate_limiter_unavailable_response(),
+    };
+    let effective = effective_owner_config(
+        &state.config.rate_limit,
+        policy.as_ref(),
+        chrono::Utc::now(),
+    );
+    let config = &effective;
     let mut redis = state.redis.clone();
     let now = chrono::Utc::now().timestamp_millis() as f64;
 
@@ -3382,5 +3417,40 @@ mod tests {
             .query_async(&mut conn)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owner_policy_tests {
+    use super::*;
+    use crate::owner_rate_limits::OwnerRateLimit;
+    #[test]
+    fn override_and_expiry_preserve_other_limits() {
+        let defaults = RateLimitConfig::default();
+        let now = chrono::Utc::now();
+        let mut policy = OwnerRateLimit {
+            requests_per_minute: 180,
+            requests_per_hour: 1500,
+            delegate_key_per_minute: 90,
+            expires_at: Some(now + chrono::Duration::minutes(1)),
+        };
+        let effective = effective_owner_config(&defaults, Some(&policy), now);
+        assert_eq!(effective.max_requests_per_minute, 180);
+        assert_eq!(effective.max_requests_per_hour, 1500);
+        assert_eq!(effective.max_requests_per_delegate_key, 90);
+        assert_eq!(effective.max_storage_bytes, defaults.max_storage_bytes);
+        assert_eq!(
+            effective.bench_bypass_enabled,
+            defaults.bench_bypass_enabled
+        );
+        policy.expires_at = Some(now);
+        assert_eq!(
+            effective_owner_config(&defaults, Some(&policy), now).max_requests_per_minute,
+            defaults.max_requests_per_minute
+        );
+        assert_eq!(
+            effective_owner_config(&defaults, None, now).max_requests_per_hour,
+            defaults.max_requests_per_hour
+        );
     }
 }

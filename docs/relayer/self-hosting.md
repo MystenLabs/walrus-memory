@@ -234,3 +234,40 @@ See [Database Sync](/indexer/database-sync) for the full schema.
 - The indexer records which owner has an account. Delegate-key authentication does not scan `AccountRegistry`; a cold key needs `x-account-id` or `MEMWAL_ACCOUNT_ID`.
 - Without `OPENAI_API_KEY`, the server uses deterministic mock embeddings (hash-based), useful for local testing but not production.
 - Use `LOG_FORMAT=json` in production and see [Observability](/relayer/observability) for dashboards and alerts.
+
+## Owner-specific request budgets
+
+An operator can keep deployment-wide defaults and set different weighted request
+budgets for selected owner wallets in **Admin Dashboard → Owner rate limits**.
+Enter the owner wallet address (not an account object ID or delegate public key),
+load its policy, and set the account points per minute, account points per hour,
+and points per minute for each delegate key. The owner is resolved by the server's
+existing authentication; callers cannot select a policy through request payloads.
+All accounts owned by that wallet share the existing owner budget.
+
+An optional expiry restores the environment defaults automatically. **Restore
+defaults** removes the override immediately for subsequent requests. Neither action
+resets existing usage counters, so requests can remain throttled until earlier
+usage leaves the sliding window. Defaults come from `RATE_LIMIT_REQUESTS_PER_MINUTE`,
+`RATE_LIMIT_REQUESTS_PER_HOUR`, and `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE`.
+
+The private `GET`, `PUT`, and `DELETE /api/admin/rate-limits/{owner}` endpoints
+require `x-admin-api-key` matching `ADMIN_API_KEY`. Responses use `no-store, private`.
+`PUT` replaces all three positive integer limits and accepts an `expires_at`
+RFC 3339 timestamp or `null` for no expiry. Minute limits are capped at 1,000,000;
+the hourly limit is capped at 100,000,000. These are configuration bounds, not
+capacity guarantees. Expiry must be in the future when saving.
+
+Policies and their change history are runtime database records created by migration
+`027_owner_rate_limits.sql`. The migration seeds no owner identities. Do not commit
+operator credentials, real owner lists, or customer-specific configuration to source
+control. Each authenticated request performs an indexed policy lookup with a
+one-second deadline, so changes are shared across replicas without a stale policy
+cache. Lookup failures return 503. Existing Redis fallback uses the same effective
+limits. Storage quotas, endpoint weights, MCP transport limits, sponsorship limits,
+and the separate owner read API remain independently enforced.
+
+To exercise the policy database and HTTP tests locally, set
+`OWNER_RATE_LIMIT_TEST_DATABASE_URL` to a disposable local PostgreSQL database and
+run `cargo test --manifest-path services/server/Cargo.toml --bin memwal-server owner_`.
+The tests use isolated temporary schemas and reject non-local database hosts.

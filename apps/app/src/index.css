@@ -16420,3 +16420,18 @@ body:has(.signin-proposed) {
     white-space: nowrap;
   }
 }
+
+/* Private operator policy form; uses the existing admin card and button styles. */
+.admin-rate-description { color: var(--text-secondary, #94a3b8); line-height: 1.6; margin: 0 0 18px; }
+.admin-rate-lookup label, .admin-rate-grid label { display: flex; flex-direction: column; gap: 8px; }
+.admin-rate-lookup-row { display: flex; gap: 12px; margin-top: 8px; }
+.admin-rate-lookup-row input { flex: 1; min-width: 0; }
+.admin-rate-limits-card input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border-color, #334155); background: transparent; color: inherit; font: inherit; }
+.admin-rate-limits-card input:focus-visible { outline: 2px solid var(--accent, #38bdf8); outline-offset: 2px; }
+.admin-rate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 20px 0; }
+.admin-rate-grid small { color: var(--text-secondary, #94a3b8); }
+.admin-rate-owner { overflow-wrap: anywhere; margin-top: 20px; }
+.admin-rate-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.admin-rate-reset { background: transparent; color: inherit; border: 1px solid var(--border-color, #334155); padding: 10px 16px; border-radius: 8px; cursor: pointer; }
+.admin-rate-limits-card button:disabled { opacity: .5; cursor: wait; }
+@media (max-width: 640px) { .admin-rate-grid { grid-template-columns: 1fr; } .admin-rate-lookup-row { flex-direction: column; } }

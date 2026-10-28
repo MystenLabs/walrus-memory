@@ -8,6 +8,7 @@ mod jobs_security_delete;
 mod mcp_proxy;
 mod oauth;
 mod observability;
+mod owner_rate_limits;
 mod owner_token_auth;
 mod rate_limit;
 mod routes;
@@ -779,6 +780,170 @@ mod mcp_rate_limit_tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
+    #[tokio::test]
+    async fn owner_policy_admin_requires_operator_key_on_every_method() {
+        let state = test_state(denying_redis().await).await;
+        let app = owner_rate_limit_routes().with_state(state);
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/admin/rate-limits/0x1")
+                        .header("authorization", "Bearer example-delegate-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_policy_http_uses_scoped_limits_and_fails_closed() {
+        let Ok(database_url) = std::env::var("OWNER_RATE_LIMIT_TEST_DATABASE_URL") else {
+            return;
+        };
+        let parsed = url::Url::parse(&database_url).unwrap();
+        assert!(matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1")
+        ));
+        let setup = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let schema = format!("policy_http_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&setup)
+            .await
+            .unwrap();
+        let statement = format!("SET search_path TO {schema}");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |connection, _| {
+                let statement = statement.clone();
+                Box::pin(async move {
+                    sqlx::query(&statement).execute(connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/027_owner_rate_limits.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owner = security_delete_auth::canonical_sui_address("0x1").unwrap();
+        let other = security_delete_auth::canonical_sui_address("0x2").unwrap();
+        sqlx::query("INSERT INTO owner_rate_limits(owner,requests_per_minute,requests_per_hour,delegate_key_per_minute) VALUES ($1,180,1500,90)")
+            .bind(&owner).execute(&pool).await.unwrap();
+        let mut state = test_state(denying_redis().await).await;
+        Arc::get_mut(&mut state).unwrap().db = Arc::new(VectorDb::from_pool(pool.clone()));
+        // When supplied by the local test command, exercise real authenticated
+        // admin roundtrips as well as the middleware below.
+        if let Ok(key) = std::env::var("ADMIN_API_KEY") {
+            let admin = owner_rate_limit_routes().with_state(state.clone());
+            for (method, body) in [
+                (
+                    Method::PUT,
+                    r#"{"requests_per_minute":180,"requests_per_hour":1500,"delegate_key_per_minute":90,"expires_at":null}"#,
+                ),
+                (Method::GET, ""),
+                (Method::DELETE, ""),
+            ] {
+                let response = admin
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/api/admin/rate-limits/0x2")
+                            .header("x-admin-api-key", &key)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["cache-control"], "no-store, private");
+            }
+            let response = admin.oneshot(Request::builder().method(Method::PUT)
+                .uri("/api/admin/rate-limits/0x2")
+                .header("x-admin-api-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"requests_per_minute":0,"requests_per_hour":1500,"delegate_key_per_minute":90}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let app = Router::new()
+            .route("/api/recall", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit::rate_limit_middleware,
+            ))
+            .with_state(state);
+        async fn call(app: &Router, owner: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/recall")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(types::AuthInfo {
+                public_key: "example-key".into(),
+                owner: owner.into(),
+                account_id: "example-account".into(),
+                delegate_key: None,
+                seal_session: None,
+            });
+            let response = app.clone().oneshot(req).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let (status, body) = call(&app, &owner).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["limit"], "90 weighted-requests/min");
+        assert_eq!(
+            call(&app, &other).await.1["limit"],
+            "30 weighted-requests/min"
+        );
+        sqlx::query("UPDATE owner_rate_limits SET expires_at=now()-interval '1 second'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            call(&app, &owner).await.1["limit"],
+            "30 weighted-requests/min"
+        );
+        // A policy-store failure must not fall through to a larger global default.
+        sqlx::query("DROP TABLE owner_rate_limits")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(call(&app, &owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&setup)
+            .await
+            .unwrap();
+        setup.close().await;
+    }
+}
+
+// Keep policy administration behind the same operator credential on every method.
+fn owner_rate_limit_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/api/admin/rate-limits/{owner}",
+            get(owner_rate_limits::get_policy)
+                .put(owner_rate_limits::put_policy)
+                .delete(owner_rate_limits::delete_policy)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .layer(middleware::from_fn(auth::verify_admin_key))
 }
 
 fn parse_env_u64(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
@@ -2749,7 +2914,8 @@ async fn main() {
             "/api/admin/unblock-requests",
             get(routes::list_unblock_requests).layer(DefaultBodyLimit::max(16 * 1024)),
         )
-        .layer(middleware::from_fn(auth::verify_admin_key));
+        .layer(middleware::from_fn(auth::verify_admin_key))
+        .merge(owner_rate_limit_routes());
 
     // Public routes
     // /health and /config accept no body — cap at 16 KiB to reject
