@@ -19,6 +19,8 @@ import {
 import type { PluginConfig } from "../types.js";
 
 const MAX_TRACKED_MESSAGES_PER_SCOPE = 1_000;
+const MAX_TRACKED_SCOPES = 1_000;
+const SCOPE_IDLE_TTL_MS = 30 * 60_000;
 
 interface ScopeCaptureState {
   /** Message keys already sent to a successful `analyze()` call. */
@@ -27,6 +29,9 @@ interface ScopeCaptureState {
   firstSeenAt: Map<string, Date>;
   /** Currently running `analyze()` promise for this scope, if any. */
   inFlight: Promise<unknown> | null;
+  /** Protect the whole hook, including retry delays between analyze calls. */
+  activeHook: boolean;
+  lastUsedAt: number;
 }
 
 function rememberBoundedKey<T>(setOrMap: Set<string> | Map<string, T>, key: string, value?: T): void {
@@ -49,16 +54,47 @@ function rememberBoundedKey<T>(setOrMap: Set<string> | Map<string, T>, key: stri
 export function registerCaptureHook(api: any, client: MemWal, config: PluginConfig): void {
   const stateByScope = new Map<string, ScopeCaptureState>();
 
-  function getScopeState(scopeKey: string): ScopeCaptureState {
+  function touchScope(scopeKey: string, state: ScopeCaptureState): void {
+    state.lastUsedAt = Date.now();
+    stateByScope.delete(scopeKey);
+    stateByScope.set(scopeKey, state);
+  }
+
+  function isActive(state: ScopeCaptureState): boolean {
+    return state.activeHook || state.inFlight !== null;
+  }
+
+  function getScopeState(scopeKey: string): ScopeCaptureState | undefined {
+    const now = Date.now();
+    // In access order, only the oldest entries can have expired. Active work
+    // stays tracked even after a timeout so another turn cannot duplicate it.
+    for (const [key, state] of stateByScope) {
+      if (now - state.lastUsedAt < SCOPE_IDLE_TTL_MS) break;
+      if (!isActive(state)) stateByScope.delete(key);
+    }
+
     let state = stateByScope.get(scopeKey);
     if (!state) {
+      if (stateByScope.size >= MAX_TRACKED_SCOPES) {
+        for (const [key, candidate] of stateByScope) {
+          if (!isActive(candidate)) {
+            stateByScope.delete(key);
+            break;
+          }
+        }
+        // All slots are busy: skip a new scope instead of losing its guard
+        // or letting a burst of sessions grow the cache without a bound.
+        if (stateByScope.size >= MAX_TRACKED_SCOPES) return undefined;
+      }
       state = {
         capturedKeys: new Set<string>(),
         firstSeenAt: new Map<string, Date>(),
         inFlight: null,
+        activeHook: false,
+        lastUsedAt: now,
       };
-      stateByScope.set(scopeKey, state);
     }
+    touchScope(scopeKey, state);
     return state;
   }
 
@@ -68,6 +104,12 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
     const { namespace, agentName } = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
     const scopeKey = `${namespace}\0${ctx?.sessionKey ?? ""}`;
     const state = getScopeState(scopeKey);
+    if (!state) {
+      api.logger.debug?.("memory-memwal: auto-capture skipped — capture scopes are busy");
+      return;
+    }
+    if (state.activeHook) return;
+    state.activeHook = true;
 
     try {
       // Extract both user and assistant messages — the server LLM on analyze()
@@ -192,6 +234,9 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       api.logger.warn(
         `memory-memwal: auto-capture failed: ${String(err)}`,
       );
+    } finally {
+      state.activeHook = false;
+      touchScope(scopeKey, state);
     }
   });
 }
