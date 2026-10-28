@@ -251,8 +251,8 @@ resets existing usage counters, so requests can remain throttled until earlier
 usage leaves the sliding window. Defaults come from `RATE_LIMIT_REQUESTS_PER_MINUTE`,
 `RATE_LIMIT_REQUESTS_PER_HOUR`, and `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE`.
 
-The private `GET`, `PUT`, and `DELETE /api/admin/rate-limits/{owner}` endpoints
-require `x-admin-api-key` matching `ADMIN_API_KEY`. Responses use `no-store, private`.
+The private endpoint `/api/admin/rate-limits/:owner` supports `GET`, `PUT`,
+and `DELETE`. Requests require `x-admin-api-key` matching `ADMIN_API_KEY`. Responses use `no-store, private`.
 `PUT` replaces all three positive integer limits and accepts an `expires_at`
 RFC 3339 timestamp or `null` for no expiry. Minute limits are capped at 1,000,000;
 the hourly limit is capped at 100,000,000. These are configuration bounds, not
