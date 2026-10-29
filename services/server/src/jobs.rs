@@ -739,8 +739,9 @@ async fn admit_wallet_upload(
 
 /// The storage reservation is admitted at enqueue and expires after 15
 /// minutes. A congestion wait can outlive that. Refresh it so a burst cannot
-/// take the bytes this job is still going to write. If the row was already
-/// swept, admit it again; a rejection is logged and the upload still retries.
+/// take the bytes this job is still going to write. Only live (`expires_at > NOW()`)
+/// rows may be extended directly; an expired or swept row must re-enter
+/// `reserve_storage_quota_one` under the owner's quota lock.
 async fn keep_upload_storage_reservation(
     state: &AppState,
     job_id: &str,
@@ -751,7 +752,7 @@ async fn keep_upload_storage_reservation(
     let extended = sqlx::query(
         "UPDATE storage_reservations
          SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
-         WHERE id = $1",
+         WHERE id = $1 AND expires_at > NOW()",
     )
     .bind(job_id)
     .bind(ttl_secs)
@@ -782,6 +783,68 @@ async fn keep_upload_storage_reservation(
             job_id,
             e
         );
+    }
+}
+
+/// Prove or renew a job's storage reservation under the owner's quota lock
+/// before an unpaid upload step spends Walrus storage.
+pub(crate) async fn ensure_upload_storage_reservation_with_db(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if max_storage_bytes <= 0 {
+        return Ok(());
+    }
+    let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
+    let extended = sqlx::query(
+        "UPDATE storage_reservations
+         SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
+         WHERE id = $1 AND expires_at > NOW()",
+    )
+    .bind(job_id)
+    .bind(ttl_secs)
+    .execute(db.pool())
+    .await
+    .map_err(|e| {
+        WalletJobError::Transient(format!(
+            "could not extend storage reservation for job {}: {}",
+            job_id, e
+        ))
+    })?;
+
+    if extended.rows_affected() > 0 {
+        return Ok(());
+    }
+
+    let lock_key = crate::rate_limit::stable_hash_i64(owner);
+    let reservations = [crate::storage::db::StorageReservationRequest {
+        id: job_id.to_string(),
+        bytes: bytes.max(1),
+    }];
+    match db
+        .admit_storage_reservations(
+            owner,
+            lock_key,
+            max_storage_bytes,
+            &reservations,
+            crate::rate_limit::STORAGE_RESERVATION_TTL,
+        )
+        .await
+    {
+        Ok(crate::storage::db::StorageAdmission::Admitted) => Ok(()),
+        Ok(crate::storage::db::StorageAdmission::Rejected { used }) => {
+            Err(WalletJobError::Permanent(format!(
+                "storage quota exceeded after reservation expired (used={} bytes, max={} bytes)",
+                used, max_storage_bytes
+            )))
+        }
+        Err(e) => Err(WalletJobError::Transient(format!(
+            "could not re-admit storage reservation for job {}: {}",
+            job_id, e
+        ))),
     }
 }
 
@@ -2042,6 +2105,16 @@ async fn execute_durable_upload(
     // checkpoint before asking the sidecar to perform the next side effect.
     let mut budget = DurableUploadBudget::new();
     while budget.take_step() {
+        if !upload_journal_signer_committed(&journal) && journal.register_transaction.is_none() {
+            ensure_upload_storage_reservation_with_db(
+                &state.db,
+                state.config.rate_limit.max_storage_bytes,
+                remember_job_id,
+                owner,
+                encrypted.len() as i64,
+            )
+            .await?;
+        }
         let mut attaches = 0u32;
         let advanced = loop {
             let _ = sqlx::query(
@@ -3481,7 +3554,7 @@ pub enum WalletJobError {
 }
 
 impl WalletJobError {
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             WalletJobError::Transient(msg)
             | WalletJobError::Permanent(msg)
