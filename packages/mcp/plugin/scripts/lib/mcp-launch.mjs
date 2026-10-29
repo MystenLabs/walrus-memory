@@ -455,12 +455,32 @@ export function installArguments(spec, staging) {
         // otherwise run preinstall/install/postinstall of the whole dependency tree
         // as the user, before any of our verification runs.
         "--ignore-scripts",
+        "--json",
         `--registry=${MCP_REGISTRY}`,
         "--no-audit",
         "--no-fund",
         "--no-save",
         "--loglevel=error",
     ];
+}
+
+/** Only an exact missing-version npm error can use the reviewed bootstrap. */
+export function isMissingPinnedVersion(result, version) {
+    try {
+        const error = JSON.parse(result.stdout).error;
+        return error?.code === "ETARGET"
+            && error.summary === `No matching version found for ${MCP_PACKAGE_NAME}@${version}.`;
+    } catch { return false; }
+}
+
+/** No fallback on network, integrity, permissions or dependency failures. */
+export function resolvePinnedEntry(preferred, bootstrap, load) {
+    try { return load(preferred); }
+    catch (error) {
+        if (!bootstrap || bootstrap === preferred
+            || error?.code !== "MCP_VERSION_UNAVAILABLE" || error.version !== preferred) throw error;
+        return load(bootstrap);
+    }
 }
 
 /**
@@ -503,6 +523,12 @@ function install(version, root) {
             throw new Error(`could not run npm (${npm.path}): ${result.error.message}`);
         }
         if (result.status !== 0) {
+            if (isMissingPinnedVersion(result, version)) {
+                const error = new Error(`The pinned ${MCP_PACKAGE_NAME}@${version} is not published`);
+                error.code = "MCP_VERSION_UNAVAILABLE";
+                error.version = version;
+                throw error;
+            }
             throw new Error(
                 `npm install ${spec} failed (exit ${result.status}): ` +
                     `${(result.stderr || result.stdout || "").trim()}`,
@@ -542,17 +568,27 @@ function install(version, root) {
  * The absolute path the plugin should launch. Installs the pinned version into the
  * trusted area on first use; later calls are a stat of a known path.
  *
- * There is deliberately no fallback: if the trusted install cannot be produced, the
- * launcher fails instead of reaching for a package name that a project could answer.
+ * A reviewed bootstrap is permitted only for npm's exact missing-version error.
+ * Every candidate uses the same trusted install path and verification; the launcher
+ * never resolves a package from the user's project.
  */
-export function ensureTrustedEntry({ version = pinnedVersion(), root = runtimeRoot() } = {}) {
+export function ensureTrustedEntry(options = {}) {
+    const { version = pinnedVersion(), root = runtimeRoot() } = options;
     const trustedRoot = prepareRuntimeRoot(assertRuntimeRootLocation(root));
-    const dir = installDir(version, trustedRoot);
-    if (verifyTrustedDirectory(dir)) {
-        const existing = resolveInstalledEntry(dir, version);
-        if (existing) return existing;
+    const manifest = options.version === undefined
+        ? JSON.parse(readFileSync(join(PLUGIN_ROOT, "plugin.json"), "utf8")) : {};
+    const bootstrap = manifest.mcpBootstrapVersion;
+    if (bootstrap !== undefined && !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(bootstrap)) {
+        throw new Error("Invalid MCP bootstrap version");
     }
-    return install(version, trustedRoot);
+    return resolvePinnedEntry(version, bootstrap, candidate => {
+        const dir = installDir(candidate, trustedRoot);
+        if (verifyTrustedDirectory(dir)) {
+            const existing = resolveInstalledEntry(dir, candidate);
+            if (existing) return existing;
+        }
+        return install(candidate, trustedRoot);
+    });
 }
 
 /** Exported for the regression test: the path we expect, without installing anything. */
