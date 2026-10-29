@@ -792,11 +792,12 @@ export class MemWal {
      * When `idempotencyKey` is omitted, derives a deterministic key (`r1-<sha256>`)
      * from `(30-minute UTC bucket, resolvedNamespace, text)` (or `dedupe:<sha256>`
      * when `dedupe: true`) and retains it in `pendingRememberKeys` until the job
-     * succeeds terminally (`done`) or `destroy()` is called. Retrying `rememberAndWait`
-     * with the same `(text, namespace)` after a polling timeout reuses the key so the
-     * relayer collapses the retry onto the existing `job_id` without appending a
-     * duplicate memory. After a terminal failure, provide an explicit `idempotencyKey`
-     * or call `destroy()` to trigger a fresh operation on the same instance.
+     * succeeds terminally (`done`). Retrying `rememberAndWait` with the same
+     * `(text, namespace)` after a polling timeout reuses the key so the relayer
+     * collapses the retry onto the existing `job_id` without appending a
+     * duplicate memory. After a terminal failure, provide an explicit fresh
+     * `idempotencyKey` on the live instance, or explicitly destroy and create
+     * a new client with credentials and a fresh operation key.
      */
     async rememberAndWait(
         text: string,
