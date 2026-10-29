@@ -16438,9 +16438,12 @@ body:has(.signin-proposed) {
 .dash-page .admin-priority-card .dashboard-add-key-create,
 .dash-page .admin-priority-card .dashboard-add-key-create:hover:not(:disabled),
 .dash-page .admin-priority-card .dashboard-add-key-create:active:not(:disabled) {
+  width: 112px;
+  min-width: 112px;
   min-height: 48px;
   height: 48px;
-  padding: 10px 18px;
+  padding: 10px 12px;
+  justify-content: center;
   transform: none;
   translate: none;
   box-shadow: none;

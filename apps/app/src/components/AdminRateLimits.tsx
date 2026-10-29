@@ -141,9 +141,11 @@ function WalletRow({
             aria-label="Save wallet"
             disabled={busy || multiplier === 'custom'}
           >
-            <span className="admin-priority-save-indicator">
-              {isSaved && <Check size={16} aria-label="Wallet saved" />}
-            </span>
+            {isSaved && (
+              <span className="admin-priority-save-indicator">
+                <Check size={16} aria-label="Wallet saved" />
+              </span>
+            )}
             <span>Save</span>
           </button>
           <button
