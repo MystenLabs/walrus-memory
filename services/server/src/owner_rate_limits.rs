@@ -1,13 +1,14 @@
 //! Private operator policy. Identity comes from authenticated owner resolution;
 //! overrides never change authentication, endpoint weights, or storage quotas.
 use crate::rate_limit::RateLimitConfig;
-use crate::security_delete_auth::canonical_sui_address;
 use crate::types::{AppError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use sui_sdk_types::Address;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +114,12 @@ fn policy_store_error(_: sqlx::Error) -> AppError {
 }
 
 fn owner_address(raw: &str) -> Result<String, AppError> {
-    canonical_sui_address(raw).map_err(|_| AppError::BadRequest("Invalid owner address".into()))
+    owner_address_value(raw).map(|address| address.to_string())
+}
+
+fn owner_address_value(raw: &str) -> Result<Address, AppError> {
+    raw.parse()
+        .map_err(|_| AppError::BadRequest("Invalid owner address".into()))
 }
 
 pub async fn load_policy(
@@ -169,7 +175,8 @@ pub async fn put_policy(
     Path(raw): Path<String>,
     Json(policy): Json<OwnerRateLimit>,
 ) -> Result<Json<PolicyResponse>, AppError> {
-    let owner = owner_address(&raw)?;
+    let address = owner_address_value(&raw)?;
+    let owner = address.to_string();
     policy.validate(Utc::now())?;
     let _policy_guard =
         tokio::time::timeout(REFRESH_INTERVAL, state.owner_policies.mutation_guard())
@@ -184,7 +191,7 @@ pub async fn put_policy(
     .map_err(policy_store_error)?;
     state
         .owner_policies
-        .apply_committed(owner.clone(), Some(policy.clone()));
+        .apply_committed(address, Some(policy.clone()));
     // Return exactly the saved policy, without a second read racing another operator.
     let defaults = OwnerRateLimit::defaults(&state.config.rate_limit);
     Ok(Json(PolicyResponse {
@@ -199,7 +206,8 @@ pub async fn delete_policy(
     State(state): State<Arc<AppState>>,
     Path(raw): Path<String>,
 ) -> Result<Json<PolicyResponse>, AppError> {
-    let owner = owner_address(&raw)?;
+    let address = owner_address_value(&raw)?;
+    let owner = address.to_string();
     let _policy_guard =
         tokio::time::timeout(REFRESH_INTERVAL, state.owner_policies.mutation_guard())
             .await
@@ -208,7 +216,7 @@ pub async fn delete_policy(
         .await
         .map_err(|_| policy_store_error(sqlx::Error::PoolTimedOut))?
         .map_err(policy_store_error)?;
-    state.owner_policies.apply_committed(owner.clone(), None);
+    state.owner_policies.apply_committed(address, None);
     let defaults = OwnerRateLimit::defaults(&state.config.rate_limit);
     Ok(Json(PolicyResponse {
         owner,
@@ -224,16 +232,16 @@ pub async fn delete_policy(
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_SNAPSHOT_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PolicySnapshot {
     revision: Option<i64>,
     checked_at: Option<std::time::Instant>,
-    policies: std::collections::HashMap<String, OwnerRateLimit>,
+    policies: Arc<HashMap<Address, OwnerRateLimit>>,
 }
 
 #[derive(Default)]
 pub struct OwnerPolicyStore {
-    snapshot: std::sync::RwLock<PolicySnapshot>,
+    snapshot: arc_swap::ArcSwap<PolicySnapshot>,
     // Serializes refreshes with local committed mutations, preventing an older
     // refresh from overwriting a just-saved policy on this replica.
     refresh_lock: tokio::sync::Mutex<()>,
@@ -259,72 +267,103 @@ impl OwnerPolicyStore {
         owner: &str,
         now: std::time::Instant,
     ) -> Result<Option<OwnerRateLimit>, PolicySnapshotUnavailable> {
-        let snapshot = self
-            .snapshot
-            .read()
-            .map_err(|_| PolicySnapshotUnavailable)?;
+        let owner: Address = owner.parse().map_err(|_| PolicySnapshotUnavailable)?;
+        let snapshot = self.snapshot.load();
         if snapshot
             .checked_at
             .is_none_or(|checked| now.saturating_duration_since(checked) >= MAX_SNAPSHOT_AGE)
         {
             return Err(PolicySnapshotUnavailable);
         }
-        Ok(snapshot.policies.get(owner).cloned())
+        Ok(snapshot.policies.get(&owner).cloned())
     }
 
     pub async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.refresh_lock.lock().await
     }
 
+    // Writers hold mutation_guard; requests retain an immutable snapshot while
+    // the next one is built. Unchanged refreshes share the same policy map.
+    fn update_snapshot(&self, update: impl FnOnce(&mut PolicySnapshot)) {
+        let mut next = self.snapshot.load_full().as_ref().clone();
+        update(&mut next);
+        self.snapshot.store(Arc::new(next));
+    }
+
     // Called only after durable commit, while holding mutation_guard.
-    fn apply_committed(&self, owner: String, policy: Option<OwnerRateLimit>) {
-        if let Ok(mut snapshot) = self.snapshot.write() {
+    fn apply_committed(&self, owner: Address, policy: Option<OwnerRateLimit>) {
+        self.update_snapshot(|snapshot| {
+            let policies = Arc::make_mut(&mut snapshot.policies);
             match policy {
                 Some(policy) => {
-                    snapshot.policies.insert(owner, policy);
+                    policies.insert(owner, policy);
                 }
                 None => {
-                    snapshot.policies.remove(&owner);
+                    policies.remove(&owner);
                 }
             }
             snapshot.revision = None;
             // A single edit cannot certify freshness of all other owners.
-        }
+        });
     }
 
     pub async fn refresh(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let _guard = self.refresh_lock.lock().await;
-        let current = self
-            .snapshot
-            .read()
-            .map_err(|_| sqlx::Error::Protocol("policy snapshot lock unavailable".into()))?
-            .revision;
+        let current = self.snapshot.load().revision;
         let checked_at = std::time::Instant::now();
         let (revision, policies) = tokio::time::timeout(REFRESH_INTERVAL, async {
-            let observed: i64 = sqlx::query_scalar("SELECT revision FROM owner_rate_limit_revision WHERE singleton").fetch_one(pool).await?;
+            const REVISION_QUERY: &str =
+                "SELECT revision FROM owner_rate_limit_revision WHERE singleton";
+            let observed: i64 = sqlx::query_scalar(REVISION_QUERY).fetch_one(pool).await?;
             if current == Some(observed) {
                 return Ok::<_, sqlx::Error>((observed, None));
             }
             let mut transaction = pool.begin().await?;
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *transaction).await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *transaction)
+                .await?;
             // Re-read inside the transaction so generation and rows refer to
             // one MVCC snapshot even if another replica commits meanwhile.
-            let revision: i64 = sqlx::query_scalar("SELECT revision FROM owner_rate_limit_revision WHERE singleton").fetch_one(&mut *transaction).await?;
-            let records = sqlx::query_as::<_, OwnerPolicyRecord>("SELECT owner, requests_per_minute, requests_per_hour, delegate_key_per_minute, expires_at FROM owner_rate_limits WHERE expires_at IS NULL OR expires_at > now()")
-                .fetch_all(&mut *transaction).await?;
-            let policies = records.into_iter().map(|row| (row.owner, OwnerRateLimit { requests_per_minute: row.requests_per_minute, requests_per_hour: row.requests_per_hour, delegate_key_per_minute: row.delegate_key_per_minute, expires_at: row.expires_at })).collect();
+            let revision: i64 = sqlx::query_scalar(REVISION_QUERY)
+                .fetch_one(&mut *transaction)
+                .await?;
+            let records = sqlx::query_as::<_, OwnerPolicyRecord>(
+                "SELECT owner, requests_per_minute, requests_per_hour,
+                        delegate_key_per_minute, expires_at
+                 FROM owner_rate_limits
+                 WHERE expires_at IS NULL OR expires_at > now()",
+            )
+            .fetch_all(&mut *transaction)
+            .await?;
+            let policies = records
+                .into_iter()
+                .map(|row| {
+                    let owner: Address = row.owner.parse().map_err(|_| {
+                        sqlx::Error::Protocol("invalid policy owner address".into())
+                    })?;
+                    Ok((
+                        owner,
+                        OwnerRateLimit {
+                            requests_per_minute: row.requests_per_minute,
+                            requests_per_hour: row.requests_per_hour,
+                            delegate_key_per_minute: row.delegate_key_per_minute,
+                            expires_at: row.expires_at,
+                        },
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, sqlx::Error>>()?;
             transaction.commit().await?;
             Ok::<_, sqlx::Error>((revision, Some(policies)))
-        }).await.map_err(|_| sqlx::Error::PoolTimedOut)??;
-        let mut snapshot = self
-            .snapshot
-            .write()
-            .map_err(|_| sqlx::Error::Protocol("policy snapshot lock unavailable".into()))?;
-        if let Some(policies) = policies {
-            snapshot.policies = policies;
-        }
-        snapshot.revision = Some(revision);
-        snapshot.checked_at = Some(checked_at);
+        })
+        .await
+        .map_err(|_| sqlx::Error::PoolTimedOut)??;
+        self.update_snapshot(|snapshot| {
+            if let Some(policies) = policies {
+                snapshot.policies = Arc::new(policies);
+            }
+            snapshot.revision = Some(revision);
+            snapshot.checked_at = Some(checked_at);
+        });
         Ok(())
     }
 
@@ -347,7 +386,7 @@ impl OwnerPolicyStore {
 
     #[cfg(test)]
     pub fn expire_for_test(&self) {
-        self.snapshot.write().unwrap().checked_at = None;
+        self.update_snapshot(|snapshot| snapshot.checked_at = None);
     }
 }
 
@@ -359,7 +398,7 @@ mod tests {
         let store = OwnerPolicyStore::new();
         assert!(store.policy_for("0x1").is_err());
         let now = std::time::Instant::now();
-        store.snapshot.write().unwrap().checked_at = Some(now);
+        store.update_snapshot(|snapshot| snapshot.checked_at = Some(now));
         assert!(store.policy_at("0x1", now).unwrap().is_none());
         assert!(store.policy_at("0x1", now + MAX_SNAPSHOT_AGE).is_err());
         assert!(store
@@ -374,15 +413,52 @@ mod tests {
     fn local_commit_does_not_certify_unrelated_stale_owners() {
         let store = OwnerPolicyStore::new();
         store.apply_committed(
-            "0x1".into(),
+            "0x1".parse().unwrap(),
             Some(OwnerRateLimit::defaults(&RateLimitConfig::default())),
         );
         assert!(store.policy_for("0x1").is_err());
-        assert!(store.snapshot.read().unwrap().revision.is_none());
-        store.snapshot.write().unwrap().checked_at = Some(std::time::Instant::now());
+        assert!(store.snapshot.load().revision.is_none());
+        store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
         assert!(store.policy_for("0x1").unwrap().is_some());
-        store.apply_committed("0x1".into(), None);
+        store.apply_committed("0x1".parse().unwrap(), None);
         assert!(store.policy_for("0x1").unwrap().is_none());
+    }
+
+    #[test]
+    fn published_snapshot_readers_remain_consistent_during_updates() {
+        let store = OwnerPolicyStore::new();
+        let owner: Address = "0xabc".parse().unwrap();
+        let mut policy = OwnerRateLimit::defaults(&RateLimitConfig::default());
+        policy.requests_per_minute = 180;
+        store.apply_committed(owner, Some(policy.clone()));
+        store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
+        let previous = store.snapshot.load();
+        // A retained reader must not block publication, or observe a half edit.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    policy.requests_per_minute = 240;
+                    store.apply_committed(owner, Some(policy));
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(previous.policies[&owner].requests_per_minute, 180);
+        assert_eq!(
+            store
+                .policy_for("0x000AbC")
+                .unwrap()
+                .unwrap()
+                .requests_per_minute,
+            240
+        );
+        assert!(store.policy_for("invalid").is_err());
+        let current = store.snapshot.load();
+        store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
+        assert!(
+            Arc::ptr_eq(&current.policies, &store.snapshot.load().policies),
+            "freshness updates must share the policy map without copying it"
+        );
     }
 
     #[test]
@@ -390,27 +466,71 @@ mod tests {
     fn policy_snapshot_lookup_benchmark() {
         let store = OwnerPolicyStore::new();
         let policy = OwnerRateLimit::defaults(&RateLimitConfig::default());
-        {
-            let mut snapshot = store.snapshot.write().unwrap();
-            snapshot.policies = (0..10_000)
-                .map(|i| (format!("0x{i:064x}"), policy.clone()))
-                .collect();
+        store.update_snapshot(|snapshot| {
+            snapshot.policies = Arc::new(
+                (0..10_000)
+                    .map(|i| (format!("0x{i:064x}").parse().unwrap(), policy.clone()))
+                    .collect(),
+            );
             snapshot.checked_at = Some(std::time::Instant::now());
-        }
+        });
         let owners: Vec<String> = (0..12_000).map(|i| format!("0x{i:064x}")).collect();
-        let mut times = Vec::with_capacity(100_000);
-        for i in 0..100_000 {
-            let start = std::time::Instant::now();
-            std::hint::black_box(store.policy_for(std::hint::black_box(&owners[i % owners.len()])))
-                .unwrap();
-            times.push(start.elapsed().as_nanos());
+        // Compare complete address normalization + policy lookup with the
+        // previous canonical-string/RwLock design, at 1 and 8 reader threads.
+        let baseline = std::sync::RwLock::new((
+            std::time::Instant::now(),
+            (0..10_000)
+                .map(|i| (format!("0x{i:064x}"), policy.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        ));
+        fn measure(
+            resolve: impl Fn(&str) -> Option<OwnerRateLimit> + Sync,
+            owners: &[String],
+            threads: usize,
+        ) -> (u128, u128) {
+            let mut times = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|thread| {
+                        let resolve = &resolve;
+                        scope.spawn(move || {
+                            (0..(100_000 / threads))
+                                .map(|i| {
+                                    let start = std::time::Instant::now();
+                                    std::hint::black_box(resolve(std::hint::black_box(
+                                        &owners[(i + thread) % owners.len()],
+                                    )));
+                                    start.elapsed().as_nanos()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            times.sort_unstable();
+            (times[times.len() / 2], times[times.len() * 95 / 100])
         }
-        times.sort_unstable();
-        eprintln!(
-            "snapshot entries=10000 lookups=100000 p50={}ns p95={}ns max={}ns",
-            times[50_000], times[95_000], times[99_999]
-        );
-        assert_eq!(store.snapshot.read().unwrap().policies.len(), 10_000);
+        for threads in [1, 8] {
+            baseline.write().unwrap().0 = std::time::Instant::now();
+            let old = measure(
+                |owner| {
+                    let owner = crate::security_delete_auth::canonical_sui_address(owner).unwrap();
+                    let now = std::time::Instant::now();
+                    let snapshot = baseline.read().unwrap();
+                    assert!(now.duration_since(snapshot.0) < MAX_SNAPSHOT_AGE);
+                    snapshot.1.get(&owner).cloned()
+                },
+                &owners,
+                threads,
+            );
+            store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
+            let new = measure(|owner| store.policy_for(owner).unwrap(), &owners, threads);
+            eprintln!("entries=10000 lookups=100000 threads={threads} canonical_string_rwlock_p50={}ns p95={}ns binary_snapshot_p50={}ns p95={}ns", old.0, old.1, new.0, new.1);
+        }
+        assert_eq!(store.snapshot.load().policies.len(), 10_000);
     }
 
     #[test]
@@ -520,7 +640,7 @@ mod tests {
         {
             let _guard = first.mutation_guard().await;
             store_policy(&pool, &owner, &policy).await.unwrap();
-            first.apply_committed(owner.clone(), Some(policy.clone()));
+            first.apply_committed(owner.parse().unwrap(), Some(policy.clone()));
         }
         assert_eq!(
             first

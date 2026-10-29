@@ -265,8 +265,11 @@ Policies and their change history are runtime database records created by migrat
 `027_owner_rate_limits.sql`. The migration seeds no owner identities. Do not commit
 operator credentials, real owner lists, or customer-specific configuration to source
 control. Authenticated requests resolve policy from a local RAM snapshot; they do
-not query PostgreSQL or Redis to read policy. Each replica checks a shared database
-generation every second using a separate pool limited to one connection, and only
+not query PostgreSQL or Redis to read policy. Snapshots are published atomically;
+request readers do not take a shared read lock or wait for policy updates. Owners
+are looked up by binary Sui address without allocating a canonical address string.
+Freshness-only updates reuse the policy map rather than copying it. Each replica
+checks a shared database generation every second using a separate pool limited to one connection, and only
 reloads policies when that generation changes. Generation and policy rows are read
 in one repeatable-read transaction. A successful admin mutation updates the local
 snapshot immediately after commit; other replicas pick it up on their next

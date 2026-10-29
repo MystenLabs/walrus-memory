@@ -75,6 +75,7 @@ tonic = "0.14"
 httpdate = "1"
 
 # Async utilities
+arc-swap = "1.9"
 futures = "0.3"
 async-trait = "0.1"
 

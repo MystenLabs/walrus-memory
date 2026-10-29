@@ -403,20 +403,31 @@ fn rate_limiter_unavailable_response() -> Response {
 // Rate Limit Middleware
 // ============================================================
 
-fn effective_owner_config<'a>(
-    defaults: &'a RateLimitConfig,
+// Keep only the three request budgets on the hot path. In particular, do not
+// clone the Redis URL or carry storage/bypass settings into owner overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestBudgets {
+    max_requests_per_minute: i64,
+    max_requests_per_hour: i64,
+    max_requests_per_delegate_key: i64,
+}
+
+fn effective_owner_budgets(
+    defaults: &RateLimitConfig,
     policy: Option<&crate::owner_rate_limits::OwnerRateLimit>,
     now: chrono::DateTime<chrono::Utc>,
-) -> std::borrow::Cow<'a, RateLimitConfig> {
-    if let Some(policy) = policy.filter(|p| p.active_at(now)) {
-        let mut effective = defaults.clone();
-        effective.max_requests_per_minute = policy.requests_per_minute;
-        effective.max_requests_per_hour = policy.requests_per_hour;
-        effective.max_requests_per_delegate_key = policy.delegate_key_per_minute;
-        std::borrow::Cow::Owned(effective)
-    } else {
-        // Most owners have no override: avoid cloning config strings per request.
-        std::borrow::Cow::Borrowed(defaults)
+) -> RequestBudgets {
+    match policy.filter(|policy| policy.active_at(now)) {
+        Some(policy) => RequestBudgets {
+            max_requests_per_minute: policy.requests_per_minute,
+            max_requests_per_hour: policy.requests_per_hour,
+            max_requests_per_delegate_key: policy.delegate_key_per_minute,
+        },
+        None => RequestBudgets {
+            max_requests_per_minute: defaults.max_requests_per_minute,
+            max_requests_per_hour: defaults.max_requests_per_hour,
+            max_requests_per_delegate_key: defaults.max_requests_per_delegate_key,
+        },
     }
 }
 
@@ -469,22 +480,14 @@ pub async fn rate_limit_middleware(
 
     // No database/Redis lookup for policy resolution on the request path.
     // Unknown owners use defaults; an uninitialized/stale snapshot fails closed.
-    let policy_owner = match crate::security_delete_auth::canonical_sui_address(&auth.owner) {
-        Ok(owner) => owner,
-        Err(_) => return rate_limiter_unavailable_response(),
-    };
-    let policy = match state.owner_policies.policy_for(&policy_owner) {
+    let policy = match state.owner_policies.policy_for(&auth.owner) {
         Ok(policy) => policy,
         Err(_) => return rate_limiter_unavailable_response(),
     };
-    let effective = effective_owner_config(
-        &state.config.rate_limit,
-        policy.as_ref(),
-        chrono::Utc::now(),
-    );
-    let config = &effective;
+    let now = chrono::Utc::now();
+    let config = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now);
     let mut redis = state.redis.clone();
-    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let now = now.timestamp_millis() as f64;
 
     // Determine cost weight based on endpoint; path is normalized inside endpoint_weight.
     let weight = endpoint_weight(request.uri().path());
@@ -3431,22 +3434,17 @@ mod owner_policy_tests {
             delegate_key_per_minute: 90,
             expires_at: Some(now + chrono::Duration::minutes(1)),
         };
-        let effective = effective_owner_config(&defaults, Some(&policy), now);
+        let effective = effective_owner_budgets(&defaults, Some(&policy), now);
         assert_eq!(effective.max_requests_per_minute, 180);
         assert_eq!(effective.max_requests_per_hour, 1500);
         assert_eq!(effective.max_requests_per_delegate_key, 90);
-        assert_eq!(effective.max_storage_bytes, defaults.max_storage_bytes);
-        assert_eq!(
-            effective.bench_bypass_enabled,
-            defaults.bench_bypass_enabled
-        );
         policy.expires_at = Some(now);
         assert_eq!(
-            effective_owner_config(&defaults, Some(&policy), now).max_requests_per_minute,
+            effective_owner_budgets(&defaults, Some(&policy), now).max_requests_per_minute,
             defaults.max_requests_per_minute
         );
         assert_eq!(
-            effective_owner_config(&defaults, None, now).max_requests_per_hour,
+            effective_owner_budgets(&defaults, None, now).max_requests_per_hour,
             defaults.max_requests_per_hour
         );
     }
