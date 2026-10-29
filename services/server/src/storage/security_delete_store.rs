@@ -709,9 +709,9 @@ pub async fn finalize_batch_deleted(
             WHERE v.id = t.id
             RETURNING v.id, v.owner, v.namespace, v.blob_id
          )
-         INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-         SELECT id, owner, namespace, blob_id FROM removed
-         ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+         INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+         SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+         ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
     )
     .bind(batch_id)
     .execute(&mut *tx)
