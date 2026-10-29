@@ -54,7 +54,7 @@ const oversized = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", 
 before(async () => {
     const app = express();
     mountMcpRoutes(app, { relayerUrl: "http://127.0.0.1:1" });
-    await new Promise<void>((resolve) => { httpServer = app.listen(0, "127.0.0.1", resolve); });
+    await new Promise<void>((resolve) => { httpServer = app.listen(0, "127.0.0.1", () => resolve()); });
     baseUrl = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
 });
 

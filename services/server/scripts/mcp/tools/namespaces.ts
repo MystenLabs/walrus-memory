@@ -158,25 +158,53 @@ export function formatNamespaceSuggestionHint(
     return parts.join(" ");
 }
 
+export interface DiscoveredNamespaces {
+    namespaces: NamespaceEntry[];
+    has_more: boolean;
+}
+
 /**
- * Best-effort call to `session.memwal.listNamespaces({ limit: 50 })`.
- * Never throws so unit tests with partial `session.memwal` stubs or older
- * relayers degrade gracefully without failing `memwal_recall` / `memwal_restore`.
+ * Best-effort call to `session.memwal.listNamespaces()`.
+ * Paginate until `targetNamespace` is found or pagination completes,
+ * up to `maxPages` pages. Never throws so unit tests with partial stubs
+ * or older relayers degrade gracefully without failing callers.
  */
 export async function tryListNamespaces(
     session: MemWalSession | undefined,
+    targetNamespaceOrLimit?: string | number,
     limit = 50,
-): Promise<NamespaceEntry[] | null> {
+    maxPages = 5,
+): Promise<DiscoveredNamespaces | null> {
     const fn = (
         session?.memwal as
             | { listNamespaces?: (opts?: { limit?: number; cursor?: string }) => Promise<NamespacesPage> }
             | undefined
     )?.listNamespaces;
     if (typeof fn !== "function") return null;
+
+    const targetNamespace =
+        typeof targetNamespaceOrLimit === "string" ? targetNamespaceOrLimit : undefined;
+    const pageSize =
+        typeof targetNamespaceOrLimit === "number" ? targetNamespaceOrLimit : limit;
+
     try {
-        const page = await fn.call(session!.memwal, { limit });
-        if (!page || !Array.isArray(page.namespaces)) return null;
-        return page.namespaces;
+        const all: NamespaceEntry[] = [];
+        let cursor: string | undefined;
+        let hasMore = false;
+        for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
+            const page = await fn.call(session!.memwal, { limit: pageSize, cursor });
+            if (!page || !Array.isArray(page.namespaces)) return null;
+            all.push(...page.namespaces);
+            hasMore = page.has_more === true;
+            if (!hasMore || !page.next_cursor) {
+                break;
+            }
+            if (targetNamespace && page.namespaces.some((ns) => ns.name === targetNamespace)) {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        return { namespaces: all, has_more: hasMore };
     } catch {
         return null;
     }

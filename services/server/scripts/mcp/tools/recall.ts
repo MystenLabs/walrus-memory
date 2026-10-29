@@ -105,6 +105,7 @@ export function emptyRecallText(
     namespaceContext?: {
         activeNamespace: string;
         namespaces: readonly NamespaceEntry[];
+        has_more?: boolean;
     },
 ): string {
     if (resultCount > 0) {
@@ -118,13 +119,20 @@ export function emptyRecallText(
         return `No matching memories could be returned (${dropped} matched but failed to download or decrypt). This is not an empty namespace.`;
     }
     if (namespaceContext) {
-        const { activeNamespace, namespaces } = namespaceContext;
+        const { activeNamespace, namespaces, has_more } = namespaceContext;
         const activeEntry = namespaces.find((ns) => ns.name === activeNamespace);
-        if (!activeEntry || activeEntry.memory_count === 0) {
-            const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
-            return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
+        if (activeEntry) {
+            if (activeEntry.memory_count === 0) {
+                const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+                return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
+            }
+            return `No matching memories found in namespace "${activeNamespace}" (0 matches among ${activeEntry.memory_count} ${activeEntry.memory_count === 1 ? "memory" : "memories"}).`;
         }
-        return `No matching memories found in namespace "${activeNamespace}" (0 matches among ${activeEntry.memory_count} ${activeEntry.memory_count === 1 ? "memory" : "memories"}).`;
+        if (has_more) {
+            return `No matching memories found in namespace "${activeNamespace}".`;
+        }
+        const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+        return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
     }
     return "No matching memories found.";
 }
@@ -196,9 +204,9 @@ export function registerRecallTool(
             if (filtered.length === 0) {
                 const activeNamespace =
                     namespace?.trim() || session.namespace?.trim() || "default";
-                const namespaces =
+                const discovery =
                     result.results.length === 0 && dropped === 0
-                        ? await tryListNamespaces(session, 50)
+                        ? await tryListNamespaces(session, activeNamespace, 50)
                         : null;
                 return {
                     content: [
@@ -207,8 +215,12 @@ export function registerRecallTool(
                             text: emptyRecallText(
                                 result.results.length,
                                 dropped,
-                                namespaces
-                                    ? { activeNamespace, namespaces }
+                                discovery
+                                    ? {
+                                          activeNamespace,
+                                          namespaces: discovery.namespaces,
+                                          has_more: discovery.has_more,
+                                      }
                                     : undefined,
                             ),
                         },

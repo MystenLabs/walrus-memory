@@ -102,8 +102,8 @@ export function registerRestoreTool(
                 result.restored === 0 &&
                 result.skipped === 0 &&
                 (result.failed ?? 0) === 0;
-            const namespaces = isEmpty
-                ? await tryListNamespaces(session, 50)
+            const discovery = isEmpty
+                ? await tryListNamespaces(session, namespace, 50)
                 : null;
             return {
                 content: [
@@ -112,7 +112,7 @@ export function registerRestoreTool(
                         text: formatRestoreResult(
                             result,
                             limit,
-                            namespaces ?? undefined,
+                            discovery?.namespaces ?? undefined,
                         ),
                     },
                 ],
