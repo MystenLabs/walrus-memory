@@ -52,7 +52,7 @@ The MCP server exposes **nine tools**: seven **relayer tools** (memory operation
 <Warning>
 **Burst writes and rate-limit budgets**: The relayer enforces sliding-window rate limits across three primary budgets:
 
-1. **Per-delegate-key burst limit**: 30 points per minute (configured via `RATE_LIMIT_REQUESTS_PER_DELEGATE_KEY`, default `30`).
+1. **Per-delegate-key burst limit**: 30 points per minute (configured via `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE`, default `30`).
 2. **Per-account burst limit**: 60 points per minute per `MemWalAccount` (configured via `RATE_LIMIT_REQUESTS_PER_MINUTE`, default `60`).
 3. **Per-account sustained limit**: 500 points per hour per `MemWalAccount` (configured via `RATE_LIMIT_REQUESTS_PER_HOUR`, default `500`).
 
