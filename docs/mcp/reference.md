@@ -50,7 +50,20 @@ The MCP server exposes **nine tools**: seven **relayer tools** (memory operation
 </Note>
 
 <Warning>
-**Burst writes and rate-limit budgets**: The relayer enforces a two-layer sliding-window rate limit per 60 seconds: **Layer 1** (`300 points / 60s` per IP or per delegate key) and **Layer 2** (`600 points / 60s` per `MemWalAccount`), with tool weights `recall` = 2, `remember` = 5, `analyze` = 10, `restore` = 15, and `remember_bulk` = 15. When saving multiple facts at once, prefer `memwal_remember_bulk` (up to 20 facts for a single 15-point call instead of 5 points per `memwal_remember`), space rapid writes apart, and honor `Retry-After` / `retry_after_seconds` on HTTP 429 responses.
+**Burst writes and rate-limit budgets**: The relayer enforces sliding-window rate limits across three primary budgets:
+
+1. **Per-delegate-key burst limit**: 30 points per minute (configured via `RATE_LIMIT_REQUESTS_PER_DELEGATE_KEY`, default `30`).
+2. **Per-account burst limit**: 60 points per minute per `MemWalAccount` (configured via `RATE_LIMIT_REQUESTS_PER_MINUTE`, default `60`).
+3. **Per-account sustained limit**: 500 points per hour per `MemWalAccount` (configured via `RATE_LIMIT_REQUESTS_PER_HOUR`, default `500`).
+
+Tool endpoint weights:
+- `memwal_recall`: 1 point
+- `memwal_restore`: 3 points
+- `memwal_remember`: 5 points
+- `memwal_remember_bulk`: 10 points (covering up to 20 facts in a single request)
+- `memwal_analyze`: 5 points base plus 1 point per extracted fact
+
+When saving multiple facts at once, prefer `memwal_remember_bulk` to conserve both per-minute burst and hourly sustained quota (10 points for up to 20 facts versus 5 points per individual `memwal_remember`). Ensure high-volume agents account for the 500 points per hour sustained limit, space rapid writes apart, and honor `Retry-After` or `retry_after_seconds` on HTTP 429 responses.
 </Warning>
 
 ## First-run behavior
