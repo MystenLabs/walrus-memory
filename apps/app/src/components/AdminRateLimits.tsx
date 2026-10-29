@@ -97,13 +97,7 @@ function WalletRow({
     void run(() => resetOwnerRateLimits(adminKey, saved.owner), onRemove)
   }
   return (
-    <li
-      className={
-        saved
-          ? 'admin-priority-wallet'
-          : 'dashboard-add-key-form admin-priority-wallet admin-priority-wallet--draft'
-      }
-    >
+    <li className="admin-priority-wallet">
       <form className="admin-priority-row" onSubmit={save}>
         <input
           aria-label="Wallet address"
