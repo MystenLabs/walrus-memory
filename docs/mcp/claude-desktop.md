@@ -81,24 +81,42 @@ Newer Claude Desktop versions pre-populate `claude_desktop_config.json` with oth
 
 Quit and reopen Claude Desktop (`Cmd+Q` on macOS; closing the window is not enough), then ask the agent to run `memwal_login` on first use.
 
-## Add memory instructions
+## One-time setup (required)
 
 Regular Claude Desktop chat does not run the lifecycle hooks that reinforce automatic memory on
-[Claude Code](/mcp/claude-code), [Codex](/mcp/codex), and [Antigravity](/mcp/antigravity).
-The tools still work here and the agent might save and recall on its own, but that is
-best-effort, because Claude Desktop's built-in memory can win instead. State the
-expectation yourself to get closer to the plugin behavior.
+[Claude Code](/mcp/claude-code), [Codex](/mcp/codex), and [Antigravity](/mcp/antigravity),
+does not inject MCP `initialize.instructions` into the model, and starts custom write tools at
+Ask. After the server is connected and you are signed in, do these three steps once.
 
-Open **Settings → Profile → personal preferences** (applies to every conversation), or a
-single **Project's instructions** (applies only inside that project), and paste:
+<Steps>
+  <Step>
+    ### Choose native memory or Walrus Memory
 
-```text
-Use Walrus Memory as my memory.
-- Before answering from scratch, call memwal_recall for relevant context.
-- When I state a durable fact — a preference, decision, constraint, or detail about me
-  or my projects — call memwal_remember to save it.
-- Prefer Walrus Memory over your built-in memory.
-```
+    If you want portable memory across apps, turn off Claude native memory in Settings → Memory (or "Search and reference past chats"). That change is reversible and does not delete existing native memories.
+
+    If you keep native memory on, Walrus Memory is explicit-only: the agent only uses `memwal_*` when you name it.
+  </Step>
+  <Step>
+    ### Paste the standing instruction
+
+    Open **Settings → Profile (or General) → Instructions for Claude / Personal Preferences** (applies to every conversation), or a single **Project's instructions** (applies only inside that project), and paste this block, then start a new chat:
+
+    ```text
+    Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
+
+    Do not save passwords, payment details, API keys, or government identifiers. After saving, briefly confirm what you stored.
+
+    Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.
+    ```
+  </Step>
+  <Step>
+    ### Always allow after the first save
+
+    State a durable fact (or run the setup verification save). When Claude asks permission to use `memwal_remember` or `memwal_remember_bulk`, choose **Always allow**. Keep recall allowed. Later saves stay silent after that click. View or delete stored facts at [memory.walrus.xyz](https://memory.walrus.xyz).
+  </Step>
+</Steps>
+
+The MCP prompt `memwal_enable_proactive` is a one-shot `/` fallback that returns the same standing instruction. It does not persist like Profile instructions. Paste the block above and choose Always allow. The prompt does not replace those steps.
 
 ## Local MCP tools
 

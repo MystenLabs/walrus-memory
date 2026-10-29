@@ -101,24 +101,36 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.getByText(/handed off to your MCP client/i)).toBeInTheDocument()
     })
 
-    it('offers the starter system prompt once the client is connected', async () => {
+    it('offers the one-time setup once the client is connected', async () => {
         stubListener(async () => new Response('{}', { status: 200 }))
         await signIn()
 
         expect(await screen.findByText(/MCP client connected/i)).toBeInTheDocument()
-        expect(screen.getByText(/most agents only write when told to/i)).toBeInTheDocument()
-        expect(screen.getByText(/call memwal_remember in that same turn/i)).toBeInTheDocument()
-        expect(screen.getByRole('button', { name: /copy prompt/i })).toBeInTheDocument()
+        expect(screen.getByText(/Required: one-time setup/i)).toBeInTheDocument()
+        expect(screen.getByText(/without asking for confirmation/i)).toBeInTheDocument()
+        expect(screen.getByText(/Instructions for Claude/i)).toBeInTheDocument()
+        expect(screen.getByText(/CLAUDE.md/)).toBeInTheDocument()
+        expect(screen.getByText(/AGENTS.md/)).toBeInTheDocument()
+        expect(screen.getByText(/\.cursor\/rules/)).toBeInTheDocument()
+        expect(screen.getByText(/does not delete existing native memories/i)).toBeInTheDocument()
+        expect(screen.queryByText(/ChatGPT/i)).not.toBeInTheDocument()
+        expect(screen.getAllByText(/Always allow/i).length).toBeGreaterThanOrEqual(1)
+        expect(screen.getByRole('link', { name: /memory\.walrus\.xyz/i })).toHaveAttribute(
+            'href',
+            'https://memory.walrus.xyz',
+        )
+        expect(screen.getByRole('button', { name: /copy instruction/i })).toBeInTheDocument()
+        expect(screen.getByText(/other clients use the same three steps/i)).toBeInTheDocument()
     })
 
-    it('withholds the starter prompt when the hand-off never landed', async () => {
+    it('withholds the one-time setup when the hand-off never landed', async () => {
         stubListener(async () => {
             throw new TypeError('Failed to fetch')
         })
         await signIn()
 
         expect(await screen.findByText(/Almost there/i)).toBeInTheDocument()
-        expect(screen.queryByRole('button', { name: /copy prompt/i })).not.toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: /copy instruction/i })).not.toBeInTheDocument()
     })
 
     it('does not claim success when nothing answers on localhost', async () => {

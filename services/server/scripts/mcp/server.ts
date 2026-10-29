@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createRequire } from "node:module";
 import { applyAgentClientFromServer } from "./agent-client.js";
 import type { MemWalSession } from "./auth.js";
+import { registerPrompts } from "./prompts.js";
 import { registerTools } from "./tools/index.js";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "./limits.js";
 import {
@@ -101,6 +102,7 @@ export function createMcpServer(session: MemWalSession): McpServer {
         },
     );
 
+    registerPrompts(server);
     registerTools(server, session);
 
     // SDK populates getClientVersion() during initialize; this fires after
