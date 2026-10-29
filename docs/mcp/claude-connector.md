@@ -106,6 +106,23 @@ The OAuth path and the header path reach the same tools through the same relayer
   </Step>
 </Steps>
 
+## One-time setup after you connect
+
+Claude Desktop chat does not inject MCP `initialize.instructions` into the model, and write tools start at Ask. After the connector is connected, complete these three steps once. They are the same steps as [Claude Desktop](/mcp/claude-desktop#one-time-setup-required).
+
+1. **Native memory.** If you want portable memory across apps, turn off Claude native memory in Settings → Memory (or "Search and reference past chats"). That is reversible and does not delete existing native memories. If you keep native memory on, Walrus Memory is explicit-only: name memwal when you want a save.
+2. **Standing instruction.** Open Settings → Profile (or General) → Instructions for Claude / Personal Preferences. Paste this block, then start a new chat.
+
+    ```text
+    Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
+
+    Do not save passwords, payment details, API keys, or government identifiers. After saving, briefly confirm what you stored.
+
+    Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.
+    ```
+
+3. **Always allow.** After the first successful `memwal_remember`, choose **Always allow** for `memwal_remember` and `memwal_remember_bulk` (keep recall allowed). View or delete memories at [memory.walrus.xyz](https://memory.walrus.xyz).
+
 ## What you approve
 
 The relayer supports three scopes, and a client requests the subset it needs. The consent screen shows what the client actually asked for, so read it there rather than assuming all three:
