@@ -811,12 +811,18 @@ fn contains_credential_label(s: &str) -> bool {
 }
 
 fn has_adjacent_credential_label(input: &str, start: usize, end: usize, window: usize) -> bool {
-    let before_start = start.saturating_sub(window);
+    let mut before_start = start.saturating_sub(window);
+    while before_start > 0 && !input.is_char_boundary(before_start) {
+        before_start -= 1;
+    }
     let before_slice = &input[before_start..start];
     if contains_credential_label(before_slice) {
         return true;
     }
-    let after_end = (end + window).min(input.len());
+    let mut after_end = (end + window).min(input.len());
+    while after_end < input.len() && !input.is_char_boundary(after_end) {
+        after_end += 1;
+    }
     let after_slice = &input[end..after_end];
     if contains_credential_label(after_slice) {
         return true;
@@ -2145,6 +2151,23 @@ mod tests {
         let screened_commit =
             screen_fact_text(commit_sha).expect("clean commit sha should survive");
         assert!(screened_commit.contains("4f2b8c1e3a5d7f90123456789abcdef012345678"));
+
+        // Multilingual and emoji context windows must not panic on char boundaries (#435).
+        let unicode_fact = format!(
+            "User loves {} and secret is {}",
+            "😀".repeat(13),
+            "a".repeat(64)
+        );
+        let screened_unicode =
+            screen_fact_text(&unicode_fact).expect("unicode fact should survive without panic");
+        assert!(screened_unicode.contains("User loves"));
+        assert!(screened_unicode.contains(&"😀".repeat(13)));
+        assert!(screened_unicode.contains("[redacted:labelled-key-material]"));
+
+        let non_secret_unicode = format!("User status: {} {}", "😀".repeat(13), "a".repeat(64));
+        let screened_non_secret =
+            screen_fact_text(&non_secret_unicode).expect("unlabelled unicode hex fact survives");
+        assert!(screened_non_secret.contains(&"a".repeat(64)));
 
         // Batch screening drops credential-only facts and preserves clean/redacted facts.
         let batch = vec![
