@@ -906,9 +906,30 @@ mod mcp_rate_limit_tests {
         let other = security_delete_auth::canonical_sui_address("0x2").unwrap();
         sqlx::query("INSERT INTO owner_rate_limits(owner,requests_per_minute,requests_per_hour,delegate_key_per_minute) VALUES ($1,180,1500,90)")
             .bind(&owner).execute(&pool).await.unwrap();
+        // A healthy sidecar makes the actual /health readiness gate testable
+        // independently of policy failure, including while probes are cached.
+        let sidecar_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sidecar_url = format!("http://{}", sidecar_listener.local_addr().unwrap());
+        let sidecar = tokio::spawn(async move {
+            axum::serve(
+                sidecar_listener,
+                Router::new().route("/health", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .unwrap();
+        });
         let mut state = test_state(denying_redis().await).await;
-        Arc::get_mut(&mut state).unwrap().db = Arc::new(VectorDb::from_pool(pool.clone()));
-        state.owner_policies.refresh(&pool).await.unwrap();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.db = Arc::new(VectorDb::from_pool(pool.clone()));
+        Arc::make_mut(&mut inner.config).sidecar_url = sidecar_url;
+        state.owner_policies.refresh_for_test(&pool).await.unwrap();
+        assert!(
+            routes::health(axum::extract::State(state.clone()))
+                .await
+                .0
+                .write_ready
+        );
+        let health_state = state.clone();
         let policy_store = state.owner_policies.clone();
         // When supplied by the local test command, exercise real authenticated
         // admin roundtrips as well as the middleware below.
@@ -996,7 +1017,7 @@ mod mcp_rate_limit_tests {
             .execute(&pool)
             .await
             .unwrap();
-        policy_store.refresh(&pool).await.unwrap();
+        policy_store.refresh_for_test(&pool).await.unwrap();
         assert_eq!(
             call(&app, &owner).await.1["limit"],
             "30 weighted-requests/min"
@@ -1006,9 +1027,17 @@ mod mcp_rate_limit_tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(policy_store.refresh(&pool).await.is_err());
+        assert!(policy_store.refresh_for_test(&pool).await.is_err());
         policy_store.expire_for_test();
         assert_eq!(call(&app, &owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !routes::health(axum::extract::State(health_state))
+                .await
+                .0
+                .write_ready,
+            "stale policy must override an otherwise healthy cached readiness probe"
+        );
+        sidecar.abort();
         pool.close().await;
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
             .execute(&setup)
@@ -2172,12 +2201,9 @@ async fn main() {
         .acquire_timeout(std::time::Duration::from_secs(1))
         .connect_lazy(&config.database_url)
         .expect("invalid policy database URL");
-    let owner_policies = Arc::new(owner_rate_limits::OwnerPolicyStore::new());
-    owner_policies
-        .refresh(&policy_pool)
+    let owner_policies = owner_rate_limits::OwnerPolicyStore::start(policy_pool)
         .await
         .expect("initial owner policy snapshot unavailable");
-    owner_policies.spawn_refresher(policy_pool);
 
     let state = Arc::new(AppState {
         owner_policies,

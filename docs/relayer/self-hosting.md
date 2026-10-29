@@ -271,14 +271,16 @@ are looked up by binary Sui address without allocating a canonical address strin
 Freshness-only updates reuse the policy map rather than copying it. Each replica
 checks a shared database generation every second using a separate pool limited to one connection, and only
 reloads policies when that generation changes. Generation and policy rows are read
-in one repeatable-read transaction. A successful admin mutation updates the local
-snapshot immediately after commit; other replicas pick it up on their next
-successful refresh. Propagation is normally about one second, not instantaneous.
+in one repeatable-read transaction. Admin mutations only commit to the database;
+a single background writer per replica publishes snapshots. Every replica,
+including the one handling an admin mutation, applies the committed change on its
+next successful refresh. Propagation is normally about one second, not instantaneous.
 Expiry is checked on every request, independently of background refreshes.
 
 If the initial snapshot cannot load, startup fails. If a running replica cannot
 confirm snapshot freshness for five seconds, requests fail closed with 503 instead
-of using stale policy indefinitely. Refresh attempts have a one-second deadline
+of using stale policy indefinitely, and `/health` reports `write_ready=false`
+(the HTTP liveness response remains 200). Refresh attempts have a one-second deadline
 and failures are recorded in server telemetry. Existing Redis fallback uses the same effective
 limits. Storage quotas, endpoint weights, MCP transport limits, sponsorship limits,
 and the separate owner read API remain independently enforced.

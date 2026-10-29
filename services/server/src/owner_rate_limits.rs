@@ -1,6 +1,7 @@
 //! Private operator policy. Identity comes from authenticated owner resolution;
 //! overrides never change authentication, endpoint weights, or storage quotas.
 use crate::rate_limit::RateLimitConfig;
+use crate::security_delete_auth::canonical_sui_address;
 use crate::types::{AppError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -114,12 +115,7 @@ fn policy_store_error(_: sqlx::Error) -> AppError {
 }
 
 fn owner_address(raw: &str) -> Result<String, AppError> {
-    owner_address_value(raw).map(|address| address.to_string())
-}
-
-fn owner_address_value(raw: &str) -> Result<Address, AppError> {
-    raw.parse()
-        .map_err(|_| AppError::BadRequest("Invalid owner address".into()))
+    canonical_sui_address(raw).map_err(|_| AppError::BadRequest("Invalid owner address".into()))
 }
 
 pub async fn load_policy(
@@ -175,23 +171,15 @@ pub async fn put_policy(
     Path(raw): Path<String>,
     Json(policy): Json<OwnerRateLimit>,
 ) -> Result<Json<PolicyResponse>, AppError> {
-    let address = owner_address_value(&raw)?;
-    let owner = address.to_string();
+    let owner = owner_address(&raw)?;
     policy.validate(Utc::now())?;
-    let _policy_guard =
-        tokio::time::timeout(REFRESH_INTERVAL, state.owner_policies.mutation_guard())
-            .await
-            .map_err(|_| policy_store_error(sqlx::Error::PoolTimedOut))?;
     tokio::time::timeout(
-        REFRESH_INTERVAL,
+        POLICY_STORE_TIMEOUT,
         store_policy(state.db.pool(), &owner, &policy),
     )
     .await
     .map_err(|_| policy_store_error(sqlx::Error::PoolTimedOut))?
     .map_err(policy_store_error)?;
-    state
-        .owner_policies
-        .apply_committed(address, Some(policy.clone()));
     // Return exactly the saved policy, without a second read racing another operator.
     let defaults = OwnerRateLimit::defaults(&state.config.rate_limit);
     Ok(Json(PolicyResponse {
@@ -206,17 +194,11 @@ pub async fn delete_policy(
     State(state): State<Arc<AppState>>,
     Path(raw): Path<String>,
 ) -> Result<Json<PolicyResponse>, AppError> {
-    let address = owner_address_value(&raw)?;
-    let owner = address.to_string();
-    let _policy_guard =
-        tokio::time::timeout(REFRESH_INTERVAL, state.owner_policies.mutation_guard())
-            .await
-            .map_err(|_| policy_store_error(sqlx::Error::PoolTimedOut))?;
-    tokio::time::timeout(REFRESH_INTERVAL, remove_policy(state.db.pool(), &owner))
+    let owner = owner_address(&raw)?;
+    tokio::time::timeout(POLICY_STORE_TIMEOUT, remove_policy(state.db.pool(), &owner))
         .await
         .map_err(|_| policy_store_error(sqlx::Error::PoolTimedOut))?
         .map_err(policy_store_error)?;
-    state.owner_policies.apply_committed(address, None);
     let defaults = OwnerRateLimit::defaults(&state.config.rate_limit);
     Ok(Json(PolicyResponse {
         owner,
@@ -229,6 +211,7 @@ pub async fn delete_policy(
 // Requests read a small immutable-in-practice snapshot, never PostgreSQL.
 // Replicas check a shared generation once per second on a dedicated connection.
 // Policy edits can take up to one refresh interval to reach other replicas.
+const POLICY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_SNAPSHOT_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -239,20 +222,36 @@ struct PolicySnapshot {
     policies: Arc<HashMap<Address, OwnerRateLimit>>,
 }
 
+impl PolicySnapshot {
+    fn is_fresh(&self, now: std::time::Instant) -> bool {
+        self.checked_at
+            .is_some_and(|checked| now.saturating_duration_since(checked) < MAX_SNAPSHOT_AGE)
+    }
+}
+
 #[derive(Default)]
 pub struct OwnerPolicyStore {
     snapshot: arc_swap::ArcSwap<PolicySnapshot>,
-    // Serializes refreshes with local committed mutations, preventing an older
-    // refresh from overwriting a just-saved policy on this replica.
-    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
 pub struct PolicySnapshotUnavailable;
 
 impl OwnerPolicyStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    // Initialize before serving requests, then start exactly one snapshot writer.
+    pub async fn start(pool: sqlx::PgPool) -> Result<Arc<Self>, sqlx::Error> {
+        let store = Arc::new(Self::new());
+        store.refresh(&pool).await?;
+        store.spawn_refresher(pool);
+        Ok(store)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.snapshot.load().is_fresh(std::time::Instant::now())
     }
 
     pub fn policy_for(
@@ -269,49 +268,25 @@ impl OwnerPolicyStore {
     ) -> Result<Option<OwnerRateLimit>, PolicySnapshotUnavailable> {
         let owner: Address = owner.parse().map_err(|_| PolicySnapshotUnavailable)?;
         let snapshot = self.snapshot.load();
-        if snapshot
-            .checked_at
-            .is_none_or(|checked| now.saturating_duration_since(checked) >= MAX_SNAPSHOT_AGE)
-        {
+        if !snapshot.is_fresh(now) {
             return Err(PolicySnapshotUnavailable);
         }
         Ok(snapshot.policies.get(&owner).cloned())
     }
 
-    pub async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.refresh_lock.lock().await
-    }
-
-    // Writers hold mutation_guard; requests retain an immutable snapshot while
-    // the next one is built. Unchanged refreshes share the same policy map.
+    // Test fixtures may publish artificial timestamps; production has only the
+    // background refresh task writing snapshots.
+    #[cfg(test)]
     fn update_snapshot(&self, update: impl FnOnce(&mut PolicySnapshot)) {
         let mut next = self.snapshot.load_full().as_ref().clone();
         update(&mut next);
         self.snapshot.store(Arc::new(next));
     }
 
-    // Called only after durable commit, while holding mutation_guard.
-    fn apply_committed(&self, owner: Address, policy: Option<OwnerRateLimit>) {
-        self.update_snapshot(|snapshot| {
-            let policies = Arc::make_mut(&mut snapshot.policies);
-            match policy {
-                Some(policy) => {
-                    policies.insert(owner, policy);
-                }
-                None => {
-                    policies.remove(&owner);
-                }
-            }
-            snapshot.revision = None;
-            // A single edit cannot certify freshness of all other owners.
-        });
-    }
-
-    pub async fn refresh(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        let _guard = self.refresh_lock.lock().await;
+    async fn refresh(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let current = self.snapshot.load().revision;
         let checked_at = std::time::Instant::now();
-        let (revision, policies) = tokio::time::timeout(REFRESH_INTERVAL, async {
+        let (revision, policies) = tokio::time::timeout(POLICY_STORE_TIMEOUT, async {
             const REVISION_QUERY: &str =
                 "SELECT revision FROM owner_rate_limit_revision WHERE singleton";
             let observed: i64 = sqlx::query_scalar(REVISION_QUERY).fetch_one(pool).await?;
@@ -357,17 +332,19 @@ impl OwnerPolicyStore {
         })
         .await
         .map_err(|_| sqlx::Error::PoolTimedOut)??;
-        self.update_snapshot(|snapshot| {
-            if let Some(policies) = policies {
-                snapshot.policies = Arc::new(policies);
-            }
-            snapshot.revision = Some(revision);
-            snapshot.checked_at = Some(checked_at);
-        });
+        let policies = match policies {
+            Some(policies) => Arc::new(policies),
+            None => Arc::clone(&self.snapshot.load().policies),
+        };
+        self.snapshot.store(Arc::new(PolicySnapshot {
+            revision: Some(revision),
+            checked_at: Some(checked_at),
+            policies,
+        }));
         Ok(())
     }
 
-    pub fn spawn_refresher(self: &Arc<Self>, pool: sqlx::PgPool) {
+    fn spawn_refresher(self: &Arc<Self>, pool: sqlx::PgPool) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(REFRESH_INTERVAL);
@@ -385,6 +362,11 @@ impl OwnerPolicyStore {
     }
 
     #[cfg(test)]
+    pub async fn refresh_for_test(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        self.refresh(pool).await
+    }
+
+    #[cfg(test)]
     pub fn expire_for_test(&self) {
         self.update_snapshot(|snapshot| snapshot.checked_at = None);
     }
@@ -397,9 +379,11 @@ mod tests {
     fn snapshot_unknown_owner_and_freshness_bound() {
         let store = OwnerPolicyStore::new();
         assert!(store.policy_for("0x1").is_err());
+        assert!(!store.is_ready());
         let now = std::time::Instant::now();
         store.update_snapshot(|snapshot| snapshot.checked_at = Some(now));
         assert!(store.policy_at("0x1", now).unwrap().is_none());
+        assert!(store.is_ready());
         assert!(store.policy_at("0x1", now + MAX_SNAPSHOT_AGE).is_err());
         assert!(store
             .policy_at(
@@ -410,35 +394,24 @@ mod tests {
     }
 
     #[test]
-    fn local_commit_does_not_certify_unrelated_stale_owners() {
-        let store = OwnerPolicyStore::new();
-        store.apply_committed(
-            "0x1".parse().unwrap(),
-            Some(OwnerRateLimit::defaults(&RateLimitConfig::default())),
-        );
-        assert!(store.policy_for("0x1").is_err());
-        assert!(store.snapshot.load().revision.is_none());
-        store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
-        assert!(store.policy_for("0x1").unwrap().is_some());
-        store.apply_committed("0x1".parse().unwrap(), None);
-        assert!(store.policy_for("0x1").unwrap().is_none());
-    }
-
-    #[test]
     fn published_snapshot_readers_remain_consistent_during_updates() {
         let store = OwnerPolicyStore::new();
         let owner: Address = "0xabc".parse().unwrap();
         let mut policy = OwnerRateLimit::defaults(&RateLimitConfig::default());
         policy.requests_per_minute = 180;
-        store.apply_committed(owner, Some(policy.clone()));
-        store.update_snapshot(|snapshot| snapshot.checked_at = Some(std::time::Instant::now()));
+        store.update_snapshot(|snapshot| {
+            snapshot.policies = Arc::new(HashMap::from([(owner, policy.clone())]));
+            snapshot.checked_at = Some(std::time::Instant::now());
+        });
         let previous = store.snapshot.load();
         // A retained reader must not block publication, or observe a half edit.
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     policy.requests_per_minute = 240;
-                    store.apply_committed(owner, Some(policy));
+                    store.update_snapshot(|snapshot| {
+                        snapshot.policies = Arc::new(HashMap::from([(owner, policy)]));
+                    });
                 })
                 .join()
                 .unwrap();
@@ -617,6 +590,7 @@ mod tests {
         assert!(list_records(&pool, Some(&owner)).await.unwrap().is_empty());
         let first = OwnerPolicyStore::new();
         let second = OwnerPolicyStore::new();
+        let background = OwnerPolicyStore::start(pool.clone()).await.unwrap();
         first.refresh(&pool).await.unwrap();
         second.refresh(&pool).await.unwrap();
         assert_eq!(
@@ -637,11 +611,33 @@ mod tests {
         second.refresh(&pool).await.unwrap();
         lock.rollback().await.unwrap();
         policy.requests_per_minute = 240;
-        {
-            let _guard = first.mutation_guard().await;
-            store_policy(&pool, &owner, &policy).await.unwrap();
-            first.apply_committed(owner.parse().unwrap(), Some(policy.clone()));
-        }
+        store_policy(&pool, &owner, &policy).await.unwrap();
+        // Admin commits do not modify RAM. Only refresh publishes new state.
+        assert_eq!(
+            first
+                .policy_for(&owner)
+                .unwrap()
+                .unwrap()
+                .requests_per_minute,
+            180
+        );
+        first.refresh(&pool).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if background
+                    .policy_for(&owner)
+                    .unwrap()
+                    .unwrap()
+                    .requests_per_minute
+                    == 240
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background refresh must propagate a committed edit");
         assert_eq!(
             first
                 .policy_for(&owner)
@@ -667,12 +663,6 @@ mod tests {
                 .requests_per_minute,
             240
         );
-        // A local refresh cannot overwrite a mutation while its commit guard is held.
-        {
-            let guard = first.mutation_guard().await;
-            assert!(first.refresh_lock.try_lock().is_err());
-            drop(guard);
-        }
         policy.requests_per_minute = 240;
         policy.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
         store_policy(&pool, &owner, &policy).await.unwrap();
@@ -703,10 +693,20 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(revision, 4);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while background.policy_for(&owner).unwrap().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background refresh must propagate a committed reset");
+        drop(background);
         pool.close().await;
         // Fresh snapshots continue without any available database connections.
         assert!(second.policy_for(&owner).unwrap().is_none());
+        assert!(second.is_ready());
         second.expire_for_test();
+        assert!(!second.is_ready());
         assert!(second.refresh(&pool).await.is_err());
         assert!(second.policy_for(&owner).is_err());
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
