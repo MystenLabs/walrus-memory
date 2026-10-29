@@ -68,7 +68,13 @@ fn security_delete_cors() -> CorsLayer {
 fn relayer_cors(origins: Vec<HeaderValue>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
@@ -448,6 +454,55 @@ mod cors_tests {
                     .unwrap(),
                 "*"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn relayer_cors_allows_admin_policy_put_for_configured_origins() {
+        let origin = "http://127.0.0.1:5179";
+        let app = Router::new()
+            .route(
+                "/api/admin/rate-limits/{owner}",
+                axum::routing::put(|| async {}),
+            )
+            .layer(relayer_cors(vec![origin.parse().unwrap()]));
+        for candidate in [origin, "https://unlisted.example"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/api/admin/rate-limits/0x1")
+                        .header(header::ORIGIN, candidate)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                        .header(
+                            header::ACCESS_CONTROL_REQUEST_HEADERS,
+                            "content-type,x-admin-api-key",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if candidate == origin {
+                assert_eq!(
+                    response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                    origin
+                );
+                let methods = response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+                    .to_str()
+                    .unwrap();
+                assert!(methods.split(',').any(|method| method == "PUT"));
+                let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                    .to_str()
+                    .unwrap();
+                assert!(headers.split(',').any(|name| name == "x-admin-api-key"));
+            } else {
+                assert!(response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none());
+            }
         }
     }
 
