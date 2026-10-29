@@ -262,11 +262,10 @@ export function withMemWal(
                     const recallQuery = truncateUtf8Bytes(lastUserMessage, MAX_EMBED_INPUT_BYTES, {
                         strategy: "head-tail",
                     });
-                    const recallResult = await memwal.recall({
-                        query: recallQuery,
-                        limit: maxMemories,
-                        ...(maxTokens !== undefined ? { maxTokens } : {}),
-                    });
+                    const recallResult =
+                        maxTokens !== undefined
+                            ? await memwal.recall({ query: recallQuery, limit: maxMemories, maxTokens })
+                            : await memwal.recall(recallQuery, maxMemories);
                     if (recallResult.results.length === 0 && recallResult.degraded) {
                         const droppedCount =
                             typeof recallResult.dropped_count === "number" && recallResult.dropped_count > 0
