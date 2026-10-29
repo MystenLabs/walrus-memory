@@ -5301,6 +5301,101 @@ mod quota_admission_tests {
         cleanup(&db, &owner).await;
     }
 
+    #[tokio::test]
+    async fn expired_reservation_cannot_resurrect_or_upload_past_owner_quota() {
+        let db = test_db().await;
+        let owner = unique_owner("mw10-expired");
+        let max_bytes: i64 = 100;
+
+        // 1. Job 1 (60 bytes) is admitted with a 0-second TTL so it expires immediately.
+        assert_eq!(
+            db.admit_storage_reservations(
+                &owner,
+                lock_key(&owner),
+                max_bytes,
+                &[StorageReservationRequest {
+                    id: "mw10-job-1".into(),
+                    bytes: 60,
+                }],
+                Duration::from_secs(0),
+            )
+            .await
+            .unwrap(),
+            StorageAdmission::Admitted
+        );
+
+        // 2. Job 2 (60 bytes) arrives after Job 1 expired, sweeps Job 1, and takes 60 of 100 bytes.
+        assert_eq!(
+            db.admit_storage_reservations(
+                &owner,
+                lock_key(&owner),
+                max_bytes,
+                &[StorageReservationRequest {
+                    id: "mw10-job-2".into(),
+                    bytes: 60,
+                }],
+                TTL,
+            )
+            .await
+            .unwrap(),
+            StorageAdmission::Admitted
+        );
+
+        // 3. Job 1 wakes up for its unpaid upload step: renewal must be rejected because 60 + 60 > 100.
+        let err = crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-1",
+            &owner,
+            60,
+        )
+        .await
+        .expect_err("expired swept reservation must not proceed when owner quota is full");
+        assert!(
+            err.aborts_retries(),
+            "quota exhaustion on expired reservation must abort unpaid upload: {err}"
+        );
+        assert!(
+            err.message()
+                .contains("storage quota exceeded after reservation expired"),
+            "{err}"
+        );
+
+        // 4. Even if an expired row has NOT been swept yet, UPDATE must not resurrect it without re-checking quota.
+        sqlx::query(
+            "INSERT INTO storage_reservations (id, owner, bytes, expires_at)
+             VALUES ('mw10-job-unswept', $1, 60, NOW() - INTERVAL '10 seconds')",
+        )
+        .bind(&owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let unswept_err = crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-unswept",
+            &owner,
+            60,
+        )
+        .await
+        .expect_err("expired unswept reservation must not resurrect when owner quota is full");
+        assert!(unswept_err.aborts_retries(), "{unswept_err}");
+
+        // 5. Job 2 (whose reservation is still live) extends cleanly and can proceed.
+        crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-2",
+            &owner,
+            60,
+        )
+        .await
+        .expect("live reservation must extend cleanly");
+
+        cleanup(&db, &owner).await;
+    }
+
     /// Bulk admission is all-or-nothing, which is what keeps the existing
     /// "reject the whole request" behaviour and the 402 shape intact.
     #[tokio::test]
