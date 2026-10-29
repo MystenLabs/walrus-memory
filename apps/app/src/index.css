@@ -16446,3 +16446,8 @@ body:has(.signin-proposed) {
   box-shadow: none;
   transition: background-color .15s ease, color .15s ease, border-color .15s ease;
 }
+
+.dash-page .admin-priority-card .admin-priority-actions {
+  margin: 0;
+  align-self: center;
+}

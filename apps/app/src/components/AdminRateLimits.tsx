@@ -51,13 +51,11 @@ function WalletRow({
   )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
   const expired =
     saved?.expires_at && Date.parse(saved.expires_at) <= Date.now()
   const run = async (action: () => Promise<unknown>, done: () => void) => {
     setBusy(true)
     setError('')
-    setMessage('')
     try {
       await action()
       done()
@@ -84,7 +82,6 @@ function WalletRow({
     void run(
       () => saveOwnerRateLimits(adminKey, owner.trim(), policy),
       () => {
-        setMessage('Saved')
         onSaved()
       },
     )
@@ -117,7 +114,6 @@ function WalletRow({
           disabled={busy}
           onChange={(event) => {
             setMultiplier(event.target.value)
-            setMessage('')
           }}
         >
           {multiplier === 'custom' && (
@@ -155,11 +151,6 @@ function WalletRow({
       {expired && (
         <span className="admin-priority-note">
           Expired · Save to reactivate
-        </span>
-      )}
-      {message && (
-        <span role="status" className="admin-priority-note">
-          {message}
         </span>
       )}
       {error && (
