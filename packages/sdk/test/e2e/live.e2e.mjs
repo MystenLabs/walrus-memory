@@ -342,7 +342,7 @@ describe("authenticated", { skip: requiresKey, concurrency: 1 }, () => {
     });
 
     test(
-        "5x concurrent rememberAndWait completes or surfaces structured MemWalRememberJobTimeoutError diagnostics (#1130)",
+        "5x concurrent rememberAndWait smoke test recording completion or MemWalRememberJobTimeoutError (Refs #1130)",
         { skip: requiresConcurrentOptIn },
         async () => {
             const namespace = `${E2E_NAMESPACE}-concurrent5`;
@@ -350,8 +350,9 @@ describe("authenticated", { skip: requiresKey, concurrency: 1 }, () => {
             const unique = randomUUID().replaceAll("-", "").slice(0, 8);
             const timeoutMs = positiveIntEnv("MEMWAL_CONCURRENT_TIMEOUT_MS", 90_000);
 
+            let outcomes = [];
             try {
-                const outcomes = await Promise.allSettled(
+                outcomes = await Promise.allSettled(
                     [1, 2, 3, 4, 5].map((i) =>
                         mw.rememberAndWait(
                             `SDK e2e concurrent #${i} (${unique}): parallel remember load verification`,
@@ -386,7 +387,26 @@ describe("authenticated", { skip: requiresKey, concurrency: 1 }, () => {
                 }
             } finally {
                 // Best-effort cleanup of the isolated test namespace on the shared bench account.
+                // Wait for any timed-out jobs to settle so their late completion does not leak into the namespace.
                 try {
+                    const timedOutJobIds = outcomes
+                        .filter((o) => o.status === "rejected" && o.reason?.jobId)
+                        .map((o) => o.reason.jobId);
+                    if (timedOutJobIds.length > 0) {
+                        await Promise.allSettled(
+                            timedOutJobIds.map(async (jobId) => {
+                                for (let poll = 0; poll < 10; poll += 1) {
+                                    try {
+                                        const st = await mw.getRememberStatus(jobId);
+                                        if (st?.status === "done" || st?.status === "failed") break;
+                                    } catch {
+                                        // Ignore polling errors
+                                    }
+                                    await new Promise((r) => setTimeout(r, 1_000));
+                                }
+                            }),
+                        );
+                    }
                     await mw.signedRequest(
                         "POST",
                         "/api/forget",

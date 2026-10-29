@@ -24,7 +24,7 @@ const CONTENTION_RETRY_MESSAGE =
     "This is not caused by your account, wallet, or delegate key, and there is nothing for you to fund. " +
     "Keep polling; do not resubmit unless the job reaches status `failed`.";
 
-test("5x concurrent rememberAndWait under upload contention surfaces MemWalRememberJobTimeoutError with jobId, lastStatus, and serverError (#1130)", async () => {
+test("5x concurrent rememberAndWait surfaces MemWalRememberJobTimeoutError with jobId, lastStatus, and serverError (Refs #1130)", async () => {
     let acceptedCount = 0;
 
     globalThis.fetch = async (url, init = {}) => {
@@ -96,7 +96,7 @@ test("5x concurrent rememberAndWait under upload contention surfaces MemWalRemem
     assert.equal(seenJobIds.size, 5, "each concurrent call must track its own distinct jobId");
 });
 
-test("5x concurrent rememberAndWait resolves all 5 jobs when multi-wallet workers complete within budget (#1130)", async () => {
+test("5x concurrent rememberAndWait resolves 5 concurrent jobs that each reach done (Refs #1130)", async () => {
     let acceptedCount = 0;
     const pollsByJob = new Map();
 

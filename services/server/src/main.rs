@@ -1244,6 +1244,7 @@ mod owner_token_active_check_tests {
         let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
         let state = Arc::new(AppState {
             db: Arc::clone(&db),
+            owner_policies: Arc::new(owner_rate_limits::OwnerPolicyStore::new()),
             wallet_lock_pool: pool.clone(),
             legacy_db: None,
             security_delete_nonce_store: Arc::new(security_delete_auth::RedisNonceStore::new(
