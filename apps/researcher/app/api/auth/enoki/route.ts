@@ -92,11 +92,11 @@ export async function POST(request: Request) {
         let canDecrypt = false;
         try {
           await resolveAndMigrateUserDelegateKey(existing);
-          canDecrypt = true;
+          canDecrypt = Boolean(existing.publicKey && existing.accountId);
         } catch {
           canDecrypt = false;
         }
-        if (canDecrypt) {
+        if (canDecrypt && existing.publicKey && existing.accountId) {
           // Returning user — recreate session from stored credentials
           await createSession(
             existing.id,

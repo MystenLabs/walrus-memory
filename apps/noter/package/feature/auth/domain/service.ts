@@ -217,17 +217,21 @@ export async function upsertEnokiUser(
  *
  * Uses an atomic compare-and-swap on `delegatePrivateKey` to protect against
  * concurrent credential rotations. If another session updated credentials
- * between the initial read and migration, reloads the current row and returns
- * the fresh credentials instead of overwriting with the stale migrated key.
+ * between the initial read and migration, reloads the complete credential tuple
+ * (`delegatePrivateKey` and `delegateAccountId`) and propagates it back to
+ * `user` so callers never combine the new key with a stale account ID.
  */
 export async function resolveAndMigrateUserDelegateKey(
   db: DbClient,
-  user: Pick<User, "id" | "delegatePrivateKey">,
+  user: Pick<User, "id" | "delegatePrivateKey"> & {
+    delegateAccountId?: string | null;
+  },
   secretOverride?: string
 ): Promise<{
   plaintextKey: string;
   encryptedEnvelope: string;
   migrated: boolean;
+  delegateAccountId: string | null;
 }> {
   if (!user.delegatePrivateKey) {
     throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
@@ -253,26 +257,45 @@ export async function resolveAndMigrateUserDelegateKey(
 
     if (updated.length > 0) {
       user.delegatePrivateKey = resolved.encryptedEnvelope;
-      return resolved;
+      return {
+        ...resolved,
+        delegateAccountId: user.delegateAccountId ?? null,
+      };
     }
 
     // Lost race: a concurrent credential rotation modified delegatePrivateKey.
-    // Reload current credentials rather than returning the stale key.
+    // Reload the complete credential tuple (delegatePrivateKey, delegateAccountId)
+    // rather than returning the stale key or leaving a stale delegateAccountId on user.
     const [reloaded] = await db
-      .select({ delegatePrivateKey: users.delegatePrivateKey })
+      .select({
+        delegatePrivateKey: users.delegatePrivateKey,
+        delegateAccountId: users.delegateAccountId,
+      })
       .from(users)
       .where(eq(users.id, user.id));
 
-    if (!reloaded || !reloaded.delegatePrivateKey) {
+    if (
+      !reloaded ||
+      !reloaded.delegatePrivateKey ||
+      !reloaded.delegateAccountId
+    ) {
       throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
     }
     user.delegatePrivateKey = reloaded.delegatePrivateKey;
-    return openOrMigrateDelegatePrivateKey(
+    user.delegateAccountId = reloaded.delegateAccountId;
+    const reloadedResolved = openOrMigrateDelegatePrivateKey(
       reloaded.delegatePrivateKey,
       secretOverride
     );
+    return {
+      ...reloadedResolved,
+      delegateAccountId: reloaded.delegateAccountId,
+    };
   }
-  return resolved;
+  return {
+    ...resolved,
+    delegateAccountId: user.delegateAccountId ?? null,
+  };
 }
 
 /**
@@ -335,7 +358,7 @@ export async function getEnokiUserBySuiAddress(db: DbClient, suiAddress: string)
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
     try {
       await resolveAndMigrateUserDelegateKey(db, user);
-      return user;
+      return user.delegateAccountId ? user : null;
     } catch {
       return null;
     }
@@ -359,10 +382,12 @@ export async function getDelegateKeyForOwner(
     .limit(1);
 
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
-    const { plaintextKey } = await resolveAndMigrateUserDelegateKey(db, user);
+    const { plaintextKey, delegateAccountId } =
+      await resolveAndMigrateUserDelegateKey(db, user);
+    if (!delegateAccountId) return null;
     return {
       delegatePrivateKey: plaintextKey,
-      delegateAccountId: user.delegateAccountId,
+      delegateAccountId,
     };
   }
   return null;
