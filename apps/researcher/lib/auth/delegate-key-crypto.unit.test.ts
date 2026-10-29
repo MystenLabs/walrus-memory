@@ -7,6 +7,8 @@ import {
   DelegateKeyCryptoError,
   encryptDelegatePrivateKey,
   isEncryptedDelegateKeyEnvelope,
+  isLegacyPlaintextDelegateKey,
+  openOrMigrateDelegatePrivateKey,
 } from "./delegate-key-crypto";
 
 const SECRET_A = "0123456789abcdef0123456789abcdef";
@@ -69,14 +71,49 @@ test("rejects double encryption, raw plaintext on decrypt, and short secrets", (
   );
 });
 
-test("queries.ts and session.ts wire encryptDelegatePrivateKey and decryptDelegatePrivateKey", () => {
+test("migrates pre-upgrade 64-hex plaintext delegate keys into v1 envelopes and opens existing v1 envelopes", () => {
+  assert.equal(isLegacyPlaintextDelegateKey(SAMPLE_KEY), true);
+  assert.equal(isLegacyPlaintextDelegateKey("not-a-hex-key"), false);
+
+  const migrated = openOrMigrateDelegatePrivateKey(SAMPLE_KEY, SECRET_A);
+  assert.equal(migrated.migrated, true);
+  assert.equal(migrated.plaintextKey, SAMPLE_KEY);
+  assert.equal(isEncryptedDelegateKeyEnvelope(migrated.encryptedEnvelope), true);
+
+  const reopened = openOrMigrateDelegatePrivateKey(
+    migrated.encryptedEnvelope,
+    SECRET_A
+  );
+  assert.equal(reopened.migrated, false);
+  assert.equal(reopened.plaintextKey, SAMPLE_KEY);
+  assert.equal(reopened.encryptedEnvelope, migrated.encryptedEnvelope);
+
+  assert.throws(
+    () => openOrMigrateDelegatePrivateKey("malformed-non-hex", SECRET_A),
+    DelegateKeyCryptoError
+  );
+});
+
+test("queries.ts, session.ts, and enoki/route.ts wire encryptDelegatePrivateKey and resolveAndMigrateUserDelegateKey", () => {
   const queriesSource = readFileSync(resolve("lib/db/queries.ts"), "utf8");
   const sessionSource = readFileSync(resolve("lib/auth/session.ts"), "utf8");
+  const enokiRouteSource = readFileSync(
+    resolve("app/api/auth/enoki/route.ts"),
+    "utf8"
+  );
 
   assert.match(queriesSource, /encryptDelegatePrivateKey\(delegatePrivateKey\)/);
+  assert.match(queriesSource, /openOrMigrateDelegatePrivateKey\(/);
   assert.doesNotMatch(
     queriesSource,
     /\.values\(\{[^}]*delegatePrivateKey\s*,/
   );
-  assert.match(sessionSource, /decryptDelegatePrivateKey\(user\.delegatePrivateKey\)/);
+  assert.match(
+    sessionSource,
+    /resolveAndMigrateUserDelegateKey\(user\)/
+  );
+  assert.match(
+    enokiRouteSource,
+    /resolveAndMigrateUserDelegateKey\(existing\)/
+  );
 });

@@ -9,6 +9,7 @@ const AUTH_TAG_BYTES = 16;
 const KEY_BYTES = 32;
 const MIN_SECRET_LENGTH = 32;
 const HKDF_INFO = "memwal-noter-delegate-private-key-v1";
+const LEGACY_PLAINTEXT_HEX_REGEX = /^[0-9a-f]{64}$/i;
 const DEV_TEST_FALLBACK_SECRET =
   "noter-dev-test-only-delegate-key-secret-do-not-use-in-prod";
 
@@ -59,6 +60,49 @@ function deriveEncryptionKey(secretOverride?: string): Buffer {
 
 export function isEncryptedDelegateKeyEnvelope(value: string): boolean {
   return value.startsWith(`${ENVELOPE_VERSION}.`);
+}
+
+export function isLegacyPlaintextDelegateKey(value: string): boolean {
+  return typeof value === "string" && LEGACY_PLAINTEXT_HEX_REGEX.test(value);
+}
+
+/**
+ * Resolve a stored delegate key column value by either decrypting an existing
+ * `v1.` AES-256-GCM envelope or upgrading a pre-upgrade 64-hex plaintext key
+ * into a fresh `v1.` envelope for in-place database backfill. Fails closed on
+ * malformed or tampered values.
+ */
+export function openOrMigrateDelegatePrivateKey(
+  storedValue: string,
+  secretOverride?: string
+): {
+  plaintextKey: string;
+  encryptedEnvelope: string;
+  migrated: boolean;
+} {
+  if (!storedValue || typeof storedValue !== "string") {
+    throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+  }
+  if (isEncryptedDelegateKeyEnvelope(storedValue)) {
+    const plaintextKey = decryptDelegatePrivateKey(storedValue, secretOverride);
+    return {
+      plaintextKey,
+      encryptedEnvelope: storedValue,
+      migrated: false,
+    };
+  }
+  if (isLegacyPlaintextDelegateKey(storedValue)) {
+    const encryptedEnvelope = encryptDelegatePrivateKey(
+      storedValue,
+      secretOverride
+    );
+    return {
+      plaintextKey: storedValue,
+      encryptedEnvelope,
+      migrated: true,
+    };
+  }
+  throw new DelegateKeyCryptoError("Malformed delegate key envelope");
 }
 
 /**

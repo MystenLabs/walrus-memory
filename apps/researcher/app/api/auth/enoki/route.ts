@@ -1,8 +1,8 @@
 import { createSession } from "@/lib/auth/session";
-import { decryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
 import {
   getUserBySuiAddress,
   createEnokiUser,
+  resolveAndMigrateUserDelegateKey,
   updateEnokiUserCredentials,
 } from "@/lib/db/queries";
 import * as ed from "@noble/ed25519";
@@ -91,7 +91,7 @@ export async function POST(request: Request) {
       if (existing?.delegatePrivateKey && existing?.publicKey && existing?.accountId) {
         let canDecrypt = false;
         try {
-          decryptDelegatePrivateKey(existing.delegatePrivateKey);
+          await resolveAndMigrateUserDelegateKey(existing);
           canDecrypt = true;
         } catch {
           canDecrypt = false;
