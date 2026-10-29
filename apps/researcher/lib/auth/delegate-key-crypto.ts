@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
-import { getAuthSecret } from "@/lib/auth/auth-secret";
+import { getAuthSecret } from "./auth-secret";
 
 const ENVELOPE_VERSION = "v1";
 const NONCE_BYTES = 12;

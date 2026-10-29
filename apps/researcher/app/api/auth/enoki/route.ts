@@ -1,4 +1,5 @@
 import { createSession } from "@/lib/auth/session";
+import { decryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
 import {
   getUserBySuiAddress,
   createEnokiUser,
@@ -88,13 +89,22 @@ export async function POST(request: Request) {
       const existing = await getUserBySuiAddress(suiAddress);
 
       if (existing?.delegatePrivateKey && existing?.publicKey && existing?.accountId) {
-        // Returning user — recreate session from stored credentials
-        await createSession(
-          existing.id,
-          existing.publicKey,
-          existing.accountId,
-        );
-        return Response.json({ success: true, needsSetup: false });
+        let canDecrypt = false;
+        try {
+          decryptDelegatePrivateKey(existing.delegatePrivateKey);
+          canDecrypt = true;
+        } catch {
+          canDecrypt = false;
+        }
+        if (canDecrypt) {
+          // Returning user — recreate session from stored credentials
+          await createSession(
+            existing.id,
+            existing.publicKey,
+            existing.accountId,
+          );
+          return Response.json({ success: true, needsSetup: false });
+        }
       }
 
       // No stored credentials — client needs to generate key + register on-chain
