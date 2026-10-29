@@ -240,40 +240,37 @@ pub(crate) async fn query_owner_namespaces(
         ) w ON l.namespace = w.namespace
     ";
 
-    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> = if let Some((
-        cursor_updated_at,
-        cursor_namespace,
-    )) = after.clone()
-    {
-        let sql = format!(
+    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> =
+        if let Some((cursor_updated_at, cursor_namespace)) = after.clone() {
+            let sql = format!(
             "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
                  WHERE (last_updated_at, namespace) > ($2, $3) AND last_updated_at <= $4
                  ORDER BY last_updated_at, namespace
                  LIMIT $5",
         );
-        sqlx::query_as(&sql)
-            .bind(owner)
-            .bind(cursor_updated_at)
-            .bind(cursor_namespace)
-            .bind(snapshot_at)
-            .bind(limit + 1)
-            .fetch_all(pool)
-            .await
-    } else {
-        let sql = format!(
+            sqlx::query_as(&sql)
+                .bind(owner)
+                .bind(cursor_updated_at)
+                .bind(cursor_namespace)
+                .bind(snapshot_at)
+                .bind(limit + 1)
+                .fetch_all(pool)
+                .await
+        } else {
+            let sql = format!(
             "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
                  WHERE last_updated_at <= $2
                  ORDER BY last_updated_at, namespace
                  LIMIT $3",
         );
-        sqlx::query_as(&sql)
-            .bind(owner)
-            .bind(snapshot_at)
-            .bind(limit + 1)
-            .fetch_all(pool)
-            .await
-    }
-    .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
+            sqlx::query_as(&sql)
+                .bind(owner)
+                .bind(snapshot_at)
+                .bind(limit + 1)
+                .fetch_all(pool)
+                .await
+        }
+        .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
 
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);

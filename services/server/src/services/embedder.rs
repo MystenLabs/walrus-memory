@@ -150,7 +150,10 @@ pub(crate) async fn embed_text_with_alerts(
                         "transport_error",
                         started.elapsed(),
                     );
-                    AppError::EmbeddingProviderUnavailable(format!("Embedding API request failed: {}", e))
+                    AppError::EmbeddingProviderUnavailable(format!(
+                        "Embedding API request failed: {}",
+                        e
+                    ))
                 })?;
             let status_label = resp.status().as_u16().to_string();
             crate::observability::observe_external(
@@ -239,7 +242,10 @@ pub(crate) async fn embed_text_with_alerts(
             }
 
             let api_resp: EmbeddingApiResponse = serde_json::from_str(&body).map_err(|e| {
-                AppError::EmbeddingProviderUnavailable(format!("Failed to parse embedding response: {}", e))
+                AppError::EmbeddingProviderUnavailable(format!(
+                    "Failed to parse embedding response: {}",
+                    e
+                ))
             })?;
 
             let vector = api_resp
@@ -439,7 +445,10 @@ mod tests {
             stub_provider(401, r#"{"error":{"message":"User not found.","code":401}}"#).await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "401 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -453,7 +462,10 @@ mod tests {
         .await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "402 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -464,7 +476,10 @@ mod tests {
             stub_provider(403, r#"{"error":{"message":"Key disabled","code":403}}"#).await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "403 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -483,7 +498,10 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(refused, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                refused,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "connection refused must map to UpstreamUnavailable, got {refused:?}"
         );
 
@@ -532,7 +550,10 @@ mod tests {
             let (base, _) = stub_provider(200, body).await;
             let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
             assert!(
-                matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+                matches!(
+                    result,
+                    Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+                ),
                 "200 body {body:?} must map to UpstreamUnavailable, got {result:?}"
             );
         }
@@ -585,7 +606,10 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+                matches!(
+                    result,
+                    Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+                ),
                 "status {status} → {result:?}"
             );
         }
