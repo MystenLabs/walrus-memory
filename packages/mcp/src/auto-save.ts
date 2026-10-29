@@ -77,7 +77,7 @@ import {
 import { projectApprovalsPath } from "./auth.js";
 import { log } from "./logger.js";
 
-/** Env var that pins automatic saving on or off for one MCP server process. */
+/** Env var that pins automatic saving off for one MCP server process. */
 export const AUTO_SAVE_ENV = "MEMWAL_AUTO_SAVE";
 
 const SETTINGS_FILE = "settings.json";
@@ -161,7 +161,7 @@ function writeSettings(next: MemWalSettings): string {
 export type AutoSaveState = "on" | "off" | "unset";
 
 export type AutoSaveSource =
-    /** `MEMWAL_AUTO_SAVE` in this process's environment. */
+    /** `MEMWAL_AUTO_SAVE=0` in this process's environment. */
     | "env"
     /** An answer written to settings.json. */
     | "settings"
@@ -183,8 +183,8 @@ export interface AutoSaveStatus {
 }
 
 /**
- * Resolve the current state: environment, then the stored answer, then the
- * unset rules above.
+ * Resolve the current state: a disabling `MEMWAL_AUTO_SAVE` override, then the
+ * stored answer, then the unset rules above.
  */
 export function autoSaveStatus(): AutoSaveStatus {
     const path = settingsPath();
@@ -195,10 +195,23 @@ export function autoSaveStatus(): AutoSaveStatus {
         answered === null ? "unset" : answered ? "on" : "off";
 
     const fromEnv = parseBooleanSetting(process.env[AUTO_SAVE_ENV]);
-    if (fromEnv !== null) {
-        // Overrides the behaviour, and counts as a deliberate configuration
-        // act: someone who set this does not need to be asked as well.
-        return { enabled: fromEnv, state, source: "env", pendingConsent: false, path };
+    if (fromEnv === false) {
+        // Turning automatic saving OFF for this process is always safe.
+        // Turning it ON from `process.env` is refused for the same reason
+        // `credsDirOverride()` refuses a project path: an MCP client reads
+        // `.cursor/mcp.json`, `.vscode/mcp.json`, or `.claude/settings.json`
+        // out of the checkout and passes its `env` block here, so a truthy
+        // `MEMWAL_AUTO_SAVE` cannot be distinguished from a repository
+        // granting itself consent or overriding a stored `autoSave: false`.
+        // If no stored answer exists yet, `pendingConsent` stays true so
+        // interactive `login` still prompts.
+        return {
+            enabled: false,
+            state: "off",
+            source: "env",
+            pendingConsent: answered === null,
+            path,
+        };
     }
 
     if (answered !== null) {

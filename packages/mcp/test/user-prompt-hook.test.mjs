@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,19 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOOK = resolve(__dirname, "../plugin/scripts/on_user_prompt.mjs");
 const EMPTY_CREDS_DIR = mkdtempSync(join(tmpdir(), "memwal-hook-test-"));
+// These cases are about classification, not consent: publish a consented state
+// in the isolated trusted state dir so they test the ON rubric.
+writeFileSync(
+    join(EMPTY_CREDS_DIR, "auto-save-state.json"),
+    JSON.stringify({
+        version: 1,
+        enabled: true,
+        state: "on",
+        source: "settings",
+        pendingConsent: false,
+        updatedAt: new Date().toISOString(),
+    }),
+);
 
 function runHook(prompt, sessionId = `test-${Math.random().toString(16).slice(2)}`) {
     const result = spawnSync(process.execPath, [HOOK], {
@@ -33,10 +46,6 @@ function runHook(prompt, sessionId = `test-${Math.random().toString(16).slice(2)
         env: {
             ...process.env,
             MEMWAL_CREDS_DIR: EMPTY_CREDS_DIR,
-            // These cases are about classification, not consent: pin the
-            // automatic-save rubric explicitly so they keep testing the thing
-            // they were written for, whatever the resolver would decide.
-            MEMWAL_AUTO_SAVE: "1",
         },
     });
     assert.equal(result.status, 0, result.stderr);

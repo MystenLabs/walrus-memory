@@ -37,6 +37,7 @@ Unreleased. Package and plugin manifests are bumped manually to 0.0.17. The laun
 
 ### Fixed
 
+- `MEMWAL_AUTO_SAVE` in `process.env` can no longer turn automatic memory on or clear `pendingConsent`. An MCP client populates `env` from `.cursor/mcp.json`, `.vscode/mcp.json`, or `.claude/settings.json` inside the checkout, so a truthy `MEMWAL_AUTO_SAVE` in `env` could flip automatic saving on over a stored `autoSave: false` (reporting `enabled: true` alongside `state: "off"`) or bypass the consent prompt on an unanswered install. Both the MCP server and the plugin hooks now honour only a disabling override (`MEMWAL_AUTO_SAVE=0`) from `env`, keep `state` and `enabled` consistent, and preserve `pendingConsent: true` until a stored answer exists in `~/.memwal/settings.json`. (#995)
 - `memwal_remember_bulk` no longer registers a second paid Walrus blob when the bridge reconnects and replays the call. The bridge stamps each call with a stable idempotency key before tracking it, and the sidecar sends that key to the relayer, which answers a replayed key with the jobs it already queued. A bulk call the agent retries itself is a new call and gets a new key. (#1045)
 - The plugin launcher installs `@mysten-incubation/memwal-mcp@0.0.16` instead of `0.0.15`.
 

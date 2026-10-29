@@ -27,9 +27,10 @@
  *     "state unknown", which is automatic memory OFF. A hook must never block a
  *     session, and an absent answer is not consent.
  *
- * `MEMWAL_AUTO_SAVE` is still honoured first. It comes from this process's
- * environment — the client's hook configuration, set by the user — never from a
- * file a repository can carry.
+ * `MEMWAL_AUTO_SAVE=0` is honoured to turn automatic saving off for this
+ * process. A truthy value in `process.env` is ignored: an MCP client or hook
+ * runner can populate `env` from a config file inside the checkout, so an
+ * environment variable cannot grant consent or override a stored `off` answer.
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -120,6 +121,8 @@ function readPublishedState() {
         if (!parsed || typeof parsed !== "object") return null;
         if (parsed.version !== SUPPORTED_VERSION) return null;
         if (typeof parsed.enabled !== "boolean") return null;
+        if (parsed.state === "off" && parsed.enabled !== false) return null;
+        if (parsed.state === "on" && parsed.enabled !== true) return null;
         return parsed;
     } catch {
         return null;
@@ -134,17 +137,17 @@ function readPublishedState() {
  * told the question is still open.
  */
 export function autoSaveStatus() {
+    const published = readPublishedState();
     const fromEnv = parseBooleanSetting(process.env[AUTO_SAVE_ENV]);
-    if (fromEnv !== null) {
+    if (fromEnv === false) {
         return {
-            enabled: fromEnv,
-            state: fromEnv ? "on" : "off",
+            enabled: false,
+            state: "off",
             source: "env",
-            pendingConsent: false,
+            pendingConsent: published ? published.pendingConsent === true : true,
         };
     }
 
-    const published = readPublishedState();
     if (!published) {
         return {
             enabled: false,
