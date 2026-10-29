@@ -20,6 +20,15 @@ const budgetKeys = [
   'delegate_key_per_minute',
 ] as const
 
+// Reset the saved form only when persisted settings or their defaults change.
+function savedWalletKey(wallet: SavedWallet, defaults: OwnerRateLimitPolicy) {
+  return [
+    wallet.owner,
+    wallet.expires_at ?? '',
+    ...budgetKeys.map((key) => `${wallet[key]}/${defaults[key]}`),
+  ].join(':')
+}
+
 function currentMultiplier(
   policy: OwnerRateLimitPolicy,
   defaults: OwnerRateLimitPolicy,
@@ -244,7 +253,7 @@ export function AdminRateLimits({
           <ul className="admin-priority-list">
             {wallets.map((wallet) => (
               <WalletRow
-                key={wallet.owner}
+                key={savedWalletKey(wallet, defaults)}
                 saved={wallet}
                 defaults={defaults}
                 adminKey={adminKey}

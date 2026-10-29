@@ -151,6 +151,72 @@ describe('priority wallets', () => {
       expect(resetOwnerRateLimits).toHaveBeenCalledWith('test-key', owner),
     )
   })
+  it.each(['policy', 'defaults'] as const)(
+    'refreshes saved form state when server %s change',
+    async (change) => {
+      const saved = {
+        ...defaults,
+        owner,
+        requests_per_minute: 1200,
+        requests_per_hour: 10000,
+        delegate_key_per_minute: 600,
+      }
+      const nextDefaults = change === 'defaults'
+        ? {
+            ...defaults,
+            requests_per_minute: 240,
+            requests_per_hour: 2000,
+            delegate_key_per_minute: 120,
+          }
+        : defaults
+      const nextPolicy = change === 'policy'
+        ? {
+            ...saved,
+            requests_per_minute: 600,
+            requests_per_hour: 5000,
+            delegate_key_per_minute: 300,
+          }
+        : saved
+      vi.mocked(fetchOwnerRateLimitList)
+        .mockResolvedValueOnce({ ...empty, policies: [saved] })
+        .mockResolvedValue({
+          ...empty,
+          defaults: nextDefaults,
+          policies: [nextPolicy],
+        })
+      show()
+      await screen.findByDisplayValue(owner)
+      expect(screen.getByLabelText('Rate multiplier')).toHaveTextContent('×10')
+      fireEvent.click(screen.getByRole('combobox', { name: 'Rate multiplier' }))
+      fireEvent.click(screen.getByRole('option', { name: '×20' }))
+      expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+      await waitFor(() =>
+        expect(screen.getByLabelText('Rate multiplier')).toHaveTextContent('×5'),
+      )
+      expect(screen.getByLabelText('Wallet saved')).toBeInTheDocument()
+    },
+  )
+  it('preserves unsaved edits when refresh returns unchanged settings', async () => {
+    vi.mocked(fetchOwnerRateLimitList).mockResolvedValue({
+      ...empty,
+      policies: [{
+        ...defaults,
+        owner,
+        requests_per_minute: 600,
+        requests_per_hour: 5000,
+        delegate_key_per_minute: 300,
+      }],
+    })
+    show()
+    await screen.findByDisplayValue(owner)
+    fireEvent.click(screen.getByRole('combobox', { name: 'Rate multiplier' }))
+    fireEvent.click(screen.getByRole('option', { name: '×10' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(fetchOwnerRateLimitList).toHaveBeenCalledTimes(2))
+    expect(screen.getByLabelText('Rate multiplier')).toHaveTextContent('×10')
+    expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+  })
   it('removes an unsaved row without a backend mutation', async () => {
     show()
     await add()
