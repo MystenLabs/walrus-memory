@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Card } from './Card'
+import { RateMultiplierSelect } from './RateMultiplierSelect'
 import {
   fetchOwnerRateLimitList,
   saveOwnerRateLimits,
@@ -113,27 +114,14 @@ function WalletRow({
             setIsSaved(false)
           }}
         />
-        <select
-          aria-label="Rate multiplier"
-          className="dashboard-add-key-input admin-priority-select"
+        <RateMultiplierSelect
           value={multiplier}
           disabled={busy}
-          onChange={(event) => {
-            setMultiplier(event.target.value)
+          onChange={(value) => {
+            setMultiplier(value)
             setIsSaved(false)
           }}
-        >
-          {multiplier === 'custom' && (
-            <option value="custom" disabled>
-              Custom
-            </option>
-          )}
-          {MULTIPLIERS.map((value) => (
-            <option key={value} value={value}>
-              ×{value}
-            </option>
-          ))}
-        </select>
+        />
         <div className="dashboard-add-key-actions dashboard-key-row-actions admin-priority-actions">
           <button
             type="submit"

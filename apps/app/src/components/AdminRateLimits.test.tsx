@@ -69,9 +69,8 @@ describe('priority wallets', () => {
       })
       show()
       await add()
-      fireEvent.change(screen.getByLabelText('Rate multiplier'), {
-        target: { value: String(factor) },
-      })
+      fireEvent.click(screen.getByRole('combobox', { name: 'Rate multiplier' }))
+      fireEvent.click(screen.getByRole('option', { name: `×${factor}` }))
       fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
       await waitFor(() =>
         expect(saveOwnerRateLimits).toHaveBeenCalledWith('test-key', '0x1', {
@@ -106,9 +105,8 @@ describe('priority wallets', () => {
     )
     show()
     expect(await screen.findByLabelText('Wallet saved')).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Rate multiplier'), {
-      target: { value: '10' },
-    })
+    fireEvent.click(screen.getByRole('combobox', { name: 'Rate multiplier' }))
+    fireEvent.click(screen.getByRole('option', { name: '×10' }))
     expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
     expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
@@ -145,7 +143,7 @@ describe('priority wallets', () => {
     })
     show()
     expect(await screen.findByDisplayValue(owner)).toHaveAttribute('readonly')
-    expect(screen.getByLabelText('Rate multiplier')).toHaveValue('5')
+    expect(screen.getByLabelText('Rate multiplier')).toHaveTextContent('×5')
     fireEvent.click(
       screen.getByRole('button', { name: 'Remove priority wallet' }),
     )
