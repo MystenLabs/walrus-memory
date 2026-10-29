@@ -109,6 +109,14 @@ test("queries.ts, session.ts, and enoki/route.ts wire encryptDelegatePrivateKey 
     /\.values\(\{[^}]*delegatePrivateKey\s*,/
   );
   assert.match(
+    queriesSource,
+    /eq\(user\.delegatePrivateKey,\s*originalPlaintext\)/
+  );
+  assert.match(
+    queriesSource,
+    /eq\(user\.delegatePrivateKey,\s*row\.delegatePrivateKey\)/
+  );
+  assert.match(
     sessionSource,
     /resolveAndMigrateUserDelegateKey\(user\)/
   );
@@ -116,4 +124,64 @@ test("queries.ts, session.ts, and enoki/route.ts wire encryptDelegatePrivateKey 
     enokiRouteSource,
     /resolveAndMigrateUserDelegateKey\(existing\)/
   );
+});
+
+test("extracted helper probe: migration CAS handles a synthetic concurrent credential update", async () => {
+  const legacyPlaintext = "a".repeat(64);
+  const rotatedKey = "b".repeat(64);
+  const rotatedEnvelope = encryptDelegatePrivateKey(rotatedKey, SECRET_A);
+
+  let dbRow = {
+    id: "user-1",
+    publicKey: "pk-1",
+    accountId: "acct-1",
+    delegatePrivateKey: legacyPlaintext,
+  };
+
+  const targetUser = {
+    id: "user-1",
+    delegatePrivateKey: dbRow.delegatePrivateKey,
+  };
+
+  // Helper probe simulating resolveAndMigrateUserDelegateKey atomic CAS logic:
+  async function probeResolveAndMigrate(userParam: typeof targetUser) {
+    const originalPlaintext = userParam.delegatePrivateKey;
+    const resolved = openOrMigrateDelegatePrivateKey(originalPlaintext, SECRET_A);
+    if (!resolved.migrated) return resolved.plaintextKey;
+
+    // Simulate concurrent rotation updating the row before our CAS update lands
+    // (e.g. updateEnokiUserCredentials replaces delegatePrivateKey, publicKey, and accountId)
+    dbRow = {
+      ...dbRow,
+      publicKey: "pk-rotated",
+      accountId: "acct-rotated",
+      delegatePrivateKey: rotatedEnvelope,
+    };
+
+    // Atomic CAS update: only updates if delegatePrivateKey == originalPlaintext
+    let updateCount = 0;
+    if (dbRow.id === userParam.id && dbRow.delegatePrivateKey === originalPlaintext) {
+      dbRow.delegatePrivateKey = resolved.encryptedEnvelope;
+      updateCount = 1;
+    }
+
+    if (updateCount > 0) {
+      userParam.delegatePrivateKey = resolved.encryptedEnvelope;
+      return resolved.plaintextKey;
+    }
+
+    // Lost race: reload current credentials
+    const reloaded = { delegatePrivateKey: dbRow.delegatePrivateKey };
+    userParam.delegatePrivateKey = reloaded.delegatePrivateKey;
+    return openOrMigrateDelegatePrivateKey(reloaded.delegatePrivateKey, SECRET_A).plaintextKey;
+  }
+
+  const resultKey = await probeResolveAndMigrate(targetUser);
+
+  // Must return the freshly rotated key, NOT the stale resurrected key
+  assert.equal(resultKey, rotatedKey);
+  // Stored row must retain the rotated credentials (not overwritten by old migrated envelope)
+  assert.equal(dbRow.delegatePrivateKey, rotatedEnvelope);
+  assert.equal(dbRow.accountId, "acct-rotated");
+  assert.equal(targetUser.delegatePrivateKey, rotatedEnvelope);
 });

@@ -214,6 +214,11 @@ export async function upsertEnokiUser(
  * backfill a pre-upgrade 64-hex plaintext delegate key in PostgreSQL so the
  * existing account and memory access survive the upgrade without generating a
  * replacement account.
+ *
+ * Uses an atomic compare-and-swap on `delegatePrivateKey` to protect against
+ * concurrent credential rotations. If another session updated credentials
+ * between the initial read and migration, reloads the current row and returns
+ * the fresh credentials instead of overwriting with the stale migrated key.
  */
 export async function resolveAndMigrateUserDelegateKey(
   db: DbClient,
@@ -227,19 +232,45 @@ export async function resolveAndMigrateUserDelegateKey(
   if (!user.delegatePrivateKey) {
     throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
   }
+  const originalPlaintext = user.delegatePrivateKey;
   const resolved = openOrMigrateDelegatePrivateKey(
-    user.delegatePrivateKey,
+    originalPlaintext,
     secretOverride
   );
   if (resolved.migrated) {
-    await db
+    const updated = await db
       .update(users)
       .set({
         delegatePrivateKey: resolved.encryptedEnvelope,
       })
-      .where(eq(users.id, user.id))
+      .where(
+        and(
+          eq(users.id, user.id),
+          eq(users.delegatePrivateKey, originalPlaintext)
+        )
+      )
       .returning();
-    user.delegatePrivateKey = resolved.encryptedEnvelope;
+
+    if (updated.length > 0) {
+      user.delegatePrivateKey = resolved.encryptedEnvelope;
+      return resolved;
+    }
+
+    // Lost race: a concurrent credential rotation modified delegatePrivateKey.
+    // Reload current credentials rather than returning the stale key.
+    const [reloaded] = await db
+      .select({ delegatePrivateKey: users.delegatePrivateKey })
+      .from(users)
+      .where(eq(users.id, user.id));
+
+    if (!reloaded || !reloaded.delegatePrivateKey) {
+      throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+    }
+    user.delegatePrivateKey = reloaded.delegatePrivateKey;
+    return openOrMigrateDelegatePrivateKey(
+      reloaded.delegatePrivateKey,
+      secretOverride
+    );
   }
   return resolved;
 }
@@ -247,6 +278,9 @@ export async function resolveAndMigrateUserDelegateKey(
 /**
  * Batch-backfill any remaining pre-upgrade 64-hex plaintext delegate keys in
  * `users` into AES-256-GCM `v1.` envelopes in place.
+ *
+ * Compares `users.delegatePrivateKey` with the read plaintext atomically to
+ * avoid clobbering concurrent credential updates.
  */
 export async function backfillLegacyDelegateKeys(
   db: DbClient,
@@ -268,14 +302,21 @@ export async function backfillLegacyDelegateKeys(
         row.delegatePrivateKey,
         secretOverride
       );
-      await db
+      const updated = await db
         .update(users)
         .set({
           delegatePrivateKey: encryptedEnvelope,
         })
-        .where(eq(users.id, row.id))
+        .where(
+          and(
+            eq(users.id, row.id),
+            eq(users.delegatePrivateKey, row.delegatePrivateKey)
+          )
+        )
         .returning();
-      migratedCount += 1;
+      if (updated.length > 0) {
+        migratedCount += 1;
+      }
     }
   }
   return migratedCount;
