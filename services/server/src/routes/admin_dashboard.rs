@@ -121,8 +121,9 @@ pub async fn get_wallets(
     let sidecar_data: SidecarWalletMetrics =
         if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
             let v = crate::storage::walrus_native::fetch_wallet_balances_in_process().await;
-            serde_json::from_value(v)
-                .map_err(|e| AppError::Internal(format!("Invalid in-process wallet metrics: {e}")))?
+            serde_json::from_value(v).map_err(|e| {
+                AppError::Internal(format!("Invalid in-process wallet metrics: {e}"))
+            })?
         } else {
             let wallet_balances_url = format!("{}/internal/wallet-balances", sidecar_url);
 

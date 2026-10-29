@@ -219,8 +219,7 @@ async fn call_sidecar_sponsor_execute(
                     &status.as_u16().to_string(),
                     started.elapsed(),
                 );
-                let sanitized =
-                    crate::sui::enoki::sanitize_upstream_error_for_logging(&err_msg);
+                let sanitized = crate::sui::enoki::sanitize_upstream_error_for_logging(&err_msg);
                 let body = serde_json::json!({ "error": sanitized }).to_string();
                 return Ok((status, axum::body::Bytes::from(body.into_bytes())));
             }
@@ -574,7 +573,9 @@ async fn forward_sponsor(
                     .status(axum::http::StatusCode::OK)
                     .header("Content-Type", "application/json")
                     .body(Body::from(body))
-                    .map_err(|e| AppError::Internal(format!("Sponsor response build failed: {e}")));
+                    .map_err(|e| {
+                        AppError::Internal(format!("Sponsor response build failed: {e}"))
+                    });
             }
             Err(err) => {
                 let err_msg = err.error_message();
