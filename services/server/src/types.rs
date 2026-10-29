@@ -162,6 +162,7 @@ pub struct AppState {
     /// `Arc` so the `MemoryEngine` impl can share the same handle rather
     /// than duplicating the pool.
     pub db: Arc<VectorDb>,
+    pub owner_policies: Arc<crate::owner_rate_limits::OwnerPolicyStore>,
     /// Small dedicated pool used ONLY to hold a per-job advisory lock across an
     /// upload's guard-read → mint → persist section, so two attempts of the same
     /// job cannot both mint. The connection is checked out only after that

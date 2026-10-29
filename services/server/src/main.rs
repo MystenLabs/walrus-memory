@@ -8,6 +8,7 @@ mod jobs_security_delete;
 mod mcp_proxy;
 mod oauth;
 mod observability;
+mod owner_rate_limits;
 mod owner_token_auth;
 mod rate_limit;
 mod routes;
@@ -67,7 +68,13 @@ fn security_delete_cors() -> CorsLayer {
 fn relayer_cors(origins: Vec<HeaderValue>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
@@ -451,6 +458,55 @@ mod cors_tests {
     }
 
     #[tokio::test]
+    async fn relayer_cors_allows_admin_policy_put_for_configured_origins() {
+        let origin = "http://127.0.0.1:5179";
+        let app = Router::new()
+            .route(
+                "/api/admin/rate-limits/{owner}",
+                axum::routing::put(|| async {}),
+            )
+            .layer(relayer_cors(vec![origin.parse().unwrap()]));
+        for candidate in [origin, "https://unlisted.example"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/api/admin/rate-limits/0x1")
+                        .header(header::ORIGIN, candidate)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                        .header(
+                            header::ACCESS_CONTROL_REQUEST_HEADERS,
+                            "content-type,x-admin-api-key",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if candidate == origin {
+                assert_eq!(
+                    response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                    origin
+                );
+                let methods = response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+                    .to_str()
+                    .unwrap();
+                assert!(methods.split(',').any(|method| method == "PUT"));
+                let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                    .to_str()
+                    .unwrap();
+                assert!(headers.split(',').any(|name| name == "x-admin-api-key"));
+            } else {
+                assert!(response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn relayer_cors_exposes_x_auth_error_and_retry_after() {
         let origin = "https://app.memwal.test";
         let app = Router::new()
@@ -668,6 +724,7 @@ mod mcp_rate_limit_tests {
         let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
         Arc::new(AppState {
             db: Arc::clone(&db),
+            owner_policies: Arc::new(owner_rate_limits::OwnerPolicyStore::new()),
             wallet_lock_pool: pool.clone(),
             legacy_db: None,
             security_delete_nonce_store: Arc::new(security_delete_auth::RedisNonceStore::new(
@@ -779,6 +836,232 @@ mod mcp_rate_limit_tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
+    #[tokio::test]
+    async fn owner_policy_admin_requires_operator_key_on_every_method() {
+        let state = test_state(denying_redis().await).await;
+        let app = owner_rate_limit_routes().with_state(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/rate-limits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/admin/rate-limits/0x1")
+                        .header("authorization", "Bearer example-delegate-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_policy_http_uses_scoped_limits_and_fails_closed() {
+        let Ok(database_url) = std::env::var("OWNER_RATE_LIMIT_TEST_DATABASE_URL") else {
+            return;
+        };
+        let parsed = url::Url::parse(&database_url).unwrap();
+        assert!(matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1")
+        ));
+        let setup = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let schema = format!("policy_http_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&setup)
+            .await
+            .unwrap();
+        let statement = format!("SET search_path TO {schema}");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |connection, _| {
+                let statement = statement.clone();
+                Box::pin(async move {
+                    sqlx::query(&statement).execute(connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/027_owner_rate_limits.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owner = security_delete_auth::canonical_sui_address("0x1").unwrap();
+        let other = security_delete_auth::canonical_sui_address("0x2").unwrap();
+        sqlx::query("INSERT INTO owner_rate_limits(owner,requests_per_minute,requests_per_hour,delegate_key_per_minute) VALUES ($1,180,1500,90)")
+            .bind(&owner).execute(&pool).await.unwrap();
+        // A healthy sidecar makes the actual /health readiness gate testable
+        // independently of policy failure, including while probes are cached.
+        let sidecar_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sidecar_url = format!("http://{}", sidecar_listener.local_addr().unwrap());
+        let sidecar = tokio::spawn(async move {
+            axum::serve(
+                sidecar_listener,
+                Router::new().route("/health", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .unwrap();
+        });
+        let mut state = test_state(denying_redis().await).await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.db = Arc::new(VectorDb::from_pool(pool.clone()));
+        Arc::make_mut(&mut inner.config).sidecar_url = sidecar_url;
+        state.owner_policies.refresh_for_test(&pool).await.unwrap();
+        assert!(
+            routes::health(axum::extract::State(state.clone()))
+                .await
+                .0
+                .write_ready
+        );
+        let health_state = state.clone();
+        let policy_store = state.owner_policies.clone();
+        // When supplied by the local test command, exercise real authenticated
+        // admin roundtrips as well as the middleware below.
+        if let Ok(key) = std::env::var("ADMIN_API_KEY") {
+            let admin = owner_rate_limit_routes().with_state(state.clone());
+            let response = admin
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/admin/rate-limits")
+                        .header("x-admin-api-key", &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store, private");
+            for (method, body) in [
+                (
+                    Method::PUT,
+                    r#"{"requests_per_minute":180,"requests_per_hour":1500,"delegate_key_per_minute":90,"expires_at":null}"#,
+                ),
+                (Method::GET, ""),
+                (Method::DELETE, ""),
+            ] {
+                let response = admin
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/api/admin/rate-limits/0x2")
+                            .header("x-admin-api-key", &key)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["cache-control"], "no-store, private");
+            }
+            let response = admin.oneshot(Request::builder().method(Method::PUT)
+                .uri("/api/admin/rate-limits/0x2")
+                .header("x-admin-api-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"requests_per_minute":0,"requests_per_hour":1500,"delegate_key_per_minute":90}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let app = Router::new()
+            .route("/api/recall", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit::rate_limit_middleware,
+            ))
+            .with_state(state);
+        async fn call(app: &Router, owner: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/recall")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(types::AuthInfo {
+                public_key: "example-key".into(),
+                owner: owner.into(),
+                account_id: "example-account".into(),
+                delegate_key: None,
+                seal_session: None,
+            });
+            let response = app.clone().oneshot(req).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let (status, body) = call(&app, &owner).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["limit"], "90 weighted-requests/min");
+        assert_eq!(
+            call(&app, &other).await.1["limit"],
+            "30 weighted-requests/min"
+        );
+        sqlx::query("UPDATE owner_rate_limits SET expires_at=now()-interval '1 second'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        policy_store.refresh_for_test(&pool).await.unwrap();
+        assert_eq!(
+            call(&app, &owner).await.1["limit"],
+            "30 weighted-requests/min"
+        );
+        // A policy-store failure must not fall through to a larger global default.
+        sqlx::query("DROP TABLE owner_rate_limit_revision")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(policy_store.refresh_for_test(&pool).await.is_err());
+        policy_store.expire_for_test();
+        assert_eq!(call(&app, &owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !routes::health(axum::extract::State(health_state))
+                .await
+                .0
+                .write_ready,
+            "stale policy must override an otherwise healthy cached readiness probe"
+        );
+        sidecar.abort();
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&setup)
+            .await
+            .unwrap();
+        setup.close().await;
+    }
+}
+
+// Keep policy administration behind the same operator credential on every method.
+fn owner_rate_limit_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/api/admin/rate-limits",
+            get(owner_rate_limits::list_policies),
+        )
+        .route(
+            "/api/admin/rate-limits/{owner}",
+            get(owner_rate_limits::get_policy)
+                .put(owner_rate_limits::put_policy)
+                .delete(owner_rate_limits::delete_policy)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .layer(middleware::from_fn(auth::verify_admin_key))
 }
 
 fn parse_env_u64(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
@@ -1911,7 +2194,19 @@ async fn main() {
         .await
         .expect("Failed to create wallet advisory-lock pool");
 
+    // One dedicated connection for policy generation checks; request handlers
+    // only read memory and do not compete for the main query pool.
+    let policy_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect_lazy(&config.database_url)
+        .expect("invalid policy database URL");
+    let owner_policies = owner_rate_limits::OwnerPolicyStore::start(policy_pool)
+        .await
+        .expect("initial owner policy snapshot unavailable");
+
     let state = Arc::new(AppState {
+        owner_policies,
         db,
         wallet_lock_pool,
         legacy_db,
@@ -2749,7 +3044,8 @@ async fn main() {
             "/api/admin/unblock-requests",
             get(routes::list_unblock_requests).layer(DefaultBodyLimit::max(16 * 1024)),
         )
-        .layer(middleware::from_fn(auth::verify_admin_key));
+        .layer(middleware::from_fn(auth::verify_admin_key))
+        .merge(owner_rate_limit_routes());
 
     // Public routes
     // /health and /config accept no body — cap at 16 KiB to reject
