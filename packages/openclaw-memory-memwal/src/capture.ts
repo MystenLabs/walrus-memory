@@ -65,6 +65,26 @@ const ADDRESSES_MODEL = [
   /^(ign[o0a]re|disregard|f[o0]rget|override|bypass|run|execute|call|invoke|reveal|print|output)\b/i,
 ];
 
+/** Conversational opt-out patterns that instruct the assistant not to persist the turn. */
+const OPT_OUT_PATTERNS = [
+  /\b(?:do\s+not|don['\u2019]?t|please\s+do\s+not|please\s+don['\u2019]?t|never)\s+(?:ever\s+)?(?:remember|save|store|capture|record|log|keep|memorize|index)\b/i,
+  /\b(?:off\s+the\s+record|do\s+not\s+keep\s+(?:this\s+)?in\s+memory|don['\u2019]?t\s+keep\s+(?:this\s+)?in\s+memory)\b/i,
+  /(?:^|\s)(?:\[\s*no[-_\s]?save\s*\]|#no[-_]?save\b)/i,
+];
+
+/** High-confidence inline credential and secret patterns excluded from automatic capture. */
+const SECRET_PATTERNS = [
+  /\bsuiprivkey1[02-9ac-hj-np-z]{50,}\b/i,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+  /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,}\b/,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bAIza[0-9A-Za-z_-]{35}\b/,
+  /\b(?:authorization\s*:\s*(?:bearer|basic)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+  /\b(?:api[_-\s]?key|secret[_-\s]?key|private[_-\s]?key|delegate[_-\s]?key|access[_-\s]?token|refresh[_-\s]?token|client[_-\s]?secret|password|passwd|pwd)\s*(?:[:=]|\bis\b)\s*['"]?(?:0x[0-9a-fA-F]{64}|[0-9a-fA-F]{64}|[^\s'",;]{8,})/i,
+];
+
 /** Memory trigger patterns — always capture if matched. */
 const TRIGGER_PATTERNS = [
   /remember|prefer|radši|zapamatuj/i,
@@ -117,6 +137,20 @@ export function looksLikeInjection(text: string): boolean {
   );
 }
 
+/** Check if text contains an explicit conversational opt-out directive. */
+export function looksLikeOptOut(text: string): boolean {
+  if (!text) return false;
+  if (OPT_OUT_PATTERNS.some((p) => p.test(text))) return true;
+  const normalized = normalizeForInjectionCheck(text);
+  return Boolean(normalized && OPT_OUT_PATTERNS.some((p) => p.test(normalized)));
+}
+
+/** Check if text contains high-confidence inline credentials or secret keys. */
+export function looksLikeSecret(text: string): boolean {
+  if (!text) return false;
+  return SECRET_PATTERNS.some((p) => p.test(text));
+}
+
 /** Determine whether a conversation turn is worth capturing. */
 export function shouldCapture(text: string): boolean {
   if (text.length < MIN_CAPTURE_LENGTH) return false;
@@ -127,6 +161,8 @@ export function shouldCapture(text: string): boolean {
   if (emojiCount > MAX_EMOJI_COUNT) return false;
 
   if (looksLikeInjection(text)) return false;
+  if (looksLikeOptOut(text)) return false;
+  if (looksLikeSecret(text)) return false;
   if (TRIGGER_PATTERNS.some((p) => p.test(text))) return true;
 
   return true;
