@@ -14,15 +14,20 @@
  * A unit test cannot catch this — whether a version exists is a fact about npm,
  * not about the repository — so it lives here.
  *
+ * An explicit published bootstrap can serve dev installs while their exact
+ * preferred stable version is pending. Runtime fallback is allowed only for
+ * npm ETARGET on that exact preferred version, never for network/install errors.
+ *
  * Two findings, deliberately unequal:
  *
  *   ERROR   the pin is not published. The launcher cannot install it. Blocking.
- *           One exception: on a ref headed for `main`, a pin equal to
+ *           An explicit published bootstrap permits a pending preferred pin.
+ *           Otherwise, on a ref headed for `main`, a pin equal to
  *           packages/mcp/package.json's version is the release being cut, and
  *           release-mcp.yml publishes exactly that from this tree moments later.
  *           Erroring there would redden every release. The exception is scoped to
  *           `main` on purpose: `dev` pinning an unpublished release version is
- *           precisely the 2026-09-17 bug, and must stay an error.
+ *           precisely the 2026-09-17 bug without an explicit published bootstrap.
  *
  *   WARNING the pin is published but is not what the dist-tag for this branch
  *           points at. Not blocking, because it cannot be: pushing to `dev`
@@ -120,6 +125,13 @@ async function main() {
     }
 
     if (!versions.includes(pin)) {
+        const bootstrap = manifest.mcpBootstrapVersion;
+        if (pin === sourceVersion && typeof bootstrap === "string" && versions.includes(bootstrap)) {
+            annotate("warning", `Preferred ${pin} is not published yet; the launcher can bootstrap from published ${bootstrap}. Stable installs switch to ${pin} when npm serves it.`);
+            summary.push(`Preferred release pending; explicit published bootstrap: \`${bootstrap}\`.`);
+            summarise(summary);
+            return;
+        }
         // The release being cut is allowed to pin ahead of npm: release-mcp.yml
         // publishes packages/mcp/package.json's version from this very tree a
         // moment after the push. Only on a ref headed for `main`, though —

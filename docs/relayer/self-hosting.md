@@ -289,3 +289,22 @@ To exercise the policy database and HTTP tests locally, set
 `OWNER_RATE_LIMIT_TEST_DATABASE_URL` to a disposable local PostgreSQL database and
 run `cargo test --manifest-path services/server/Cargo.toml --bin memwal-server owner_`.
 The tests use isolated temporary schemas and reject non-local database hosts.
+
+### Uploader gas failures in live validation
+
+A successful recall or `write_ready=true` does not prove a durable upload can
+finish. If a remember job reports infrastructure capacity failure, inspect the
+relayer upload error and the uploader balances in the admin dashboard. The
+specific message `Unable to perform gas selection due to insufficient SUI balance`
+requires operator maintenance of the configured uploader pool. It is not an
+account rate-limit error and must not be addressed by increasing API limits or by
+asking the end user to fund their wallet.
+
+For dev, confirm the configured Sui network and replenish the affected uploader
+wallets through the approved testnet funding procedure. Address-balance-only
+configurations must have spendable address balance, not just owned coin objects.
+Do not transfer production funds, change keys or lower E2E assertions as a
+workaround. After maintenance, rerun `SDK / E2E (live relayer)` and confirm each
+remember job reaches `done`, then recall from the test namespace. A failed or
+pending job is not a stored memory. This release does not perform wallet funding
+or add balance RPCs to the remember/recall request path.
