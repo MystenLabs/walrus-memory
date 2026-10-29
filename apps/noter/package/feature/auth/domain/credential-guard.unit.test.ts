@@ -12,6 +12,7 @@ vi.mock("server-only", () => ({}));
 const ADDR = `0x${"3".repeat(64)}`;
 
 let existingRow: Record<string, unknown> | undefined;
+let updateReturningOverride: (() => Promise<unknown[]>) | undefined;
 const updateSet = vi.fn();
 const insertValues = vi.fn();
 
@@ -23,6 +24,8 @@ function makeDb() {
       from: () => ({
         where: () => ({
           limit: async () => (existingRow ? [existingRow] : []),
+          then: (resolve: (rows: unknown[]) => void) =>
+            resolve(existingRow ? [existingRow] : []),
         }),
         then: (resolve: (rows: unknown[]) => void) =>
           resolve(existingRow ? [existingRow] : []),
@@ -31,14 +34,15 @@ function makeDb() {
     update: () => ({
       set: (payload: unknown) => {
         updateSet(payload);
-        if (existingRow && payload && typeof payload === "object") {
+        if (!updateReturningOverride && existingRow && payload && typeof payload === "object") {
           existingRow = { ...existingRow, ...(payload as object) };
         }
         return {
           where: () => ({
-            returning: async () => [
-              existingRow ?? { id: "u1", ...(payload as object) },
-            ],
+            returning: async () => {
+              if (updateReturningOverride) return updateReturningOverride();
+              return [existingRow ?? { id: "u1", ...(payload as object) }];
+            },
           }),
         };
       },
@@ -59,6 +63,7 @@ async function load() {
 beforeEach(() => {
   vi.clearAllMocks();
   existingRow = undefined;
+  updateReturningOverride = undefined;
 });
 
 describe("upsertEnokiUser — insert-only credential guard", () => {
@@ -175,5 +180,78 @@ describe("upsertEnokiUser — insert-only credential guard", () => {
       delegateAccountId: "0x" + "9".repeat(64),
     });
     expect(updateSet).not.toHaveBeenCalled();
+  });
+
+  it("reloads fresh credentials when resolveAndMigrateUserDelegateKey races with a concurrent credential update", async () => {
+    const legacyKey = "c".repeat(64);
+    const newRotatedKey = "e".repeat(64);
+    const { encryptDelegatePrivateKey } = await import("../lib/delegate-key-crypto");
+    const newRotatedEnvelope = encryptDelegatePrivateKey(newRotatedKey);
+
+    existingRow = {
+      id: "u-racing",
+      suiAddress: ADDR,
+      authMethod: "enoki",
+      delegatePrivateKey: legacyKey,
+      delegateAccountId: "0x" + "1".repeat(64),
+    };
+
+    const targetUser = {
+      id: "u-racing",
+      delegatePrivateKey: legacyKey,
+    };
+
+    const { resolveAndMigrateUserDelegateKey } = await load();
+    const db = makeDb();
+
+    // Simulate concurrent rotation updating the database row before our CAS update lands
+    updateReturningOverride = async () => {
+      existingRow = {
+        ...existingRow,
+        delegatePrivateKey: newRotatedEnvelope,
+        delegateAccountId: "0x" + "2".repeat(64),
+      };
+      // CAS condition did not match because stored key was no longer legacyKey
+      return [];
+    };
+
+    const result = await resolveAndMigrateUserDelegateKey(db as never, targetUser);
+
+    // Lost race handler reloads current credentials:
+    expect(result.plaintextKey).toBe(newRotatedKey);
+    expect(targetUser.delegatePrivateKey).toBe(newRotatedEnvelope);
+    // The stored row in the database preserves the newly rotated envelope without being clobbered
+    expect(existingRow.delegatePrivateKey).toBe(newRotatedEnvelope);
+  });
+
+  it("backfillLegacyDelegateKeys uses atomic CAS and skips rows updated concurrently", async () => {
+    const legacyKey = "d".repeat(64);
+    const rotatedKey = "f".repeat(64);
+    const { encryptDelegatePrivateKey } = await import("../lib/delegate-key-crypto");
+    const rotatedEnvelope = encryptDelegatePrivateKey(rotatedKey);
+
+    existingRow = {
+      id: "u-batch",
+      suiAddress: ADDR,
+      authMethod: "enoki",
+      delegatePrivateKey: legacyKey,
+      delegateAccountId: "0x" + "3".repeat(64),
+    };
+
+    const { backfillLegacyDelegateKeys } = await load();
+    const db = makeDb();
+
+    // Simulate concurrent update on the row right after initial select
+    updateReturningOverride = async () => {
+      existingRow = {
+        ...existingRow,
+        delegatePrivateKey: rotatedEnvelope,
+      };
+      return []; // CAS matched 0 rows
+    };
+
+    const count = await backfillLegacyDelegateKeys(db as never);
+    expect(count).toBe(0);
+    expect(existingRow.delegatePrivateKey).toBe(rotatedEnvelope);
   });
 });
