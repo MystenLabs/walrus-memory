@@ -3015,8 +3015,12 @@ impl VectorDb {
 
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp()
+             FROM _sync_lock
              ON CONFLICT (id) DO UPDATE SET
                 owner = EXCLUDED.owner,
                 namespace = EXCLUDED.namespace,
@@ -3027,7 +3031,7 @@ impl VectorDb {
                 agent_id = EXCLUDED.agent_id,
                 package_id = EXCLUDED.package_id,
                 end_epoch = EXCLUDED.end_epoch,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(row.id)
         .bind(row.owner)
@@ -3093,8 +3097,12 @@ impl VectorDb {
             AppError::Internal(format!("Failed to begin plaintext insert tx: {}", e))
         })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp()
+             FROM _sync_lock
              ON CONFLICT (id) DO UPDATE SET
                 owner = EXCLUDED.owner,
                 namespace = EXCLUDED.namespace,
@@ -3103,7 +3111,7 @@ impl VectorDb {
                 blob_size_bytes = EXCLUDED.blob_size_bytes,
                 plaintext = EXCLUDED.plaintext,
                 importance = EXCLUDED.importance,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(id)
         .bind(owner)
@@ -3411,14 +3419,18 @@ impl VectorDb {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to begin forget tx: {}", e)))?;
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($1))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE owner = $1 AND namespace = $2
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(owner)
         .bind(namespace)
@@ -3489,8 +3501,12 @@ impl VectorDb {
     ) -> Result<bool, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "UPDATE vector_entries
-             SET importance = $4, updated_at = NOW()
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             UPDATE vector_entries
+             SET importance = $4, updated_at = clock_timestamp()
+             FROM _sync_lock
              WHERE id = $1 AND owner = $2 AND namespace = $3",
         )
         .bind(id)
@@ -3520,14 +3536,18 @@ impl VectorDb {
     ) -> Result<u64, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE blob_id = $1 AND owner = $2 AND namespace = $3
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(blob_id)
         .bind(owner)
@@ -3839,7 +3859,7 @@ impl VectorDb {
                  expires_at = $2,
                  updated_at = CASE
                      WHEN end_epoch IS DISTINCT FROM $1 OR expires_at IS NULL
-                     THEN NOW()
+                     THEN clock_timestamp()
                      ELSE updated_at
                  END
              WHERE id = $3",
