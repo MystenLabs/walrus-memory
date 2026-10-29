@@ -16451,3 +16451,12 @@ body:has(.signin-proposed) {
   margin: 0;
   align-self: center;
 }
+
+.admin-priority-save-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}

@@ -49,6 +49,7 @@ function WalletRow({
   const [multiplier, setMultiplier] = useState(
     saved ? currentMultiplier(saved, defaults) : '2',
   )
+  const [isSaved, setIsSaved] = useState(!!saved)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const expired =
@@ -79,9 +80,11 @@ function WalletRow({
       delegate_key_per_minute: defaults.delegate_key_per_minute * factor,
       expires_at: saved?.expires_at && !expired ? saved.expires_at : null,
     }
+    setIsSaved(false)
     void run(
       () => saveOwnerRateLimits(adminKey, owner.trim(), policy),
       () => {
+        setIsSaved(true)
         onSaved()
       },
     )
@@ -105,7 +108,10 @@ function WalletRow({
           value={owner}
           readOnly={!!saved}
           disabled={busy}
-          onChange={(event) => setOwner(event.target.value)}
+          onChange={(event) => {
+            setOwner(event.target.value)
+            setIsSaved(false)
+          }}
         />
         <select
           aria-label="Rate multiplier"
@@ -114,6 +120,7 @@ function WalletRow({
           disabled={busy}
           onChange={(event) => {
             setMultiplier(event.target.value)
+            setIsSaved(false)
           }}
         >
           {multiplier === 'custom' && (
@@ -134,7 +141,9 @@ function WalletRow({
             aria-label="Save wallet"
             disabled={busy || multiplier === 'custom'}
           >
-            <Check size={16} />
+            <span className="admin-priority-save-indicator">
+              {isSaved && <Check size={16} aria-label="Wallet saved" />}
+            </span>
             <span>Save</span>
           </button>
           <button

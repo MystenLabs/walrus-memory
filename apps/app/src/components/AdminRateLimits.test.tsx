@@ -83,6 +83,47 @@ describe('priority wallets', () => {
       )
     },
   )
+  it('shows a check only for a saved value and clears it after an edit', async () => {
+    const policy = {
+      ...defaults,
+      owner,
+      requests_per_minute: 600,
+      requests_per_hour: 5000,
+      delegate_key_per_minute: 300,
+    }
+    vi.mocked(fetchOwnerRateLimitList).mockResolvedValue({
+      ...empty,
+      policies: [policy],
+    })
+    let resolveSave!: (
+      value: Awaited<ReturnType<typeof saveOwnerRateLimits>>,
+    ) => void
+    vi.mocked(saveOwnerRateLimits).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = resolve
+        }),
+    )
+    show()
+    expect(await screen.findByLabelText('Wallet saved')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Rate multiplier'), {
+      target: { value: '10' },
+    })
+    expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
+    expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+    resolveSave({ owner, defaults, override_policy: policy, effective: policy })
+    expect(await screen.findByLabelText('Wallet saved')).toBeInTheDocument()
+  })
+  it('does not mark new or failed saves as saved', async () => {
+    vi.mocked(saveOwnerRateLimits).mockRejectedValue(new Error('SERVER_ERROR'))
+    show()
+    await add()
+    expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
+    await screen.findByRole('alert')
+    expect(screen.queryByLabelText('Wallet saved')).not.toBeInTheDocument()
+  })
   it('loads saved wallets and removes their override', async () => {
     vi.mocked(fetchOwnerRateLimitList).mockResolvedValue({
       ...empty,
