@@ -8,6 +8,13 @@ CREATE TABLE IF NOT EXISTS owner_rate_limits (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- A cheap generation check lets each replica refresh only when policy changes.
+CREATE TABLE IF NOT EXISTS owner_rate_limit_revision (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO owner_rate_limit_revision(singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
+
 -- Retain changes, including resets, without recording credentials or free-form labels.
 CREATE TABLE IF NOT EXISTS owner_rate_limit_audit (
     id BIGSERIAL PRIMARY KEY,
@@ -18,6 +25,7 @@ CREATE TABLE IF NOT EXISTS owner_rate_limit_audit (
 );
 CREATE OR REPLACE FUNCTION audit_owner_rate_limits() RETURNS trigger AS $$
 BEGIN
+    UPDATE owner_rate_limit_revision SET revision = revision + 1 WHERE singleton;
     INSERT INTO owner_rate_limit_audit(operation, previous_value, new_value)
     VALUES (TG_OP, CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
                    CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END);

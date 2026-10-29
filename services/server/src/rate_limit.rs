@@ -403,18 +403,21 @@ fn rate_limiter_unavailable_response() -> Response {
 // Rate Limit Middleware
 // ============================================================
 
-fn effective_owner_config(
-    defaults: &RateLimitConfig,
+fn effective_owner_config<'a>(
+    defaults: &'a RateLimitConfig,
     policy: Option<&crate::owner_rate_limits::OwnerRateLimit>,
     now: chrono::DateTime<chrono::Utc>,
-) -> RateLimitConfig {
-    let mut effective = defaults.clone();
+) -> std::borrow::Cow<'a, RateLimitConfig> {
     if let Some(policy) = policy.filter(|p| p.active_at(now)) {
+        let mut effective = defaults.clone();
         effective.max_requests_per_minute = policy.requests_per_minute;
         effective.max_requests_per_hour = policy.requests_per_hour;
         effective.max_requests_per_delegate_key = policy.delegate_key_per_minute;
+        std::borrow::Cow::Owned(effective)
+    } else {
+        // Most owners have no override: avoid cloning config strings per request.
+        std::borrow::Cow::Borrowed(defaults)
     }
-    effective
 }
 
 /// Multi-layer rate limiting middleware for the write-path authenticated
@@ -436,7 +439,7 @@ fn effective_owner_config(
 ///
 /// Returns 429 Too Many Requests with JSON body if any layer exceeds its limit.
 ///
-/// Owner policy lookup fails closed with 503; Redis outages use the existing
+/// Unavailable or stale owner policy snapshots fail closed with 503; Redis outages use the existing
 /// in-memory fallback with the same effective owner limits.
 ///
 /// Normalizes trailing slash in path before cost weight lookup.
@@ -464,21 +467,15 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    // Resolve every request from shared durable state: edits and expiry apply
-    // across replicas without a cache invalidation window. A failed lookup
-    // must not silently bypass a restrictive owner policy.
+    // No database/Redis lookup for policy resolution on the request path.
+    // Unknown owners use defaults; an uninitialized/stale snapshot fails closed.
     let policy_owner = match crate::security_delete_auth::canonical_sui_address(&auth.owner) {
         Ok(owner) => owner,
         Err(_) => return rate_limiter_unavailable_response(),
     };
-    let policy = match tokio::time::timeout(
-        Duration::from_secs(1),
-        crate::owner_rate_limits::load_policy(state.db.pool(), &policy_owner),
-    )
-    .await
-    {
-        Ok(Ok(policy)) => policy,
-        _ => return rate_limiter_unavailable_response(),
+    let policy = match state.owner_policies.policy_for(&policy_owner) {
+        Ok(policy) => policy,
+        Err(_) => return rate_limiter_unavailable_response(),
     };
     let effective = effective_owner_config(
         &state.config.rate_limit,

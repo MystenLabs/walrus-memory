@@ -724,6 +724,7 @@ mod mcp_rate_limit_tests {
         let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
         Arc::new(AppState {
             db: Arc::clone(&db),
+            owner_policies: Arc::new(owner_rate_limits::OwnerPolicyStore::new()),
             wallet_lock_pool: pool.clone(),
             legacy_db: None,
             security_delete_nonce_store: Arc::new(security_delete_auth::RedisNonceStore::new(
@@ -907,6 +908,8 @@ mod mcp_rate_limit_tests {
             .bind(&owner).execute(&pool).await.unwrap();
         let mut state = test_state(denying_redis().await).await;
         Arc::get_mut(&mut state).unwrap().db = Arc::new(VectorDb::from_pool(pool.clone()));
+        state.owner_policies.refresh(&pool).await.unwrap();
+        let policy_store = state.owner_policies.clone();
         // When supplied by the local test command, exercise real authenticated
         // admin roundtrips as well as the middleware below.
         if let Ok(key) = std::env::var("ADMIN_API_KEY") {
@@ -993,15 +996,18 @@ mod mcp_rate_limit_tests {
             .execute(&pool)
             .await
             .unwrap();
+        policy_store.refresh(&pool).await.unwrap();
         assert_eq!(
             call(&app, &owner).await.1["limit"],
             "30 weighted-requests/min"
         );
         // A policy-store failure must not fall through to a larger global default.
-        sqlx::query("DROP TABLE owner_rate_limits")
+        sqlx::query("DROP TABLE owner_rate_limit_revision")
             .execute(&pool)
             .await
             .unwrap();
+        assert!(policy_store.refresh(&pool).await.is_err());
+        policy_store.expire_for_test();
         assert_eq!(call(&app, &owner).await.0, StatusCode::SERVICE_UNAVAILABLE);
         pool.close().await;
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -2159,7 +2165,22 @@ async fn main() {
         .await
         .expect("Failed to create wallet advisory-lock pool");
 
+    // One dedicated connection for policy generation checks; request handlers
+    // only read memory and do not compete for the main query pool.
+    let policy_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect_lazy(&config.database_url)
+        .expect("invalid policy database URL");
+    let owner_policies = Arc::new(owner_rate_limits::OwnerPolicyStore::new());
+    owner_policies
+        .refresh(&policy_pool)
+        .await
+        .expect("initial owner policy snapshot unavailable");
+    owner_policies.spawn_refresher(policy_pool);
+
     let state = Arc::new(AppState {
+        owner_policies,
         db,
         wallet_lock_pool,
         legacy_db,
