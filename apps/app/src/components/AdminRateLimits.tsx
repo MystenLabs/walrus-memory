@@ -1,25 +1,171 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
+import { Check, Plus, Trash2 } from 'lucide-react'
 import { Card } from './Card'
 import {
-  fetchOwnerRateLimits,
+  fetchOwnerRateLimitList,
   saveOwnerRateLimits,
   resetOwnerRateLimits,
 } from '../utils/admin-api'
-import type { OwnerRateLimitResponse } from '../utils/admin-api'
+import type { OwnerRateLimitPolicy } from '../utils/admin-api'
 
-const fields = [
-  ['requests_per_minute', 'Account points / minute', 1_000_000],
-  ['requests_per_hour', 'Account points / hour', 100_000_000],
-  ['delegate_key_per_minute', 'Each delegate key points / minute', 1_000_000],
+const MULTIPLIERS = [2, 5, 10, 20] as const
+const QUERY_KEY = ['admin', 'owner-rate-limits']
+type SavedWallet = OwnerRateLimitPolicy & { owner: string }
+const budgetKeys = [
+  'requests_per_minute',
+  'requests_per_hour',
+  'delegate_key_per_minute',
 ] as const
 
-function localDateTime(value: string | null): string {
-  if (!value) return ''
-  const date = new Date(value)
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
-    .toISOString()
-    .slice(0, 16)
+function currentMultiplier(
+  policy: OwnerRateLimitPolicy,
+  defaults: OwnerRateLimitPolicy,
+): string {
+  return String(
+    MULTIPLIERS.find((value) =>
+      budgetKeys.every((key) => policy[key] === defaults[key] * value),
+    ) ?? 'custom',
+  )
+}
+
+function WalletRow({
+  saved,
+  defaults,
+  adminKey,
+  onInvalidKey,
+  onSaved,
+  onRemove,
+}: {
+  saved?: SavedWallet
+  defaults: OwnerRateLimitPolicy
+  adminKey: string
+  onInvalidKey: () => void
+  onSaved: () => void
+  onRemove: () => void
+}) {
+  const [owner, setOwner] = useState(saved?.owner ?? '')
+  const [multiplier, setMultiplier] = useState(
+    saved ? currentMultiplier(saved, defaults) : '2',
+  )
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const expired =
+    saved?.expires_at && Date.parse(saved.expires_at) <= Date.now()
+  const run = async (action: () => Promise<unknown>, done: () => void) => {
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      await action()
+      done()
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INVALID_KEY') onInvalidKey()
+      else setError('Không lưu được thay đổi. Kiểm tra địa chỉ ví và thử lại.')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const save = (event: FormEvent) => {
+    event.preventDefault()
+    const factor = Number(multiplier)
+    if (!MULTIPLIERS.some((value) => value === factor)) return
+    const policy = {
+      requests_per_minute: defaults.requests_per_minute * factor,
+      requests_per_hour: defaults.requests_per_hour * factor,
+      delegate_key_per_minute: defaults.delegate_key_per_minute * factor,
+      expires_at: saved?.expires_at && !expired ? saved.expires_at : null,
+    }
+    void run(
+      () => saveOwnerRateLimits(adminKey, owner.trim(), policy),
+      () => {
+        setMessage('Đã lưu')
+        onSaved()
+      },
+    )
+  }
+  const remove = () => {
+    if (!saved) {
+      onRemove()
+      return
+    }
+    void run(() => resetOwnerRateLimits(adminKey, saved.owner), onRemove)
+  }
+  return (
+    <li className="admin-priority-wallet">
+      <form className="admin-priority-row" onSubmit={save}>
+        <input
+          aria-label="Địa chỉ ví"
+          className="admin-priority-address"
+          placeholder="Địa chỉ ví · 0x…"
+          required
+          pattern="0x[0-9a-fA-F]{1,64}"
+          value={owner}
+          readOnly={!!saved}
+          disabled={busy}
+          onChange={(event) => setOwner(event.target.value)}
+        />
+        <select
+          aria-label="Mức ưu tiên"
+          className="admin-priority-select"
+          value={multiplier}
+          disabled={busy}
+          onChange={(event) => {
+            setMultiplier(event.target.value)
+            setMessage('')
+          }}
+        >
+          {multiplier === 'custom' && (
+            <option value="custom" disabled>
+              Tùy chỉnh
+            </option>
+          )}
+          {MULTIPLIERS.map((value) => (
+            <option key={value} value={value}>
+              ×{value}
+            </option>
+          ))}
+        </select>
+        <div className="admin-priority-actions">
+          <button
+            type="submit"
+            className="btn btn-secondary btn-sm"
+            aria-label="Lưu ví"
+            disabled={busy || multiplier === 'custom'}
+          >
+            <Check size={16} />
+            <span>Lưu</span>
+          </button>
+          <button
+            type="button"
+            className="admin-priority-remove"
+            aria-label="Xóa ví ưu tiên"
+            disabled={busy}
+            onClick={remove}
+          >
+            <Trash2 size={17} />
+          </button>
+        </div>
+      </form>
+      {expired && (
+        <span className="admin-priority-note">
+          Đã hết hạn · Lưu để kích hoạt lại
+        </span>
+      )}
+      {message && (
+        <span role="status" className="admin-priority-note">
+          {message}
+        </span>
+      )}
+      {error && (
+        <span role="alert" className="admin-error">
+          {error}
+        </span>
+      )}
+    </li>
+  )
 }
 
 export function AdminRateLimits({
@@ -29,201 +175,111 @@ export function AdminRateLimits({
   adminKey: string
   onInvalidKey: () => void
 }) {
-  const [owner, setOwner] = useState('')
-  const [data, setData] = useState<OwnerRateLimitResponse | null>(null)
-  const [values, setValues] = useState({
-    requests_per_minute: '',
-    requests_per_hour: '',
-    delegate_key_per_minute: '',
+  const client = useQueryClient()
+  const [drafts, setDrafts] = useState<string[]>([])
+  const {
+    data,
+    isLoading,
+    error,
+    refetch,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
+    queryKey: QUERY_KEY,
+    queryFn: ({ pageParam }) => fetchOwnerRateLimitList(adminKey, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    retry: (count, err) => err.message !== 'INVALID_KEY' && count < 2,
   })
-  const [expiresAt, setExpiresAt] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
-
-  const accept = (result: OwnerRateLimitResponse) => {
-    setData(result)
-    const policy = result.override_policy ?? result.defaults
-    setValues({
-      requests_per_minute: String(policy.requests_per_minute),
-      requests_per_hour: String(policy.requests_per_hour),
-      delegate_key_per_minute: String(policy.delegate_key_per_minute),
-    })
-    setExpiresAt(localDateTime(policy.expires_at))
+  const refresh = () => {
+    void client.invalidateQueries({ queryKey: QUERY_KEY })
   }
-  const run = async (
-    operation: () => Promise<OwnerRateLimitResponse>,
-    success: string,
-  ) => {
-    setBusy(true)
-    setError('')
-    setMessage('')
-    try {
-      accept(await operation())
-      setMessage(success)
-    } catch (err) {
-      if (err instanceof Error && err.message === 'INVALID_KEY') onInvalidKey()
-      else
-        setError(
-          'Unable to update or load limits. Check the address, values, expiry, and connection, then try again.',
-        )
-    } finally {
-      setBusy(false)
-    }
-  }
-  const load = (event: FormEvent) => {
-    event.preventDefault()
-    // Clear a previous owner's policy even if this lookup fails.
-    setData(null)
-    void run(() => fetchOwnerRateLimits(adminKey, owner.trim()), '')
-  }
-  const save = (event: FormEvent) => {
-    event.preventDefault()
-    if (!data) return
-    const policy = {
-      requests_per_minute: Number(values.requests_per_minute),
-      requests_per_hour: Number(values.requests_per_hour),
-      delegate_key_per_minute: Number(values.delegate_key_per_minute),
-      expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
-    }
-    if (
-      fields.some(
-        ([key, , max]) =>
-          !Number.isSafeInteger(policy[key]) ||
-          policy[key] < 1 ||
-          policy[key] > max,
-      ) ||
-      (policy.expires_at && Date.parse(policy.expires_at) <= Date.now())
-    ) {
-      setError(
-        'Enter positive whole-number limits and a future expiry, or leave expiry empty.',
-      )
-      return
-    }
-    void run(
-      () => saveOwnerRateLimits(adminKey, data.owner, policy),
-      'Override saved. New requests use these limits.',
-    )
-  }
-  const expired =
-    data?.override_policy?.expires_at &&
-    Date.parse(data.override_policy.expires_at) <= Date.now()
-
+  const defaults = data?.pages[0]?.defaults
+  const wallets = data?.pages.flatMap((page) => page.policies) ?? []
+  const invalidKey = error instanceof Error && error.message === 'INVALID_KEY'
+  useEffect(() => {
+    if (invalidKey) onInvalidKey()
+  }, [invalidKey, onInvalidKey])
   return (
     <Card
-      title="Owner rate limits"
-      className="dashboard-keys-card admin-rate-limits-card"
+      title="Ví ưu tiên"
+      subtitle="Tăng giới hạn cho từng ví. Các ví khác giữ nguyên mức mặc định."
+      className="dashboard-keys-card sept-section admin-activity-card admin-priority-card"
     >
-      <p className="admin-rate-description">
-        Set weighted request budgets for one owner wallet and its delegate keys.
-        Other owners keep the environment defaults. Existing usage counters are
-        preserved.
-      </p>
-      <form onSubmit={load} className="admin-rate-lookup">
-        <label htmlFor="rate-owner">Owner wallet address</label>
-        <div className="admin-rate-lookup-row">
-          <input
-            id="rate-owner"
-            required
-            pattern="0x[0-9a-fA-F]{1,64}"
-            placeholder="0x…"
-            value={owner}
-            disabled={busy}
-            onChange={(event) => {
-              setOwner(event.target.value)
-              setData(null)
-              setMessage('')
-              setError('')
-            }}
-          />
-          <button className="lp-nav-cta" disabled={busy} type="submit">
-            {busy ? 'Working…' : 'Load limits'}
+      {isLoading && (
+        <p className="admin-activity-note">Đang tải danh sách ví…</p>
+      )}
+      {error && (
+        <div className="admin-error" role="alert">
+          {invalidKey
+            ? 'Phiên admin đã hết hạn.'
+            : 'Không tải được danh sách ví.'}
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => (invalidKey ? onInvalidKey() : void refetch())}
+          >
+            Thử lại
           </button>
         </div>
-      </form>
-      {error && (
-        <p role="alert" className="admin-error">
-          {error}
-        </p>
       )}
-      {message && <p role="status">{message}</p>}
-      {data && (
-        <form onSubmit={save}>
-          <p className="admin-rate-owner">
-            <strong>Owner:</strong> <code>{data.owner}</code>
-          </p>
-          <p>
-            {data.override_policy
-              ? expired
-                ? 'Override expired. Environment defaults are active.'
-                : 'Owner override is active.'
-              : 'Using environment defaults.'}
-          </p>
-          <div className="admin-rate-grid">
-            {fields.map(([key, label, max]) => (
-              <label key={key} htmlFor={`rate-${key}`}>
-                <span>{label}</span>
-                <input
-                  id={`rate-${key}`}
-                  type="number"
-                  aria-label={label}
-                  required
-                  min={1}
-                  max={max}
-                  step={1}
-                  value={values[key]}
-                  disabled={busy}
-                  onChange={(event) =>
-                    setValues((previous) => ({
-                      ...previous,
-                      [key]: event.target.value,
-                    }))
-                  }
-                />
-                <small>
-                  Default: {data.defaults[key].toLocaleString()} · Effective:{' '}
-                  {data.effective[key].toLocaleString()}
-                </small>
-              </label>
-            ))}
-            <label htmlFor="rate-expiry">
-              <span>Expires at (your local time)</span>
-              <input
-                id="rate-expiry"
-                type="datetime-local"
-                value={expiresAt}
-                disabled={busy}
-                onChange={(event) => setExpiresAt(event.target.value)}
+      {defaults && (
+        <>
+          <ul className="admin-priority-list">
+            {wallets.map((wallet) => (
+              <WalletRow
+                key={wallet.owner}
+                saved={wallet}
+                defaults={defaults}
+                adminKey={adminKey}
+                onInvalidKey={onInvalidKey}
+                onSaved={refresh}
+                onRemove={refresh}
               />
-              <small>
-                Leave empty for no expiry. Expiry restores environment defaults.
-              </small>
-            </label>
-          </div>
-          <p className="admin-rate-description">
-            These budgets cover recall, writes, and status polling. They do not
-            change storage quotas, MCP transport limits, sponsor limits, or the
-            separate owner read API.
-          </p>
-          <div className="admin-rate-actions">
-            <button className="lp-nav-cta" disabled={busy} type="submit">
-              Save override
-            </button>
+            ))}
+            {drafts.map((id) => (
+              <WalletRow
+                key={id}
+                defaults={defaults}
+                adminKey={adminKey}
+                onInvalidKey={onInvalidKey}
+                onSaved={() => {
+                  setDrafts((rows) => rows.filter((row) => row !== id))
+                  refresh()
+                }}
+                onRemove={() =>
+                  setDrafts((rows) => rows.filter((row) => row !== id))
+                }
+              />
+            ))}
+          </ul>
+          {wallets.length === 0 && drafts.length === 0 && (
+            <p className="admin-priority-empty">Chưa có ví ưu tiên</p>
+          )}
+          {hasNextPage && (
             <button
-              className="admin-rate-reset"
-              disabled={busy || !data.override_policy}
               type="button"
-              onClick={() =>
-                void run(
-                  () => resetOwnerRateLimits(adminKey, data.owner),
-                  'Override removed. Environment defaults apply.',
-                )
-              }
+              className="btn btn-secondary btn-sm"
+              disabled={isFetchingNextPage}
+              onClick={() => void fetchNextPage()}
             >
-              Restore defaults
+              Xem thêm
             </button>
-          </div>
-        </form>
+          )}
+          <button
+            type="button"
+            className="admin-priority-add"
+            onClick={() => setDrafts((rows) => [...rows, crypto.randomUUID()])}
+          >
+            <Plus size={20} />
+            <span>Thêm ví</span>
+          </button>
+          <p className="admin-activity-note admin-priority-footnote">
+            Hệ số áp dụng cho giới hạn đọc/ghi của ví, dựa trên mức mặc định tại
+            lúc lưu.
+          </p>
+        </>
       )}
     </Card>
   )

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   fetchOwnerRateLimits,
+  fetchOwnerRateLimitList,
   saveOwnerRateLimits,
   resetOwnerRateLimits,
 } from './admin-api'
@@ -31,5 +32,19 @@ describe('owner rate limit API', () => {
       expect(options.headers['x-admin-api-key']).toBe('test-key')
     }
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual(policy)
+  })
+  it('loads the persisted list with an encoded cursor and no-store authentication', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({}) })
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchOwnerRateLimitList('test-key', '0x1')
+    expect(fetchMock.mock.calls[0][0]).toMatch(
+      /\/api\/admin\/rate-limits\?after=0x1$/,
+    )
+    expect(fetchMock.mock.calls[0][1].headers['x-admin-api-key']).toBe(
+      'test-key',
+    )
+    expect(fetchMock.mock.calls[0][1].cache).toBe('no-store')
   })
 })

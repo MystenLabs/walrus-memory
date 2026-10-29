@@ -119,13 +119,13 @@ export default function AdminDashboard() {
               adminKey={adminKey ?? ''}
               onInvalidKey={handleInvalidKey}
               preview={activityPreview && !adminKey}
+              afterMemories={adminKey ? <AdminRateLimits adminKey={adminKey} onInvalidKey={handleInvalidKey} /> : undefined}
             />
             {adminKey && (
               <>
                 <AdminWalletBalances adminKey={adminKey} onInvalidKey={handleInvalidKey} />
                 <AdminUploadErrors adminKey={adminKey} onInvalidKey={handleInvalidKey} />
                 <AdminConfig adminKey={adminKey} onInvalidKey={handleInvalidKey} />
-                <AdminRateLimits adminKey={adminKey} onInvalidKey={handleInvalidKey} />
               </>
             )}
           </div>

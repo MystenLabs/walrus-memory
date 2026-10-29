@@ -451,3 +451,13 @@ export async function saveOwnerRateLimits(adminKey: string, owner: string, polic
 export async function resetOwnerRateLimits(adminKey: string, owner: string): Promise<OwnerRateLimitResponse> {
   return await makeAdminRequest(`/rate-limits/${encodeURIComponent(owner)}`, adminKey, 'DELETE') as OwnerRateLimitResponse
 }
+
+export interface OwnerRateLimitList {
+  defaults: OwnerRateLimitPolicy
+  policies: (OwnerRateLimitPolicy & { owner: string })[]
+  next_cursor: string | null
+}
+export async function fetchOwnerRateLimitList(adminKey: string, after?: string): Promise<OwnerRateLimitList> {
+  const query = after ? `?after=${encodeURIComponent(after)}` : ''
+  return await makeAdminRequest(`/rate-limits${query}`, adminKey) as OwnerRateLimitList
+}

@@ -238,19 +238,22 @@ See [Database Sync](/indexer/database-sync) for the full schema.
 ## Owner-specific request budgets
 
 An operator can keep deployment-wide defaults and set different weighted request
-budgets for selected owner wallets in **Admin Dashboard → Owner rate limits**.
-Enter the owner wallet address (not an account object ID or delegate public key),
-load its policy, and set the account points per minute, account points per hour,
-and points per minute for each delegate key. The owner is resolved by the server's
+budgets for selected owner wallets in **Admin Dashboard → Ví ưu tiên**, immediately below Memories written.
+Use the add-wallet button, enter the owner wallet address (not an account object ID
+or delegate public key), choose ×2, ×5, ×10, or ×20, and save. The selected multiplier
+is applied to all three environment defaults at save time. Saved wallets are loaded
+from the private backend when the dashboard opens; removing a wallet restores defaults. The owner is resolved by the server's
 existing authentication; callers cannot select a policy through request payloads.
 All accounts owned by that wallet share the existing owner budget.
 
-An optional expiry restores the environment defaults automatically. **Restore
-defaults** removes the override immediately for subsequent requests. Neither action
+Removing a priority wallet restores the environment defaults for subsequent
+requests. Policies set through the API can also expire automatically. Neither action
 resets existing usage counters, so requests can remain throttled until earlier
 usage leaves the sliding window. Defaults come from `RATE_LIMIT_REQUESTS_PER_MINUTE`,
 `RATE_LIMIT_REQUESTS_PER_HOUR`, and `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE`.
 
+The private collection endpoint `/api/admin/rate-limits` (`GET`) lists saved policies in pages of
+100, with an optional `after` owner cursor and a `next_cursor` response.
 The private endpoint `/api/admin/rate-limits/:owner` supports `GET`, `PUT`,
 and `DELETE`. Requests require `x-admin-api-key` matching `ADMIN_API_KEY`. Responses use `no-store, private`.
 `PUT` replaces all three positive integer limits and accepts an `expires_at`

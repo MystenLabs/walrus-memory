@@ -3,7 +3,7 @@
 use crate::rate_limit::RateLimitConfig;
 use crate::security_delete_auth::canonical_sui_address;
 use crate::types::{AppError, AppState};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,58 @@ pub struct PolicyResponse {
     pub defaults: OwnerRateLimit,
     pub override_policy: Option<OwnerRateLimit>,
     pub effective: OwnerRateLimit,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct OwnerPolicyRecord {
+    owner: String,
+    requests_per_minute: i64,
+    requests_per_hour: i64,
+    delegate_key_per_minute: i64,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyListQuery {
+    after: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PolicyListResponse {
+    defaults: OwnerRateLimit,
+    policies: Vec<OwnerPolicyRecord>,
+    next_cursor: Option<String>,
+}
+
+async fn list_records(
+    pool: &sqlx::PgPool,
+    after: Option<&str>,
+) -> Result<Vec<OwnerPolicyRecord>, sqlx::Error> {
+    sqlx::query_as::<_, OwnerPolicyRecord>("SELECT owner, requests_per_minute, requests_per_hour, delegate_key_per_minute, expires_at FROM owner_rate_limits WHERE ($1::text IS NULL OR owner > $1) ORDER BY owner LIMIT 101")
+        .bind(after).fetch_all(pool).await
+}
+
+pub async fn list_policies(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PolicyListQuery>,
+) -> Result<Json<PolicyListResponse>, AppError> {
+    let after = query.after.as_deref().map(owner_address).transpose()?;
+    let mut policies = list_records(state.db.pool(), after.as_deref())
+        .await
+        .map_err(policy_store_error)?;
+    let more = policies.len() > 100;
+    policies.truncate(100);
+    let next_cursor = if more {
+        policies.last().map(|p| p.owner.clone())
+    } else {
+        None
+    };
+    Ok(Json(PolicyListResponse {
+        defaults: OwnerRateLimit::defaults(&state.config.rate_limit),
+        policies,
+        next_cursor,
+    }))
 }
 
 impl OwnerRateLimit {
@@ -232,6 +284,8 @@ mod tests {
             180
         );
         assert!(load_policy(&pool, &other).await.unwrap().is_none());
+        assert_eq!(list_records(&pool, None).await.unwrap().len(), 1);
+        assert!(list_records(&pool, Some(&owner)).await.unwrap().is_empty());
         policy.requests_per_minute = 240;
         policy.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
         store_policy(&pool, &owner, &policy).await.unwrap();

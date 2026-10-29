@@ -784,6 +784,17 @@ mod mcp_rate_limit_tests {
     async fn owner_policy_admin_requires_operator_key_on_every_method() {
         let state = test_state(denying_redis().await).await;
         let app = owner_rate_limit_routes().with_state(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/rate-limits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         for method in [Method::GET, Method::PUT, Method::DELETE] {
             let response = app
                 .clone()
@@ -845,6 +856,19 @@ mod mcp_rate_limit_tests {
         // admin roundtrips as well as the middleware below.
         if let Ok(key) = std::env::var("ADMIN_API_KEY") {
             let admin = owner_rate_limit_routes().with_state(state.clone());
+            let response = admin
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/admin/rate-limits")
+                        .header("x-admin-api-key", &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store, private");
             for (method, body) in [
                 (
                     Method::PUT,
@@ -936,6 +960,10 @@ mod mcp_rate_limit_tests {
 // Keep policy administration behind the same operator credential on every method.
 fn owner_rate_limit_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/api/admin/rate-limits",
+            get(owner_rate_limits::list_policies),
+        )
         .route(
             "/api/admin/rate-limits/{owner}",
             get(owner_rate_limits::get_policy)

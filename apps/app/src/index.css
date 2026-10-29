@@ -16421,17 +16421,22 @@ body:has(.signin-proposed) {
   }
 }
 
-/* Private operator policy form; uses the existing admin card and button styles. */
-.admin-rate-description { color: var(--text-secondary, #94a3b8); line-height: 1.6; margin: 0 0 18px; }
-.admin-rate-lookup label, .admin-rate-grid label { display: flex; flex-direction: column; gap: 8px; }
-.admin-rate-lookup-row { display: flex; gap: 12px; margin-top: 8px; }
-.admin-rate-lookup-row input { flex: 1; min-width: 0; }
-.admin-rate-limits-card input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border-color, #334155); background: transparent; color: inherit; font: inherit; }
-.admin-rate-limits-card input:focus-visible { outline: 2px solid var(--accent, #38bdf8); outline-offset: 2px; }
-.admin-rate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 20px 0; }
-.admin-rate-grid small { color: var(--text-secondary, #94a3b8); }
-.admin-rate-owner { overflow-wrap: anywhere; margin-top: 20px; }
-.admin-rate-actions { display: flex; flex-wrap: wrap; gap: 12px; }
-.admin-rate-reset { background: transparent; color: inherit; border: 1px solid var(--border-color, #334155); padding: 10px 16px; border-radius: 8px; cursor: pointer; }
-.admin-rate-limits-card button:disabled { opacity: .5; cursor: wait; }
-@media (max-width: 640px) { .admin-rate-grid { grid-template-columns: 1fr; } .admin-rate-lookup-row { flex-direction: column; } }
+/* Priority wallets share the activity section shell above. */
+.admin-priority-list { list-style: none; margin: 0; padding: 0; }
+.admin-priority-wallet { padding: 16px 0; border-bottom: 1px solid #303234; }
+.admin-priority-row { display: grid; grid-template-columns: minmax(0, 1fr) 104px 116px; align-items: center; gap: 16px; }
+.admin-priority-card .admin-priority-address, .admin-priority-card .admin-priority-select { box-sizing: border-box; width: 100%; height: 46px; padding: 0 14px; border: 1px solid #262b30; border-radius: 6px; background: transparent; color: #faf8f5; font-family: "Google Sans Flex", sans-serif; font-size: 15px; }
+.admin-priority-card .admin-priority-address { min-width: 0; font-family: "Google Sans Code", var(--font-mono); }
+.admin-priority-card .admin-priority-select { text-align: center; font-weight: 600; cursor: pointer; color-scheme: dark; }
+.admin-priority-card input:focus-visible, .admin-priority-card select:focus-visible { outline: 2px solid #cab1ff; outline-offset: 3px; }
+.admin-priority-actions { display: flex; align-items: center; gap: 12px; }
+.admin-priority-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+.admin-priority-remove { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 40px; background: none; border: none; color: #a8abad; cursor: pointer; }
+.admin-priority-remove:hover { color: #faf8f5; }
+.admin-priority-add { display: inline-flex; align-items: center; gap: 10px; margin: 20px 0 0; padding: 10px 0; border: none; background: none; color: #faf8f5; font: inherit; font-size: 16px; cursor: pointer; }
+.admin-priority-add:hover { color: #cab1ff; }
+.admin-priority-empty, .admin-priority-note { color: #a8abad; font-size: 14px; }
+.admin-priority-note { display: block; margin-top: 8px; }
+.admin-priority-card .admin-priority-footnote { margin-top: 16px; }
+.admin-priority-card button:disabled { opacity: .5; cursor: wait; }
+@media (max-width: 640px) { .admin-priority-row { grid-template-columns: minmax(0, 1fr) 90px; gap: 12px; } .admin-priority-address { grid-column: 1 / -1; } .admin-priority-actions { justify-content: flex-end; } }
