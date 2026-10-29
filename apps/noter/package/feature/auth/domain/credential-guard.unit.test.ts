@@ -53,29 +53,62 @@ beforeEach(() => {
 });
 
 describe("upsertEnokiUser — insert-only credential guard", () => {
-  it("inserts a new user when no row exists", async () => {
-    const { upsertEnokiUser } = await load();
+  it("inserts a new user when no row exists and encrypts delegatePrivateKey at rest", async () => {
+    const { upsertEnokiUser, getDelegateKeyForOwner } = await load();
+    const { decryptDelegatePrivateKey, isEncryptedDelegateKeyEnvelope } =
+      await import("../lib/delegate-key-crypto");
     const db = makeDb();
-    await upsertEnokiUser(db as never, {
+    const created = await upsertEnokiUser(db as never, {
       suiAddress: ADDR,
-      delegatePrivateKey: "key-new",
+      delegatePrivateKey: "a".repeat(64),
       delegateAccountId: "acct-new",
     });
     expect(insertValues).toHaveBeenCalledTimes(1);
     expect(updateSet).not.toHaveBeenCalled();
+
+    const written = insertValues.mock.calls[0]?.[0] as {
+      delegatePrivateKey: string;
+    };
+    expect(written.delegatePrivateKey).not.toBe("a".repeat(64));
+    expect(isEncryptedDelegateKeyEnvelope(written.delegatePrivateKey)).toBe(
+      true
+    );
+    expect(decryptDelegatePrivateKey(written.delegatePrivateKey)).toBe(
+      "a".repeat(64)
+    );
+
+    existingRow = created as Record<string, unknown>;
+    const resolved = await getDelegateKeyForOwner(db as never, ADDR);
+    expect(resolved).toEqual({
+      delegatePrivateKey: "a".repeat(64),
+      delegateAccountId: "acct-new",
+    });
   });
 
-  it("provisions creds on an existing row that has none yet", async () => {
+  it("provisions creds on an existing row that has none yet and encrypts at rest", async () => {
     existingRow = { id: "u1", authMethod: "enoki", delegatePrivateKey: null };
     const { upsertEnokiUser } = await load();
+    const { decryptDelegatePrivateKey, isEncryptedDelegateKeyEnvelope } =
+      await import("../lib/delegate-key-crypto");
     const db = makeDb();
     await upsertEnokiUser(db as never, {
       suiAddress: ADDR,
-      delegatePrivateKey: "key-first",
+      delegatePrivateKey: "b".repeat(64),
       delegateAccountId: "acct-first",
     });
     expect(updateSet).toHaveBeenCalledTimes(1);
     expect(insertValues).not.toHaveBeenCalled();
+
+    const updated = updateSet.mock.calls[0]?.[0] as {
+      delegatePrivateKey: string;
+    };
+    expect(updated.delegatePrivateKey).not.toBe("b".repeat(64));
+    expect(isEncryptedDelegateKeyEnvelope(updated.delegatePrivateKey)).toBe(
+      true
+    );
+    expect(decryptDelegatePrivateKey(updated.delegatePrivateKey)).toBe(
+      "b".repeat(64)
+    );
   });
 
   it("refuses to overwrite an existing row that already has a delegate key", async () => {

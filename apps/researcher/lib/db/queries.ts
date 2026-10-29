@@ -15,6 +15,7 @@ import {
   type SQL,
 } from "drizzle-orm";
 import type { VisibilityType } from "@/components/chat/visibility-selector";
+import { encryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
 import type { Citation, SourceMeta } from "@/lib/sprint/types";
 import { ChatbotError } from "../errors";
 import {
@@ -83,12 +84,13 @@ export async function upsertDelegateCredentialsByPublicKey({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<User> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   const existing = await getUserByPublicKey(publicKey);
   try {
     if (existing) {
       const [updated] = await db
         .update(user)
-        .set({ delegatePrivateKey, accountId })
+        .set({ delegatePrivateKey: encryptedDelegateKey, accountId })
         .where(eq(user.id, existing.id))
         .returning();
       return updated;
@@ -97,7 +99,12 @@ export async function upsertDelegateCredentialsByPublicKey({
     const email = `key-${publicKey.slice(0, 8)}@ed25519`;
     const [created] = await db
       .insert(user)
-      .values({ email, publicKey, delegatePrivateKey, accountId })
+      .values({
+        email,
+        publicKey,
+        delegatePrivateKey: encryptedDelegateKey,
+        accountId,
+      })
       .returning();
     return created;
   } catch (_error) {
@@ -133,11 +140,18 @@ export async function createEnokiUser({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<User> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   const email = `enoki-${suiAddress.slice(0, 8)}@zklogin`;
   try {
     const [created] = await db
       .insert(user)
-      .values({ email, publicKey, suiAddress, delegatePrivateKey, accountId })
+      .values({
+        email,
+        publicKey,
+        suiAddress,
+        delegatePrivateKey: encryptedDelegateKey,
+        accountId,
+      })
       .returning();
     return created;
   } catch (_error) {
@@ -157,10 +171,11 @@ export async function updateEnokiUserCredentials({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<void> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   try {
     await db
       .update(user)
-      .set({ publicKey, delegatePrivateKey, accountId })
+      .set({ publicKey, delegatePrivateKey: encryptedDelegateKey, accountId })
       .where(eq(user.id, userId));
   } catch (_error) {
     throw new ChatbotError(

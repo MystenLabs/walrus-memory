@@ -31,7 +31,7 @@ export const user = pgTable("User", {
   password: varchar("password", { length: 64 }),
   publicKey: varchar("publicKey", { length: 128 }).unique(),
   suiAddress: varchar("suiAddress", { length: 128 }).unique(),
-  delegatePrivateKey: varchar("delegatePrivateKey", { length: 128 }),
+  delegatePrivateKey: text("delegatePrivateKey"),
   accountId: varchar("accountId", { length: 128 }),
 });
 
