@@ -126,7 +126,7 @@ test("queries.ts, session.ts, and enoki/route.ts wire encryptDelegatePrivateKey 
   );
 });
 
-test("extracted helper probe: migration CAS handles a synthetic concurrent credential update", async () => {
+test("extracted helper probe: migration CAS propagates the full rotated credential tuple to getSession and returning Enoki callers", async () => {
   const legacyPlaintext = "a".repeat(64);
   const rotatedKey = "b".repeat(64);
   const rotatedEnvelope = encryptDelegatePrivateKey(rotatedKey, SECRET_A);
@@ -138,13 +138,16 @@ test("extracted helper probe: migration CAS handles a synthetic concurrent crede
     delegatePrivateKey: legacyPlaintext,
   };
 
-  const targetUser = {
-    id: "user-1",
-    delegatePrivateKey: dbRow.delegatePrivateKey,
-  };
-
-  // Helper probe simulating resolveAndMigrateUserDelegateKey atomic CAS logic:
-  async function probeResolveAndMigrate(userParam: typeof targetUser) {
+  // Helper probe simulating resolveAndMigrateUserDelegateKey atomic CAS + full tuple reload:
+  async function probeResolveAndMigrate(userParam: {
+    id: string;
+    delegatePrivateKey: string | null;
+    publicKey?: string | null;
+    accountId?: string | null;
+  }) {
+    if (!userParam.delegatePrivateKey) {
+      throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+    }
     const originalPlaintext = userParam.delegatePrivateKey;
     const resolved = openOrMigrateDelegatePrivateKey(originalPlaintext, SECRET_A);
     if (!resolved.migrated) return resolved.plaintextKey;
@@ -170,18 +173,43 @@ test("extracted helper probe: migration CAS handles a synthetic concurrent crede
       return resolved.plaintextKey;
     }
 
-    // Lost race: reload current credentials
-    const reloaded = { delegatePrivateKey: dbRow.delegatePrivateKey };
+    // Lost race: reload complete credential tuple (delegatePrivateKey, publicKey, accountId)
+    const reloaded = {
+      delegatePrivateKey: dbRow.delegatePrivateKey,
+      publicKey: dbRow.publicKey,
+      accountId: dbRow.accountId,
+    };
     userParam.delegatePrivateKey = reloaded.delegatePrivateKey;
+    userParam.publicKey = reloaded.publicKey;
+    userParam.accountId = reloaded.accountId;
     return openOrMigrateDelegatePrivateKey(reloaded.delegatePrivateKey, SECRET_A).plaintextKey;
   }
 
-  const resultKey = await probeResolveAndMigrate(targetUser);
+  // Probe getSession caller: reads initial row, runs resolveAndMigrate, then returns session.user tuple
+  async function probeGetSession() {
+    const user = { ...dbRow };
+    const privateKey = await probeResolveAndMigrate(user);
+    return {
+      user: {
+        id: user.id,
+        publicKey: user.publicKey,
+        privateKey,
+        accountId: user.accountId,
+      },
+    };
+  }
 
-  // Must return the freshly rotated key, NOT the stale resurrected key
-  assert.equal(resultKey, rotatedKey);
+  const session = await probeGetSession();
+
+  // Caller tuple must contain the complete rotated credential tuple (never new key + old account/publicKey)
+  assert.deepEqual(session.user, {
+    id: "user-1",
+    publicKey: "pk-rotated",
+    privateKey: rotatedKey,
+    accountId: "acct-rotated",
+  });
   // Stored row must retain the rotated credentials (not overwritten by old migrated envelope)
   assert.equal(dbRow.delegatePrivateKey, rotatedEnvelope);
+  assert.equal(dbRow.publicKey, "pk-rotated");
   assert.equal(dbRow.accountId, "acct-rotated");
-  assert.equal(targetUser.delegatePrivateKey, rotatedEnvelope);
 });

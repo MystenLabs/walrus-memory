@@ -128,9 +128,14 @@ export async function resolveMemoryCredentials(req: Request): Promise<{
   }
 
   let decryptedKey: string;
+  let resolvedAccountId: string;
   try {
     const resolved = await resolveAndMigrateUserDelegateKey(db, user);
+    if (!resolved.delegateAccountId) {
+      throw new Error("Missing delegate account ID");
+    }
     decryptedKey = resolved.plaintextKey;
+    resolvedAccountId = resolved.delegateAccountId;
   } catch {
     throw new MemoryRequestError(
       401,
@@ -140,7 +145,7 @@ export async function resolveMemoryCredentials(req: Request): Promise<{
 
   return {
     key: decryptedKey,
-    accountId: user.delegateAccountId,
+    accountId: resolvedAccountId,
     userId: user.id,
   };
 }

@@ -42,6 +42,7 @@ export async function getSession(): Promise<{ user: SessionUser } | null> {
     const privateKey = user.delegatePrivateKey
       ? await resolveAndMigrateUserDelegateKey(user)
       : "";
+    if (!user.publicKey) return null;
 
     return {
       user: {

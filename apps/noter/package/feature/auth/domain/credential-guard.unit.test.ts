@@ -182,9 +182,11 @@ describe("upsertEnokiUser — insert-only credential guard", () => {
     expect(updateSet).not.toHaveBeenCalled();
   });
 
-  it("reloads fresh credentials when resolveAndMigrateUserDelegateKey races with a concurrent credential update", async () => {
+  it("reloads and propagates the complete credential tuple when migration races with a concurrent credential update", async () => {
     const legacyKey = "c".repeat(64);
     const newRotatedKey = "e".repeat(64);
+    const oldAccountId = "0x" + "1".repeat(64);
+    const newRotatedAccountId = "0x" + "2".repeat(64);
     const { encryptDelegatePrivateKey } = await import("../lib/delegate-key-crypto");
     const newRotatedEnvelope = encryptDelegatePrivateKey(newRotatedKey);
 
@@ -193,15 +195,10 @@ describe("upsertEnokiUser — insert-only credential guard", () => {
       suiAddress: ADDR,
       authMethod: "enoki",
       delegatePrivateKey: legacyKey,
-      delegateAccountId: "0x" + "1".repeat(64),
+      delegateAccountId: oldAccountId,
     };
 
-    const targetUser = {
-      id: "u-racing",
-      delegatePrivateKey: legacyKey,
-    };
-
-    const { resolveAndMigrateUserDelegateKey } = await load();
+    const { getEnokiUserBySuiAddress, getDelegateKeyForOwner } = await load();
     const db = makeDb();
 
     // Simulate concurrent rotation updating the database row before our CAS update lands
@@ -209,19 +206,33 @@ describe("upsertEnokiUser — insert-only credential guard", () => {
       existingRow = {
         ...existingRow,
         delegatePrivateKey: newRotatedEnvelope,
-        delegateAccountId: "0x" + "2".repeat(64),
+        delegateAccountId: newRotatedAccountId,
       };
       // CAS condition did not match because stored key was no longer legacyKey
       return [];
     };
 
-    const result = await resolveAndMigrateUserDelegateKey(db as never, targetUser);
+    const returningUser = await getEnokiUserBySuiAddress(db as never, ADDR);
+    expect(returningUser).not.toBeNull();
+    expect(returningUser?.delegatePrivateKey).toBe(newRotatedEnvelope);
+    expect(returningUser?.delegateAccountId).toBe(newRotatedAccountId);
 
-    // Lost race handler reloads current credentials:
-    expect(result.plaintextKey).toBe(newRotatedKey);
-    expect(targetUser.delegatePrivateKey).toBe(newRotatedEnvelope);
-    // The stored row in the database preserves the newly rotated envelope without being clobbered
+    // Reset row to legacy state to also verify getDelegateKeyForOwner caller tuple on lost CAS race
+    existingRow = {
+      id: "u-racing",
+      suiAddress: ADDR,
+      authMethod: "enoki",
+      delegatePrivateKey: legacyKey,
+      delegateAccountId: oldAccountId,
+    };
+
+    const ownerTuple = await getDelegateKeyForOwner(db as never, ADDR);
+    expect(ownerTuple).toEqual({
+      delegatePrivateKey: newRotatedKey,
+      delegateAccountId: newRotatedAccountId,
+    });
     expect(existingRow.delegatePrivateKey).toBe(newRotatedEnvelope);
+    expect(existingRow.delegateAccountId).toBe(newRotatedAccountId);
   });
 
   it("backfillLegacyDelegateKeys uses atomic CAS and skips rows updated concurrently", async () => {

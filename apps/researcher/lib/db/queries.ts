@@ -190,6 +190,13 @@ export async function updateEnokiUserCredentials({
   }
 }
 
+export type MigratedUserCredentials = {
+  id: string;
+  delegatePrivateKey: string | null;
+  publicKey?: string | null;
+  accountId?: string | null;
+};
+
 /**
  * Decrypt an at-rest `v1.` delegate key envelope, or transparently encrypt and
  * backfill a pre-upgrade 64-hex plaintext delegate key in PostgreSQL so
@@ -198,11 +205,12 @@ export async function updateEnokiUserCredentials({
  *
  * Uses an atomic compare-and-swap on `delegatePrivateKey` to protect against
  * concurrent credential rotations. If another session updated credentials
- * between the initial read and migration, reloads the current row and returns
- * the fresh credentials instead of overwriting with the stale migrated key.
+ * between the initial read and migration, reloads the complete credential tuple
+ * (`delegatePrivateKey`, `publicKey`, `accountId`) and propagates it back to
+ * `targetUser` so callers never pair the new key with stale account metadata.
  */
 export async function resolveAndMigrateUserDelegateKey(
-  targetUser: Pick<User, "id" | "delegatePrivateKey">,
+  targetUser: MigratedUserCredentials,
   secretOverride?: string
 ): Promise<string> {
   if (!targetUser.delegatePrivateKey) {
@@ -232,16 +240,27 @@ export async function resolveAndMigrateUserDelegateKey(
       }
 
       // Lost race: a concurrent credential rotation modified delegatePrivateKey.
-      // Reload current credentials rather than returning the stale key.
+      // Reload the full credential tuple so callers receive the rotated publicKey and accountId too.
       const [reloaded] = await db
-        .select({ delegatePrivateKey: user.delegatePrivateKey })
+        .select({
+          delegatePrivateKey: user.delegatePrivateKey,
+          publicKey: user.publicKey,
+          accountId: user.accountId,
+        })
         .from(user)
         .where(eq(user.id, targetUser.id));
 
-      if (!reloaded || !reloaded.delegatePrivateKey) {
+      if (
+        !reloaded ||
+        !reloaded.delegatePrivateKey ||
+        !reloaded.publicKey ||
+        !reloaded.accountId
+      ) {
         throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
       }
       targetUser.delegatePrivateKey = reloaded.delegatePrivateKey;
+      targetUser.publicKey = reloaded.publicKey;
+      targetUser.accountId = reloaded.accountId;
       const reloadedResolved = openOrMigrateDelegatePrivateKey(
         reloaded.delegatePrivateKey,
         secretOverride
