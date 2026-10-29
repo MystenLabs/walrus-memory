@@ -4501,9 +4501,7 @@ mod tests {
             "OpenRouter upstream error (code=504) [body scrubbed]"
         );
         assert_eq!(
-            sanitize_upstream_error_for_logging(
-                "Failed to read LLM response body: stream closed"
-            ),
+            sanitize_upstream_error_for_logging("Failed to read LLM response body: stream closed"),
             "Failed to read LLM response body [transport error]"
         );
         assert_eq!(

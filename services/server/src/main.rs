@@ -1595,15 +1595,14 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
                         sidecar_request.header("authorization", format!("Bearer {}", secret));
                 }
                 match sidecar_request.send().await {
-                    Ok(resp) if resp.status().is_success() => resp
-                        .json::<serde_json::Value>()
-                        .await
-                        .map_err(|e| {
+                    Ok(resp) if resp.status().is_success() => {
+                        resp.json::<serde_json::Value>().await.map_err(|e| {
                             format!(
                                 "balance_monitor: failed to parse sidecar wallet metrics: {}",
                                 e
                             )
-                        }),
+                        })
+                    }
                     Ok(resp) => Err(format!(
                         "balance_monitor: sidecar wallet metrics returned status {}",
                         resp.status()
@@ -1617,16 +1616,11 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
 
         match parsed_data {
             Ok(data) => {
-                if let Some(wallets) =
-                    data.get("perWallet").and_then(|value| value.as_array())
-                {
+                if let Some(wallets) = data.get("perWallet").and_then(|value| value.as_array()) {
                     for wallet in wallets {
-                        let Some(address) =
-                            wallet.get("address").and_then(|value| value.as_str())
+                        let Some(address) = wallet.get("address").and_then(|value| value.as_str())
                         else {
-                            tracing::warn!(
-                                "balance_monitor: wallet metrics entry missing address"
-                            );
+                            tracing::warn!("balance_monitor: wallet metrics entry missing address");
                             continue;
                         };
                         let wallet_index = wallet
@@ -1735,9 +1729,7 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
                         }
                     }
                 } else {
-                    tracing::warn!(
-                        "balance_monitor: sidecar wallet metrics missing perWallet"
-                    );
+                    tracing::warn!("balance_monitor: sidecar wallet metrics missing perWallet");
                 }
                 uploader_totals = routes::admin_activity::uploader_spendable_totals(&data);
             }
@@ -2188,8 +2180,9 @@ async fn main() {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
-    let sidecar_child = if crate::storage::walrus_native::is_in_process_sidecar_enabled(&sidecar_url)
-    {
+    let sidecar_child = if crate::storage::walrus_native::is_in_process_sidecar_enabled(
+        &sidecar_url,
+    ) {
         tracing::info!(
             "  sidecar: in-process Rust Walrus + SEAL + Enoki engine enabled (Node.js sidecar disabled)"
         );
@@ -2253,12 +2246,12 @@ async fn main() {
             stop_sidecar_child(&mut sidecar_child).await;
             panic!("TS sidecar failed to start after 15s. Check scripts/sidecar-server.ts");
         }
-        let seal_health_url =
-            if seal_url.trim_end_matches('/') != sidecar_url.trim_end_matches('/') {
-                Some(format!("{}/health", seal_url.trim_end_matches('/')))
-            } else {
-                None
-            };
+        let seal_health_url = if seal_url.trim_end_matches('/') != sidecar_url.trim_end_matches('/')
+        {
+            Some(format!("{}/health", seal_url.trim_end_matches('/')))
+        } else {
+            None
+        };
         if let Some(seal_health) = &seal_health_url {
             if !wait_for_local_health(&http_client, seal_health, "seal listener").await {
                 stop_sidecar_child(&mut sidecar_child).await;
@@ -2286,15 +2279,13 @@ async fn main() {
         let sidecar_watch_url = health_url.clone();
         let seal_watch_url = seal_health_url.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                sidecar_watch_interval_secs,
-            ));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(sidecar_watch_interval_secs));
             let mut consecutive_failures = 0u32;
             let timeout = std::time::Duration::from_secs(sidecar_watch_timeout_secs);
             loop {
                 interval.tick().await;
-                let upload_ok =
-                    health_ok(&sidecar_watch_client, &sidecar_watch_url, timeout).await;
+                let upload_ok = health_ok(&sidecar_watch_client, &sidecar_watch_url, timeout).await;
                 let seal_ok = match &seal_watch_url {
                     Some(url) => health_ok(&sidecar_watch_client, url, timeout).await,
                     None => true,
