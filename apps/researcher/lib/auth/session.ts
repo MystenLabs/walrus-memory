@@ -2,9 +2,8 @@ import "server-only";
 
 import { jwtVerify } from "jose";
 import { cookies } from "next/headers";
-import { getUserById } from "@/lib/db/queries";
+import { getUserById, resolveAndMigrateUserDelegateKey } from "@/lib/db/queries";
 import { getAuthSecretKey } from "@/lib/auth/auth-secret";
-import { decryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
 import {
   SESSION_MAX_AGE_SECONDS,
   signSessionIdentity,
@@ -41,7 +40,7 @@ export async function getSession(): Promise<{ user: SessionUser } | null> {
     if (!user || !user.publicKey) return null;
 
     const privateKey = user.delegatePrivateKey
-      ? decryptDelegatePrivateKey(user.delegatePrivateKey)
+      ? await resolveAndMigrateUserDelegateKey(user)
       : "";
 
     return {

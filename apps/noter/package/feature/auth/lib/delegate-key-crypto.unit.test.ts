@@ -7,6 +7,8 @@ import {
   DelegateKeyCryptoError,
   encryptDelegatePrivateKey,
   isEncryptedDelegateKeyEnvelope,
+  isLegacyPlaintextDelegateKey,
+  openOrMigrateDelegatePrivateKey,
 } from "./delegate-key-crypto";
 
 const SECRET_A = "0123456789abcdef0123456789abcdef";
@@ -69,5 +71,29 @@ describe("delegate-key-crypto (Noter)", () => {
     expect(() => encryptDelegatePrivateKey(SAMPLE_KEY, "too-short")).toThrow(
       DelegateKeyCryptoError
     );
+  });
+
+  it("migrates legacy 64-hex plaintext keys into v1 envelopes and opens existing v1 envelopes", () => {
+    expect(isLegacyPlaintextDelegateKey(SAMPLE_KEY)).toBe(true);
+    expect(isLegacyPlaintextDelegateKey("not-a-hex-key")).toBe(false);
+
+    const migrated = openOrMigrateDelegatePrivateKey(SAMPLE_KEY, SECRET_A);
+    expect(migrated.migrated).toBe(true);
+    expect(migrated.plaintextKey).toBe(SAMPLE_KEY);
+    expect(isEncryptedDelegateKeyEnvelope(migrated.encryptedEnvelope)).toBe(
+      true
+    );
+
+    const reopened = openOrMigrateDelegatePrivateKey(
+      migrated.encryptedEnvelope,
+      SECRET_A
+    );
+    expect(reopened.migrated).toBe(false);
+    expect(reopened.plaintextKey).toBe(SAMPLE_KEY);
+    expect(reopened.encryptedEnvelope).toBe(migrated.encryptedEnvelope);
+
+    expect(() =>
+      openOrMigrateDelegatePrivateKey("malformed-non-hex", SECRET_A)
+    ).toThrow(DelegateKeyCryptoError);
   });
 });

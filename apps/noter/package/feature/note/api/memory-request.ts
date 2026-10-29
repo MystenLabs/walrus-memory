@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/shared/lib/db";
 import { users, walletSessions } from "@/shared/db/schema";
 import { requireSharedRedisClient } from "@/shared/lib/shared-redis";
-import { decryptDelegatePrivateKey } from "@/feature/auth/lib/delegate-key-crypto";
+import { resolveAndMigrateUserDelegateKey } from "@/feature/auth/domain/service";
 import { memoryTextWithinLimit } from "./memory-policy";
 
 export { MAX_MEMORY_TEXT_BYTES } from "./memory-policy";
@@ -129,7 +129,8 @@ export async function resolveMemoryCredentials(req: Request): Promise<{
 
   let decryptedKey: string;
   try {
-    decryptedKey = decryptDelegatePrivateKey(user.delegatePrivateKey);
+    const resolved = await resolveAndMigrateUserDelegateKey(db, user);
+    decryptedKey = resolved.plaintextKey;
   } catch {
     throw new MemoryRequestError(
       401,

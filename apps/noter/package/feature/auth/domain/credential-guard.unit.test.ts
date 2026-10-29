@@ -24,13 +24,22 @@ function makeDb() {
         where: () => ({
           limit: async () => (existingRow ? [existingRow] : []),
         }),
+        then: (resolve: (rows: unknown[]) => void) =>
+          resolve(existingRow ? [existingRow] : []),
       }),
     }),
     update: () => ({
       set: (payload: unknown) => {
         updateSet(payload);
+        if (existingRow && payload && typeof payload === "object") {
+          existingRow = { ...existingRow, ...(payload as object) };
+        }
         return {
-          where: () => ({ returning: async () => [{ id: "u1", ...(payload as object) }] }),
+          where: () => ({
+            returning: async () => [
+              existingRow ?? { id: "u1", ...(payload as object) },
+            ],
+          }),
         };
       },
     }),
@@ -130,5 +139,41 @@ describe("upsertEnokiUser — insert-only credential guard", () => {
     // The stored key must never be replaced.
     expect(updateSet).not.toHaveBeenCalled();
     expect(insertValues).not.toHaveBeenCalled();
+  });
+
+  it("migrates a pre-upgrade 64-hex plaintext row in place on returning Enoki lookup and key resolution without replacing the account", async () => {
+    const legacyPlaintextKey = "c".repeat(64);
+    existingRow = {
+      id: "u-legacy",
+      suiAddress: ADDR,
+      authMethod: "enoki",
+      delegatePrivateKey: legacyPlaintextKey,
+      delegateAccountId: "0x" + "9".repeat(64),
+    };
+
+    const { getEnokiUserBySuiAddress, getDelegateKeyForOwner } = await load();
+    const { decryptDelegatePrivateKey, isEncryptedDelegateKeyEnvelope } =
+      await import("../lib/delegate-key-crypto");
+    const db = makeDb();
+
+    // Returning user check succeeds (does not return null / needsSetup) and backfills v1 envelope
+    const returningUser = await getEnokiUserBySuiAddress(db as never, ADDR);
+    expect(returningUser).not.toBeNull();
+    expect(returningUser?.id).toBe("u-legacy");
+    expect(returningUser?.delegateAccountId).toBe("0x" + "9".repeat(64));
+    expect(updateSet).toHaveBeenCalledTimes(1);
+
+    const migratedColumn = existingRow.delegatePrivateKey as string;
+    expect(isEncryptedDelegateKeyEnvelope(migratedColumn)).toBe(true);
+    expect(decryptDelegatePrivateKey(migratedColumn)).toBe(legacyPlaintextKey);
+
+    // Subsequent key resolution uses the migrated v1 envelope without further DB writes
+    updateSet.mockClear();
+    const resolved = await getDelegateKeyForOwner(db as never, ADDR);
+    expect(resolved).toEqual({
+      delegatePrivateKey: legacyPlaintextKey,
+      delegateAccountId: "0x" + "9".repeat(64),
+    });
+    expect(updateSet).not.toHaveBeenCalled();
   });
 });

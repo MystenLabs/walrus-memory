@@ -15,7 +15,12 @@ import {
   type SQL,
 } from "drizzle-orm";
 import type { VisibilityType } from "@/components/chat/visibility-selector";
-import { encryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
+import {
+  DelegateKeyCryptoError,
+  encryptDelegatePrivateKey,
+  isLegacyPlaintextDelegateKey,
+  openOrMigrateDelegatePrivateKey,
+} from "@/lib/auth/delegate-key-crypto";
 import type { Citation, SourceMeta } from "@/lib/sprint/types";
 import { ChatbotError } from "../errors";
 import {
@@ -183,6 +188,73 @@ export async function updateEnokiUserCredentials({
       "Failed to update Enoki user credentials"
     );
   }
+}
+
+/**
+ * Decrypt an at-rest `v1.` delegate key envelope, or transparently encrypt and
+ * backfill a pre-upgrade 64-hex plaintext delegate key in PostgreSQL so
+ * existing accounts and memory access survive the upgrade without generating a
+ * replacement account.
+ */
+export async function resolveAndMigrateUserDelegateKey(
+  targetUser: Pick<User, "id" | "delegatePrivateKey">,
+  secretOverride?: string
+): Promise<string> {
+  if (!targetUser.delegatePrivateKey) {
+    throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+  }
+  const resolved = openOrMigrateDelegatePrivateKey(
+    targetUser.delegatePrivateKey,
+    secretOverride
+  );
+  if (resolved.migrated) {
+    try {
+      await db
+        .update(user)
+        .set({ delegatePrivateKey: resolved.encryptedEnvelope })
+        .where(eq(user.id, targetUser.id));
+      targetUser.delegatePrivateKey = resolved.encryptedEnvelope;
+    } catch (_error) {
+      throw new ChatbotError(
+        "bad_request:database",
+        "Failed to migrate legacy delegate credentials"
+      );
+    }
+  }
+  return resolved.plaintextKey;
+}
+
+/**
+ * Batch-backfill any remaining pre-upgrade 64-hex plaintext delegate keys in
+ * `"User"` into AES-256-GCM `v1.` envelopes in place.
+ */
+export async function backfillLegacyDelegateKeys(
+  secretOverride?: string
+): Promise<number> {
+  const rows = await db
+    .select({
+      id: user.id,
+      delegatePrivateKey: user.delegatePrivateKey,
+    })
+    .from(user);
+  let migratedCount = 0;
+  for (const row of rows) {
+    if (
+      row.delegatePrivateKey &&
+      isLegacyPlaintextDelegateKey(row.delegatePrivateKey)
+    ) {
+      const encryptedEnvelope = encryptDelegatePrivateKey(
+        row.delegatePrivateKey,
+        secretOverride
+      );
+      await db
+        .update(user)
+        .set({ delegatePrivateKey: encryptedEnvelope })
+        .where(eq(user.id, row.id));
+      migratedCount += 1;
+    }
+  }
+  return migratedCount;
 }
 
 // ============================================================
