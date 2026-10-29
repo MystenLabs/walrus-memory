@@ -49,9 +49,11 @@ function show() {
   )
 }
 async function add() {
-  await screen.findByRole('button', { name: 'Thêm ví' })
-  fireEvent.click(screen.getByRole('button', { name: 'Thêm ví' }))
-  fireEvent.change(screen.getByLabelText('Địa chỉ ví'), {
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Add wallet' })).toBeEnabled(),
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Add wallet' }))
+  fireEvent.change(screen.getByLabelText('Wallet address'), {
     target: { value: '0x1' },
   })
 }
@@ -67,10 +69,10 @@ describe('priority wallets', () => {
       })
       show()
       await add()
-      fireEvent.change(screen.getByLabelText('Mức ưu tiên'), {
+      fireEvent.change(screen.getByLabelText('Rate multiplier'), {
         target: { value: String(factor) },
       })
-      fireEvent.click(screen.getByRole('button', { name: 'Lưu ví' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
       await waitFor(() =>
         expect(saveOwnerRateLimits).toHaveBeenCalledWith('test-key', '0x1', {
           requests_per_minute: 120 * factor,
@@ -102,8 +104,10 @@ describe('priority wallets', () => {
     })
     show()
     expect(await screen.findByDisplayValue(owner)).toHaveAttribute('readonly')
-    expect(screen.getByLabelText('Mức ưu tiên')).toHaveValue('5')
-    fireEvent.click(screen.getByRole('button', { name: 'Xóa ví ưu tiên' }))
+    expect(screen.getByLabelText('Rate multiplier')).toHaveValue('5')
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove priority wallet' }),
+    )
     await waitFor(() =>
       expect(resetOwnerRateLimits).toHaveBeenCalledWith('test-key', owner),
     )
@@ -111,8 +115,10 @@ describe('priority wallets', () => {
   it('removes an unsaved row without a backend mutation', async () => {
     show()
     await add()
-    fireEvent.click(screen.getByRole('button', { name: 'Xóa ví ưu tiên' }))
-    expect(screen.queryByLabelText('Địa chỉ ví')).not.toBeInTheDocument()
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove priority wallet' }),
+    )
+    expect(screen.queryByLabelText('Wallet address')).not.toBeInTheDocument()
     expect(resetOwnerRateLimits).not.toHaveBeenCalled()
   })
   it('signs out if listing rejects the admin credential', async () => {
@@ -126,9 +132,9 @@ describe('priority wallets', () => {
     vi.mocked(saveOwnerRateLimits).mockRejectedValue(new Error('SERVER_ERROR'))
     show()
     await add()
-    fireEvent.click(screen.getByRole('button', { name: 'Lưu ví' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Không lưu được')
-    expect(screen.getByLabelText('Địa chỉ ví')).toHaveValue('0x1')
+    fireEvent.click(screen.getByRole('button', { name: 'Save wallet' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Unable to save')
+    expect(screen.getByLabelText('Wallet address')).toHaveValue('0x1')
   })
   it('sits immediately after Memories written and before Actions', () => {
     const { container } = render(
@@ -137,7 +143,7 @@ describe('priority wallets', () => {
           adminKey="test-key"
           onInvalidKey={onInvalidKey}
           preview
-          afterMemories={<div>Ví ưu tiên</div>}
+          afterMemories={<div>Priority wallets</div>}
         />
       </QueryClientProvider>,
     )
@@ -145,7 +151,7 @@ describe('priority wallets', () => {
       ...container.querySelector('.admin-activity-section')!.children,
     ]
     expect(sections[1]).toHaveTextContent('Memories written')
-    expect(sections[2]).toHaveTextContent('Ví ưu tiên')
+    expect(sections[2]).toHaveTextContent('Priority wallets')
     expect(sections[3]).toHaveTextContent('Actions')
   })
 })

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Plus, Trash2 } from 'lucide-react'
+import { Check, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Card } from './Card'
 import {
   fetchOwnerRateLimitList,
@@ -63,7 +63,10 @@ function WalletRow({
       done()
     } catch (err) {
       if (err instanceof Error && err.message === 'INVALID_KEY') onInvalidKey()
-      else setError('Không lưu được thay đổi. Kiểm tra địa chỉ ví và thử lại.')
+      else
+        setError(
+          'Unable to save changes. Check the wallet address and try again.',
+        )
     } finally {
       setBusy(false)
     }
@@ -81,7 +84,7 @@ function WalletRow({
     void run(
       () => saveOwnerRateLimits(adminKey, owner.trim(), policy),
       () => {
-        setMessage('Đã lưu')
+        setMessage('Saved')
         onSaved()
       },
     )
@@ -94,12 +97,18 @@ function WalletRow({
     void run(() => resetOwnerRateLimits(adminKey, saved.owner), onRemove)
   }
   return (
-    <li className="admin-priority-wallet">
+    <li
+      className={
+        saved
+          ? 'admin-priority-wallet'
+          : 'dashboard-add-key-form admin-priority-wallet admin-priority-wallet--draft'
+      }
+    >
       <form className="admin-priority-row" onSubmit={save}>
         <input
-          aria-label="Địa chỉ ví"
-          className="admin-priority-address"
-          placeholder="Địa chỉ ví · 0x…"
+          aria-label="Wallet address"
+          className="dashboard-add-key-input admin-priority-address"
+          placeholder="Wallet address · 0x…"
           required
           pattern="0x[0-9a-fA-F]{1,64}"
           value={owner}
@@ -108,8 +117,8 @@ function WalletRow({
           onChange={(event) => setOwner(event.target.value)}
         />
         <select
-          aria-label="Mức ưu tiên"
-          className="admin-priority-select"
+          aria-label="Rate multiplier"
+          className="dashboard-add-key-input admin-priority-select"
           value={multiplier}
           disabled={busy}
           onChange={(event) => {
@@ -119,7 +128,7 @@ function WalletRow({
         >
           {multiplier === 'custom' && (
             <option value="custom" disabled>
-              Tùy chỉnh
+              Custom
             </option>
           )}
           {MULTIPLIERS.map((value) => (
@@ -128,20 +137,20 @@ function WalletRow({
             </option>
           ))}
         </select>
-        <div className="admin-priority-actions">
+        <div className="dashboard-add-key-actions dashboard-key-row-actions admin-priority-actions">
           <button
             type="submit"
-            className="btn btn-secondary btn-sm"
-            aria-label="Lưu ví"
+            className="btn dashboard-add-key-create"
+            aria-label="Save wallet"
             disabled={busy || multiplier === 'custom'}
           >
             <Check size={16} />
-            <span>Lưu</span>
+            <span>Save</span>
           </button>
           <button
             type="button"
-            className="admin-priority-remove"
-            aria-label="Xóa ví ưu tiên"
+            className="btn btn-danger btn-sm dashboard-key-icon-action"
+            aria-label="Remove priority wallet"
             disabled={busy}
             onClick={remove}
           >
@@ -151,7 +160,7 @@ function WalletRow({
       </form>
       {expired && (
         <span className="admin-priority-note">
-          Đã hết hạn · Lưu để kích hoạt lại
+          Expired · Save to reactivate
         </span>
       )}
       {message && (
@@ -192,6 +201,7 @@ export function AdminRateLimits({
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     retry: (count, err) => err.message !== 'INVALID_KEY' && count < 2,
   })
+  const addWallet = () => setDrafts((rows) => [...rows, crypto.randomUUID()])
   const refresh = () => {
     void client.invalidateQueries({ queryKey: QUERY_KEY })
   }
@@ -203,24 +213,45 @@ export function AdminRateLimits({
   }, [invalidKey, onInvalidKey])
   return (
     <Card
-      title="Ví ưu tiên"
-      subtitle="Tăng giới hạn cho từng ví. Các ví khác giữ nguyên mức mặc định."
-      className="dashboard-keys-card sept-section admin-activity-card admin-priority-card"
+      title="Priority wallets"
+      subtitle="Manage wallets with higher request limits. All other wallets keep the default limits."
+      className="dashboard-keys-card sept-section admin-priority-card"
+      action={
+        <div className="card-header-actions">
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm dashboard-keys-refresh"
+            disabled={isLoading}
+            onClick={() => void refetch()}
+          >
+            <span>Refresh</span>
+            <RefreshCw size={12} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="lp-nav-cta dashboard-keys-add"
+            disabled={!defaults}
+            onClick={addWallet}
+          >
+            Add wallet <Plus size={18} strokeWidth={2.5} aria-hidden="true" />
+          </button>
+        </div>
+      }
     >
       {isLoading && (
-        <p className="admin-activity-note">Đang tải danh sách ví…</p>
+        <p className="admin-activity-note">Loading priority wallets…</p>
       )}
       {error && (
         <div className="admin-error" role="alert">
           {invalidKey
-            ? 'Phiên admin đã hết hạn.'
-            : 'Không tải được danh sách ví.'}
+            ? 'Your admin session has expired.'
+            : 'Unable to load priority wallets.'}
           <button
             type="button"
             className="btn btn-secondary btn-sm"
             onClick={() => (invalidKey ? onInvalidKey() : void refetch())}
           >
-            Thử lại
+            Try again
           </button>
         </div>
       )}
@@ -255,7 +286,17 @@ export function AdminRateLimits({
             ))}
           </ul>
           {wallets.length === 0 && drafts.length === 0 && (
-            <p className="admin-priority-empty">Chưa có ví ưu tiên</p>
+            <div className="dashboard-empty-message dashboard-empty-message--account">
+              <span>No priority wallets yet. </span>
+              <button
+                type="button"
+                className="dashboard-empty-message-link"
+                onClick={addWallet}
+              >
+                Add a wallet
+              </button>
+              <span> to give it a higher request limit.</span>
+            </div>
           )}
           {hasNextPage && (
             <button
@@ -264,20 +305,11 @@ export function AdminRateLimits({
               disabled={isFetchingNextPage}
               onClick={() => void fetchNextPage()}
             >
-              Xem thêm
+              Load more
             </button>
           )}
-          <button
-            type="button"
-            className="admin-priority-add"
-            onClick={() => setDrafts((rows) => [...rows, crypto.randomUUID()])}
-          >
-            <Plus size={20} />
-            <span>Thêm ví</span>
-          </button>
           <p className="admin-activity-note admin-priority-footnote">
-            Hệ số áp dụng cho giới hạn đọc/ghi của ví, dựa trên mức mặc định tại
-            lúc lưu.
+            Each multiplier applies to the current default limits when saved.
           </p>
         </>
       )}

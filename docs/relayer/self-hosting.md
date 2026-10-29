@@ -238,7 +238,7 @@ See [Database Sync](/indexer/database-sync) for the full schema.
 ## Owner-specific request budgets
 
 An operator can keep deployment-wide defaults and set different weighted request
-budgets for selected owner wallets in **Admin Dashboard → Ví ưu tiên**, immediately below Memories written.
+budgets for selected owner wallets in **Admin Dashboard → Priority wallets**, immediately below Memories written.
 Use the add-wallet button, enter the owner wallet address (not an account object ID
 or delegate public key), choose ×2, ×5, ×10, or ×20, and save. The selected multiplier
 is applied to all three environment defaults at save time. Saved wallets are loaded
