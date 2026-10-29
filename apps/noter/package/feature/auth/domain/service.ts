@@ -10,6 +10,10 @@ import type { db as dbClient } from "@/shared/lib/db";
 import type { User } from "@/shared/db/type";
 import { users, zkLoginSessions, walletSessions } from "@/shared/db/schema";
 import { eq, and } from "drizzle-orm";
+import {
+  decryptDelegatePrivateKey,
+  encryptDelegatePrivateKey,
+} from "../lib/delegate-key-crypto";
 
 type DbClient = typeof dbClient;
 
@@ -168,11 +172,15 @@ export async function upsertEnokiUser(
       throw new DelegateCredentialConflictError();
     }
 
+    const encryptedDelegateKey = encryptDelegatePrivateKey(
+      input.delegatePrivateKey
+    );
+
     const [user] = await db
       .update(users)
       .set({
         authMethod: "enoki",
-        delegatePrivateKey: input.delegatePrivateKey,
+        delegatePrivateKey: encryptedDelegateKey,
         delegateAccountId: input.delegateAccountId,
         lastSeenAt: new Date(),
       })
@@ -181,12 +189,16 @@ export async function upsertEnokiUser(
     return user;
   }
 
+  const encryptedDelegateKey = encryptDelegatePrivateKey(
+    input.delegatePrivateKey
+  );
+
   const [user] = await db
     .insert(users)
     .values({
       suiAddress: input.suiAddress,
       authMethod: "enoki",
-      delegatePrivateKey: input.delegatePrivateKey,
+      delegatePrivateKey: encryptedDelegateKey,
       delegateAccountId: input.delegateAccountId,
       name: "Enoki User",
       lastSeenAt: new Date(),
@@ -206,7 +218,12 @@ export async function getEnokiUserBySuiAddress(db: DbClient, suiAddress: string)
     .limit(1);
 
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
-    return user;
+    try {
+      decryptDelegatePrivateKey(user.delegatePrivateKey);
+      return user;
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -227,8 +244,9 @@ export async function getDelegateKeyForOwner(
     .limit(1);
 
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
+    const decrypted = decryptDelegatePrivateKey(user.delegatePrivateKey);
     return {
-      delegatePrivateKey: user.delegatePrivateKey,
+      delegatePrivateKey: decrypted,
       delegateAccountId: user.delegateAccountId,
     };
   }

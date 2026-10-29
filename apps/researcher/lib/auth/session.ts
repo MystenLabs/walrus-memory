@@ -4,6 +4,7 @@ import { jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import { getUserById } from "@/lib/db/queries";
 import { getAuthSecretKey } from "@/lib/auth/auth-secret";
+import { decryptDelegatePrivateKey } from "@/lib/auth/delegate-key-crypto";
 import {
   SESSION_MAX_AGE_SECONDS,
   signSessionIdentity,
@@ -39,11 +40,15 @@ export async function getSession(): Promise<{ user: SessionUser } | null> {
     const user = await getUserById(payload.userId);
     if (!user || !user.publicKey) return null;
 
+    const privateKey = user.delegatePrivateKey
+      ? decryptDelegatePrivateKey(user.delegatePrivateKey)
+      : "";
+
     return {
       user: {
         id: user.id,
         publicKey: user.publicKey,
-        privateKey: user.delegatePrivateKey ?? "",
+        privateKey,
         accountId: user.accountId ?? "",
       },
     };

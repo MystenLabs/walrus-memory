@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/shared/lib/db";
 import { users, walletSessions } from "@/shared/db/schema";
 import { requireSharedRedisClient } from "@/shared/lib/shared-redis";
+import { decryptDelegatePrivateKey } from "@/feature/auth/lib/delegate-key-crypto";
 import { memoryTextWithinLimit } from "./memory-policy";
 
 export { MAX_MEMORY_TEXT_BYTES } from "./memory-policy";
@@ -126,8 +127,18 @@ export async function resolveMemoryCredentials(req: Request): Promise<{
     );
   }
 
+  let decryptedKey: string;
+  try {
+    decryptedKey = decryptDelegatePrivateKey(user.delegatePrivateKey);
+  } catch {
+    throw new MemoryRequestError(
+      401,
+      "Session has no Walrus Memory credentials"
+    );
+  }
+
   return {
-    key: user.delegatePrivateKey,
+    key: decryptedKey,
     accountId: user.delegateAccountId,
     userId: user.id,
   };
