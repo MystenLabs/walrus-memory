@@ -85,6 +85,98 @@ test("emptyRecallText distinguishes empty namespace from populated namespace wit
         populatedNs,
         'No matching memories found in namespace "pcl302" (0 matches among 15 memories).',
     );
+
+    const incompletePageNs = emptyRecallText(0, 0, {
+        activeNamespace: "other-ns",
+        namespaces,
+        has_more: true,
+    });
+    assert.equal(
+        incompletePageNs,
+        'No matching memories found in namespace "other-ns".',
+    );
+});
+
+test("memwal_recall paginates across listNamespaces pages until targetNamespace is found", async (t) => {
+    let callCount = 0;
+    const client = await openTestClient(
+        t,
+        {
+            recall: async () => ({ results: [], total: 0 }),
+            listNamespaces: async ({ cursor }: { cursor?: string }) => {
+                callCount++;
+                if (!cursor) {
+                    return {
+                        namespaces: [
+                            {
+                                id: "ns-1",
+                                name: "page1-ns",
+                                memory_count: 5,
+                            },
+                        ],
+                        next_cursor: "page-2-cursor",
+                        has_more: true,
+                        snapshot_version: 1,
+                    };
+                }
+                return {
+                    namespaces: [
+                        {
+                            id: "ns-2",
+                            name: "rare-ns",
+                            memory_count: 7,
+                        },
+                    ],
+                    next_cursor: null,
+                    has_more: false,
+                    snapshot_version: 1,
+                };
+            },
+        },
+        { namespace: "default" },
+    );
+
+    const res = await client.callTool({
+        name: "memwal_recall",
+        arguments: { query: "search text", namespace: "rare-ns" },
+    });
+    const text = textFromResult(res);
+
+    assert.equal(callCount, 2);
+    assert.equal(
+        text,
+        'No matching memories found in namespace "rare-ns" (0 matches among 7 memories).',
+    );
+});
+
+test("memwal_recall on incomplete namespace pagination does not falsely report 0 memories", async (t) => {
+    const client = await openTestClient(
+        t,
+        {
+            recall: async () => ({ results: [], total: 0 }),
+            listNamespaces: async () => ({
+                namespaces: [
+                    {
+                        id: "ns-1",
+                        name: "first-page-ns",
+                        memory_count: 10,
+                    },
+                ],
+                next_cursor: null,
+                has_more: true,
+                snapshot_version: 1,
+            }),
+        },
+        { namespace: "default" },
+    );
+
+    const res = await client.callTool({
+        name: "memwal_recall",
+        arguments: { query: "something", namespace: "unseen-ns" },
+    });
+    const text = textFromResult(res);
+
+    assert.equal(text, 'No matching memories found in namespace "unseen-ns".');
 });
 
 test("memwal_recall on a misspelled namespace suggests close existing namespaces from listNamespaces()", async (t) => {
