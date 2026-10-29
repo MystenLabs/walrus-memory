@@ -370,6 +370,14 @@ impl<'a> std::borrow::Borrow<dyn DelegateAccountKey + 'a> for (String, Vec<u8>) 
     }
 }
 
+/// Maximum concurrent cold on-chain `verify_delegate_key_onchain` RPC calls.
+///
+/// Warm cache hits (`DELEGATE_VERIFY_CACHE_TTL`) and negative reject-cache hits
+/// (`DELEGATE_REJECT_CACHE_TTL`) resolve before touching this semaphore, so
+/// legitimate repeat callers retain full throughput even if distinct unregistered
+/// `(account, key)` probes saturate all cold RPC verification slots.
+pub const MAX_INFLIGHT_DELEGATE_RPC_VERIFICATIONS: usize = 32;
+
 pub struct DelegateVerifyCacheState {
     pub entries:
         tokio::sync::RwLock<std::collections::HashMap<(String, Vec<u8>), TimedVerifiedOwner>>,
@@ -382,14 +390,21 @@ pub struct DelegateVerifyCacheState {
     /// already gone. An insert refuses when the generation moved under it, so
     /// the revoke wins and the next caller reads the chain again.
     pub evictions: std::sync::atomic::AtomicU64,
+    /// Bounds concurrent cold on-chain delegate verification RPC calls.
+    pub rpc_semaphore: tokio::sync::Semaphore,
 }
 
 pub type DelegateVerifyCache = std::sync::Arc<DelegateVerifyCacheState>;
 
 pub fn new_delegate_verify_cache() -> DelegateVerifyCache {
+    new_delegate_verify_cache_with_concurrency(MAX_INFLIGHT_DELEGATE_RPC_VERIFICATIONS)
+}
+
+pub fn new_delegate_verify_cache_with_concurrency(max_inflight: usize) -> DelegateVerifyCache {
     std::sync::Arc::new(DelegateVerifyCacheState {
         entries: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         evictions: std::sync::atomic::AtomicU64::new(0),
+        rpc_semaphore: tokio::sync::Semaphore::new(max_inflight.max(1)),
     })
 }
 
@@ -565,17 +580,27 @@ async fn verify_delegate_key_cached_inner(
         )));
     }
 
-    match verify_delegate_key_onchain(
-        http_client,
-        rpc_url,
-        grpc_client,
-        account_object_id,
-        public_key_bytes,
-        expected_type_origin_package_id,
-        get_object_attempts,
-    )
-    .await
-    {
+    let onchain_result = match cache.rpc_semaphore.try_acquire() {
+        Ok(permit) => {
+            let res = verify_delegate_key_onchain(
+                http_client,
+                rpc_url,
+                grpc_client,
+                account_object_id,
+                public_key_bytes,
+                expected_type_origin_package_id,
+                get_object_attempts,
+            )
+            .await;
+            drop(permit);
+            res
+        }
+        Err(_) => Err(OnchainVerifyError::RpcError(
+            "delegate verification RPC concurrency limit reached".to_string(),
+        )),
+    };
+
+    match onchain_result {
         Ok(owner) => {
             let key = (account_object_id.to_string(), public_key_bytes.to_vec());
             // The unconditional `reject_cache.remove` that used to stand here
@@ -3167,6 +3192,88 @@ mod tests {
             cache.entries.read().await.is_empty(),
             "a failed verification must leave no entry behind"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_delegate_key_cached_bounds_inflight_rpc_while_preserving_cached_callers() {
+        let cache = new_delegate_verify_cache_with_concurrency(2);
+        let reject_cache = new_delegate_reject_cache();
+        let client = reqwest::Client::new();
+
+        // Seed a fresh positive entry and a stale-grace positive entry.
+        let fresh_account = "0xaccount-fresh";
+        let fresh_pk = sample_pk();
+        let fresh_owner =
+            seed_verify_cache(&cache, fresh_account, &fresh_pk, std::time::Duration::ZERO).await;
+
+        let grace_account = "0xaccount-grace";
+        let grace_pk = vec![9u8; 32];
+        let grace_owner = seed_verify_cache(
+            &cache,
+            grace_account,
+            &grace_pk,
+            DELEGATE_VERIFY_CACHE_TTL + std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        // Saturate both in-flight RPC slots with two held permits.
+        let permit_a = cache.rpc_semaphore.try_acquire().unwrap();
+        let permit_b = cache.rpc_semaphore.try_acquire().unwrap();
+
+        // 1. Distinct unregistered cold probes are rejected immediately before RPC work.
+        let cold_err = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            "0xunregistered-probe",
+            &[42u8; 32],
+            "0xpkg",
+        )
+        .await
+        .expect_err("saturated cold RPC slots must reject unregistered probe before RPC");
+        assert!(
+            matches!(
+                &cold_err,
+                OnchainVerifyError::RpcError(msg)
+                    if msg.contains("delegate verification RPC concurrency limit reached")
+            ),
+            "unexpected error: {cold_err:?}"
+        );
+
+        // 2. Legitimate fresh cached caller resolves immediately without needing an RPC slot.
+        let resolved_fresh = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            fresh_account,
+            &fresh_pk,
+            "0xpkg",
+        )
+        .await
+        .expect("fresh cached caller must succeed while RPC semaphore is saturated");
+        assert_eq!(resolved_fresh, fresh_owner);
+
+        // 3. Legitimate caller inside the 600s stale grace window also resolves immediately.
+        let resolved_grace = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            grace_account,
+            &grace_pk,
+            "0xpkg",
+        )
+        .await
+        .expect("stale-grace caller must succeed while RPC semaphore is saturated");
+        assert_eq!(resolved_grace, grace_owner);
+
+        drop(permit_a);
+        drop(permit_b);
     }
 
     // ── DelegateKeysCache periodic sweep (nothing else ever removed a map

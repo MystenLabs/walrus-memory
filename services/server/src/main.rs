@@ -2863,7 +2863,9 @@ async fn main() {
         // /api/accounts/{owner}/exists route. See routes::whoami.
         .route("/api/whoami", get(routes::whoami))
         // Router::layer runs middleware bottom-to-top (last added runs first).
-        // Keep auth outer so AuthInfo is in request extensions before rate limiting reads it.
+        // Keep auth outer so AuthInfo is in request extensions before rate limiting reads it,
+        // and place `signed_preauth_rate_limit_middleware` outermost so source-IP and
+        // deployment-wide floods are rejected before body buffering and Sui RPC lookup.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit::rate_limit_middleware,
@@ -2871,6 +2873,10 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::verify_signature,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::signed_preauth_rate_limit_middleware,
         ))
         .layer(DefaultBodyLimit::max(auth::PROTECTED_BODY_LIMIT_BYTES));
 
@@ -2905,6 +2911,10 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::verify_read_api_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::signed_preauth_rate_limit_middleware,
         ))
         .layer(DefaultBodyLimit::max(auth::PROTECTED_BODY_LIMIT_BYTES));
 
