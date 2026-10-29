@@ -284,7 +284,8 @@ pub struct VectorDb {
 /// already guards its pool this way; these modules did not, which left the race
 /// latent until a test was added.
 #[cfg(test)]
-static DB_SETUP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+pub(crate) static DB_SETUP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 /// Builds a test `VectorDb`, retrying when Postgres aborts the migration
 /// replay with a deadlock (40P01).
@@ -342,14 +343,11 @@ impl VectorDb {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, VectorDb, VectorInsert};
-
-    static VECTOR_SCHEMA_SETUP_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
 
     /// Looks a migration up in the pipeline by file name.
     ///

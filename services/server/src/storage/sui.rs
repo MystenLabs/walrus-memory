@@ -155,6 +155,110 @@ pub async fn verify_delegate_key_onchain(
     )))
 }
 
+/// Verify that an on-chain `MemWalAccount` object exists, has the expected Move
+/// type origin, and has `active == true`.
+///
+/// Used by owner-token issuance (`POST /v1/owner-tokens`) and owner-token read
+/// authentication (`verify_read_api_auth` on `/v1/owners/{owner}/*`), which
+/// authorize at the account level without a delegate key.
+///
+/// Returns `Ok(owner_address)` if the account is active on-chain.
+pub async fn verify_account_active_onchain(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    expected_type_origin_package_id: &str,
+    get_object_attempts: u32,
+) -> Result<String, OnchainVerifyError> {
+    if let Some(grpc_client) = grpc_client {
+        return verify_account_active_onchain_grpc(
+            grpc_client.clone(),
+            account_object_id,
+            expected_type_origin_package_id,
+            get_object_attempts,
+        )
+        .await;
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sui_getObject",
+        "params": [
+            account_object_id,
+            { "showContent": true }
+        ]
+    });
+
+    let request = http_client
+        .post(rpc_url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .json(&body);
+    let request = crate::observability::apply_request_id_header(request);
+    let started = std::time::Instant::now();
+    let response = request.send().await.map_err(|e| {
+        crate::observability::observe_external(
+            "sui_rpc",
+            "sui_getObject",
+            "transport_error",
+            started.elapsed(),
+        );
+        OnchainVerifyError::RpcError(format!("HTTP request failed: {}", e))
+    })?;
+    let status_label = response.status().as_u16().to_string();
+    crate::observability::observe_external(
+        "sui_rpc",
+        "sui_getObject",
+        &status_label,
+        started.elapsed(),
+    );
+
+    let rpc_response: RpcResponse = parse_json_rpc_response(response, "sui_getObject").await?;
+
+    if let Some(error) = rpc_response.error {
+        return Err(OnchainVerifyError::RpcError(format!(
+            "RPC error {}: {}",
+            error.code, error.message
+        )));
+    }
+
+    let result = rpc_response
+        .result
+        .ok_or_else(|| partial_get_object(PARTIAL_RPC_NO_RESULT))?;
+    let content = require_get_object_content(result)?;
+
+    ensure_memwal_account_type(
+        content.object_type.as_deref(),
+        expected_type_origin_package_id,
+        account_object_id,
+    )?;
+
+    let fields = content
+        .fields
+        .ok_or_else(|| OnchainVerifyError::RpcError("Object has no fields".into()))?;
+
+    let owner = fields
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing 'owner' field".into()))?
+        .to_string();
+
+    let active = json_account_active(&fields)?;
+    if !active {
+        tracing::warn!(
+            "account {} is deactivated — rejecting owner account auth",
+            account_object_id
+        );
+        return Err(OnchainVerifyError::AccountDeactivated(format!(
+            "Account {} has been deactivated",
+            account_object_id
+        )));
+    }
+
+    Ok(owner)
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct DelegateKeyInfo {
     pub sui_address: String,
@@ -229,14 +333,23 @@ pub async fn list_delegate_keys_cached(
         return Ok(cached.value.clone());
     }
 
-    let keys = list_delegate_keys_onchain(
+    let keys = match list_delegate_keys_onchain(
         http_client,
         rpc_url,
         grpc_client,
         account_object_id,
         expected_type_origin_package_id,
     )
-    .await?;
+    .await
+    {
+        Ok(keys) => keys,
+        Err(err) => {
+            if !err.is_unavailable() {
+                cache.write().await.remove(account_object_id);
+            }
+            return Err(err);
+        }
+    };
 
     cache.write().await.insert(
         account_object_id.to_string(),
@@ -618,6 +731,16 @@ async fn verify_delegate_key_cached_inner(
                 // exists to close.
                 let mut entries = cache.entries.write().await;
                 entries.remove(probe);
+                if matches!(
+                    err,
+                    OnchainVerifyError::AccountDeactivated(_)
+                        | OnchainVerifyError::NotFound(_)
+                        | OnchainVerifyError::WrongObjectType(_)
+                ) {
+                    let account_probe: &dyn DelegateAccountKey =
+                        &(account_object_id, OWNER_ACCOUNT_ACTIVE_PROBE_KEY);
+                    entries.remove(account_probe);
+                }
                 cache
                     .evictions
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -677,6 +800,197 @@ async fn verify_delegate_key_cached_inner(
                             age_secs = age.as_secs(),
                             error = %err,
                             "serving stale delegate verification while Sui is unavailable (sampled)"
+                        );
+                    }
+                    Ok(owner)
+                }
+                None => Err(err),
+            }
+        }
+    }
+}
+
+/// Sentinel key slice used in [`DelegateVerifyCache`] and [`DelegateRejectCache`]
+/// for account-level `active` checks on owner-token routes (`/v1/owners/{owner}/*`
+/// and `POST /v1/owner-tokens`).
+///
+/// Delegate public keys are always 32 bytes (`[u8; 32]`), so the empty slice
+/// `b""` never collides with any delegate key entry while sharing the same
+/// 30s positive TTL, 10s negative cache, eviction generation counter, and
+/// periodic background sweeper.
+pub const OWNER_ACCOUNT_ACTIVE_PROBE_KEY: &[u8] = b"";
+
+/// Cached wrapper around [`verify_account_active_onchain`] for owner-token
+/// read requests (`verify_read_api_auth` on `/v1/owners/{owner}/*`).
+///
+/// Shares [`DelegateVerifyCache`] (`DELEGATE_VERIFY_CACHE_TTL` = 30s, plus
+/// `DELEGATE_VERIFY_STALE_GRACE` when Sui RPC is unreachable) and
+/// [`DelegateRejectCache`] (`DELEGATE_REJECT_CACHE_TTL` = 10s for
+/// `AccountDeactivated`) keyed by `(account_object_id, b"")`.
+pub async fn verify_account_active_cached(
+    cache: &DelegateVerifyCache,
+    reject_cache: &DelegateRejectCache,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    expected_type_origin_package_id: &str,
+) -> Result<String, OnchainVerifyError> {
+    verify_account_active_cached_inner(
+        cache,
+        reject_cache,
+        http_client,
+        rpc_url,
+        grpc_client,
+        account_object_id,
+        expected_type_origin_package_id,
+        false,
+    )
+    .await
+}
+
+/// Live on-chain `active` verification for `POST /v1/owner-tokens` issuance.
+///
+/// Always consults the chain so a newly deactivated account cannot mint a
+/// fresh owner token from a 30s positive cache window, while still updating
+/// [`DelegateVerifyCache`] / [`DelegateRejectCache`] so the immediate
+/// follow-up `/v1/owners/{owner}/*` reads hit the warm cache.
+pub async fn verify_account_active_for_issuance(
+    cache: &DelegateVerifyCache,
+    reject_cache: &DelegateRejectCache,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    expected_type_origin_package_id: &str,
+) -> Result<String, OnchainVerifyError> {
+    verify_account_active_cached_inner(
+        cache,
+        reject_cache,
+        http_client,
+        rpc_url,
+        grpc_client,
+        account_object_id,
+        expected_type_origin_package_id,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_account_active_cached_inner(
+    cache: &DelegateVerifyCache,
+    reject_cache: &DelegateRejectCache,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    grpc_client: Option<&sui_rpc::Client>,
+    account_object_id: &str,
+    expected_type_origin_package_id: &str,
+    for_issuance: bool,
+) -> Result<String, OnchainVerifyError> {
+    let probe: &dyn DelegateAccountKey = &(account_object_id, OWNER_ACCOUNT_ACTIVE_PROBE_KEY);
+
+    let get_object_attempts = if for_issuance {
+        GET_OBJECT_ATTEMPTS
+    } else {
+        let entries = cache.entries.read().await;
+        match entries.get(probe) {
+            Some(cached) if cached.is_fresh() => return Ok(cached.owner.clone()),
+            Some(cached) if cached.is_servable_while_unavailable() => 1,
+            _ => GET_OBJECT_ATTEMPTS,
+        }
+    };
+
+    let generation_before = cache.evictions.load(std::sync::atomic::Ordering::Acquire);
+    let verify_started = std::time::Instant::now();
+
+    if !for_issuance
+        && reject_cache
+            .read()
+            .await
+            .get(probe)
+            .copied()
+            .is_some_and(reject_entry_is_fresh)
+    {
+        return Err(OnchainVerifyError::AccountDeactivated(format!(
+            "Account {account_object_id} has been deactivated (cached)"
+        )));
+    }
+
+    match verify_account_active_onchain(
+        http_client,
+        rpc_url,
+        grpc_client,
+        account_object_id,
+        expected_type_origin_package_id,
+        get_object_attempts,
+    )
+    .await
+    {
+        Ok(owner) => {
+            let key = (
+                account_object_id.to_string(),
+                OWNER_ACCOUNT_ACTIVE_PROBE_KEY.to_vec(),
+            );
+            let mut entries = cache.entries.write().await;
+            if may_store_verification(
+                generation_before,
+                cache.evictions.load(std::sync::atomic::Ordering::Acquire),
+            ) {
+                entries.insert(
+                    key,
+                    TimedVerifiedOwner {
+                        owner: owner.clone(),
+                        verified_at: verify_started,
+                    },
+                );
+            }
+            Ok(owner)
+        }
+        Err(err) => {
+            if verify_cache_miss_action(&err) == VerifyCacheMissAction::Evict {
+                let mut entries = cache.entries.write().await;
+                entries.retain(|(acct, _), _| acct != account_object_id);
+                cache
+                    .evictions
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if matches!(err, OnchainVerifyError::AccountDeactivated(_)) {
+                    let mut rejects = reject_cache.write().await;
+                    let present = rejects.contains_key(probe);
+                    if !present && rejects.len() >= DELEGATE_REJECT_CACHE_MAX_ENTRIES {
+                        rejects.retain(|_, rejected_at| reject_entry_is_fresh(*rejected_at));
+                    }
+                    if should_record_rejection(rejects.len(), present) {
+                        rejects.insert(
+                            (
+                                account_object_id.to_string(),
+                                OWNER_ACCOUNT_ACTIVE_PROBE_KEY.to_vec(),
+                            ),
+                            std::time::Instant::now(),
+                        );
+                    }
+                }
+                drop(entries);
+                return Err(err);
+            }
+            if for_issuance {
+                return Err(err);
+            }
+            let stale = cache
+                .entries
+                .read()
+                .await
+                .get(probe)
+                .filter(|c| c.is_servable_while_unavailable())
+                .map(|c| (c.owner.clone(), c.verified_at.elapsed()));
+            match stale {
+                Some((owner, age)) => {
+                    if crate::observability::should_log_stale_serve(account_object_id) {
+                        tracing::warn!(
+                            account_id = %account_object_id,
+                            age_secs = age.as_secs(),
+                            error = %err,
+                            "serving stale account active verification while Sui is unavailable (sampled)"
                         );
                     }
                     Ok(owner)
@@ -1029,6 +1343,18 @@ pub async fn list_delegate_keys_onchain(
     let fields = content
         .fields
         .ok_or_else(|| OnchainVerifyError::RpcError("Object has no fields".into()))?;
+
+    let active = json_account_active(&fields)?;
+    if !active {
+        tracing::warn!(
+            "account {} is deactivated — rejecting delegate keys listing",
+            account_object_id
+        );
+        return Err(OnchainVerifyError::AccountDeactivated(format!(
+            "Account {} has been deactivated",
+            account_object_id
+        )));
+    }
 
     parse_delegate_keys(&fields)
 }
@@ -1476,6 +1802,48 @@ async fn verify_delegate_key_onchain_grpc(
     )))
 }
 
+async fn verify_account_active_onchain_grpc(
+    client: sui_rpc::Client,
+    account_object_id: &str,
+    expected_type_origin_package_id: &str,
+    attempts: u32,
+) -> Result<String, OnchainVerifyError> {
+    let object = grpc_get_object(client, account_object_id, attempts).await?;
+
+    ensure_memwal_account_type(
+        object.object_type.as_deref(),
+        expected_type_origin_package_id,
+        account_object_id,
+    )?;
+
+    let json = object
+        .json
+        .ok_or_else(|| OnchainVerifyError::RpcError("Object has no json content".into()))?;
+    let fields = grpc_value_as_struct(&json)
+        .ok_or_else(|| OnchainVerifyError::RpcError("Object json is not a struct".into()))?;
+
+    let owner = fields
+        .fields
+        .get("owner")
+        .and_then(grpc_value_as_str)
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing 'owner' field".into()))?
+        .to_string();
+
+    let active = grpc_account_active(fields)?;
+    if !active {
+        tracing::warn!(
+            "account {} is deactivated — rejecting owner account auth (gRPC)",
+            account_object_id
+        );
+        return Err(OnchainVerifyError::AccountDeactivated(format!(
+            "Account {} has been deactivated",
+            account_object_id
+        )));
+    }
+
+    Ok(owner)
+}
+
 /// gRPC counterpart of `list_delegate_keys_onchain`'s JSON-RPC body — same
 /// shape as `verify_delegate_key_onchain_grpc` above (GetObject, type check,
 /// struct navigation), but returns every delegate key rather than searching
@@ -1500,6 +1868,18 @@ async fn list_delegate_keys_onchain_grpc(
         .ok_or_else(|| OnchainVerifyError::RpcError("Object has no json content".into()))?;
     let fields = grpc_value_as_struct(&json)
         .ok_or_else(|| OnchainVerifyError::RpcError("Object json is not a struct".into()))?;
+
+    let active = grpc_account_active(fields)?;
+    if !active {
+        tracing::warn!(
+            "account {} is deactivated — rejecting delegate keys listing (gRPC)",
+            account_object_id
+        );
+        return Err(OnchainVerifyError::AccountDeactivated(format!(
+            "Account {} has been deactivated",
+            account_object_id
+        )));
+    }
 
     let delegate_keys = fields
         .fields
@@ -3434,6 +3814,196 @@ mod tests {
     fn seal_policy_package_rejects_invalid_configured_ids() {
         assert!(parse_package_id("MEMWAL_PACKAGE_ID", "not-an-address").is_err());
         assert!(parse_package_id("MEMWAL_SEAL_POLICY_PACKAGE_ID", "0xnothex").is_err());
+    }
+
+    async fn spawn_mock_account_rpc(
+        package_id: &str,
+        owner: &str,
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        rpc_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        let pkg = package_id.to_string();
+        let owner_addr = owner.to_string();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let pkg = pkg.clone();
+                let owner_addr = owner_addr.clone();
+                let active = std::sync::Arc::clone(&active);
+                let rpc_calls = std::sync::Arc::clone(&rpc_calls);
+                async move {
+                    rpc_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let is_active = active.load(std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "data": {
+                                "content": {
+                                    "dataType": "moveObject",
+                                    "type": format!("{pkg}::account::MemWalAccount"),
+                                    "fields": {
+                                        "owner": owner_addr,
+                                        "active": is_active,
+                                        "delegate_keys": [
+                                            {
+                                                "fields": {
+                                                    "public_key": vec![7u8; 32],
+                                                    "sui_address": "0x0000000000000000000000000000000000000000000000000000000000000111",
+                                                    "label": "cli",
+                                                    "created_at": "1700000000000"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn verify_account_active_caches_positive_and_evicts_on_deactivation() {
+        let pkg = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+        let owner = "0x0000000000000000000000000000000000000000000000000000000000000def";
+        let account_id = "0x0000000000000000000000000000000000000000000000000000000000000999";
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rpc_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc_url = spawn_mock_account_rpc(
+            pkg,
+            owner,
+            std::sync::Arc::clone(&active),
+            std::sync::Arc::clone(&rpc_calls),
+        )
+        .await;
+
+        let verify_cache = new_delegate_verify_cache();
+        let reject_cache = new_delegate_reject_cache();
+        let client = reqwest::Client::new();
+
+        // Seed a delegate key entry on the same account to verify cross-eviction on deactivation.
+        seed_verify_cache(
+            &verify_cache,
+            account_id,
+            &sample_pk(),
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        // 1. Token issuance verifies live on-chain (`active: true`) and warms the cache.
+        let resolved_owner = verify_account_active_for_issuance(
+            &verify_cache,
+            &reject_cache,
+            &client,
+            &rpc_url,
+            None,
+            account_id,
+            pkg,
+        )
+        .await
+        .expect("active account must verify for issuance");
+        assert_eq!(resolved_owner, owner);
+        assert_eq!(rpc_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2. Subsequent read-path check hits the warm positive cache without an RPC call.
+        let cached_owner = verify_account_active_cached(
+            &verify_cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            pkg,
+        )
+        .await
+        .expect("warm positive cache must serve without RPC");
+        assert_eq!(cached_owner, owner);
+
+        // 3. Flip account to `active = false` on-chain. Issuance bypasses the positive
+        //    cache, observes `AccountDeactivated`, evicts all positive entries for the
+        //    account, and records a negative cache entry.
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        let err = verify_account_active_for_issuance(
+            &verify_cache,
+            &reject_cache,
+            &client,
+            &rpc_url,
+            None,
+            account_id,
+            pkg,
+        )
+        .await
+        .expect_err("deactivated account must be rejected at issuance");
+        assert!(matches!(err, OnchainVerifyError::AccountDeactivated(_)));
+        assert_eq!(rpc_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            verify_cache.entries.read().await.is_empty(),
+            "deactivation must evict both account-level and delegate-key positive cache entries"
+        );
+
+        // 4. Subsequent read-path check hits the negative cache (`AccountDeactivated`)
+        //    without making another RPC call.
+        let cached_err = verify_account_active_cached(
+            &verify_cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            account_id,
+            pkg,
+        )
+        .await
+        .expect_err("deactivated account must be rejected on read path");
+        assert!(matches!(
+            cached_err,
+            OnchainVerifyError::AccountDeactivated(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_delegate_keys_cached_rejects_and_evicts_deactivated_account() {
+        let pkg = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+        let owner = "0x0000000000000000000000000000000000000000000000000000000000000def";
+        let account_id = "0x0000000000000000000000000000000000000000000000000000000000000888";
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rpc_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc_url = spawn_mock_account_rpc(
+            pkg,
+            owner,
+            std::sync::Arc::clone(&active),
+            std::sync::Arc::clone(&rpc_calls),
+        )
+        .await;
+
+        let cache = new_delegate_keys_cache();
+        cache.write().await.insert(
+            account_id.to_string(),
+            TimedDelegateKeys {
+                value: sample_delegate_keys(),
+                fetched_at: std::time::Instant::now()
+                    - DELEGATE_KEYS_CACHE_TTL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+
+        let client = reqwest::Client::new();
+        let err = list_delegate_keys_cached(&cache, &client, &rpc_url, None, account_id, pkg)
+            .await
+            .expect_err("deactivated account must fail delegate keys listing");
+        assert!(matches!(err, OnchainVerifyError::AccountDeactivated(_)));
+        assert!(
+            !cache.read().await.contains_key(account_id),
+            "definitive on-chain error must evict stale DelegateKeysCache entry"
+        );
     }
 
     // ── gRPC path: live network tests (real testnet, no mocking) ─────────

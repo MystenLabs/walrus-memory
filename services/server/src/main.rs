@@ -559,7 +559,7 @@ mod mcp_rate_limit_tests {
     use tower::ServiceExt;
 
     /// Bytes consumed by one RESP command, or `None` if `buf` is incomplete.
-    fn resp_command_len(buf: &[u8]) -> Option<usize> {
+    pub(super) fn resp_command_len(buf: &[u8]) -> Option<usize> {
         if *buf.first()? != b'*' {
             return None;
         }
@@ -642,7 +642,7 @@ mod mcp_rate_limit_tests {
             .expect("stub redis accepts the handshake")
     }
 
-    fn rate_limit_test_config() -> Config {
+    pub(super) fn rate_limit_test_config() -> Config {
         Config {
             port: 8000,
             database_url: "postgres://memwal@127.0.0.1/memwal".to_string(),
@@ -1062,6 +1062,478 @@ fn owner_rate_limit_routes() -> Router<Arc<AppState>> {
                 .layer(DefaultBodyLimit::max(4096)),
         )
         .layer(middleware::from_fn(auth::verify_admin_key))
+}
+
+#[cfg(test)]
+mod owner_token_active_check_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const MOCK_ACTIVE: u8 = 0;
+    const MOCK_DEACTIVATED: u8 = 1;
+    const MOCK_UNAVAILABLE: u8 = 2;
+
+    async fn reply_allowed(mut socket: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = socket.set_nodelay(true);
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    while let Some(consumed) = mcp_rate_limit_tests::resp_command_len(&buf) {
+                        buf.drain(..consumed);
+                        if socket.write_all(b":1\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn allowing_redis() -> redis::aio::ConnectionManager {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(reply_allowed(socket));
+            }
+        });
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(1)
+            .set_factor(1)
+            .set_exponent_base(1)
+            .set_max_delay(50)
+            .set_connection_timeout(std::time::Duration::from_secs(2))
+            .set_response_timeout(std::time::Duration::from_secs(2));
+        client
+            .get_connection_manager_with_config(config)
+            .await
+            .expect("stub redis accepts the handshake")
+    }
+
+    async fn spawn_mock_sui_rpc(mode: Arc<AtomicU8>, package_id: String, owner: String) -> String {
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let mode = Arc::clone(&mode);
+                let package_id = package_id.clone();
+                let owner = owner.clone();
+                async move {
+                    match mode.load(Ordering::SeqCst) {
+                        MOCK_UNAVAILABLE => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({ "error": "upstream unavailable" })),
+                        ),
+                        current => {
+                            let active = current == MOCK_ACTIVE;
+                            (
+                                StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "result": {
+                                        "data": {
+                                            "content": {
+                                                "dataType": "moveObject",
+                                                "type": format!("{package_id}::account::MemWalAccount"),
+                                                "fields": {
+                                                    "owner": owner,
+                                                    "active": active,
+                                                    "delegate_keys": [
+                                                        {
+                                                            "fields": {
+                                                                "public_key": vec![7u8; 32],
+                                                                "sui_address": "0x0000000000000000000000000000000000000000000000000000000000000777",
+                                                                "label": "laptop-agent",
+                                                                "created_at": "1700000000000"
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn setup_accounts_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://memwal:memwal_secret@localhost:5432/memwal".into());
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+            .expect("test database should be available");
+        let _guard = crate::storage::db::DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS accounts (
+                account_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts (owner);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn deactivated_account_rejects_owner_token_issuance_and_all_owner_read_routes() {
+        let pool = setup_accounts_pool().await;
+        let db = Arc::new(VectorDb::from_pool(pool.clone()));
+        let raw_uuid = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("0x{raw_uuid}{raw_uuid}");
+        let account_id = format!(
+            "0x{}{}",
+            raw_uuid.chars().rev().collect::<String>(),
+            raw_uuid
+        );
+        let package_id =
+            "0x0000000000000000000000000000000000000000000000000000000000000abc".to_string();
+
+        sqlx::query(
+            "INSERT INTO accounts (account_id, owner) VALUES ($1, $2)
+             ON CONFLICT (owner) DO UPDATE SET account_id = EXCLUDED.account_id",
+        )
+        .bind(&account_id)
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rpc_mode = Arc::new(AtomicU8::new(MOCK_ACTIVE));
+        let sui_rpc_url =
+            spawn_mock_sui_rpc(Arc::clone(&rpc_mode), package_id.clone(), owner.clone()).await;
+
+        let redis = allowing_redis().await;
+        let http_client = reqwest::Client::new();
+        let mut cfg = mcp_rate_limit_tests::rate_limit_test_config();
+        cfg.sui_rpc_url = sui_rpc_url;
+        cfg.package_id = package_id;
+        let config = Arc::new(cfg);
+        let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
+        let state = Arc::new(AppState {
+            db: Arc::clone(&db),
+            wallet_lock_pool: pool.clone(),
+            legacy_db: None,
+            security_delete_nonce_store: Arc::new(security_delete_auth::RedisNonceStore::new(
+                redis.clone(),
+            )),
+            security_delete_wallet_verifier: Arc::new(
+                security_delete_auth::NativeWalletSignatureVerifier,
+            ),
+            security_delete_sui: None,
+            security_delete_background_sui: None,
+            walrus_sui_client: None,
+            security_delete_execution_gate: Arc::new(types::SecurityDeleteExecutionGate::new(1)),
+            config: Arc::clone(&config),
+            http_client: http_client.clone(),
+            sui_grpc_client: None,
+            delegate_keys_cache: storage::sui::new_delegate_keys_cache(),
+            delegate_verify_cache: storage::sui::new_delegate_verify_cache(),
+            delegate_reject_cache: storage::sui::new_delegate_reject_cache(),
+            mcp_connect_episodes: observability::new_mcp_connect_episodes(),
+            alerts: Arc::clone(&alerts),
+            key_pool: Arc::new(KeyPool::new(Vec::new())),
+            engine: Arc::new(PlaintextEngine::new(db)),
+            embedder: Arc::new(
+                OpenAiEmbedder::new(http_client.clone(), Arc::clone(&config))
+                    .with_alerts(Arc::clone(&alerts)),
+            ),
+            extractor: Arc::new(LlmExtractor::new(http_client, config).with_alerts(alerts)),
+            ranker: Arc::new(CompositeRanker),
+            redis,
+            fallback_rate_limit: tokio::sync::Mutex::new(rate_limit::InMemoryFallback::default()),
+            remember_job_storage: PostgresStorage::new(pool.clone()),
+            wallet_storage: PostgresStorage::new_with_config(
+                pool.clone(),
+                apalis_sql::Config::new(WALLET_UPLOAD_QUEUE),
+            ),
+            wallet_followup_storage: PostgresStorage::new_with_config(
+                pool.clone(),
+                apalis_sql::Config::new(WALLET_FOLLOWUP_QUEUE).set_buffer_size(1),
+            ),
+            bulk_job_storage: PostgresStorage::new(pool.clone()),
+            blob_cache_ttl: std::time::Duration::from_secs(DEFAULT_BLOB_CACHE_TTL_SECS),
+            blob_cache_max_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
+            embedding_cache_ttl: std::time::Duration::from_secs(DEFAULT_EMBEDDING_CACHE_TTL_SECS),
+        });
+
+        let read_api_routes = Router::new()
+            .route(
+                "/v1/owners/{owner}/namespaces",
+                get(routes::list_owner_namespaces),
+            )
+            .route(
+                "/v1/owners/{owner}/memories",
+                get(routes::list_owner_memories),
+            )
+            .route("/v1/owners/{owner}/agents", get(routes::list_owner_agents))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit::read_api_rate_limit_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth::verify_read_api_auth,
+            ));
+
+        let owner_token_routes = Router::new()
+            .route("/v1/owner-tokens", post(routes::issue_token))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit::owner_token_credential_rate_limit_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                routes::owner_token::service_credential_gate,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit::owner_token_ip_rate_limit_middleware,
+            ));
+
+        let app = Router::new()
+            .merge(read_api_routes)
+            .merge(owner_token_routes)
+            .with_state(Arc::clone(&state));
+
+        // 1. Active account: minting an owner token succeeds and
+        //    `GET /v1/owners/{owner}/agents` (which exercises both
+        //    `verify_read_api_auth` and `list_delegate_keys_cached` without
+        //    requiring pgvector tables) returns 200 OK.
+        let mint_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/owner-tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        routes::owner_token::SERVICE_CREDENTIAL_HEADER,
+                        "owner-token-test-credential",
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "owner": owner }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mint_resp.status(), StatusCode::OK);
+        let mint_body = axum::body::to_bytes(mint_resp.into_body(), 4096)
+            .await
+            .unwrap();
+        let mint_json: serde_json::Value = serde_json::from_slice(&mint_body).unwrap();
+        let token = mint_json["token"]
+            .as_str()
+            .expect("minted token string")
+            .to_string();
+
+        let agents_uri = format!("/v1/owners/{owner}/agents");
+        let agents_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&agents_uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            agents_resp.status(),
+            StatusCode::OK,
+            "active account should serve {agents_uri}"
+        );
+
+        // 2. Deactivate the account on-chain:
+        //    - `POST /v1/owner-tokens` refuses to mint (403 Forbidden) and evicts
+        //      the positive cache entry.
+        //    - Every `/v1/owners/{owner}/{namespaces,memories,agents}` route rejects
+        //      the still-unexpired bearer token with 401 Unauthorized.
+        rpc_mode.store(MOCK_DEACTIVATED, Ordering::SeqCst);
+
+        let deactivated_mint = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/owner-tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        routes::owner_token::SERVICE_CREDENTIAL_HEADER,
+                        "owner-token-test-credential",
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "owner": owner }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deactivated_mint.status(),
+            StatusCode::FORBIDDEN,
+            "POST /v1/owner-tokens must refuse to mint for a deactivated account"
+        );
+
+        for path in ["namespaces", "memories", "agents"] {
+            let uri = format!("/v1/owners/{owner}/{path}");
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "deactivated account must reject unexpired owner token on {uri}"
+            );
+        }
+
+        // 3. Even on a cold verify/reject cache (e.g. after TTL expiry without a
+        //    prior `POST /v1/owner-tokens` call) and with a pre-warmed
+        //    `delegate_keys_cache`, `verify_read_api_auth` queries Sui, rejects
+        //    with 401 Unauthorized across all three endpoints, and evicts
+        //    `delegate_keys_cache`.
+        state.delegate_verify_cache.entries.write().await.clear();
+        state.delegate_reject_cache.write().await.clear();
+        state.delegate_keys_cache.write().await.insert(
+            account_id.clone(),
+            storage::sui::TimedDelegateKeys {
+                value: Vec::new(),
+                fetched_at: std::time::Instant::now(),
+            },
+        );
+
+        for path in ["namespaces", "memories", "agents"] {
+            let uri = format!("/v1/owners/{owner}/{path}");
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "cold-cache read on deactivated account must return 401 on {uri}"
+            );
+        }
+        assert!(
+            !state
+                .delegate_keys_cache
+                .read()
+                .await
+                .contains_key(&account_id),
+            "deactivated account rejection must evict delegate_keys_cache"
+        );
+
+        // 4. Transient Sui RPC failure on a cold cache fails closed with 503
+        //    Service Unavailable (`x-auth-error: AUTH_UPSTREAM_UNAVAILABLE` on
+        //    read routes).
+        state.delegate_verify_cache.entries.write().await.clear();
+        state.delegate_reject_cache.write().await.clear();
+        rpc_mode.store(MOCK_UNAVAILABLE, Ordering::SeqCst);
+
+        let unavailable_mint = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/owner-tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        routes::owner_token::SERVICE_CREDENTIAL_HEADER,
+                        "owner-token-test-credential",
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "owner": owner }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable_mint.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for path in ["namespaces", "memories", "agents"] {
+            let uri = format!("/v1/owners/{owner}/{path}");
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient RPC unavailability must return 503 on {uri}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-auth-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("AUTH_UPSTREAM_UNAVAILABLE")
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM accounts WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
 }
 
 fn parse_env_u64(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
