@@ -133,6 +133,14 @@ struct NamespacesCursor {
     namespace: String,
     #[serde(default)]
     snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pg_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_pg_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walk_floor_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walk_floor_namespace: Option<String>,
 }
 
 /// `snapshot_at: None` resets the walk boundary — pass `None` when encoding
@@ -145,15 +153,32 @@ struct NamespacesCursor {
 /// `Some(snapshot_at)` here would silently freeze incremental sync after the
 /// first full walk (a row updated after that walk's snapshot would then
 /// never pass `updated_at <= snapshot_at` on any later poll).
+#[cfg(test)]
 fn encode_namespaces_cursor(
     updated_at: chrono::DateTime<chrono::Utc>,
     namespace: &str,
     snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> String {
+    encode_namespaces_cursor_ex(updated_at, namespace, snapshot_at, None, None, None, None)
+}
+
+fn encode_namespaces_cursor_ex(
+    updated_at: chrono::DateTime<chrono::Utc>,
+    namespace: &str,
+    snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
+    pg_snapshot: Option<String>,
+    prior_pg_snapshot: Option<String>,
+    walk_floor_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    walk_floor_namespace: Option<String>,
+) -> String {
     let json = serde_json::to_vec(&NamespacesCursor {
         updated_at,
         namespace: namespace.to_string(),
         snapshot_at,
+        pg_snapshot,
+        prior_pg_snapshot,
+        walk_floor_updated_at,
+        walk_floor_namespace,
     })
     .expect("cursor serializes");
     // Same URL_SAFE_NO_PAD rationale as `encode_cursor` below — this value is
@@ -165,7 +190,19 @@ fn decode_namespaces_cursor(raw: &str) -> Result<NamespacesCursor, AppError> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| AppError::BadRequest("invalid cursor".to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|_| AppError::BadRequest("invalid cursor".to_string()))
+    let parsed: NamespacesCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid cursor".to_string()))?;
+    if let Some(ref snap) = parsed.pg_snapshot {
+        if !is_valid_pg_snapshot(snap) {
+            return Err(AppError::BadRequest("invalid cursor".to_string()));
+        }
+    }
+    if let Some(ref snap) = parsed.prior_pg_snapshot {
+        if !is_valid_pg_snapshot(snap) {
+            return Err(AppError::BadRequest("invalid cursor".to_string()));
+        }
+    }
+    Ok(parsed)
 }
 
 /// `updated_after`/`cursor` here is the opaque `next_cursor` a previous call
@@ -186,6 +223,59 @@ fn decode_namespaces_cursor(raw: &str) -> Result<NamespacesCursor, AppError> {
 /// aggregation, so `memory_count`/`storage_used` would then cover only each
 /// namespace's recently-touched subset — wrong totals, not merely a
 /// different plan.
+/// Advisory lock namespace (`classid`) used by write transactions on
+/// `vector_entries` and `memory_tombstones` (`pg_advisory_xact_lock_shared(20261029, hashtext(owner))`).
+/// Because every writer acquires a shared lock, writers for the same owner
+/// never block each other, while `visibility_horizon_and_snapshot` can inspect
+/// `pg_locks` to find the oldest in-flight writer transaction for that specific
+/// owner without cross-tenant or cross-test interference.
+pub(crate) const SYNC_WATERMARK_ADVISORY_CLASSID: i32 = 20261029;
+
+/// Compute the safe keyset visibility horizon and current MVCC snapshot
+/// from PostgreSQL for `owner`.
+///
+/// In PostgreSQL, `NOW()` is the transaction start timestamp (`xact_start`),
+/// not the commit timestamp. When two writers for `owner` overlap and the
+/// earlier-started transaction commits second, an uncapped `snapshot_at` can
+/// advance a polling client's cursor past the in-flight writer's timestamp
+/// before that writer commits, permanently skipping the row on later
+/// `(updated_at, id) > cursor` polls. Capping `snapshot_at` at
+/// `MIN(xact_start) - 1us` across active transactions holding the owner's
+/// shared sync advisory lock defers rows at or above that horizon until the
+/// older writer finishes.
+async fn visibility_horizon_and_snapshot(
+    pool: &PgPool,
+    owner: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, String), AppError> {
+    sqlx::query_as(
+        "SELECT LEAST(
+             clock_timestamp(),
+             COALESCE(
+                 (
+                     SELECT MIN(a.xact_start) - INTERVAL '1 microsecond'
+                     FROM pg_locks l
+                     JOIN pg_stat_activity a ON a.pid = l.pid
+                     WHERE l.locktype = 'advisory'
+                       AND l.classid = $1::oid
+                       AND l.objid = (hashtext($2)::int4)::oid
+                       AND l.objsubid = 2
+                       AND l.granted
+                       AND l.pid <> pg_backend_pid()
+                       AND a.datname = current_database()
+                       AND a.xact_start IS NOT NULL
+                 ),
+                 clock_timestamp()
+             )
+         ),
+         pg_current_snapshot()::text",
+    )
+    .bind(SYNC_WATERMARK_ADVISORY_CLASSID)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to resolve sync visibility horizon: {}", e)))
+}
+
 pub(crate) async fn query_owner_namespaces(
     pool: &PgPool,
     owner: &str,
@@ -202,13 +292,34 @@ pub(crate) async fn query_owner_namespaces(
     // `MemoriesCursor::snapshot_at` below): bind this whole walk to one
     // boundary, captured now on the first page and threaded forward
     // unchanged from the incoming cursor on every later page.
-    let (after, snapshot_at) = match cursor_after {
-        Some(c) => {
-            let snapshot_at = c.snapshot_at.unwrap_or_else(chrono::Utc::now);
-            (Some((c.updated_at, c.namespace)), snapshot_at)
-        }
-        None => (None, chrono::Utc::now()),
-    };
+    let (page_after, walk_floor, snapshot_at, current_pg_snapshot, prior_pg_snapshot) =
+        match cursor_after {
+            Some(c) => match c.snapshot_at {
+                Some(ts) => {
+                    let current = match c.pg_snapshot {
+                        Some(snap) => snap,
+                        None => visibility_horizon_and_snapshot(pool, owner).await?.1,
+                    };
+                    let floor = c.walk_floor_updated_at.zip(c.walk_floor_namespace);
+                    (
+                        Some((c.updated_at, c.namespace)),
+                        floor,
+                        ts,
+                        current,
+                        c.prior_pg_snapshot,
+                    )
+                }
+                None => {
+                    let (ts, current) = visibility_horizon_and_snapshot(pool, owner).await?;
+                    let floor = (c.updated_at, c.namespace);
+                    (None, Some(floor), ts, current, c.pg_snapshot)
+                }
+            },
+            None => {
+                let (ts, current) = visibility_horizon_and_snapshot(pool, owner).await?;
+                (None, None, ts, current, None)
+            }
+        };
 
     // Peek one row past `limit` to get an explicit has_more signal — a page
     // shorter than `limit` is NOT a reliable "no more data" signal on its
@@ -222,58 +333,113 @@ pub(crate) async fn query_owner_namespaces(
         SELECT COALESCE(l.namespace, w.namespace) AS namespace,
                COALESCE(l.memory_count, 0) AS memory_count,
                COALESCE(l.storage_used, 0) AS storage_used,
-               GREATEST(l.last_updated_at, w.last_mutated_at) AS last_updated_at
+               GREATEST(l.last_updated_at, w.last_mutated_at) AS last_updated_at,
+               (COALESCE(l.has_late_commit, FALSE) OR COALESCE(w.has_late_commit, FALSE)) AS has_late_commit
         FROM (
             SELECT namespace,
                    COUNT(*)::BIGINT AS memory_count,
                    COALESCE(SUM(blob_size_bytes), 0)::BIGINT AS storage_used,
-                   MAX(updated_at) AS last_updated_at
+                   MAX(updated_at) AS last_updated_at,
+                   BOOL_OR($2::text IS NOT NULL AND NOT pg_visible_in_snapshot(xmin::text::xid8, $2::pg_snapshot)) AS has_late_commit
             FROM vector_entries
             WHERE owner = $1
             GROUP BY namespace
         ) l
         FULL OUTER JOIN (
-            SELECT namespace, MAX(deleted_at) AS last_mutated_at
+            SELECT namespace,
+                   MAX(deleted_at) AS last_mutated_at,
+                   BOOL_OR($2::text IS NOT NULL AND NOT pg_visible_in_snapshot(xmin::text::xid8, $2::pg_snapshot)) AS has_late_commit
             FROM memory_tombstones
             WHERE owner = $1
             GROUP BY namespace
         ) w ON l.namespace = w.namespace
     ";
 
-    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> = if let Some((
-        cursor_updated_at,
-        cursor_namespace,
-    )) = after.clone()
-    {
-        let sql = format!(
-            "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
-                 WHERE (last_updated_at, namespace) > ($2, $3) AND last_updated_at <= $4
-                 ORDER BY last_updated_at, namespace
-                 LIMIT $5",
-        );
-        sqlx::query_as(&sql)
-            .bind(owner)
-            .bind(cursor_updated_at)
-            .bind(cursor_namespace)
-            .bind(snapshot_at)
-            .bind(limit + 1)
-            .fetch_all(pool)
-            .await
-    } else {
-        let sql = format!(
-            "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
-                 WHERE last_updated_at <= $2
-                 ORDER BY last_updated_at, namespace
-                 LIMIT $3",
-        );
-        sqlx::query_as(&sql)
-            .bind(owner)
-            .bind(snapshot_at)
-            .bind(limit + 1)
-            .fetch_all(pool)
-            .await
-    }
-    .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
+    let mut rows: Vec<(String, i64, i64, chrono::DateTime<chrono::Utc>)> =
+        match (walk_floor.clone(), page_after.clone()) {
+            (
+                Some((floor_updated_at, floor_namespace)),
+                Some((after_updated_at, after_namespace)),
+            ) => {
+                let sql = format!(
+                    "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+                     WHERE (
+                         (last_updated_at, namespace) > ($3, $4)
+                         OR (has_late_commit AND (last_updated_at, namespace) <= ($3, $4))
+                     )
+                       AND (last_updated_at, namespace) > ($5, $6)
+                       AND last_updated_at <= $7
+                     ORDER BY last_updated_at, namespace
+                     LIMIT $8",
+                );
+                sqlx::query_as(&sql)
+                    .bind(owner)
+                    .bind(prior_pg_snapshot.as_deref())
+                    .bind(floor_updated_at)
+                    .bind(floor_namespace)
+                    .bind(after_updated_at)
+                    .bind(after_namespace)
+                    .bind(snapshot_at)
+                    .bind(limit + 1)
+                    .fetch_all(pool)
+                    .await
+            }
+            (Some((floor_updated_at, floor_namespace)), None) => {
+                let sql = format!(
+                    "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+                     WHERE (
+                         (last_updated_at, namespace) > ($3, $4)
+                         OR (has_late_commit AND (last_updated_at, namespace) <= ($3, $4))
+                     )
+                       AND last_updated_at <= $5
+                     ORDER BY last_updated_at, namespace
+                     LIMIT $6",
+                );
+                sqlx::query_as(&sql)
+                    .bind(owner)
+                    .bind(prior_pg_snapshot.as_deref())
+                    .bind(floor_updated_at)
+                    .bind(floor_namespace)
+                    .bind(snapshot_at)
+                    .bind(limit + 1)
+                    .fetch_all(pool)
+                    .await
+            }
+            (None, Some((after_updated_at, after_namespace))) => {
+                let sql = format!(
+                    "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+                     WHERE (last_updated_at, namespace) > ($3, $4)
+                       AND last_updated_at <= $5
+                     ORDER BY last_updated_at, namespace
+                     LIMIT $6",
+                );
+                sqlx::query_as(&sql)
+                    .bind(owner)
+                    .bind(None::<&str>)
+                    .bind(after_updated_at)
+                    .bind(after_namespace)
+                    .bind(snapshot_at)
+                    .bind(limit + 1)
+                    .fetch_all(pool)
+                    .await
+            }
+            (None, None) => {
+                let sql = format!(
+                    "SELECT namespace, memory_count, storage_used, last_updated_at FROM ({NS_SQL_TAIL}) s
+                     WHERE last_updated_at <= $3
+                     ORDER BY last_updated_at, namespace
+                     LIMIT $4",
+                );
+                sqlx::query_as(&sql)
+                    .bind(owner)
+                    .bind(None::<&str>)
+                    .bind(snapshot_at)
+                    .bind(limit + 1)
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+        .map_err(|e| AppError::Internal(format!("Failed to query namespaces: {}", e)))?;
 
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
@@ -290,33 +456,64 @@ pub(crate) async fn query_owner_namespaces(
     // reusing this walk's, which would otherwise never advance again (see
     // `encode_namespaces_cursor`'s doc comment).
     //
-    // An EMPTY page needs the same reset, not just a populated terminal
-    // one. A continuation page (the previous page had
-    // `has_more: true`) can come back with zero rows if every remaining row
-    // raced past `snapshot_at` between pages — `rows.last()` is `None`
-    // either way, so without this branch `next_cursor` collapsed to plain
-    // `None` too. Per this API's own contract, an empty page's `None`
-    // cursor means "keep whatever cursor you already have" — but the
-    // client's already-held cursor is the *previous* page's continuation
-    // cursor, which still carries this walk's now-stale `snapshot_at`.
-    // That would freeze incremental sync exactly the way the terminal-page
-    // case did, just triggered one page later. Fix: an empty page still
-    // re-encodes the incoming cursor's own watermark position (no row was
-    // consumed, so the position hasn't moved) but always with `snapshot_at`
-    // reset — `has_more` is always `false` here (zero rows can never
-    // exceed `limit`), so the reset is unconditional. `after` is `None`
-    // only when this is the very first page of a walk that found nothing
-    // at all, where there is no prior cursor to reset and `None` is still
-    // correct.
+    // When a late-committed namespace with `last_updated_at <= walk_floor`
+    // is recovered via `has_late_commit`, the terminal cursor's watermark
+    // must still be at least `walk_floor` so the cursor never moves
+    // backwards past already-emitted namespaces.
     let next_cursor = match rows.last() {
-        Some((name, _, _, last_updated_at)) => Some(encode_namespaces_cursor(
-            *last_updated_at,
-            name,
-            has_more.then_some(snapshot_at),
-        )),
-        None => after.map(|(cursor_updated_at, cursor_namespace)| {
-            encode_namespaces_cursor(cursor_updated_at, &cursor_namespace, None)
-        }),
+        Some((name, _, _, last_updated_at)) => {
+            if has_more {
+                let (floor_ts, floor_ns) = match walk_floor {
+                    Some((ts, ns)) => (Some(ts), Some(ns)),
+                    None => (None, None),
+                };
+                Some(encode_namespaces_cursor_ex(
+                    *last_updated_at,
+                    name,
+                    Some(snapshot_at),
+                    Some(current_pg_snapshot),
+                    prior_pg_snapshot,
+                    floor_ts,
+                    floor_ns,
+                ))
+            } else {
+                let (term_updated_at, term_name) = match &walk_floor {
+                    Some((floor_ts, floor_ns)) => std::cmp::max(
+                        (*last_updated_at, name.as_str()),
+                        (*floor_ts, floor_ns.as_str()),
+                    ),
+                    None => (*last_updated_at, name.as_str()),
+                };
+                Some(encode_namespaces_cursor_ex(
+                    term_updated_at,
+                    term_name,
+                    None,
+                    Some(current_pg_snapshot),
+                    None,
+                    None,
+                    None,
+                ))
+            }
+        }
+        None => {
+            let fallback = match (walk_floor, page_after) {
+                (Some(f), Some(a)) => Some(std::cmp::max(f, a)),
+                (Some(f), None) => Some(f),
+                (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            fallback.map(|(cursor_updated_at, cursor_namespace)| {
+                encode_namespaces_cursor_ex(
+                    cursor_updated_at,
+                    &cursor_namespace,
+                    None,
+                    Some(current_pg_snapshot),
+                    None,
+                    None,
+                    None,
+                )
+            })
+        }
     };
 
     let namespaces = rows
@@ -392,6 +589,11 @@ struct MemoriesCursor {
     /// When this cursor was minted. v1 cursors lack it and must_resync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     minted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// MVCC snapshot (`pg_current_snapshot()::text`) when this cursor's
+    /// watermark was captured. Used to detect rows that committed after the
+    /// cursor was minted with a timestamp at or below the cursor (`must_resync`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pg_snapshot: Option<String>,
 }
 
 /// `snapshot_at: None` resets the walk boundary — see
@@ -400,12 +602,13 @@ struct MemoriesCursor {
 /// the terminal cursor of a walk, so the client's next incremental poll
 /// gets a fresh snapshot rather than being permanently frozen at the first
 /// walk's boundary.
+#[cfg(test)]
 fn encode_cursor(
     updated_at: chrono::DateTime<chrono::Utc>,
     id: &str,
     snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> String {
-    encode_cursor_ex(updated_at, id, snapshot_at, None, None)
+    encode_cursor_ex(updated_at, id, snapshot_at, None, None, None)
 }
 
 fn encode_cursor_ex(
@@ -414,6 +617,7 @@ fn encode_cursor_ex(
     snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     deleted_id: Option<String>,
+    pg_snapshot: Option<String>,
 ) -> String {
     let json = serde_json::to_vec(&MemoriesCursor {
         updated_at,
@@ -422,6 +626,7 @@ fn encode_cursor_ex(
         deleted_at,
         deleted_id,
         minted_at: Some(chrono::Utc::now()),
+        pg_snapshot,
     })
     .expect("cursor serializes");
     // URL_SAFE_NO_PAD (not STANDARD): next_cursor is used verbatim in a URL
@@ -430,11 +635,77 @@ fn encode_cursor_ex(
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
 
+fn is_valid_pg_snapshot(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.contains(':')
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ':' || c == ',')
+}
+
 fn decode_cursor(raw: &str) -> Result<MemoriesCursor, AppError> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| AppError::BadRequest("invalid cursor".to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|_| AppError::BadRequest("invalid cursor".to_string()))
+    let parsed: MemoriesCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid cursor".to_string()))?;
+    if let Some(ref snap) = parsed.pg_snapshot {
+        if !is_valid_pg_snapshot(snap) {
+            return Err(AppError::BadRequest("invalid cursor".to_string()));
+        }
+    }
+    Ok(parsed)
+}
+
+/// Detect whether any row or tombstone for `owner` committed after `pg_snapshot`
+/// with a keyset position at or behind the client's watermark. When a transaction
+/// opens before the client's poll without locking `vector_entries` or
+/// `memory_tombstones` and later writes an explicit backdated timestamp at or
+/// below the cursor, keyset polling would otherwise skip that row.
+async fn has_unavoidable_cursor_gap(
+    pool: &PgPool,
+    owner: &str,
+    live_cursor: &(chrono::DateTime<chrono::Utc>, String),
+    deleted_cursor: Option<&(chrono::DateTime<chrono::Utc>, String)>,
+    retention_cut: chrono::DateTime<chrono::Utc>,
+    pg_snapshot: &str,
+) -> Result<bool, AppError> {
+    let (d_at, d_id): (Option<chrono::DateTime<chrono::Utc>>, Option<&str>) = match deleted_cursor {
+        Some((t, id)) => (Some(*t), Some(id.as_str())),
+        None => (None, None),
+    };
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM vector_entries
+             WHERE owner = $1
+               AND (updated_at, id) <= ($2, $3)
+               AND (expiry_synced_at IS NULL OR expiry_synced_at <= updated_at)
+               AND (metadata_synced_at IS NULL OR metadata_synced_at <= updated_at)
+               AND NOT pg_visible_in_snapshot(xmin::text::xid8, $4::pg_snapshot)
+         ) OR (
+             $5::timestamptz IS NOT NULL
+             AND $6::text IS NOT NULL
+             AND EXISTS (
+                 SELECT 1
+                 FROM memory_tombstones
+                 WHERE owner = $1
+                   AND deleted_at >= $7
+                   AND (deleted_at, memory_id) <= ($5, $6)
+                   AND NOT pg_visible_in_snapshot(xmin::text::xid8, $4::pg_snapshot)
+             )
+         )",
+    )
+    .bind(owner)
+    .bind(live_cursor.0)
+    .bind(&live_cursor.1)
+    .bind(pg_snapshot)
+    .bind(d_at)
+    .bind(d_id)
+    .bind(retention_cut)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to check cursor visibility gap: {}", e)))
 }
 
 const DEFAULT_MEMORIES_LIMIT: i64 = 100;
@@ -481,16 +752,42 @@ pub(crate) async fn query_owner_memories(
         }
     }
 
-    let (after, snapshot_at, deleted_after) = match decoded {
+    let (horizon_at, current_pg_snapshot) = visibility_horizon_and_snapshot(pool, owner).await?;
+
+    let (after, snapshot_at, deleted_after, prior_pg_snapshot) = match decoded {
         Some(c) => {
-            let snapshot_at = c.snapshot_at.unwrap_or(now);
             let deleted_after = match (c.deleted_at, c.deleted_id) {
                 (Some(t), Some(id)) => Some((t, id)),
                 _ => None,
             };
-            (Some((c.updated_at, c.id)), snapshot_at, deleted_after)
+            let live_after = (c.updated_at, c.id);
+            if c.snapshot_at.is_none() {
+                if let Some(ref pg_snap) = c.pg_snapshot {
+                    if has_unavoidable_cursor_gap(
+                        pool,
+                        owner,
+                        &live_after,
+                        deleted_after.as_ref(),
+                        retention_cut,
+                        pg_snap,
+                    )
+                    .await?
+                    {
+                        return Ok(MemoriesResponse {
+                            memories: Vec::new(),
+                            next_cursor: None,
+                            has_more: false,
+                            snapshot_version: SNAPSHOT_VERSION,
+                            deleted: Vec::new(),
+                            must_resync: true,
+                        });
+                    }
+                }
+            }
+            let snapshot_at = c.snapshot_at.unwrap_or(horizon_at);
+            (Some(live_after), snapshot_at, deleted_after, c.pg_snapshot)
         }
-        None => (None, now, None),
+        None => (None, horizon_at, None, None),
     };
 
     let mut rows: Vec<(
@@ -594,6 +891,12 @@ pub(crate) async fn query_owner_memories(
         .map(|(id, _, t)| (*t, id.clone()))
         .or(deleted_after.clone());
 
+    let next_pg_snapshot = if rows.is_empty() && deleted_rows.is_empty() {
+        prior_pg_snapshot.or(Some(current_pg_snapshot))
+    } else {
+        Some(current_pg_snapshot)
+    };
+
     // Never pin a missing live watermark to snapshot_at: a tombstone-only
     // first page would skip in-flight inserts with updated_at < snapshot_at.
     let live_mark = rows.last().map(|r| (r.4, r.0.clone())).or(after.clone());
@@ -604,6 +907,7 @@ pub(crate) async fn query_owner_memories(
             has_more.then_some(snapshot_at),
             next_deleted.as_ref().map(|(t, _)| *t),
             next_deleted.as_ref().map(|(_, id)| id.clone()),
+            next_pg_snapshot,
         )),
         None if deleted_has_more => Some(encode_cursor_ex(
             chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
@@ -611,6 +915,7 @@ pub(crate) async fn query_owner_memories(
             Some(snapshot_at),
             next_deleted.as_ref().map(|(t, _)| *t),
             next_deleted.as_ref().map(|(_, id)| id.clone()),
+            next_pg_snapshot,
         )),
         None => None,
     };
@@ -803,31 +1108,41 @@ mod tests {
             .unwrap_or_else(|_| "postgresql://memwal:memwal_secret@localhost:5432/memwal".into())
     }
 
+    static MEMORY_READ_SCHEMA_READY: std::sync::OnceLock<tokio::sync::Mutex<bool>> =
+        std::sync::OnceLock::new();
+
     async fn test_pool() -> PgPool {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&test_database_url())
             .await
             .unwrap();
-        let _guard = DB_SETUP_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
+        let mut initialized = MEMORY_READ_SCHEMA_READY
+            .get_or_init(|| tokio::sync::Mutex::new(false))
             .lock()
             .await;
-        for migration in [
-            include_str!("../../migrations/001_init.sql"),
-            include_str!("../../migrations/002_add_namespace.sql"),
-            include_str!("../../migrations/003_rate_limiter.sql"),
-            include_str!("../../migrations/008_benchmark_plaintext.sql"),
-            include_str!("../../migrations/009_importance_signal.sql"),
-            include_str!("../../migrations/014_memory_read_api_columns.sql"),
-            include_str!("../../migrations/015_memory_read_api_updated_at_not_null.sql"),
-            include_str!("../../migrations/016_memory_read_api_index.sql"),
-            include_str!("../../migrations/017_memory_expiry_columns.sql"),
-            include_str!("../../migrations/018_memory_expiry_synced_at_index.sql"),
-            include_str!("../../migrations/019_memory_read_api_updated_at_set_not_null.sql"),
-            include_str!("../../migrations/020_read_api_followups.sql"),
-        ] {
-            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        if !*initialized {
+            let _guard = DB_SETUP_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
+            for migration in [
+                include_str!("../../migrations/001_init.sql"),
+                include_str!("../../migrations/002_add_namespace.sql"),
+                include_str!("../../migrations/003_rate_limiter.sql"),
+                include_str!("../../migrations/008_benchmark_plaintext.sql"),
+                include_str!("../../migrations/009_importance_signal.sql"),
+                include_str!("../../migrations/014_memory_read_api_columns.sql"),
+                include_str!("../../migrations/015_memory_read_api_updated_at_not_null.sql"),
+                include_str!("../../migrations/016_memory_read_api_index.sql"),
+                include_str!("../../migrations/017_memory_expiry_columns.sql"),
+                include_str!("../../migrations/018_memory_expiry_synced_at_index.sql"),
+                include_str!("../../migrations/019_memory_read_api_updated_at_set_not_null.sql"),
+                include_str!("../../migrations/020_read_api_followups.sql"),
+            ] {
+                sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+            }
+            *initialized = true;
         }
         pool
     }
@@ -862,6 +1177,7 @@ mod tests {
                 deleted_at: None,
                 deleted_id: None,
                 minted_at: None,
+                pg_snapshot: None,
             })
             .expect("cursor serializes");
             let standard_encoded = base64::engine::general_purpose::STANDARD.encode(&json);
@@ -912,6 +1228,7 @@ mod tests {
             deleted_at: Some(now - chrono::Duration::days(45)),
             deleted_id: Some("long-gone".to_string()),
             minted_at: Some(now),
+            pg_snapshot: None,
         })
         .expect("cursor serializes");
         let cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json);
@@ -943,6 +1260,7 @@ mod tests {
             deleted_at: None,
             deleted_id: None,
             minted_at: Some(chrono::Utc::now() - chrono::Duration::days(45)),
+            pg_snapshot: None,
         })
         .expect("cursor serializes");
         let cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json);
@@ -2252,5 +2570,513 @@ mod tests {
         let decoded = decode_cursor(&encoded).expect("decodes without snapshot_at");
         assert_eq!(decoded.id, "legacy-id");
         assert_eq!(decoded.snapshot_at, None);
+    }
+
+    /// Regression test for GitHub issue #1018: when two writes overlap and the
+    /// earlier-started transaction (`w1`) commits after the later-started
+    /// transaction (`w2`), incremental polling on `/memories` and `/namespaces`
+    /// between the two commits must defer `w2` via the visibility horizon and
+    /// return both `m1-slow` (`alpha`) and `m2-fast` (`beta`) once `w1` commits,
+    /// rather than advancing the cursor past `w1` and permanently skipping it.
+    #[tokio::test]
+    async fn incremental_sync_does_not_skip_out_of_order_commits_on_memories_and_namespaces() {
+        let _test_pool_init = test_pool().await;
+        let _ddl_guard = DB_SETUP_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&test_database_url())
+            .await
+            .unwrap();
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        let insert_sql = "WITH _sync_lock AS (SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2)))
+                          INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes)
+                          SELECT $1, $2, $3, $4, $5, 10 FROM _sync_lock
+                          ON CONFLICT (id) DO UPDATE SET
+                             namespace = EXCLUDED.namespace,
+                             updated_at = NOW()";
+
+        // 1. Seed initial memory m0 in namespace "default" and perform initial full sync.
+        let m0_id = format!("{}-m0", owner);
+        sqlx::query(insert_sql)
+            .bind(&m0_id)
+            .bind(&owner)
+            .bind("default")
+            .bind("blob-m0")
+            .bind(&emb)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mem_init = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            mem_init
+                .memories
+                .iter()
+                .map(|m| m.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![m0_id.as_str()]
+        );
+        let mut mem_cursor = mem_init.next_cursor.expect("initial memory watermark");
+
+        let ns_init = query_owner_namespaces(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            ns_init
+                .namespaces
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default"]
+        );
+        let mut ns_cursor = ns_init.next_cursor.expect("initial namespace watermark");
+
+        // 2. Worker 1 begins a transaction and inserts m1-slow in namespace "alpha",
+        //    holding the transaction open so NOW() is fixed at t1.
+        let m1_id = format!("{}-m1-slow", owner);
+        let mut tx1 = pool.begin().await.unwrap();
+        sqlx::query(insert_sql)
+            .bind(&m1_id)
+            .bind(&owner)
+            .bind("alpha")
+            .bind("blob-m1")
+            .bind(&emb)
+            .execute(&mut *tx1)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = $1")
+            .bind(&m1_id)
+            .execute(&mut *tx1)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // 3. Worker 2 starts later (t2 > t1) and commits first with m2-fast in namespace "beta".
+        let m2_id = format!("{}-m2-fast", owner);
+        let mut tx2 = pool.begin().await.unwrap();
+        sqlx::query(insert_sql)
+            .bind(&m2_id)
+            .bind(&owner)
+            .bind("beta")
+            .bind("blob-m2")
+            .bind(&emb)
+            .execute(&mut *tx2)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = $1")
+            .bind(&m2_id)
+            .execute(&mut *tx2)
+            .await
+            .unwrap();
+        tx2.commit().await.unwrap();
+
+        // 4. Client polls while Worker 1 is still in flight.
+        let mut seen_memories = Vec::new();
+        let mut seen_namespaces = Vec::new();
+
+        let mem_poll1 = query_owner_memories(&pool, &owner, Some(mem_cursor.clone()), 100)
+            .await
+            .unwrap();
+        seen_memories.extend(mem_poll1.memories.iter().map(|m| m.memory_id.clone()));
+        if let Some(c) = mem_poll1.next_cursor {
+            mem_cursor = c;
+        }
+
+        let ns_poll1 = query_owner_namespaces(&pool, &owner, Some(ns_cursor.clone()), 100)
+            .await
+            .unwrap();
+        seen_namespaces.extend(ns_poll1.namespaces.iter().map(|n| n.name.clone()));
+        if let Some(c) = ns_poll1.next_cursor {
+            ns_cursor = c;
+        }
+
+        // 5. Worker 1 commits (with m1.updated_at = t1 < t2).
+        tx1.commit().await.unwrap();
+
+        // 6. Client polls again with its incremental cursor and must receive both m1-slow and m2-fast.
+        let mem_poll2 = query_owner_memories(&pool, &owner, Some(mem_cursor), 100)
+            .await
+            .unwrap();
+        seen_memories.extend(mem_poll2.memories.iter().map(|m| m.memory_id.clone()));
+
+        let ns_poll2 = query_owner_namespaces(&pool, &owner, Some(ns_cursor), 100)
+            .await
+            .unwrap();
+        seen_namespaces.extend(ns_poll2.namespaces.iter().map(|n| n.name.clone()));
+
+        assert_eq!(
+            seen_memories,
+            vec![m1_id, m2_id],
+            "both slow and fast concurrent writes must be returned by incremental memory sync"
+        );
+        assert_eq!(
+            seen_namespaces,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "both slow and fast concurrent namespaces must be returned by incremental namespace sync"
+        );
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for the tombstone half of GitHub issue #1018: when two
+    /// deletes overlap and the earlier-started delete transaction commits
+    /// after the later-started one, incremental polling must not skip the
+    /// earlier-started tombstone.
+    #[tokio::test]
+    async fn incremental_sync_does_not_skip_out_of_order_tombstone_deletes() {
+        let _test_pool_init = test_pool().await;
+        let _ddl_guard = DB_SETUP_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&test_database_url())
+            .await
+            .unwrap();
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        seed_entry(&pool, &owner, "m0", "default", 10, ts(0)).await;
+        seed_entry(&pool, &owner, "m1", "default", 10, ts(1)).await;
+        seed_entry(&pool, &owner, "m2", "default", 10, ts(2)).await;
+
+        let init = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(init.memories.len(), 3);
+        let mut cursor = init.next_cursor.expect("initial watermark");
+
+        let delete_sql =
+            "WITH _sync_lock AS (SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))),
+                               removed AS (
+                              DELETE FROM vector_entries
+                              USING _sync_lock
+                              WHERE id = $1 AND owner = $2
+                              RETURNING id, owner, namespace, blob_id
+                          )
+                          INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+                          SELECT id, owner, namespace, blob_id FROM removed
+                          ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()";
+
+        let m1_id = format!("{}-m1", owner);
+        let m2_id = format!("{}-m2", owner);
+
+        // Worker 1 starts deleting m1 at t1 and holds the transaction open.
+        let mut tx1 = pool.begin().await.unwrap();
+        sqlx::query(delete_sql)
+            .bind(&m1_id)
+            .bind(&owner)
+            .execute(&mut *tx1)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Worker 2 starts deleting m2 at t2 > t1 and commits first.
+        let mut tx2 = pool.begin().await.unwrap();
+        sqlx::query(delete_sql)
+            .bind(&m2_id)
+            .bind(&owner)
+            .execute(&mut *tx2)
+            .await
+            .unwrap();
+        tx2.commit().await.unwrap();
+
+        let mut seen_deleted = Vec::new();
+        let poll1 = query_owner_memories(&pool, &owner, Some(cursor.clone()), 100)
+            .await
+            .unwrap();
+        seen_deleted.extend(poll1.deleted.iter().map(|d| d.memory_id.clone()));
+        if let Some(c) = poll1.next_cursor {
+            cursor = c;
+        }
+
+        // Worker 1 commits its tombstone after poll 1.
+        tx1.commit().await.unwrap();
+
+        let poll2 = query_owner_memories(&pool, &owner, Some(cursor), 100)
+            .await
+            .unwrap();
+        seen_deleted.extend(poll2.deleted.iter().map(|d| d.memory_id.clone()));
+
+        assert_eq!(
+            seen_deleted,
+            vec![m1_id, m2_id],
+            "both slow and fast concurrent tombstones must be returned by incremental sync"
+        );
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for the fallback `must_resync: true` guarantee: if a
+    /// transaction opens before a poll without locking `vector_entries` (so
+    /// the poll advances its cursor to `m2`) and then commits a row with a
+    /// backdated `updated_at <= cursor.updated_at`, the next incremental poll
+    /// detects the post-snapshot commit behind the cursor and signals
+    /// `must_resync: true` instead of silently omitting the row.
+    #[tokio::test]
+    async fn incremental_sync_signals_must_resync_when_backdated_commit_lands_behind_cursor() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        seed_entry(&pool, &owner, "m2", "default", 10, ts(100)).await;
+
+        let poll1 = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(poll1.memories.len(), 1);
+        assert!(!poll1.must_resync);
+        let cursor = poll1.next_cursor.expect("watermark after m2");
+
+        // Now a row commits after `cursor`'s MVCC snapshot with `updated_at`
+        // behind `m2` (ts(50) < ts(100)).
+        seed_entry(&pool, &owner, "m1-late", "default", 10, ts(50)).await;
+
+        let poll2 = query_owner_memories(&pool, &owner, Some(cursor), 100)
+            .await
+            .unwrap();
+        assert!(
+            poll2.must_resync,
+            "a row committed after the cursor's MVCC snapshot with updated_at <= cursor must trigger must_resync"
+        );
+        assert!(poll2.memories.is_empty());
+        assert!(poll2.next_cursor.is_none());
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for long-running / backdated namespace writers:
+    /// even if a writer's `updated_at` is more than 60 seconds behind a faster
+    /// concurrent writer and commits after a namespace poll, `query_owner_namespaces`
+    /// must not skip the late-committing namespace, and must not move its
+    /// terminal cursor backwards past already-emitted namespaces.
+    #[tokio::test]
+    async fn incremental_sync_namespace_watermark_does_not_skip_writer_older_than_60_seconds() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        // Fast writer commits `ns-fast` at `ts(120)`.
+        seed_entry(&pool, &owner, "m-fast", "ns-fast", 10, ts(120)).await;
+
+        let ns_poll1 = query_owner_namespaces(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(ns_poll1.namespaces.len(), 1);
+        assert_eq!(ns_poll1.namespaces[0].name, "ns-fast");
+        let ns_cursor1 = ns_poll1.next_cursor.expect("watermark after ns-fast");
+
+        // Now a slow writer that started >60s earlier (`ts(10)`) commits `ns-slow`
+        // after `ns_poll1`'s MVCC snapshot.
+        seed_entry(&pool, &owner, "m-slow", "ns-slow", 10, ts(10)).await;
+
+        let ns_poll2 = query_owner_namespaces(&pool, &owner, Some(ns_cursor1), 100)
+            .await
+            .unwrap();
+        let names2: Vec<String> = ns_poll2.namespaces.iter().map(|n| n.name.clone()).collect();
+        assert_eq!(
+            names2,
+            vec!["ns-slow".to_string()],
+            "late-committing namespace older than 60s must be emitted on the next poll"
+        );
+        let ns_cursor2 = ns_poll2.next_cursor.expect("watermark after ns-slow");
+
+        // Polling again with `ns_cursor2` must not re-emit `ns-fast` or `ns-slow`.
+        let ns_poll3 = query_owner_namespaces(&pool, &owner, Some(ns_cursor2), 100)
+            .await
+            .unwrap();
+        assert!(
+            ns_poll3.namespaces.is_empty(),
+            "terminal cursor must not move backwards and re-emit already-synced namespaces"
+        );
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for security-delete batch finalization overlapping a
+    /// fast writer and an incremental poll: `finalize_batch_deleted_in_tx`
+    /// acquires the per-owner shared advisory lock so concurrent namespace and
+    /// memory polls hold back their `snapshot_at` horizon until the batch
+    /// deletion commits.
+    #[tokio::test]
+    async fn incremental_sync_namespace_watermark_does_not_skip_overlapping_security_delete() {
+        let _ = test_pool().await;
+        let _ddl_guard = DB_SETUP_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&test_database_url())
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP TRIGGER IF EXISTS trg_track_deletable ON vector_entries;
+             CREATE TABLE IF NOT EXISTS deletion_batches (
+                 id UUID PRIMARY KEY,
+                 owner TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 digest TEXT,
+                 tx_bytes BYTEA,
+                 input_blob_ids BYTEA,
+                 blob_count INT NOT NULL DEFAULT 0,
+                 nonce BIGINT NOT NULL DEFAULT 0,
+                 expire_epoch BIGINT NOT NULL DEFAULT 0,
+                 claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 signatures BYTEA,
+                 executing_at TIMESTAMPTZ,
+                 last_submit_at TIMESTAMPTZ,
+                 submit_attempts INT NOT NULL DEFAULT 0,
+                 resolved_at TIMESTAMPTZ
+             );
+             CREATE SEQUENCE IF NOT EXISTS delete_blobs_tracking_resolver_seq AS BIGINT;
+             CREATE TABLE IF NOT EXISTS delete_blobs_tracking (
+                 owner TEXT NOT NULL,
+                 blob_id TEXT NOT NULL,
+                 object_id TEXT,
+                 state TEXT NOT NULL DEFAULT 'deletable',
+                 batch_id UUID REFERENCES deletion_batches(id),
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 tracked_seq BIGINT NOT NULL DEFAULT nextval('delete_blobs_tracking_resolver_seq'),
+                 tracked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 PRIMARY KEY (owner, blob_id)
+             );
+             CREATE TABLE IF NOT EXISTS deletion_batch_members (
+                 batch_id UUID NOT NULL REFERENCES deletion_batches(id),
+                 owner TEXT NOT NULL,
+                 blob_id TEXT NOT NULL,
+                 object_id TEXT,
+                 outcome TEXT NOT NULL DEFAULT 'claimed',
+                 claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 resolved_at TIMESTAMPTZ,
+                 PRIMARY KEY (batch_id, owner, blob_id)
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+        let batch_id = uuid::Uuid::new_v4();
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        // Seed a memory in `ns-sec` at `ts(1)` that will be deleted by a security batch.
+        seed_entry(&pool, &owner, "m-sec", "ns-sec", 10, ts(1)).await;
+
+        let initial_ns = query_owner_namespaces(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(initial_ns.namespaces.len(), 1);
+        let ns_cursor0 = initial_ns.next_cursor.expect("initial ns cursor");
+
+        let initial_mem = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(initial_mem.memories.len(), 1);
+        let mem_cursor0 = initial_mem.next_cursor.expect("initial mem cursor");
+
+        // Create the deletion batch and tracking row for `m-sec` (`blob-m-sec`).
+        sqlx::query(
+            "INSERT INTO deletion_batches (id, owner, state)
+             VALUES ($1, $2, 'executing')",
+        )
+        .bind(batch_id)
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO delete_blobs_tracking (owner, blob_id, state, batch_id, created_at)
+             VALUES ($1, 'blob-m-sec', 'deleting', $2, NOW())",
+        )
+        .bind(&owner)
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Start transaction 1: security-delete finalization runs first (stamping
+        // `clock_timestamp()` at T1 and taking the per-owner shared advisory lock),
+        // but stays uncommitted while a fast writer and a poll execute.
+        let mut tx_sec = pool.begin().await.unwrap();
+        let finalized = crate::storage::security_delete_store::finalize_batch_deleted_in_tx(
+            &mut tx_sec,
+            batch_id,
+            crate::storage::security_delete_store::BATCH_EXECUTING,
+        )
+        .await
+        .unwrap();
+        assert_eq!(finalized, Some(1));
+
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        // Fast writer commits `m-fast` in `ns-fast` at T2 > T1.
+        let m_fast_id = format!("{}-m-fast", owner);
+        let insert_sql = "WITH _sync_lock AS (SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2)))
+                          INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes)
+                          SELECT $1, $2, $3, $4, $5, 10 FROM _sync_lock";
+        let mut tx_fast = pool.begin().await.unwrap();
+        sqlx::query(insert_sql)
+            .bind(&m_fast_id)
+            .bind(&owner)
+            .bind("ns-fast")
+            .bind("blob-m-fast")
+            .bind(&emb)
+            .execute(&mut *tx_fast)
+            .await
+            .unwrap();
+        tx_fast.commit().await.unwrap();
+
+        // Poll 1 runs while `tx_sec` is still uncommitted.
+        let mut seen_ns = Vec::new();
+        let mut seen_deleted = Vec::new();
+        let mut seen_memories = Vec::new();
+
+        let ns_poll1 = query_owner_namespaces(&pool, &owner, Some(ns_cursor0), 100)
+            .await
+            .unwrap();
+        seen_ns.extend(ns_poll1.namespaces.iter().map(|n| n.name.clone()));
+        let ns_cursor1 = ns_poll1.next_cursor.expect("ns cursor after poll1");
+
+        let mem_poll1 = query_owner_memories(&pool, &owner, Some(mem_cursor0), 100)
+            .await
+            .unwrap();
+        seen_memories.extend(mem_poll1.memories.iter().map(|m| m.memory_id.clone()));
+        seen_deleted.extend(mem_poll1.deleted.iter().map(|d| d.memory_id.clone()));
+        let mem_cursor1 = mem_poll1.next_cursor.expect("mem cursor after poll1");
+
+        // Now `tx_sec` commits.
+        tx_sec.commit().await.unwrap();
+
+        // Poll 2 must pick up both `ns-sec` (tombstone namespace update) and `ns-fast`,
+        // as well as the `m-sec` tombstone and `m-fast` memory.
+        let ns_poll2 = query_owner_namespaces(&pool, &owner, Some(ns_cursor1), 100)
+            .await
+            .unwrap();
+        seen_ns.extend(ns_poll2.namespaces.iter().map(|n| n.name.clone()));
+
+        let mem_poll2 = query_owner_memories(&pool, &owner, Some(mem_cursor1), 100)
+            .await
+            .unwrap();
+        seen_memories.extend(mem_poll2.memories.iter().map(|m| m.memory_id.clone()));
+        seen_deleted.extend(mem_poll2.deleted.iter().map(|d| d.memory_id.clone()));
+
+        assert_eq!(
+            seen_ns,
+            vec!["ns-sec".to_string(), "ns-fast".to_string()],
+            "both security-deleted namespace and fast writer namespace must be returned in order"
+        );
+        assert_eq!(seen_deleted, vec![format!("{owner}-m-sec")]);
+        assert_eq!(seen_memories, vec![m_fast_id]);
+
+        sqlx::query("DELETE FROM delete_blobs_tracking WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM deletion_batches WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup(&pool, &owner).await;
     }
 }
