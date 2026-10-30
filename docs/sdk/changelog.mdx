@@ -28,10 +28,14 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  Version 0.1.12 bounds withMemWal recall queries (preserving both head context and tail question/instructions via strategy: "head-tail") to 16,384 UTF-8 bytes and auto-save analyze inputs to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, preventing HTTP 400 errors on long turns. Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
+  Version 0.1.12 adds forget(namespace?) and forgetNamespace(namespace?) for namespace erasure via POST /api/forget, and bounds withMemWal recall queries (preserving both head context and tail question/instructions via strategy: "head-tail") to 16,384 UTF-8 bytes and auto-save analyze inputs to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, preventing HTTP 400 errors on long turns. Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
 ---
 
 ## 0.1.12
+
+### Added
+
+- `forget(namespace?)` (and alias `forgetNamespace(namespace?)`) on `MemWal` and `MemWalManual` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It soft-deletes the owner's index rows for the namespace (without building a SEAL session) while leaving Walrus blobs in place. `MemWalMock` retains synchronous per-blob `forget(blobId): boolean` and adds `forgetNamespace(namespace?): ForgetResult`. (#1043)
 
 ### Fixed
 

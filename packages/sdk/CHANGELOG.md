@@ -2,6 +2,10 @@
 
 ## 0.1.12
 
+### Added
+
+- `forget(namespace?)` (and alias `forgetNamespace(namespace?)`) on `MemWal` and `MemWalManual` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It soft-deletes the owner's index rows for the namespace (without building a SEAL session) while leaving Walrus blobs in place. `MemWalMock` retains synchronous per-blob `forget(blobId): boolean` and adds `forgetNamespace(namespace?): ForgetResult`. (#1043)
+
 ### Fixed
 
 - `withMemWal` bounds the recall query (preserving both head context and tail question/instructions via `strategy: "head-tail"`) to 16,384 UTF-8 bytes and auto-save `analyze()` input to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, while keeping the full user turn in the language model prompt. User turns exceeding the embedder's 16 KiB limit still inject relevant memories without HTTP 400 errors, and auto-save extracts facts across turns up to 64 KiB. (#1037)

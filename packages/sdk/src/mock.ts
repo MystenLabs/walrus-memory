@@ -21,12 +21,13 @@ import type {
     RememberJobStatus,
     RememberResult,
     RestoreResult,
+    ForgetResult,
     NamespacesResult,
     ListNamespacesOptions,
 } from "./types.js";
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
 import { resolveRecallCall } from "./recall-args.js";
-import { derivedBulkIdempotencyKey } from "./utils.js";
+import { derivedBulkIdempotencyKey, resolveForgetNamespace } from "./utils.js";
 import { MemWalRememberJobNotFoundError } from "./errors.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
@@ -653,6 +654,17 @@ export class MemWalMock {
         this.jobs.delete(memory.jobId);
         this.releaseIdempotency(memory.jobId);
         return true;
+    }
+
+    /** Delete all mock records in `namespace` (defaults to the client namespace) and return `{ deleted, namespace, owner }`. */
+    forgetNamespace(namespace?: string): ForgetResult {
+        const resolvedNamespace = resolveForgetNamespace(namespace, this.namespace);
+        const deleted = this.clear(resolvedNamespace);
+        return {
+            deleted,
+            namespace: resolvedNamespace,
+            owner: this.owner,
+        };
     }
 
     /** Clear one namespace, or every mock record when omitted. */
