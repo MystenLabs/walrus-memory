@@ -21,7 +21,11 @@ import { describe, test } from "node:test";
 
 import * as ed from "@noble/ed25519";
 
-import { MemWal, MemWalCompatibilityError } from "../../dist/index.js";
+import {
+    MemWal,
+    MemWalCompatibilityError,
+    MemWalRememberJobTimeoutError,
+} from "../../dist/index.js";
 import { bytesToHex, sha256hex } from "../../dist/utils.js";
 
 const SERVER_URL = (process.env.MEMWAL_SERVER_URL ?? "https://relayer.dev.memwal.ai").replace(/\/$/, "");
@@ -47,6 +51,12 @@ const E2E_NAMESPACE_ALT = `${E2E_NAMESPACE}-alt`;
 
 const HAS_KEY = Boolean(PRIVATE_KEY_HEX && ACCOUNT_ID);
 const requiresKey = HAS_KEY ? false : "MEMWAL_PRIVATE_KEY and MEMWAL_ACCOUNT_ID not set";
+const RUN_CONCURRENT_E2E = process.env.MEMWAL_E2E_CONCURRENT === "1";
+const requiresConcurrentOptIn = !HAS_KEY
+    ? "MEMWAL_PRIVATE_KEY and MEMWAL_ACCOUNT_ID not set"
+    : RUN_CONCURRENT_E2E
+      ? false
+      : "MEMWAL_E2E_CONCURRENT=1 not set (opt-in 5x concurrent rememberAndWait load test)";
 
 function client(namespace = E2E_NAMESPACE) {
     return MemWal.create({
@@ -330,4 +340,84 @@ describe("authenticated", { skip: requiresKey, concurrency: 1 }, () => {
         assert.ok(summary, `listNamespaces must include ${namespace}`);
         assert.equal(summary.memory_count, 3);
     });
+
+    test(
+        "5x concurrent rememberAndWait smoke test recording completion or MemWalRememberJobTimeoutError (Refs #1130)",
+        { skip: requiresConcurrentOptIn },
+        async () => {
+            const namespace = `${E2E_NAMESPACE}-concurrent5`;
+            const mw = client(namespace);
+            const unique = randomUUID().replaceAll("-", "").slice(0, 8);
+            const timeoutMs = positiveIntEnv("MEMWAL_CONCURRENT_TIMEOUT_MS", 90_000);
+
+            let outcomes = [];
+            try {
+                outcomes = await Promise.allSettled(
+                    [1, 2, 3, 4, 5].map((i) =>
+                        mw.rememberAndWait(
+                            `SDK e2e concurrent #${i} (${unique}): parallel remember load verification`,
+                            undefined,
+                            { timeoutMs },
+                        ),
+                    ),
+                );
+
+                assert.equal(outcomes.length, 5);
+                for (const outcome of outcomes) {
+                    if (outcome.status === "fulfilled") {
+                        const memory = outcome.value;
+                        assert.equal(memory.namespace, namespace);
+                        assert.ok(memory.id.length > 0);
+                        assert.ok(memory.blob_id.length > 0);
+                        assert.ok(memory.owner.startsWith("0x"));
+                    } else {
+                        const err = outcome.reason;
+                        assert.ok(
+                            err instanceof MemWalRememberJobTimeoutError,
+                            `expected MemWalRememberJobTimeoutError on timeout, got ${err?.name}: ${err?.message}`,
+                        );
+                        assert.equal(err.status, 504);
+                        assert.equal(typeof err.jobId, "string");
+                        assert.ok(err.jobId.length > 0);
+                        assert.ok(
+                            ["pending", "running", "uploaded"].includes(err.lastStatus ?? ""),
+                            `expected active lastStatus on timeout, got ${err.lastStatus}`,
+                        );
+                    }
+                }
+            } finally {
+                // Best-effort cleanup of the isolated test namespace on the shared bench account.
+                // Wait for any timed-out jobs to settle so their late completion does not leak into the namespace.
+                try {
+                    const timedOutJobIds = outcomes
+                        .filter((o) => o.status === "rejected" && o.reason?.jobId)
+                        .map((o) => o.reason.jobId);
+                    if (timedOutJobIds.length > 0) {
+                        await Promise.allSettled(
+                            timedOutJobIds.map(async (jobId) => {
+                                for (let poll = 0; poll < 10; poll += 1) {
+                                    try {
+                                        const st = await mw.getRememberStatus(jobId);
+                                        if (st?.status === "done" || st?.status === "failed") break;
+                                    } catch {
+                                        // Ignore polling errors
+                                    }
+                                    await new Promise((r) => setTimeout(r, 1_000));
+                                }
+                            }),
+                        );
+                    }
+                    await mw.signedRequest(
+                        "POST",
+                        "/api/forget",
+                        { namespace },
+                        [200],
+                        { includeDelegateKey: false },
+                    );
+                } catch {
+                    // Ignore cleanup errors if rate-limited.
+                }
+            }
+        },
+    );
 });
