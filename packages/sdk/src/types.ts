@@ -353,6 +353,40 @@ export interface EmbedResult {
     vector: number[];
 }
 
+/** A single memory used as context by ask() */
+export interface AskMemory {
+    blob_id: string;
+    text: string;
+    distance: number;
+    score?: number;
+    created_at?: string;
+}
+
+/** Result from ask() */
+export interface AskResult {
+    answer: string;
+    memories_used: number;
+    memories: AskMemory[];
+}
+
+/** Options for ask() */
+export interface AskOptions {
+    /** Max memories to use as context (default: 5, relayer caps at 100). Must be a positive integer. */
+    limit?: number;
+    /** Namespace override (default: config namespace or "default"). */
+    namespace?: string;
+    /** Optional composite-scoring weights applied by the relayer's ranker before injecting memories. */
+    scoringWeights?: ScoringWeights;
+    /** Optional request deadline in milliseconds. */
+    timeoutMs?: number;
+}
+
+/** Object-style ask() input. */
+export interface AskParams extends AskOptions {
+    /** The question to ask. */
+    question: string;
+}
+
 /** Options for analyze() / analyzeAndWait(). */
 export interface AnalyzeOptions {
     /** Override the default namespace for this call. */

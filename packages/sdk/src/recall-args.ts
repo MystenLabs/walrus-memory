@@ -1,4 +1,4 @@
-import type { RecallOptions, RecallParams } from "./types.js";
+import type { AskOptions, AskParams, RecallOptions, RecallParams } from "./types.js";
 
 /** String second argument is a namespace, not options. */
 export function resolveLimitOrOptions<T extends { limit?: number; namespace?: string }>(
@@ -26,11 +26,15 @@ export function resolveLimitOrOptions<T extends { limit?: number; namespace?: st
 }
 
 function invalidSecondArgMessage(method: string): string {
+    const firstArg = method === "ask" ? "question" : "query";
     const shared =
         `${method}() second argument must be a number (limit) or an options object, not a string. ` +
-        `Namespace belongs in an options object (${method}(query, { namespace })) or as the third argument (${method}(query, limit, namespace)).`;
+        `Namespace belongs in an options object (${method}(${firstArg}, { namespace })) or as the third argument (${method}(${firstArg}, limit, namespace)).`;
     if (method === "recall") {
         return `${shared} Preferred form: recall({ query, namespace }).`;
+    }
+    if (method === "ask") {
+        return `${shared} Preferred form: ask({ question, namespace }).`;
     }
     return shared;
 }
@@ -57,5 +61,30 @@ export function resolveRecallCall(
     return {
         query: queryOrParams,
         options: resolveLimitOrOptions("recall", limitOrOptions, namespace),
+    };
+}
+
+/** Normalize object-style and positional `ask()` arguments. */
+export function resolveAskCall(
+    questionOrParams: string | AskParams,
+    limitOrOptions?: number | AskOptions | null,
+    namespace?: string,
+): { question: string; options: AskOptions } {
+    if (
+        questionOrParams !== null &&
+        typeof questionOrParams === "object" &&
+        !Array.isArray(questionOrParams)
+    ) {
+        const { question, ...rest } = questionOrParams;
+        return { question, options: rest };
+    }
+    if (typeof questionOrParams !== "string") {
+        throw new TypeError(
+            "ask() first argument must be a question string or an AskParams object.",
+        );
+    }
+    return {
+        question: questionOrParams,
+        options: resolveLimitOrOptions("ask", limitOrOptions, namespace, 5),
     };
 }

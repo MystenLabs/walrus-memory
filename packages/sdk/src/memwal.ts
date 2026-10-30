@@ -36,6 +36,10 @@ import type {
     RecallOptions,
     RecallParams,
     EmbedResult,
+    AskMemory,
+    AskResult,
+    AskOptions,
+    AskParams,
     AnalyzeOptions,
     AnalyzeResult,
     AnalyzeWaitResult,
@@ -90,7 +94,7 @@ import {
 } from "./compatibility.js";
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
 import { pollingDelayMs } from "./polling-delay.js";
-import { resolveRecallCall } from "./recall-args.js";
+import { resolveAskCall, resolveRecallCall } from "./recall-args.js";
 import {
     MemWalRateLimitedError,
     MemWalRememberJobFailedError,
@@ -1424,6 +1428,65 @@ export class MemWal {
             { text },
             { includeDelegateKey: false },
         );
+    }
+
+    /**
+     * Ask a question answered using your memories.
+     *
+     * The server recalls relevant memories, decrypts them using the SEAL
+     * session credential, injects them as context, and calls an LLM to
+     * produce a personalized answer.
+     *
+     * Supports both object-style `ask({ question, limit, namespace, scoringWeights })`
+     * and positional `ask(question, limit?, namespace?)` / `ask(question, options?)`.
+     *
+     * @returns AskResult with answer, memories_used count, and memories list
+     *
+     * @example
+     * ```typescript
+     * const result = await memwal.ask({
+     *     question: "What food should I avoid?",
+     *     limit: 5,
+     *     namespace: "profile",
+     * });
+     * console.log(result.answer);
+     * ```
+     */
+    async ask(params: AskParams): Promise<AskResult>;
+    async ask(question: string, options: AskOptions): Promise<AskResult>;
+    async ask(
+        question: string,
+        limit?: number,
+        namespace?: string,
+    ): Promise<AskResult>;
+    async ask(
+        questionOrParams: string | AskParams,
+        limitOrOptions: number | AskOptions | undefined = 5,
+        namespace?: string,
+    ): Promise<AskResult> {
+        const { question, options } = resolveAskCall(
+            questionOrParams,
+            limitOrOptions,
+            namespace,
+        );
+        assertNonBlankText(question, "question cannot be empty");
+        const limit = options.limit !== undefined ? options.limit : 5;
+        assertPositiveIntegerLimit(limit);
+        assertFiniteScoringWeights(options.scoringWeights);
+
+        const result = await this.signedRequest<AskResult>(
+            "POST",
+            "/api/ask",
+            {
+                question,
+                limit,
+                namespace: options.namespace ?? this.namespace,
+                scoring_weights: scoringWeightsToWire(options.scoringWeights),
+            },
+            { timeoutMs: options.timeoutMs },
+        );
+        requireArrayField<AskMemory>(result, "memories", "POST /api/ask");
+        return result;
     }
 
     /**
