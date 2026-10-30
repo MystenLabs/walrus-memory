@@ -1924,6 +1924,166 @@ pub async fn mcp_rate_limit_middleware(
 }
 
 // ============================================================
+// Signed REST API — pre-authentication admission rate limiting
+// ============================================================
+
+const SIGNED_PREAUTH_GLOBAL_MIN_KEY: &str = "rate:signed:preauth:global:min";
+const SIGNED_PREAUTH_GLOBAL_HR_KEY: &str = "rate:signed:preauth:global:hr";
+
+fn signed_preauth_ip_rate_keys(ip: std::net::IpAddr) -> (String, String) {
+    let ip = McpRateLimitConfig::normalize_ip(ip);
+    (
+        format!("rate:signed:preauth:ip:min:{ip}"),
+        format!("rate:signed:preauth:ip:hr:{ip}"),
+    )
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SignedPreauthDenial {
+    IpBurst,
+    IpSustained,
+    GlobalBurst,
+    GlobalSustained,
+}
+
+/// Pre-authentication IP and deployment-wide admission windows for signed REST
+/// routes (`/api/*` and `/v1/owners/*`).
+///
+/// The source IP windows (`rate:signed:preauth:ip:min:{ip}`, `rate:signed:preauth:ip:hr:{ip}`)
+/// are evaluated before the deployment-wide ceiling (`rate:signed:preauth:global:*`),
+/// so a single noisy IP is turned away without consuming the shared global pre-auth
+/// budget that legitimate callers on other IPs use.
+pub(crate) async fn check_signed_preauth_windows<C>(
+    redis: &mut C,
+    config: &McpRateLimitConfig,
+    ip: std::net::IpAddr,
+    global_keys: (&str, &str),
+) -> Result<Option<SignedPreauthDenial>, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let min_start = now - 60_000.0;
+    let hr_start = now - 3_600_000.0;
+    let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
+
+    let windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 4] = [
+        (
+            &ip_min,
+            min_start,
+            now,
+            config.per_minute,
+            120,
+            SignedPreauthDenial::IpBurst,
+        ),
+        (
+            &ip_hr,
+            hr_start,
+            now + 0.1,
+            config.per_hour,
+            3700,
+            SignedPreauthDenial::IpSustained,
+        ),
+        (
+            global_keys.0,
+            min_start,
+            now + 0.2,
+            config.global_per_minute,
+            120,
+            SignedPreauthDenial::GlobalBurst,
+        ),
+        (
+            global_keys.1,
+            hr_start,
+            now + 0.3,
+            config.global_per_hour,
+            3700,
+            SignedPreauthDenial::GlobalSustained,
+        ),
+    ];
+
+    for (key, start, at, limit, ttl, denial) in windows {
+        if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
+            == WindowCheckResult::Denied
+        {
+            return Ok(Some(denial));
+        }
+    }
+    Ok(None)
+}
+
+fn signed_preauth_denial_response(
+    config: &McpRateLimitConfig,
+    denial: SignedPreauthDenial,
+) -> Response {
+    match denial {
+        SignedPreauthDenial::IpBurst => {
+            rate_limit_response("signed_preauth_ip_burst", config.per_minute, "min", 60)
+        }
+        SignedPreauthDenial::IpSustained => {
+            rate_limit_response("signed_preauth_ip_sustained", config.per_hour, "hour", 300)
+        }
+        SignedPreauthDenial::GlobalBurst => rate_limit_response(
+            "signed_preauth_global_burst",
+            config.global_per_minute,
+            "min",
+            60,
+        ),
+        SignedPreauthDenial::GlobalSustained => rate_limit_response(
+            "signed_preauth_global_sustained",
+            config.global_per_hour,
+            "hour",
+            300,
+        ),
+    }
+}
+
+/// Outermost pre-authentication rate limiter for `protected_routes` (`/api/*`)
+/// and `read_api_routes` (`/v1/owners/*`).
+///
+/// Runs outside `auth::verify_signature` and `auth::verify_read_api_auth` so
+/// source-IP and deployment-wide floods of unregistered delegate keys are
+/// rejected before buffering/hashing the request body, verifying Ed25519
+/// signatures, writing nonces to Redis, or resolving accounts on Sui RPC.
+/// Post-authentication owner and delegate-key budgets still run inside the
+/// auth layer.
+pub async fn signed_preauth_rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.config.rate_limit.bench_bypass_enabled {
+        return next.run(request).await;
+    }
+
+    let ip = McpRateLimitConfig::normalize_ip(rate_limit_peer_addr(
+        &request,
+        state.config.trusted_proxy_hops,
+    ));
+    let config = &state.config.mcp_rate_limit;
+    let mut redis = state.redis.clone();
+
+    match check_signed_preauth_windows(
+        &mut redis,
+        config,
+        ip,
+        (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
+    )
+    .await
+    {
+        Ok(None) => next.run(request).await,
+        Ok(Some(denial)) => {
+            tracing::warn!("signed preauth rate limit [{:?}]: ip={} denied", denial, ip);
+            signed_preauth_denial_response(config, denial)
+        }
+        Err(e) => {
+            tracing::error!("signed_preauth_rate_limit_middleware: Redis error: {}", e);
+            rate_limiter_unavailable_response()
+        }
+    }
+}
+
+// ============================================================
 // Owner Token — issuance rate limiting
 // ============================================================
 
@@ -3276,6 +3436,57 @@ mod tests {
             preauth_global_denied,
             30 - config.global_per_minute as usize
         );
+
+        // 3. Signed REST pre-auth admission (`check_signed_preauth_windows`):
+        //    - An abusive IP sending unregistered delegate probes is capped at `per_minute`
+        //      without exhausting the deployment-wide `SIGNED_PREAUTH_GLOBAL_*` bucket.
+        //    - A legitimate caller on a different IP retains capacity.
+        let mut redis_signed = SlidingWindowMockRedis::default();
+        let signed_cfg = McpRateLimitConfig {
+            per_minute: 4,
+            per_hour: 40,
+            tenant_per_minute: 4,
+            tenant_per_hour: 40,
+            global_per_minute: 10,
+            global_per_hour: 100,
+        };
+        let attacker_ip: std::net::IpAddr = "203.0.113.99".parse().unwrap();
+        let legit_ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let mut attacker_admitted = 0;
+        let mut attacker_denied = 0;
+        for _ in 0..15 {
+            match check_signed_preauth_windows(
+                &mut redis_signed,
+                &signed_cfg,
+                attacker_ip,
+                (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
+            )
+            .await
+            .unwrap()
+            {
+                None => attacker_admitted += 1,
+                Some(SignedPreauthDenial::IpBurst) => attacker_denied += 1,
+                Some(other) => panic!("unexpected denial for attacker IP: {other:?}"),
+            }
+        }
+        assert_eq!(attacker_admitted, 4);
+        assert_eq!(attacker_denied, 11);
+
+        // Legitimate caller on another IP still gets its full per-IP budget (4 requests).
+        for _ in 0..4 {
+            assert_eq!(
+                check_signed_preauth_windows(
+                    &mut redis_signed,
+                    &signed_cfg,
+                    legit_ip,
+                    (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
+                )
+                .await
+                .unwrap(),
+                None,
+                "legitimate caller on separate IP must retain pre-auth admission capacity"
+            );
+        }
     }
 
     #[tokio::test]
