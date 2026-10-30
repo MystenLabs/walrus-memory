@@ -12,6 +12,7 @@ import {
     chainBlobIdFromRaw,
     filterTrustedBlobCandidates,
     findBlobCreationSender,
+    getCachedBlobCreationTimestamp,
     isSourceCapped,
     isWalrusBlobObjectType,
     isVerifiedNonexistentSource,
@@ -896,6 +897,7 @@ test("blob provenance uses the archival creation transaction, not the latest tra
     const objectId = `0x${"1".repeat(64)}`;
     const trusted = `0x${"2".repeat(64)}`;
     const attacker = `0x${"3".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T07:23:16.416Z";
     const client = {
         async getCreationTransaction() {
             return "create-tx";
@@ -905,12 +907,16 @@ test("blob provenance uses the archival creation transaction, not the latest tra
             return {
                 status: { success: true },
                 transaction: { sender: trusted },
-                effects: { changedObjects: [{ objectId, idOperation: "Created" }] },
+                effects: {
+                    timestamp: createdTimestamp,
+                    changedObjects: [{ objectId, idOperation: "Created" }],
+                },
             };
         },
     };
 
     assert.equal(await findBlobCreationSender({ objectId, previousTransaction: "attacker-transfer-tx" }, client), trusted);
+    assert.equal(getCachedBlobCreationTimestamp(objectId), createdTimestamp);
     assert.deepEqual(
         await trustedBlobCandidate(
             { objectId, owner: { AddressOwner: attacker }, previousTransaction: "transfer-tx" },

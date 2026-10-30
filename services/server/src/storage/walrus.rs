@@ -141,6 +141,9 @@ pub struct OnChainBlob {
     /// Delegate/agent public key from on-chain metadata (memwal_agent_id)
     #[serde(rename = "agentId", default)]
     pub agent_id: Option<String>,
+    /// Original creation timestamp if reported by the sidecar
+    #[serde(rename = "createdAt", default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Response from sidecar query-blobs endpoint

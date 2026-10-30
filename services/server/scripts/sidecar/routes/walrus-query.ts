@@ -163,15 +163,25 @@ export async function findBlobCreationSender(
             normalizedSuiAddressOrNull(object?.objectId) === normalizedSuiAddressOrNull(blob.objectId) &&
             object?.idOperation === "Created"
     );
-    return created ? normalizedSuiAddressOrNull(transaction.transaction?.sender) : null;
+    if (!created) return null;
+    const createdAt =
+        typeof transaction.effects?.timestamp === "string" && transaction.effects.timestamp.length > 0
+            ? transaction.effects.timestamp
+            : typeof transaction.timestamp === "string" && transaction.timestamp.length > 0
+              ? transaction.timestamp
+              : null;
+    if (createdAt) {
+        cacheBlobCreationTimestamp(blob.objectId, createdAt);
+    }
+    return normalizedSuiAddressOrNull(transaction.transaction?.sender);
 }
 
 const CREATION_TRANSACTION_QUERY = `
 query BlobCreationTransaction($objectId: SuiAddress!) {
   object(address: $objectId) {
-    previousTransaction { digest }
+    previousTransaction { digest effects { timestamp } }
     objectVersionsBefore(first: 1) {
-      nodes { previousTransaction { digest } }
+      nodes { previousTransaction { digest effects { timestamp } } }
     }
   }
 }`;
@@ -206,6 +216,10 @@ const blobHistoryClient: BlobHistoryClient = {
         // earliest retained version. A never-mutated object has no prior nodes,
         // so its current version is itself the creation version.
         const creationVersion = object.objectVersionsBefore?.nodes?.[0] ?? object;
+        const createdAt = creationVersion?.previousTransaction?.effects?.timestamp;
+        if (typeof createdAt === "string" && createdAt.length > 0) {
+            cacheBlobCreationTimestamp(objectId, createdAt);
+        }
         return typeof creationVersion?.previousTransaction?.digest === "string"
             ? creationVersion.previousTransaction.digest
             : null;
@@ -218,6 +232,19 @@ const blobHistoryClient: BlobHistoryClient = {
 // caused by transient archive-node lag.
 const BLOB_PROVENANCE_CACHE_MAX = 10_000;
 const blobCreationSenderCache = new Map<string, string>();
+const blobCreationTimestampCache = new Map<string, string>();
+
+function cacheBlobCreationTimestamp(objectId: string, createdAt: string): void {
+    blobCreationTimestampCache.delete(objectId);
+    blobCreationTimestampCache.set(objectId, createdAt);
+    if (blobCreationTimestampCache.size > BLOB_PROVENANCE_CACHE_MAX) {
+        blobCreationTimestampCache.delete(blobCreationTimestampCache.keys().next().value!);
+    }
+}
+
+export function getCachedBlobCreationTimestamp(objectId: string): string | null {
+    return blobCreationTimestampCache.get(objectId) ?? null;
+}
 
 async function cachedBlobCreationSender(blob: Pick<RawBlobObj, "objectId" | "previousTransaction">) {
     const cached = blobCreationSenderCache.get(blob.objectId);
@@ -791,18 +818,21 @@ export function registerWalrusQueryRoute(app: Express): void {
                 namespace: string;
                 packageId: string;
                 agentId: string;
+                createdAt?: string;
             }[] = [];
 
             for (const meta of trustedMetas) {
                 if (meta.rawBlobId) {
                     const blobIdStr = blobIdFromRaw(meta.rawBlobId);
                     if (blobIdStr) {
+                        const createdAt = getCachedBlobCreationTimestamp(meta.objectId);
                         blobs.push({
                             blobId: blobIdStr,
                             objectId: meta.objectId,
                             namespace: meta.blobNamespace,
                             packageId: meta.blobPackageId,
                             agentId: meta.blobAgentId,
+                            ...(createdAt ? { createdAt } : {}),
                         });
                     }
                 }
