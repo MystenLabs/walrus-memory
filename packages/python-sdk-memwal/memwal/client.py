@@ -504,6 +504,10 @@ class MemWal:
         # Preserve a generated key across an ambiguous transport failure. A
         # subsequent identical call then collapses onto the accepted paid job.
         self._pending_remember_keys: Dict[str, str] = {}
+        # Bounded counter of derived keys whose jobs reached a terminal failure
+        # ("failed" or "not_found"), keyed by the 67-char base derived key so
+        # full-text inputs are never retained after completion.
+        self._failed_remember_keys: Dict[str, int] = {}
 
     def _resolve_namespace(self, namespace: Optional[str]) -> str:
         """``None`` uses the client default; do not treat ``""`` as missing."""
@@ -589,6 +593,7 @@ class MemWal:
         self._relayer_version_metadata = None
         self._owner_address = None
         self._pending_remember_keys.clear()
+        self._failed_remember_keys.clear()
         for attr in ("_session_build_task", "_owner_task"):
             task = getattr(self, attr, None)
             setattr(self, attr, None)
@@ -876,20 +881,45 @@ class MemWal:
         resolved_namespace = self._resolve_namespace(namespace)
         request_identity = f"{resolved_namespace}\0{text}"
         generated_key = idempotency_key is None
+        base_key = _derived_idempotency_key(request_identity) if generated_key else ""
+        fail_count = self._failed_remember_keys.get(base_key, 0) if generated_key else 0
+        if fail_count > 0:
+            salted_payload = f"{base_key}\0{fail_count}".encode("utf-8")
+            default_key = f"r1-{hashlib.sha256(salted_payload).hexdigest()}"
+        else:
+            default_key = base_key
         resolved_key = (
             idempotency_key
             or self._pending_remember_keys.get(request_identity)
-            or _derived_idempotency_key(request_identity)
+            or default_key
         )
         if generated_key:
             self._pending_remember_keys[request_identity] = resolved_key
 
         accepted = await self.remember(text, resolved_namespace, resolved_key)
-        result = await self.wait_for_remember_job(
-            accepted.job_id,
-            poll_interval_ms=poll_interval_ms,
-            timeout_ms=timeout_ms,
-        )
+        try:
+            result = await self.wait_for_remember_job(
+                accepted.job_id,
+                poll_interval_ms=poll_interval_ms,
+                timeout_ms=timeout_ms,
+            )
+        except (MemWalRememberJobFailed, MemWalRememberJobNotFound):
+            # Terminal failure: the job will never succeed, so discard the
+            # pending key and advance the failure generation so a subsequent
+            # retry for the same (namespace, text) sends a fresh key.
+            if generated_key:
+                self._pending_remember_keys.pop(request_identity, None)
+                if (
+                    len(self._failed_remember_keys) >= 256
+                    and base_key not in self._failed_remember_keys
+                ):
+                    self._failed_remember_keys.pop(
+                        next(iter(self._failed_remember_keys)), None
+                    )
+                self._failed_remember_keys[base_key] = fail_count + 1
+            raise
+        # MemWalRememberJobTimeout is intentionally NOT caught here —
+        # the job may still complete, so the key stays for a retry call.
         if generated_key:
             self._pending_remember_keys.pop(request_identity, None)
         return result
