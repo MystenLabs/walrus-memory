@@ -42,7 +42,6 @@ const EMBED_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 struct EmbeddingResponse {
     status: reqwest::StatusCode,
     body: String,
-    retry_after: Option<Duration>,
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -95,6 +94,7 @@ async fn request_embedding(
         let started = std::time::Instant::now();
         let attempt_deadline = deadline.min(tokio::time::Instant::now() + EMBED_ATTEMPT_TIMEOUT);
         let mut http_status = None;
+        let mut observed_retry_after = None;
         let request = async {
             let response = client
                 .post(url)
@@ -107,13 +107,9 @@ async fn request_embedding(
                 .await?;
             let status = response.status();
             http_status = Some(status);
-            let retry_after = retry_after(response.headers());
+            observed_retry_after = retry_after(response.headers());
             let body = response.text().await?;
-            Ok::<_, reqwest::Error>(EmbeddingResponse {
-                status,
-                body,
-                retry_after,
-            })
+            Ok::<_, reqwest::Error>(EmbeddingResponse { status, body })
         };
         let (outcome, retry_reason, detail) =
             match tokio::time::timeout_at(attempt_deadline, request).await {
@@ -135,7 +131,6 @@ async fn request_embedding(
                         Ok(EmbeddingResponse {
                             status,
                             body: "[provider error body unavailable]".into(),
-                            retry_after: None,
                         }),
                         None,
                         None,
@@ -209,10 +204,7 @@ async fn request_embedding(
         // Equal jitter avoids synchronized retries from concurrent bulk items.
         let backoff_ms = 250u64 << (attempt - 1);
         let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), backoff_ms / 2..=backoff_ms);
-        let delay = outcome
-            .as_ref()
-            .ok()
-            .and_then(|r| r.retry_after)
+        let delay = observed_retry_after
             .unwrap_or_default()
             .max(Duration::from_millis(jitter));
         let retrying = attempt < EMBED_MAX_ATTEMPTS
@@ -676,6 +668,62 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_with_a_truncated_body_is_not_retried_early() {
+        for status in [429, 503] {
+            let (base, calls, _) = scripted_provider(vec![format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\nRetry-After: 60\r\n\r\n{{"
+            )])
+            .await;
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "status={status}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_with_a_stalled_body_is_not_retried_early() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = axum::Router::new().route(
+            "/embeddings",
+            axum::routing::post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    axum::http::Response::builder()
+                        .status(503)
+                        .header("Retry-After", "60")
+                        .header("Content-Length", "100")
+                        .body(axum::body::Body::from_stream(futures::stream::pending::<
+                            Result<axum::body::Bytes, std::io::Error>,
+                        >()))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            super::embed_text(
+                &reqwest::Client::new(),
+                Some("key"),
+                &format!("http://{addr}"),
+                "q",
+            )
+            .await,
+            Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= super::EMBED_ATTEMPT_TIMEOUT);
+        assert!(started.elapsed() < super::EMBED_ATTEMPT_TIMEOUT + Duration::from_secs(2));
     }
 
     #[test]
