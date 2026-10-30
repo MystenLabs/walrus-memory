@@ -1,0 +1,30 @@
+name: Validate plugin
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate JSON manifests
+        run: |
+          find . -path ./.git -prune -o -name '*.json' -type f -print0 |
+            xargs -0 -n1 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))'
+      - name: Check hook scripts
+        run: find scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: Test hook signals
+        run: node --test test/*.test.mjs
+      - name: Check plugin package layout
+        run: node .github/scripts/check-plugin-tree.mjs
+      - name: Validate with Claude Code
+        run: npx -y @anthropic-ai/claude-code plugin validate . --strict
