@@ -282,6 +282,8 @@ Submit text as an encrypted memory job. The relayer returns after creating a bac
 
 Poll a remember job. `status` is one of `pending`, `running`, `uploaded`, `done`, or `failed`. Failed jobs include an `error` message. When background embedding or summarization fails because the upstream inference provider is unavailable (including provider `401`, `402`, `403`, `429`, `5xx`, transport errors, or invalid JSON), `error` carries a sanitized message with `code=EMBEDDING_PROVIDER_UNAVAILABLE` and `traceId` instead of raw upstream error payloads. Unknown job IDs and jobs that belong to another owner return `404`, so callers cannot enumerate job IDs.
 
+Embedding requests retry transport failures and provider `408`, `429`, and `5xx` responses, including equivalent OpenRouter error envelopes inside HTTP `200`. There are at most three attempts, each capped at 10 seconds, within a shared 30-second budget. Retries use jittered backoff and respect `Retry-After`; if the provider's cooldown exceeds the remaining budget, the request fails without retrying early. Provider `401`/`402`/`403` and input errors are not retried internally. This policy applies to embedding calls across routes; summarization and other LLM calls keep their existing behavior. Keep polling accepted remember jobs until `done` or `failed` before deciding whether to resubmit.
+
 **Response:**
 
 ```json

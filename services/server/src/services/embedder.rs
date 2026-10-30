@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::types::{AppError, Config};
 
@@ -31,6 +32,209 @@ pub const EMBEDDING_DIMS: usize = 1536;
 /// A limit of [`EMBEDDING_MODEL`]'s context window, so it applies only when a
 /// provider key is set. The key-less fallback hashes locally with no limit.
 pub(crate) const MAX_EMBED_INPUT_BYTES: usize = 16384;
+
+// Keep retries inside the existing production client's 30s request budget.
+// Each attempt has its own cap so a stalled connection leaves time to recover.
+const EMBED_MAX_ATTEMPTS: u32 = 3;
+const EMBED_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const EMBED_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct EmbeddingResponse {
+    status: reqwest::StatusCode,
+    body: String,
+    retry_after: Option<Duration>,
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()?
+                .duration_since(std::time::SystemTime::now())
+                .ok()
+        })
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
+}
+
+/// Display the source chain, which reqwest's Display omits. Strip the URL
+/// before formatting: custom provider URLs can contain credentials or queries.
+fn transport_error_detail(error: reqwest::Error) -> String {
+    use std::error::Error;
+    let error = error.without_url();
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
+}
+
+/// Retry only the read-only inference request, never encryption, reservations,
+/// or a durable upload. Auth/billing and caller-input errors pass straight
+/// through to the existing classification and deduplicated alert path.
+async fn request_embedding(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    text: &str,
+) -> Result<EmbeddingResponse, AppError> {
+    let deadline = tokio::time::Instant::now() + EMBED_TOTAL_TIMEOUT;
+    let provider_host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    for attempt in 1..=EMBED_MAX_ATTEMPTS {
+        let started = std::time::Instant::now();
+        let attempt_deadline = deadline.min(tokio::time::Instant::now() + EMBED_ATTEMPT_TIMEOUT);
+        let mut http_status = None;
+        let request = async {
+            let response = client
+                .post(url)
+                .bearer_auth(api_key)
+                .json(&EmbeddingApiRequest {
+                    model: EMBEDDING_MODEL.to_string(),
+                    input: text.to_string(),
+                })
+                .send()
+                .await?;
+            let status = response.status();
+            http_status = Some(status);
+            let retry_after = retry_after(response.headers());
+            let body = response.text().await?;
+            Ok::<_, reqwest::Error>(EmbeddingResponse {
+                status,
+                body,
+                retry_after,
+            })
+        };
+        let (outcome, retry_reason, detail) =
+            match tokio::time::timeout_at(attempt_deadline, request).await {
+                // A permanent rejection remains permanent even if its error
+                // body is truncated or stalls. Do not retry a known 401/402/403.
+                result
+                    if (result.is_err() || matches!(&result, Ok(Err(_))))
+                        && http_status
+                            .is_some_and(|s| !s.is_success() && !retryable_status(s.as_u16())) =>
+                {
+                    let status = http_status.expect("guard checked status");
+                    crate::observability::observe_external(
+                        "openai",
+                        "embeddings",
+                        status.as_str(),
+                        started.elapsed(),
+                    );
+                    (
+                        Ok(EmbeddingResponse {
+                            status,
+                            body: "[provider error body unavailable]".into(),
+                            retry_after: None,
+                        }),
+                        None,
+                        None,
+                    )
+                }
+                Ok(Ok(response)) => {
+                    crate::observability::observe_external(
+                        "openai",
+                        "embeddings",
+                        response.status.as_str(),
+                        started.elapsed(),
+                    );
+                    let reason = if retryable_status(response.status.as_u16()) {
+                        Some("http_status")
+                    } else if response.status.is_success()
+                        && crate::services::extractor::parse_openrouter_error_envelope(
+                            &response.body,
+                        )
+                        .is_some_and(|error| u16::try_from(error.code).is_ok_and(retryable_status))
+                    {
+                        Some("provider_envelope")
+                    } else {
+                        None
+                    };
+                    (Ok(response), reason, None)
+                }
+                Ok(Err(error)) => {
+                    crate::observability::observe_external(
+                        "openai",
+                        "embeddings",
+                        "transport_error",
+                        started.elapsed(),
+                    );
+                    let reason = if error.is_timeout() {
+                        "timeout"
+                    } else if error.is_connect() {
+                        "connect"
+                    } else if error.is_body() || error.is_decode() {
+                        "body"
+                    } else {
+                        "request"
+                    };
+                    let retryable = !error.is_builder() && !error.is_redirect();
+                    let detail = transport_error_detail(error);
+                    (
+                        Err(AppError::EmbeddingProviderUnavailable(format!(
+                            "Embedding API request failed: {detail}"
+                        ))),
+                        retryable.then_some(reason),
+                        Some(detail),
+                    )
+                }
+                Err(_) => {
+                    crate::observability::observe_external(
+                        "openai",
+                        "embeddings",
+                        "transport_error",
+                        started.elapsed(),
+                    );
+                    let detail = "embedding request attempt timed out".to_string();
+                    (
+                        Err(AppError::EmbeddingProviderUnavailable(detail.clone())),
+                        Some("timeout"),
+                        Some(detail),
+                    )
+                }
+            };
+        let Some(reason) = retry_reason else {
+            return outcome;
+        };
+        // Equal jitter avoids synchronized retries from concurrent bulk items.
+        let backoff_ms = 250u64 << (attempt - 1);
+        let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), backoff_ms / 2..=backoff_ms);
+        let delay = outcome
+            .as_ref()
+            .ok()
+            .and_then(|r| r.retry_after)
+            .unwrap_or_default()
+            .max(Duration::from_millis(jitter));
+        let retrying = attempt < EMBED_MAX_ATTEMPTS
+            && delay < deadline.saturating_duration_since(tokio::time::Instant::now());
+        tracing::warn!(
+            request_id = ?crate::observability::current_request_id(),
+            provider_host,
+            attempt,
+            retrying,
+            reason,
+            status = ?outcome.as_ref().ok().map(|r| r.status.as_u16()),
+            error_chain = ?detail,
+            retry_delay_ms = ?delay.as_millis(),
+            "embedding provider attempt failed"
+        );
+        if !retrying {
+            return outcome;
+        }
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("the final attempt always returns")
+}
 
 /// Whether a provider 400 complains about input length; any other 400 is a
 /// server-side problem, not the caller's.
@@ -132,37 +336,11 @@ pub(crate) async fn embed_text_with_alerts(
             // Real embedding via OpenRouter/OpenAI-compatible API
             let url = format!("{}/embeddings", api_base);
 
-            let started = std::time::Instant::now();
-            let resp = http_client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&EmbeddingApiRequest {
-                    model: EMBEDDING_MODEL.to_string(),
-                    input: text.to_string(),
-                })
-                .send()
-                .await
-                .map_err(|e| {
-                    crate::observability::observe_external(
-                        "openai",
-                        "embeddings",
-                        "transport_error",
-                        started.elapsed(),
-                    );
-                    AppError::EmbeddingProviderUnavailable(format!("Embedding API request failed: {}", e))
-                })?;
-            let status_label = resp.status().as_u16().to_string();
-            crate::observability::observe_external(
-                "openai",
-                "embeddings",
-                &status_label,
-                started.elapsed(),
-            );
+            let response = request_embedding(http_client, &url, api_key, text).await?;
+            let status = response.status;
+            let body = response.body;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
                 if crate::services::extractor::is_upstream_provider_auth_or_quota_status(status) {
                     if let Some((alerts, sui_network)) = alert_ctx {
                         let _ = alerts
@@ -201,20 +379,6 @@ pub(crate) async fn embed_text_with_alerts(
                 )));
             }
 
-            // same pattern as the extractor — capture body
-            // as text first so we can (1) treat transport-level
-            // failures as transient, and (2) detect OpenRouter
-            // error envelopes wrapped in HTTP 200. Both route to
-            // `AppError::EmbeddingProviderUnavailable` (HTTP 503) so the
-            // SDK / harness retry policy can recover. See
-            // `extractor::parse_openrouter_error_envelope`.
-            let body = resp.text().await.map_err(|e| {
-                AppError::EmbeddingProviderUnavailable(format!(
-                    "Failed to read embedding response body: {}",
-                    e
-                ))
-            })?;
-
             if let Some(envelope) =
                 crate::services::extractor::parse_openrouter_error_envelope(&body)
             {
@@ -239,7 +403,10 @@ pub(crate) async fn embed_text_with_alerts(
             }
 
             let api_resp: EmbeddingApiResponse = serde_json::from_str(&body).map_err(|e| {
-                AppError::EmbeddingProviderUnavailable(format!("Failed to parse embedding response: {}", e))
+                AppError::EmbeddingProviderUnavailable(format!(
+                    "Failed to parse embedding response: {}",
+                    e
+                ))
             })?;
 
             let vector = api_resp
@@ -294,6 +461,299 @@ struct EmbeddingData {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const VECTOR_BODY: &str = r#"{"data":[{"embedding":[0.25,0.75]}]}"#;
+
+    fn wire_response(status: u16, body: &str, headers: &str) -> String {
+        format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len())
+    }
+
+    /// A real HTTP peer that can close before headers or truncate a body,
+    /// reproducing reqwest transport failures rather than mocking AppError.
+    /// The last reply repeats so an unbounded retry loop cannot hide in a test.
+    async fn scripted_provider(
+        replies: Vec<String>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = calls.clone();
+        let recorded = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0u8; 4096];
+                    let n = stream.read(&mut bytes).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(request).unwrap());
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = &replies[index.min(replies.len() - 1)];
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), calls, requests)
+    }
+
+    #[tokio::test]
+    async fn disconnect_then_truncated_body_recovers_with_identical_embedding_requests() {
+        let (base, calls, requests) = scripted_provider(vec![
+            String::new(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".into(),
+            wire_response(200, VECTOR_BODY, ""),
+        ])
+        .await;
+        let vector = super::embed_text(
+            &reqwest::Client::new(),
+            Some("test-key"),
+            &base,
+            "original memory",
+        )
+        .await
+        .unwrap();
+        assert_eq!(vector, vec![0.25, 0.75]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let requests = requests.lock().unwrap();
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["input"], "original memory");
+        assert_eq!(body["model"], super::EMBEDDING_MODEL);
+    }
+
+    #[tokio::test]
+    async fn transient_http_statuses_and_200_error_envelopes_recover() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            for envelope in [false, true] {
+                let body = format!(r#"{{"error":{{"code":{status},"message":"temporary"}}}}"#);
+                let (base, calls, _) = scripted_provider(vec![
+                    wire_response(if envelope { 200 } else { status }, &body, ""),
+                    wire_response(200, VECTOR_BODY, ""),
+                ])
+                .await;
+                let result =
+                    super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
+                assert_eq!(
+                    result.unwrap(),
+                    vec![0.25, 0.75],
+                    "status={status}, envelope={envelope}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_billing_and_bad_input_are_not_retried() {
+        for status in [400, 401, 402, 403, 404, 422] {
+            for envelope in [false, true] {
+                let body = format!(r#"{{"error":{{"code":{status},"message":"permanent"}}}}"#);
+                let (base, calls, _) = scripted_provider(vec![wire_response(
+                    if envelope { 200 } else { status },
+                    &body,
+                    "",
+                )])
+                .await;
+                assert!(
+                    super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q")
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "status={status}, envelope={envelope}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_transport_and_http_failures_stop_after_three_attempts() {
+        for reply in [String::new(), wire_response(503, "unavailable", "")] {
+            let (base, calls, _) = scripted_provider(vec![reply]).await;
+            let error = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::types::AppError::EmbeddingProviderUnavailable(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_http_rejection_with_a_truncated_body_is_not_retried() {
+        for status in [400, 401, 402, 403] {
+            let (base, calls, _) = scripted_provider(vec![format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            )])
+            .await;
+            assert!(
+                super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_stops_retries() {
+        let (base, calls, _) = scripted_provider(vec![String::new()]).await;
+        let task = tokio::spawn(async move {
+            super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_respected_and_a_long_cooldown_is_not_retried_early() {
+        let (base, calls, _) = scripted_provider(vec![
+            wire_response(429, "rate limited", "Retry-After: 1\r\n"),
+            wire_response(200, VECTOR_BODY, ""),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q")
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        for delay in ["60", "18446744073709551615"] {
+            let (base, calls, _) = scripted_provider(vec![wire_response(
+                429,
+                "rate limited",
+                &format!("Retry-After: {delay}\r\n"),
+            )])
+            .await;
+            let started = std::time::Instant::now();
+            assert!(
+                super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q")
+                    .await
+                    .is_err()
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates_and_ignores_invalid_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(5))
+                .parse()
+                .unwrap(),
+        );
+        let delay = super::retry_after(&headers).unwrap();
+        assert!(delay > Duration::from_secs(3) && delay <= Duration::from_secs(5));
+        headers.insert(reqwest::header::RETRY_AFTER, "invalid".parse().unwrap());
+        assert!(super::retry_after(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_provider_is_bounded_by_the_total_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = axum::Router::new().route(
+            "/embeddings",
+            axum::routing::post(move || {
+                let calls = counter.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    VECTOR_BODY
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let started = std::time::Instant::now();
+        let result = super::embed_text(
+            &reqwest::Client::new(),
+            Some("key"),
+            &format!("http://{addr}"),
+            "q",
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= super::EMBED_TOTAL_TIMEOUT);
+        assert!(started.elapsed() < super::EMBED_TOTAL_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn transport_diagnostics_include_the_cause_and_strip_provider_url_secrets() {
+        let (base, _, _) = scripted_provider(vec![String::new()]).await;
+        let url = format!(
+            "{}/embeddings?secret=query-secret",
+            base.replace("http://", "http://username:password-secret@")
+        );
+        let error = reqwest::Client::new()
+            .post(&url)
+            .body("q")
+            .send()
+            .await
+            .unwrap_err();
+        let detail = super::transport_error_detail(error);
+        assert!(
+            detail.contains("connection closed before message completed"),
+            "missing source chain: {detail}"
+        );
+        for secret in ["username", "password-secret", "query-secret", "/embeddings"] {
+            assert!(
+                !detail.contains(secret),
+                "URL leaked in transport diagnostic: {detail}"
+            );
+        }
+    }
+
     /// parity test — the embedder routes OpenRouter-error-envelope
     /// bodies to `AppError::EmbeddingProviderUnavailable` via the SHARED helper
     /// `extractor::parse_openrouter_error_envelope`. If a future refactor
@@ -439,7 +899,10 @@ mod tests {
             stub_provider(401, r#"{"error":{"message":"User not found.","code":401}}"#).await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "401 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -453,7 +916,10 @@ mod tests {
         .await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "402 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -464,7 +930,10 @@ mod tests {
             stub_provider(403, r#"{"error":{"message":"Key disabled","code":403}}"#).await;
         let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
         assert!(
-            matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                result,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "403 must map to UpstreamUnavailable, got {result:?}"
         );
     }
@@ -483,7 +952,10 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(refused, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+            matches!(
+                refused,
+                Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+            ),
             "connection refused must map to UpstreamUnavailable, got {refused:?}"
         );
 
@@ -532,7 +1004,10 @@ mod tests {
             let (base, _) = stub_provider(200, body).await;
             let result = super::embed_text(&reqwest::Client::new(), Some("key"), &base, "q").await;
             assert!(
-                matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+                matches!(
+                    result,
+                    Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+                ),
                 "200 body {body:?} must map to UpstreamUnavailable, got {result:?}"
             );
         }
@@ -585,7 +1060,10 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(result, Err(crate::types::AppError::EmbeddingProviderUnavailable(_))),
+                matches!(
+                    result,
+                    Err(crate::types::AppError::EmbeddingProviderUnavailable(_))
+                ),
                 "status {status} → {result:?}"
             );
         }
