@@ -36,6 +36,10 @@ export const TOOL_METADATA = {
         // proactive recall this tool exists to encourage.
         annotations: { readOnlyHint: true, destructiveHint: false },
     },
+    memwal_namespaces: {
+        title: "List Memory Namespaces",
+        annotations: { readOnlyHint: true, destructiveHint: false },
+    },
     memwal_health: {
         title: "Check Walrus Memory Health",
         annotations: { readOnlyHint: true, destructiveHint: false },

@@ -2,6 +2,11 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
+import {
+    formatNamespaceSuggestionHint,
+    tryListNamespaces,
+    type NamespaceEntry,
+} from "./namespaces.js";
 import { wrapTool } from "./util.js";
 
 const RESTORE_INPUT = {
@@ -40,17 +45,31 @@ export function formatRestoreResult(
         truncated?: boolean;
     },
     limit = 10,
+    namespaces?: readonly NamespaceEntry[],
 ): string {
     const truncated = result.truncated === true;
     const failed = result.failed ?? 0;
+    const isEmpty =
+        !truncated &&
+        result.total === 0 &&
+        result.restored === 0 &&
+        result.skipped === 0 &&
+        failed === 0;
     // WALM-480: truncated + no success + uncounted blobs → transients
     // (download/embed blip). Raising limit does not fix that; retry does.
     const transientPage =
         truncated &&
         result.restored === 0 &&
         result.skipped + failed < result.total;
+    const suggestionHint =
+        isEmpty && namespaces
+            ? formatNamespaceSuggestionHint(result.namespace, namespaces)
+            : "";
+    const emptyLine = isEmpty
+        ? `\n  Namespace "${result.namespace}" holds 0 on-chain blobs.${suggestionHint ? ` ${suggestionHint}` : ""}`
+        : "";
     const hint = !truncated
-        ? "\n  truncated=false is not proof the sidecar saw every blob."
+        ? `${emptyLine}\n  truncated=false is not proof the sidecar saw every blob.`
         : transientPage
           ? "\n  ⚠️ This page did not restore (download/embed blip) — retry the same limit."
           : limit < SIDECAR_CAP_SATURATES_AT_LIMIT
@@ -77,11 +96,24 @@ export function registerRestoreTool(
         },
         wrapTool<{ namespace: string; limit: number }>(session, "memwal_restore", async ({ namespace, limit }) => {
             const result = await session.memwal.restore(namespace, limit);
+            const isEmpty =
+                result.truncated !== true &&
+                result.total === 0 &&
+                result.restored === 0 &&
+                result.skipped === 0 &&
+                (result.failed ?? 0) === 0;
+            const discovery = isEmpty
+                ? await tryListNamespaces(session, namespace, 50)
+                : null;
             return {
                 content: [
                     {
                         type: "text",
-                        text: formatRestoreResult(result, limit),
+                        text: formatRestoreResult(
+                            result,
+                            limit,
+                            discovery?.namespaces ?? undefined,
+                        ),
                     },
                 ],
             };

@@ -52,6 +52,10 @@ test("tools/list publishes safe titles and behavior annotations for every remote
                 title: "Recall Memories",
                 annotations: { readOnlyHint: true, destructiveHint: false },
             },
+            memwal_namespaces: {
+                title: "List Memory Namespaces",
+                annotations: { readOnlyHint: true, destructiveHint: false },
+            },
             memwal_health: {
                 title: "Check Walrus Memory Health",
                 annotations: { readOnlyHint: true, destructiveHint: false },

@@ -29,7 +29,7 @@ questions:
   - What is the difference between the MemWal plugin and MCP-only installation?
   - Which MCP clients support the MemWal automatic memory plugin?
 answer: >-
-  The MemWal MCP server exposes portable Walrus Memory as Model Context Protocol tools so AI agents can save and recall memories on their own. It can be installed as a plugin (with lifecycle hooks for automatic memory) on Claude Code, Codex, Cursor, and Antigravity, or as an MCP-only server on any MCP-aware client. Available tools include memwal_remember, memwal_recall, memwal_analyze, memwal_restore, memwal_health, memwal_login, and memwal_logout.
+  The MemWal MCP server exposes portable Walrus Memory as Model Context Protocol tools so AI agents can save and recall memories on their own. It can be installed as a plugin (with lifecycle hooks for automatic memory) on Claude Code, Codex, Cursor, and Antigravity, or as an MCP-only server on any MCP-aware client. Available tools include memwal_remember, memwal_recall, memwal_namespaces, memwal_analyze, memwal_restore, memwal_health, memwal_login, and memwal_logout.
 ---
 
 The **MemWal MCP server** exposes your portable Walrus Memory as Model Context Protocol tools, so an AI agent can decide when to save and recall memories on its own. It works with any MCP-aware client, and on **Claude Code**, **Codex**, **Cursor**, and **Antigravity** it can be installed as a **plugin** that adds automatic memory through lifecycle hooks.
@@ -113,6 +113,7 @@ Connectors UI exposes only a single bearer field and cannot supply the required
 | `memwal_remember` | Save a durable fact for the user (preference, decision, constraint, identity). |
 | `memwal_remember_bulk` | Save several distinct facts in one call. |
 | `memwal_recall` | Semantic search across stored memories for relevant context. |
+| `memwal_namespaces` | List namespaces that hold memories, with memory counts and storage used. |
 | `memwal_analyze` | Extract and save multiple facts from a passage of text. |
 | `memwal_restore` | Rebuild the search index from Walrus when recall is unexpectedly empty. |
 | `memwal_health` | Fast connectivity check (no search or decryption). |
@@ -181,4 +182,4 @@ You should see the `memwal_*` tools. Then state a durable fact (for example, a p
 
 ## Quick recovery
 
-If `memwal_recall` returns nothing although you saved before (a new machine, a fresh relayer, or after switching servers), run `memwal_restore <namespace>` to rebuild the search index from the durable Walrus blobs, then recall again.
+If `memwal_recall` returns nothing although you saved before (a new machine, a fresh relayer, or after switching servers), first verify your namespace spelling with `memwal_namespaces` (a mistyped namespace reads as 0 memories), or run `memwal_restore <namespace>` to rebuild the search index from the durable Walrus blobs, then recall again.
