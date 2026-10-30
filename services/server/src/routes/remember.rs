@@ -191,11 +191,22 @@ async fn mark_remember_job_failed(
     msg: &str,
 ) {
     let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status NOT IN ('done', 'uploaded') AND ($3::TEXT IS NULL OR prepare_claim_token = $3)",
+        "UPDATE remember_jobs
+         SET status = 'failed',
+             error_msg = $1,
+             updated_at = NOW()
+         WHERE id = $2
+           AND status NOT IN ('done', 'uploaded')
+           AND ($3::TEXT IS NULL OR prepare_claim_token = $3)
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(msg)
     .bind(job_id)
     .bind(prepare_claim_token)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(state.db.pool())
     .await;
 }
@@ -205,10 +216,19 @@ async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &s
         return;
     }
     let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = ANY($2)",
+        "UPDATE remember_jobs
+         SET status = 'failed',
+             error_msg = $1,
+             updated_at = NOW()
+         WHERE id = ANY($2)
+           AND COALESCE(error_msg, '') <> $3
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(msg)
     .bind(job_ids)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(state.db.pool())
     .await;
 }
@@ -292,7 +312,20 @@ fn spawn_prepare_remember_job(
                 // wallet handoff. Post-mint recovery must use these bytes/vector;
                 // re-encrypting plaintext would no longer match the paid blob.
                 let persisted = sqlx::query(
-                    "UPDATE remember_jobs SET preparation_encrypted_b64 = $1, preparation_vector = $2, preparation_importance = $3, preparation_account_id = $4, preparation_public_key = $5, updated_at = NOW() WHERE id = $6 AND ($7::TEXT IS NULL OR prepare_claim_token = $7)",
+                    "UPDATE remember_jobs
+                     SET preparation_encrypted_b64 = $1,
+                         preparation_vector = $2,
+                         preparation_importance = $3,
+                         preparation_account_id = $4,
+                         preparation_public_key = $5,
+                         updated_at = NOW()
+                     WHERE id = $6
+                       AND status IN ('pending', 'running')
+                       AND ($7::TEXT IS NULL OR prepare_claim_token = $7)
+                       AND COALESCE(error_msg, '') <> $8
+                       AND NOT EXISTS (
+                           SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+                       )",
                 )
                 .bind(&encrypted_b64)
                 .bind(serde_json::to_value(&vector).map_err(|e| {
@@ -303,6 +336,7 @@ fn spawn_prepare_remember_job(
                 .bind(&agent_public_key)
                 .bind(&job_id)
                 .bind(prepare_claim_token.as_deref())
+                .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
                 .execute(state.db.pool())
                 .await
                 .map_err(|e| AppError::Internal(format!("Failed to persist preparation: {}", e)))?;
@@ -311,6 +345,7 @@ fn spawn_prepare_remember_job(
                         "remember preparation lost fenced claim: job_id={}",
                         job_id
                     );
+                    rate_limit::release_storage_quota_one(&state, &job_id).await;
                     return Ok(());
                 }
 
@@ -1091,8 +1126,10 @@ async fn collapse_onto_existing_job(
                     namespace,
                     auth.public_key.clone(),
                 );
+                return accepted(existing_id, "pending".to_string());
             }
-            accepted(existing_id, "pending".to_string())
+            let actual = read_job_status(state.db.pool(), &existing_id, &existing_status).await?;
+            accepted(existing_id, actual)
         }
         ExistingJobAction::RecoverPaidBlob => {
             // The claim flips the row to `uploaded` in the same statement, so a
@@ -1161,17 +1198,36 @@ fn should_spawn_after_reset(rows_affected: u64) -> bool {
 /// so it matches zero rows and returns before `enqueue_wallet_job`.
 const PREPARE_CLAIM_TTL_SECS: i64 = 60;
 
-async fn claim_remember_preparation(
+pub(crate) async fn claim_remember_preparation(
     pool: &sqlx::PgPool,
     job_id: &str,
 ) -> Result<Option<String>, AppError> {
     let token = uuid::Uuid::new_v4().to_string();
     let claimed: Option<String> = sqlx::query_scalar(
-        "UPDATE remember_jobs SET prepare_claimed_at = NOW(), prepare_claim_token = $3, status = CASE WHEN status = 'failed' AND blob_id IS NULL THEN 'pending' ELSE status END, error_msg = CASE WHEN blob_id IS NULL THEN NULL ELSE error_msg END, updated_at = NOW() WHERE id = $1 AND blob_id IS NULL AND status IN ('pending', 'failed') AND (prepare_claimed_at IS NULL OR prepare_claimed_at < NOW() - make_interval(secs => $2) OR status = 'failed') RETURNING prepare_claim_token",
+        "UPDATE remember_jobs
+         SET prepare_claimed_at = NOW(),
+             prepare_claim_token = $3,
+             status = CASE WHEN status = 'failed' AND blob_id IS NULL THEN 'pending' ELSE status END,
+             error_msg = CASE WHEN blob_id IS NULL THEN NULL ELSE error_msg END,
+             updated_at = NOW()
+         WHERE id = $1
+           AND blob_id IS NULL
+           AND status IN ('pending', 'failed')
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )
+           AND (
+               prepare_claimed_at IS NULL
+               OR prepare_claimed_at < NOW() - make_interval(secs => $2)
+               OR status = 'failed'
+           )
+         RETURNING prepare_claim_token",
     )
     .bind(job_id)
     .bind(PREPARE_CLAIM_TTL_SECS)
     .bind(&token)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::Internal(format!("Failed to claim remember preparation: {}", e)))?;
@@ -1236,17 +1292,40 @@ async fn read_job_status(
 /// a no-op. An `uploaded` row is fenced for `PREPARE_CLAIM_TTL_SECS`, since a
 /// recovery may still be running for it; if the process died between claim and
 /// enqueue, the lease expiring is what lets a later retry take it over.
-async fn claim_paid_recovery(
+pub(crate) async fn claim_paid_recovery(
     pool: &sqlx::PgPool,
     job_id: &str,
 ) -> Result<Option<String>, AppError> {
     let token = uuid::Uuid::new_v4().to_string();
     let claimed: Option<String> = sqlx::query_scalar(
-        "UPDATE remember_jobs SET status = 'uploaded', error_msg = NULL, recovery_claimed_at = NOW(), recovery_claim_token = $3, updated_at = NOW() WHERE id = $1 AND blob_id IS NOT NULL AND (status = 'failed' OR (status = 'uploaded' AND (recovery_claimed_at IS NULL OR recovery_claimed_at < NOW() - make_interval(secs => $2)))) RETURNING recovery_claim_token",
+        "UPDATE remember_jobs
+         SET status = 'uploaded',
+             error_msg = NULL,
+             recovery_claimed_at = NOW(),
+             recovery_claim_token = $3,
+             updated_at = NOW()
+         WHERE id = $1
+           AND blob_id IS NOT NULL
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )
+           AND (
+               status = 'failed'
+               OR (
+                   status = 'uploaded'
+                   AND (
+                       recovery_claimed_at IS NULL
+                       OR recovery_claimed_at < NOW() - make_interval(secs => $2)
+                   )
+               )
+           )
+         RETURNING recovery_claim_token",
     )
     .bind(job_id)
     .bind(PREPARE_CLAIM_TTL_SECS)
     .bind(&token)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::Internal(format!("Failed to claim paid recovery: {}", e)))?;
@@ -1258,11 +1337,24 @@ async fn claim_paid_recovery(
 /// `token` can release, and only while the row still says `uploaded`.
 async fn release_paid_recovery(pool: &sqlx::PgPool, job_id: &str, token: &str, msg: &str) {
     let released = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $3, recovery_claimed_at = NULL, recovery_claim_token = NULL, updated_at = NOW() WHERE id = $1 AND recovery_claim_token = $2 AND status = 'uploaded'",
+        "UPDATE remember_jobs
+         SET status = 'failed',
+             error_msg = $3,
+             recovery_claimed_at = NULL,
+             recovery_claim_token = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND recovery_claim_token = $2
+           AND status = 'uploaded'
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(job_id)
     .bind(token)
     .bind(format!("paid recovery could not be queued: {}", msg))
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await;
     if let Err(e) = released {
@@ -2388,6 +2480,26 @@ mod tests {
         sqlx::raw_sql(include_str!(
             "../../migrations/026_drop_owner_idempotency_key_index.sql"
         ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/014_storage_reservations.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "SELECT pg_advisory_lock(72819041);
+             CREATE TABLE IF NOT EXISTS memory_tombstones (
+                 memory_id  TEXT PRIMARY KEY,
+                 owner      TEXT NOT NULL,
+                 namespace  TEXT NOT NULL,
+                 blob_id    TEXT NOT NULL,
+                 deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             SELECT pg_advisory_unlock(72819041);",
+        )
         .execute(&pool)
         .await
         .unwrap();
@@ -3871,6 +3983,164 @@ mod tests {
         .unwrap();
         assert_eq!(row5, 1, "row 5 (nsB, fresh key, T1) must insert cleanly");
 
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn forgotten_in_flight_jobs_remain_terminal_across_preparation_and_paid_recovery_claims()
+    {
+        let pool = dedupe_test_pool().await;
+        let db = crate::storage::db::VectorDb::from_pool(pool.clone());
+        let owner = format!("0xforget-retry-{}", uuid::Uuid::new_v4());
+        let namespace = "forget-retry-ns";
+
+        let unpaid_running_id = format!("job-unpaid-run-{}", uuid::Uuid::new_v4());
+        let unpaid_failed_id = format!("job-unpaid-fail-{}", uuid::Uuid::new_v4());
+        let paid_uploaded_id = format!("job-paid-up-{}", uuid::Uuid::new_v4());
+        let tombstone_only_id = format!("job-tomb-only-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, prepare_claimed_at, prepare_claim_token)
+             VALUES ($1, $2, $3, 'running', 'k-run', NOW(), 'prep-tok')",
+        )
+        .bind(&unpaid_running_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'k-fail', 'earlier transient failure')",
+        )
+        .bind(&unpaid_failed_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, idempotency_key, recovery_claimed_at, recovery_claim_token)
+             VALUES ($1, $2, $3, 'uploaded', 'blob-paid-1', '0xobj-paid-1', 'k-paid', NOW(), 'rec-tok')",
+        )
+        .bind(&paid_uploaded_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        db.delete_by_namespace(&owner, namespace)
+            .await
+            .expect("delete_by_namespace");
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'some other error')",
+        )
+        .bind(&tombstone_only_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+             VALUES ($1, $2, $3, '')",
+        )
+        .bind(&tombstone_only_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 1. In-flight wallet upload error after `delete_by_namespace` must not
+        //    downgrade `failed` back to `running` or clobber `error_msg`.
+        let retryable_err = crate::jobs::WalletJobError::Transient("sidecar HTTP 502".into());
+        crate::jobs::update_remember_job_after_wallet_error(
+            &pool,
+            Some(&unpaid_running_id),
+            &retryable_err,
+            "sidecar HTTP 502",
+            None,
+        )
+        .await;
+
+        // 2. Same-key request that resolved the job before `delete_by_namespace`
+        //    must not re-claim preparation or reset an unpaid analyze failure.
+        for jid in [&unpaid_running_id, &unpaid_failed_id, &tombstone_only_id] {
+            let prep_claim = claim_remember_preparation(&pool, jid)
+                .await
+                .expect("claim_remember_preparation");
+            assert!(
+                prep_claim.is_none(),
+                "claim_remember_preparation must not re-open forgotten job {jid}"
+            );
+
+            let analyze_reset =
+                sqlx::query(crate::routes::analyze::unpaid_analyze_retry_reset_sql())
+                    .bind(jid)
+                    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+                    .execute(&pool)
+                    .await
+                    .expect("unpaid_analyze_retry_reset_sql");
+            assert_eq!(
+                analyze_reset.rows_affected(),
+                0,
+                "unpaid_analyze_retry_reset_sql must not reset forgotten job {jid}"
+            );
+        }
+
+        // 3. Same-key request that resolved the paid job before `delete_by_namespace`
+        //    must not claim paid recovery or flip the row back to `uploaded`.
+        let paid_claim = claim_paid_recovery(&pool, &paid_uploaded_id)
+            .await
+            .expect("claim_paid_recovery");
+        assert!(
+            paid_claim.is_none(),
+            "claim_paid_recovery must not re-open forgotten paid job"
+        );
+
+        for (jid, expected_err) in [
+            (
+                &unpaid_running_id,
+                crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR,
+            ),
+            (&unpaid_failed_id, "earlier transient failure"),
+            (
+                &paid_uploaded_id,
+                crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR,
+            ),
+        ] {
+            let (status, error_msg): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                    .bind(jid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(status, "failed", "forgotten job {jid} must stay failed");
+            assert_eq!(
+                error_msg.as_deref(),
+                Some(expected_err),
+                "forgotten job {jid} must preserve expected error_msg"
+            );
+            assert_eq!(
+                crate::jobs::upload_resume_disposition(&pool, jid).await,
+                crate::jobs::UploadResume::Forgotten,
+                "forgotten job {jid} must resolve to UploadResume::Forgotten"
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM memory_tombstones WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
             .bind(&owner)
             .execute(&pool)
