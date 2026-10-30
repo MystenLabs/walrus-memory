@@ -48,6 +48,14 @@ jobs:
         with:
           node-version-file: .nvmrc
 
+      - name: Verify changed package versions
+        if: matrix.script == 'scripts/verify-manual-sdk-release.mjs' && github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          RELEASE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$RELEASE_BASE_SHA"
+          node scripts/verify-package-version-bumps.mjs --base "$RELEASE_BASE_SHA"
+
       - name: Run check
         run: node ${{ matrix.script }}
 
@@ -576,6 +584,9 @@ jobs:
 
       - name: Unit tests (cargo test)
         working-directory: services/server
+        env:
+          OWNER_RATE_LIMIT_TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+          ADMIN_API_KEY: ci-only-owner-policy-test-key
         run: cargo test --bins
 
   move-contract:

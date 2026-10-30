@@ -28,8 +28,14 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
+  Version 0.1.12 bounds withMemWal recall queries (preserving both head context and tail question/instructions via strategy: "head-tail") to 16,384 UTF-8 bytes and auto-save analyze inputs to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, preventing HTTP 400 errors on long turns. Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
 ---
+
+## 0.1.12
+
+### Fixed
+
+- `withMemWal` bounds the recall query (preserving both head context and tail question/instructions via `strategy: "head-tail"`) to 16,384 UTF-8 bytes and auto-save `analyze()` input to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, while keeping the full user turn in the language model prompt. User turns exceeding the embedder's 16 KiB limit still inject relevant memories without HTTP 400 errors, and auto-save extracts facts across turns up to 64 KiB. (#1037)
 
 ## 0.1.11
 

@@ -1,8 +1,14 @@
 # @mysten-incubation/memwal-mcp
 
-## 0.0.17
+## 0.0.18
 
-Unreleased. Package and plugin manifests are bumped manually to 0.0.17. The launcher installs the published 0.0.16 through `mcpPackageVersion` until 0.0.17 is available on npm; retarget that pin after publishing.
+### Fixed
+
+- `MEMWAL_AUTO_SAVE` in `process.env` can no longer turn automatic memory on or clear `pendingConsent`. An MCP client populates `env` from `.cursor/mcp.json`, `.vscode/mcp.json`, or `.claude/settings.json` inside the checkout, so a truthy `MEMWAL_AUTO_SAVE` in `env` could flip automatic saving on over a stored `autoSave: false` (reporting `enabled: true` alongside `state: "off"`) or bypass the consent prompt on an unanswered install. Both the MCP server and the plugin hooks now honour only a disabling override (`MEMWAL_AUTO_SAVE=0`) from `env`, keep `state` and `enabled` consistent, and preserve `pendingConsent: true` until a stored answer exists in `~/.memwal/settings.json`. (#995)
+- Wake pending SSE readers immediately when the connection is aborted, so an idle session reconnects without depending on the HTTP reader rejecting first.
+- Pin the launcher to 0.0.18 with published 0.0.17-dev.3 (which contains the consent fix) as an explicit bootstrap while the stable release is unavailable. Bootstrap is permitted only when npm reports the exact preferred package version missing; cached stable installs keep their existing offline fast path.
+
+## 0.0.17
 
 ### Fixed
 

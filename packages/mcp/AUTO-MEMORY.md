@@ -52,9 +52,10 @@ memwal-mcp auto-save off
 memwal-mcp auto-save         # report the current state and where it came from
 ```
 
-`MEMWAL_AUTO_SAVE=1` in an MCP client's `env` block overrides the file for one
-server process, and counts as a deliberate answer — it also stops the login
-prompt, so a configured install is never nagged.
+`MEMWAL_AUTO_SAVE=0` in an MCP client's `env` block turns automatic saving off
+for that server process without changing the stored answer. A truthy value in
+`env` is ignored so a checkout's MCP config cannot enable automatic saving over
+a stored `autoSave: false` or before consent has been given.
 
 **Where the state lives** — `settings.json`, next to `credentials.json`, so it
 inherits `credsPath()` resolution: `MEMWAL_CREDS_DIR` override, else the

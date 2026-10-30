@@ -52,8 +52,8 @@ Saving **without being asked is on once you agree to it**: `memwal-mcp login`
 asks the question in your terminal the first time, and on a fresh install
 nothing is saved unprompted until you answer. Saved memories are permanent —
 Walrus is immutable storage — which is why the question comes first. Change the
-answer any time with `memwal-mcp auto-save on|off` (or `MEMWAL_AUTO_SAVE` in
-your client's `env` block). Recall, and anything you explicitly ask to be
+answer any time with `memwal-mcp auto-save on|off` (or `MEMWAL_AUTO_SAVE=0` in
+your client's `env` block to disable it for one client). Recall, and anything you explicitly ask to be
 remembered, work either way. Credentials — passwords, API keys, tokens, private keys, seed
 phrases, authorization headers, and URLs with an embedded `user:password` — are
 excluded in both modes and stripped before a memory is written, because Walrus

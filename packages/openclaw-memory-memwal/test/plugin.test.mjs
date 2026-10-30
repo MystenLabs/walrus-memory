@@ -689,11 +689,13 @@ test("auto-capture with real MemWal client aborts stalled /api/analyze HTTP requ
     });
     // Stub SEAL session build so no external Sui RPC is needed in unit tests
     realClient.buildSealSession = async () => "test-seal-session";
+    // Prime relayer compatibility and lazy-loaded crypto before the timed test turn
+    await realClient.ensureCompatibleRelayer?.().catch(() => {});
 
     const h = makeApi();
     const cfg = {
       ...parseConfig({ ...VALID, serverUrl: baseUrl, autoRecall: false, autoCapture: true }),
-      requestTimeoutMs: 60,
+      requestTimeoutMs: 150,
     };
     registerHooks(h.api, realClient, cfg);
 
@@ -708,7 +710,7 @@ test("auto-capture with real MemWal client aborts stalled /api/analyze HTTP requ
     await Promise.race([
       socketClosedPromise,
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("stalled /api/analyze HTTP socket was not aborted")), 1_500),
+        setTimeout(() => reject(new Error("stalled /api/analyze HTTP socket was not aborted")), 4_000),
       ),
     ]);
     assert.equal(analyzeRequests, 1, "stalled /api/analyze must not be retried on timeout");

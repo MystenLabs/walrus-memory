@@ -1,6 +1,6 @@
 {
     "name": "memwal",
-    "version": "0.0.17",
+    "version": "0.0.18",
     "description": "Automatic Walrus Memory for Cursor \u2014 proactive recall and durable-fact saving via the MemWal MCP + lifecycle hooks.",
     "author": {
         "name": "Mysten Labs"
