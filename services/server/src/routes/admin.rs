@@ -150,7 +150,10 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
             extract: crate::services::extractor::FACT_EXTRACTION_PROMPT_VERSION.to_string(),
             ask: ASK_SYSTEM_PROMPT_VERSION.to_string(),
         },
-        write_ready: write_ready(&state).await,
+        // Check policy freshness outside the cached probes so health agrees
+        // with request admission, without adding a database query here.
+        write_ready: write_ready(&state).await
+            && (state.config.rate_limit.bench_bypass_enabled || state.owner_policies.is_ready()),
         writes: writes_health_status(
             state.config.writes_paused,
             durable_writes_degraded_probe(&state).await,

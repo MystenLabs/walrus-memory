@@ -1749,6 +1749,7 @@ dependencies = [
  "aes-gcm",
  "apalis",
  "apalis-sql",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64",

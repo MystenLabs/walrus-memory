@@ -67,7 +67,7 @@ const REMEMBER_MANUAL = [
     "the complete statement rather than a summary. Use memwal_remember_bulk when they hand you",
     "several distinct facts at once. Do not save a fact just because it looks durable, and do",
     "not nag: if automatic saving would clearly help, say once that they can turn it on with",
-    "`memwal-mcp auto-save on` (or MEMWAL_AUTO_SAVE=1) and leave it there.",
+    "`memwal-mcp auto-save on` and leave it there.",
 ];
 
 const WRITE_CONTRACT = [

@@ -774,7 +774,7 @@ async function openSseStream(
     // be open (observed in the wild: relayer session state silently dropped
     // while the bridge waited forever for a response that never arrived,
     // because the next POST landed in the void). Abort the controller — the
-    // catch block sets streamEnded=true and runBridge's serverPump triggers
+    // abort listener sets streamEnded=true and runBridge's serverPump triggers
     // reconnect("server-pump-eof"), which replays any in-flight requests on
     // the fresh session.
     const idleTimeoutMs = resolveSseIdleMs();
@@ -789,6 +789,18 @@ async function openSseStream(
     }, checkIntervalMs);
     // unref so the watchdog never holds the event loop open during shutdown.
     watchdog.unref?.();
+
+    // Some supported fetch implementations leave reader.read() pending after
+    // abort. Wake our iterator directly; cancellation is cleanup, not the signal
+    // on which reconnect progress depends.
+    const onStreamAbort = () => {
+        clearInterval(watchdog);
+        streamEnded = true;
+        wake();
+        void reader.cancel().catch(() => {});
+    };
+    controller.signal.addEventListener("abort", onStreamAbort, { once: true });
+    if (controller.signal.aborted) onStreamAbort();
 
     // Pump the SSE stream in the background.
     const pump = (async () => {
@@ -842,6 +854,7 @@ async function openSseStream(
                 }
             }
         } finally {
+            controller.signal.removeEventListener("abort", onStreamAbort);
             clearInterval(watchdog);
             streamEnded = true;
             // Wake any waiter so they see EOF.

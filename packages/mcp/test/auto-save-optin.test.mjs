@@ -73,7 +73,7 @@ function runHook(script, input, env) {
     const result = spawnSync(process.execPath, [join(SCRIPTS, script)], {
         input: JSON.stringify(input),
         encoding: "utf8",
-        env: { ...process.env, MEMWAL_AUTO_SAVE: "", ...env },
+        env: { ...process.env, ...env },
     });
     assert.equal(result.status, 0, result.stderr);
     if (!result.stdout.trim()) return "";
@@ -193,42 +193,85 @@ test("the settings file is not world-readable and keeps unrelated keys", () => {
     rmSync(dir, { recursive: true, force: true });
 });
 
-test("the environment overrides every state, in both directions", () => {
+test("MEMWAL_AUTO_SAVE can turn saving off, but never on over a declined or unanswered state", () => {
     const dir = freshCredsDir();
     withEnv({ MEMWAL_CREDS_DIR: dir, [AUTO_SAVE_ENV]: undefined }, () => {
-        // over an answered "off" / "on"
+        // A project-supplied MEMWAL_AUTO_SAVE=1 must not flip auto-save on over
+        // a stored `autoSave: false`, nor report `enabled: true` alongside `state: "off"`.
         setAutoSave(false);
         withEnv({ [AUTO_SAVE_ENV]: "1" }, () => {
-            assert.equal(isAutoSaveEnabled(), true);
-            assert.equal(autoSaveStatus().source, "env");
-            assert.equal(autoSaveStatus().state, "off", "the stored answer is untouched");
+            assert.equal(isAutoSaveEnabled(), false);
+            assert.deepEqual(autoSaveStatus(), {
+                enabled: false,
+                state: "off",
+                source: "settings",
+                pendingConsent: false,
+                path: join(dir, "settings.json"),
+            });
+            assert.equal(hookAutoSave.isAutoSaveEnabled(), false);
+            assert.deepEqual(hookAutoSave.autoSaveStatus(), {
+                enabled: false,
+                state: "off",
+                source: "settings",
+                pendingConsent: false,
+            });
         });
+
+        // Turning automatic saving OFF for one process via MEMWAL_AUTO_SAVE=0 is
+        // still honoured and reports a self-consistent `state: "off"`.
         setAutoSave(true);
         withEnv({ [AUTO_SAVE_ENV]: "0" }, () => {
             assert.equal(isAutoSaveEnabled(), false);
-            assert.equal(autoSaveStatus().source, "env");
+            assert.deepEqual(autoSaveStatus(), {
+                enabled: false,
+                state: "off",
+                source: "env",
+                pendingConsent: false,
+                path: join(dir, "settings.json"),
+            });
+            assert.equal(hookAutoSave.isAutoSaveEnabled(), false);
+            assert.deepEqual(hookAutoSave.autoSaveStatus(), {
+                enabled: false,
+                state: "off",
+                source: "env",
+                pendingConsent: false,
+            });
         });
     });
     rmSync(dir, { recursive: true, force: true });
 
-    // over each unset state, and it settles the question too — someone who set
-    // this deliberately does not also need to be prompted.
+    // When no stored answer exists, MEMWAL_AUTO_SAVE=1 cannot grant consent or
+    // suppress the prompt (`pendingConsent` remains true).
     const unanswered = freshCredsDir();
     withEnv({ MEMWAL_CREDS_DIR: unanswered, [AUTO_SAVE_ENV]: undefined }, () => {
         markConsentPending();
         withEnv({ [AUTO_SAVE_ENV]: "1" }, () => {
-            assert.equal(isAutoSaveEnabled(), true);
-            assert.equal(autoSaveStatus().pendingConsent, false);
+            assert.equal(isAutoSaveEnabled(), false);
+            assert.equal(autoSaveStatus().state, "unset");
+            assert.equal(autoSaveStatus().source, "unanswered");
+            assert.equal(autoSaveStatus().pendingConsent, true);
+            assert.equal(hookAutoSave.isAutoSaveEnabled(), false);
+            assert.equal(hookAutoSave.autoSaveStatus().pendingConsent, true);
         });
     });
     rmSync(unanswered, { recursive: true, force: true });
 
+    // On a legacy install with no stored answer, MEMWAL_AUTO_SAVE=off disables
+    // unprompted saving for this process while keeping `pendingConsent: true`
+    // so the user is still asked at their next interactive login.
     const legacy = freshCredsDir();
     withEnv({ MEMWAL_CREDS_DIR: legacy, [AUTO_SAVE_ENV]: undefined }, () => {
         writeFileSync(join(legacy, "credentials.json"), "{}");
+        publishHookState();
         withEnv({ [AUTO_SAVE_ENV]: "off" }, () => {
             assert.equal(isAutoSaveEnabled(), false);
-            assert.equal(autoSaveStatus().pendingConsent, false);
+            assert.equal(autoSaveStatus().state, "off");
+            assert.equal(autoSaveStatus().source, "env");
+            assert.equal(autoSaveStatus().pendingConsent, true);
+            assert.equal(hookAutoSave.isAutoSaveEnabled(), false);
+            assert.equal(hookAutoSave.autoSaveStatus().state, "off");
+            assert.equal(hookAutoSave.autoSaveStatus().source, "env");
+            assert.equal(hookAutoSave.autoSaveStatus().pendingConsent, true);
         });
     });
     rmSync(legacy, { recursive: true, force: true });
@@ -299,6 +342,8 @@ test("a published state this build does not understand fails safe", () => {
             "{ not json",
             JSON.stringify({ version: 99, enabled: true }),
             JSON.stringify({ version: 1, enabled: "yes" }),
+            JSON.stringify({ version: 1, enabled: true, state: "off" }),
+            JSON.stringify({ version: 1, enabled: false, state: "on" }),
             JSON.stringify({ version: 1 }),
             "null",
         ]) {
@@ -401,7 +446,7 @@ test("a hook with saving off still exits 0 and never blocks the session", () => 
         const result = spawnSync(process.execPath, [join(SCRIPTS, script)], {
             input: JSON.stringify({ prompt: "a reasonably long prompt about pnpm" }),
             encoding: "utf8",
-            env: { ...process.env, MEMWAL_CREDS_DIR: dir, MEMWAL_AUTO_SAVE: "" },
+            env: { ...process.env, MEMWAL_CREDS_DIR: dir },
         });
         assert.equal(result.status, 0, `${script}: ${result.stderr}`);
     }
@@ -539,7 +584,7 @@ test("a non-TTY run never prompts, never hangs, and says where things stand", ()
             input: "",
             encoding: "utf8",
             timeout: 10_000,
-            env: { ...process.env, MEMWAL_CREDS_DIR: dir, MEMWAL_AUTO_SAVE: "" },
+            env: { ...process.env, MEMWAL_CREDS_DIR: dir },
         },
     );
     assert.equal(result.status, 0, result.stderr);

@@ -403,6 +403,34 @@ fn rate_limiter_unavailable_response() -> Response {
 // Rate Limit Middleware
 // ============================================================
 
+// Keep only the three request budgets on the hot path. In particular, do not
+// clone the Redis URL or carry storage/bypass settings into owner overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestBudgets {
+    max_requests_per_minute: i64,
+    max_requests_per_hour: i64,
+    max_requests_per_delegate_key: i64,
+}
+
+fn effective_owner_budgets(
+    defaults: &RateLimitConfig,
+    policy: Option<&crate::owner_rate_limits::OwnerRateLimit>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RequestBudgets {
+    match policy.filter(|policy| policy.active_at(now)) {
+        Some(policy) => RequestBudgets {
+            max_requests_per_minute: policy.requests_per_minute,
+            max_requests_per_hour: policy.requests_per_hour,
+            max_requests_per_delegate_key: policy.delegate_key_per_minute,
+        },
+        None => RequestBudgets {
+            max_requests_per_minute: defaults.max_requests_per_minute,
+            max_requests_per_hour: defaults.max_requests_per_hour,
+            max_requests_per_delegate_key: defaults.max_requests_per_delegate_key,
+        },
+    }
+}
+
 /// Multi-layer rate limiting middleware for the write-path authenticated
 /// routes (`/api/*`, mounted on `protected_routes` in `main.rs`).
 ///
@@ -422,8 +450,8 @@ fn rate_limiter_unavailable_response() -> Response {
 ///
 /// Returns 429 Too Many Requests with JSON body if any layer exceeds its limit.
 ///
-/// Returns 503 Service Unavailable (fail-closed) if Redis
-/// is unreachable — previously was fail-open (silently allowed all requests).
+/// Unavailable or stale owner policy snapshots fail closed with 503; Redis outages use the existing
+/// in-memory fallback with the same effective owner limits.
 ///
 /// Normalizes trailing slash in path before cost weight lookup.
 pub async fn rate_limit_middleware(
@@ -450,9 +478,16 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    let config = &state.config.rate_limit;
+    // No database/Redis lookup for policy resolution on the request path.
+    // Unknown owners use defaults; an uninitialized/stale snapshot fails closed.
+    let policy = match state.owner_policies.policy_for(&auth.owner) {
+        Ok(policy) => policy,
+        Err(_) => return rate_limiter_unavailable_response(),
+    };
+    let now = chrono::Utc::now();
+    let config = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now);
     let mut redis = state.redis.clone();
-    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let now = now.timestamp_millis() as f64;
 
     // Determine cost weight based on endpoint; path is normalized inside endpoint_weight.
     let weight = endpoint_weight(request.uri().path());
@@ -3382,5 +3417,35 @@ mod tests {
             .query_async(&mut conn)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owner_policy_tests {
+    use super::*;
+    use crate::owner_rate_limits::OwnerRateLimit;
+    #[test]
+    fn override_and_expiry_preserve_other_limits() {
+        let defaults = RateLimitConfig::default();
+        let now = chrono::Utc::now();
+        let mut policy = OwnerRateLimit {
+            requests_per_minute: 180,
+            requests_per_hour: 1500,
+            delegate_key_per_minute: 90,
+            expires_at: Some(now + chrono::Duration::minutes(1)),
+        };
+        let effective = effective_owner_budgets(&defaults, Some(&policy), now);
+        assert_eq!(effective.max_requests_per_minute, 180);
+        assert_eq!(effective.max_requests_per_hour, 1500);
+        assert_eq!(effective.max_requests_per_delegate_key, 90);
+        policy.expires_at = Some(now);
+        assert_eq!(
+            effective_owner_budgets(&defaults, Some(&policy), now).max_requests_per_minute,
+            defaults.max_requests_per_minute
+        );
+        assert_eq!(
+            effective_owner_budgets(&defaults, None, now).max_requests_per_hour,
+            defaults.max_requests_per_hour
+        );
     }
 }

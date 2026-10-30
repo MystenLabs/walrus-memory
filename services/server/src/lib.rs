@@ -18,6 +18,7 @@ mod engine;
 mod jobs;
 mod oauth;
 mod observability;
+mod owner_rate_limits;
 mod owner_token_auth;
 mod rate_limit;
 mod security_delete_auth;

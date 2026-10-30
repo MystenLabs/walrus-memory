@@ -16420,3 +16420,54 @@ body:has(.signin-proposed) {
     white-space: nowrap;
   }
 }
+
+/* Priority-wallet controls reuse the Delegate keys section, form and buttons. */
+.admin-priority-list { list-style: none; margin: 0; padding: 0; }
+.admin-priority-wallet { padding: 16px 0; border-bottom: 1px solid #262b30; }
+.admin-priority-row { display: grid; grid-template-columns: minmax(0, 1fr) 104px 156px; align-items: center; gap: 16px; }
+.admin-priority-card .admin-priority-address { min-width: 0; width: 100%; box-sizing: border-box; }
+.admin-priority-card .admin-priority-select { width: 100%; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; text-align: left; }
+.admin-priority-actions { display: flex; align-items: center; justify-content: flex-end; gap: 16px; }
+.admin-priority-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+.admin-priority-note { display: block; margin-top: 8px; color: #8f9294; font-family: "Google Sans Flex", sans-serif; font-size: 14px; }
+.admin-priority-card .admin-priority-footnote { margin-top: 16px; }
+.admin-priority-card .dashboard-empty-message { font-family: "Google Sans Flex", sans-serif; }
+.admin-priority-card button:disabled { opacity: .5; cursor: wait; }
+@media (max-width: 640px) { .admin-priority-row { grid-template-columns: minmax(0, 1fr) 156px; gap: 12px; } .admin-priority-address { grid-column: 1 / -1; } }
+
+.dash-page .admin-priority-card .dashboard-add-key-create,
+.dash-page .admin-priority-card .dashboard-add-key-create:hover:not(:disabled),
+.dash-page .admin-priority-card .dashboard-add-key-create:active:not(:disabled) {
+  width: 112px;
+  min-width: 112px;
+  min-height: 48px;
+  height: 48px;
+  padding: 10px 12px;
+  justify-content: center;
+  transform: none;
+  translate: none;
+  box-shadow: none;
+  transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+}
+
+.dash-page .admin-priority-card .admin-priority-actions {
+  margin: 0;
+  align-self: center;
+}
+
+.admin-priority-save-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+
+.admin-priority-dropdown { position: relative; min-width: 0; }
+.admin-priority-select > svg { flex-shrink: 0; transition: transform .15s ease; color: #a8abad; }
+.admin-priority-chevron--open { transform: rotate(180deg); }
+.admin-priority-menu { position: absolute; top: calc(100% + 8px); left: 0; min-width: 100%; z-index: 40; box-sizing: border-box; padding: 4px; border: 1px solid #30363b; border-radius: 8px; background: #101214; box-shadow: 0 12px 28px rgba(0,0,0,.45); }
+.admin-priority-card .admin-priority-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 4px; background: transparent; color: #faf8f5; font-family: "Google Sans Flex", sans-serif; font-size: 15px; line-height: 1.2; cursor: pointer; }
+.admin-priority-card .admin-priority-option:hover, .admin-priority-card .admin-priority-option:focus { outline: none; background: #262b30; }
+.admin-priority-card .admin-priority-option[aria-selected="true"] { font-weight: 600; }
