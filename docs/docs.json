@@ -61,6 +61,7 @@
               "guides/system-prompt-templates",
               "guides/import-existing-memory",
               "guides/agent-runtimes",
+              "guides/multi-agent-coordination",
               "guides/delete-old-memories",
               "guides/delete-memories-programmatically"
             ]
