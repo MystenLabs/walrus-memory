@@ -47,6 +47,8 @@ type AnyLanguageModel = any;
 export interface WithMemWalOptions extends MemWalConfig {
     /** Max memories to inject per request (default: 5) */
     maxMemories?: number;
+    /** Token budget for recalled memories injected per request. Maps to recall({ maxTokens }). */
+    maxTokens?: number;
     /** Auto-save new facts from conversation (default: true) */
     autoSave?: boolean;
     /** Minimum similarity score to include a memory (0-1, default: 0.3) */
@@ -183,6 +185,7 @@ export function withMemWal(
 ) {
     const memwal = MemWal.create(options);
     const maxMemories = options.maxMemories ?? 5;
+    const maxTokens = options.maxTokens;
     const autoSave = options.autoSave ?? true;
     const minRelevance = options.minRelevance ?? 0.3;
     const debug = options.debug ?? false;
@@ -258,7 +261,10 @@ export function withMemWal(
                     const recallQuery = truncateUtf8Bytes(lastUserMessage, MAX_EMBED_INPUT_BYTES, {
                         strategy: "head-tail",
                     });
-                    const recallResult = await memwal.recall(recallQuery, maxMemories);
+                    const recallResult =
+                        maxTokens !== undefined
+                            ? await memwal.recall({ query: recallQuery, limit: maxMemories, maxTokens })
+                            : await memwal.recall(recallQuery, maxMemories);
                     const relevant = recallResult.results.filter((m: RecallMemory) => {
                         const relevance = memoryRelevance(m?.distance);
                         return relevance !== null && relevance >= minRelevance;
