@@ -348,7 +348,10 @@ impl LlmExtractor {
         // Cost: holding the body as a String uses ~response-size extra
         // memory (a few KB per chat completion — trivial).
         let body = resp.text().await.map_err(|e| {
-            AppError::EmbeddingProviderUnavailable(format!("Failed to read LLM response body: {}", e))
+            AppError::EmbeddingProviderUnavailable(format!(
+                "Failed to read LLM response body: {}",
+                e
+            ))
         })?;
 
         if let Some(envelope) = parse_openrouter_error_envelope(&body) {

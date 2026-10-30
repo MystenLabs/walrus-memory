@@ -83,6 +83,14 @@ expect(result.results[0].text).toContain("dark mode");
 
 The mock supports remember/job polling, bulk remember, recall, analyze, embed, health, restore, `forget(blobId)`, and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
 
+## Write-path validation & secret screening
+
+`remember()`, `rememberAndWait()`, and `rememberBulk*()` validate input text client-side before signing or sending requests:
+- Rejects empty/whitespace-only text and inputs exceeding `MAX_REMEMBER_TEXT_BYTES` (1 MiB)
+- Screens for high-confidence credential patterns (`suiprivkey1...` Bech32 keys, PEM private keys, vendor API keys, JWTs, URL userinfo credentials, auth headers, labelled seed phrases, and labelled key material) and throws `MemWalValidationError` (`code: "secret_pattern_detected"`) by default
+
+Use `validateRemember(text)` (or `{ dryRun: true }`) to inspect validation results offline without contacting the relayer, or pass `{ allowSecrets: true }` (alias `{ skipValidation: true }`) when storing synthetic test fixtures intentionally.
+
 ## Exports
 
 | Entry | Description |

@@ -22,12 +22,919 @@ use std::sync::Arc;
 
 use crate::jobs::WalletOperation;
 use crate::rate_limit;
-use crate::services::extractor::MAX_ANALYZE_FACTS;
+use crate::services::extractor::{ExtractedFact, MAX_ANALYZE_FACTS};
 use crate::types::*;
 
 use super::{collect_bounded_results, enqueue_wallet_job};
 
 const ANALYZE_CONCURRENCY: usize = 5;
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_base64url_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn take_while_len<F: Fn(u8) -> bool>(bytes: &[u8], f: F) -> usize {
+    bytes.iter().take_while(|&&b| f(b)).count()
+}
+
+fn match_pem_header(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix("-----BEGIN ")?;
+    let end_idx = rest.find("PRIVATE KEY-----")?;
+    let label = &rest[..end_idx];
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+    {
+        Some("-----BEGIN ".len() + end_idx + "PRIVATE KEY-----".len())
+    } else {
+        None
+    }
+}
+
+fn match_pem_footer(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix("-----END ")?;
+    let end_idx = rest.find("PRIVATE KEY-----")?;
+    let label = &rest[..end_idx];
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+    {
+        Some("-----END ".len() + end_idx + "PRIVATE KEY-----".len())
+    } else {
+        None
+    }
+}
+
+fn redact_pem_blocks(input: &str, count: &mut usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(begin_pos) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..begin_pos]);
+        let candidate = &rest[begin_pos..];
+        let Some(header_len) = match_pem_header(candidate) else {
+            out.push_str("-----BEGIN ");
+            rest = &candidate["-----BEGIN ".len()..];
+            continue;
+        };
+        let after_header = &candidate[header_len..];
+        let mut search_offset = 0;
+        let mut closed_end = None;
+        while let Some(rel_end) = after_header[search_offset..].find("-----END ") {
+            let idx = search_offset + rel_end;
+            if let Some(footer_len) = match_pem_footer(&after_header[idx..]) {
+                closed_end = Some(header_len + idx + footer_len);
+                break;
+            }
+            search_offset = idx + "-----END ".len();
+        }
+        *count += 1;
+        out.push_str("[redacted:private-key-block]");
+        if let Some(total_len) = closed_end {
+            rest = &candidate[total_len..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_url_userinfo_user_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'/' | b'@' | b':' | b'?' | b'=' | b'&')
+}
+
+fn is_url_userinfo_pass_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'/' | b'@' | b'?' | b'=' | b'&')
+}
+
+fn redact_url_userinfo(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"://" {
+            // Confirm preceded by a valid 1..=31 byte scheme.
+            let mut scheme_start = i;
+            while scheme_start > 0
+                && (i - scheme_start) < 31
+                && (bytes[scheme_start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[scheme_start - 1], b'+' | b'.' | b'-'))
+            {
+                scheme_start -= 1;
+            }
+            let valid_scheme = scheme_start < i && bytes[scheme_start].is_ascii_alphabetic();
+            if valid_scheme {
+                let after_scheme = i + 3;
+                let user_len = take_while_len(&bytes[after_scheme..], is_url_userinfo_user_byte);
+                let colon_pos = after_scheme + user_len;
+                if user_len > 0 && colon_pos < bytes.len() && bytes[colon_pos] == b':' {
+                    let pass_start = colon_pos + 1;
+                    let pass_len = take_while_len(&bytes[pass_start..], is_url_userinfo_pass_byte);
+                    let at_pos = pass_start + pass_len;
+                    if pass_len > 0 && at_pos < bytes.len() && bytes[at_pos] == b'@' {
+                        out.push_str("://[redacted:url-credentials]@");
+                        *count += 1;
+                        i = at_pos + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Match a high-confidence vendor key or JWT at the start of `s`, returning
+/// `(matched_byte_len, placeholder)`. Caller guarantees left word boundary.
+fn match_secret_token_at_start(s: &str) -> Option<(usize, &'static str)> {
+    let bytes = s.as_bytes();
+
+    // 1. Bech32 Sui private key: suiprivkey1[0-9a-z]{16,} (case-insensitive) (#435)
+    if bytes.len() >= 27 && bytes[..11].eq_ignore_ascii_case(b"suiprivkey1") {
+        let body_len = take_while_len(&bytes[11..], |b| b.is_ascii_alphanumeric());
+        let total = 11 + body_len;
+        if body_len >= 16 && (total == bytes.len() || !is_word_byte(bytes[total])) {
+            return Some((total, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 2. Anthropic / OpenAI keys
+    for prefix in [b"sk-ant-" as &[u8], b"sk-proj-"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[prefix.len()..], is_base64url_byte);
+            if body_len >= 16 {
+                return Some((prefix.len() + body_len, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+    if bytes.starts_with(b"sk-") {
+        let body_len = take_while_len(&bytes[3..], |b| b.is_ascii_alphanumeric());
+        if body_len >= 20 {
+            return Some((3 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 3. GitHub tokens
+    for prefix in [b"ghp_" as &[u8], b"gho_", b"ghu_", b"ghs_", b"ghr_"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[4..], |b| b.is_ascii_alphanumeric());
+            if body_len >= 20 {
+                return Some((4 + body_len, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+    if bytes.starts_with(b"github_pat_") {
+        let body_len = take_while_len(&bytes[11..], is_word_byte);
+        if body_len >= 20 {
+            return Some((11 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 4. AWS access key ID: (AKIA|ASIA)[0-9A-Z]{16}\b
+    if bytes.starts_with(b"AKIA") || bytes.starts_with(b"ASIA") {
+        let body_len = take_while_len(&bytes[4..], |b| {
+            b.is_ascii_uppercase() || b.is_ascii_digit()
+        });
+        if body_len == 16 && (bytes.len() == 20 || !is_word_byte(bytes[20])) {
+            return Some((20, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 5. Slack: xox[baprs]-[A-Za-z0-9-]{10,}
+    if bytes.len() >= 15
+        && bytes.starts_with(b"xox")
+        && matches!(bytes[3], b'b' | b'a' | b'p' | b'r' | b's')
+        && bytes[4] == b'-'
+    {
+        let body_len = take_while_len(&bytes[5..], |b| b.is_ascii_alphanumeric() || b == b'-');
+        if body_len >= 10 {
+            return Some((5 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 6. Google API: AIza[0-9A-Za-z_-]{35}\b
+    if bytes.starts_with(b"AIza") {
+        let body_len = take_while_len(&bytes[4..], is_base64url_byte);
+        if body_len == 35 && (bytes.len() == 39 || !is_word_byte(bytes[39])) {
+            return Some((39, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 7. GitLab: glpat-[A-Za-z0-9_-]{16,}
+    if bytes.starts_with(b"glpat-") {
+        let body_len = take_while_len(&bytes[6..], is_base64url_byte);
+        if body_len >= 16 {
+            return Some((6 + body_len, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 8. npm: npm_[A-Za-z0-9]{36}\b
+    if bytes.starts_with(b"npm_") {
+        let body_len = take_while_len(&bytes[4..], |b| b.is_ascii_alphanumeric());
+        if body_len == 36 && (bytes.len() == 40 || !is_word_byte(bytes[40])) {
+            return Some((40, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 9. SendGrid: SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
+    if bytes.starts_with(b"SG.") {
+        let seg1 = take_while_len(&bytes[3..], is_base64url_byte);
+        let dot_pos = 3 + seg1;
+        if seg1 >= 16 && dot_pos < bytes.len() && bytes[dot_pos] == b'.' {
+            let seg2 = take_while_len(&bytes[dot_pos + 1..], is_base64url_byte);
+            if seg2 >= 16 {
+                return Some((dot_pos + 1 + seg2, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+
+    // 10. Stripe: [sprk]k_(live|test)_[A-Za-z0-9]{16,}
+    if bytes.len() >= 24
+        && matches!(bytes[0], b's' | b'p' | b'r' | b'k')
+        && bytes[1] == b'k'
+        && bytes[2] == b'_'
+    {
+        for mode in [b"live_" as &[u8], b"test_"] {
+            if bytes[3..].starts_with(mode) {
+                let prefix_len = 3 + mode.len();
+                let body_len = take_while_len(&bytes[prefix_len..], |b| b.is_ascii_alphanumeric());
+                if body_len >= 16 {
+                    return Some((prefix_len + body_len, "[redacted:vendor-api-key]"));
+                }
+            }
+        }
+    }
+
+    // 11. Shopify: shp(at|ss|ca|pa)_[a-fA-F0-9]{32}\b
+    for prefix in [b"shpat_" as &[u8], b"shpss_", b"shpca_", b"shppa_"] {
+        if bytes.starts_with(prefix) {
+            let body_len = take_while_len(&bytes[6..], |b| b.is_ascii_hexdigit());
+            if body_len == 32 && (bytes.len() == 38 || !is_word_byte(bytes[38])) {
+                return Some((38, "[redacted:vendor-api-key]"));
+            }
+        }
+    }
+
+    // 12. DigitalOcean: dop_v1_[a-f0-9]{64}\b
+    if bytes.starts_with(b"dop_v1_") {
+        let body_len = take_while_len(&bytes[7..], |b| {
+            b.is_ascii_digit() || matches!(b, b'a'..=b'f')
+        });
+        if body_len == 64 && (bytes.len() == 71 || !is_word_byte(bytes[71])) {
+            return Some((71, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 13. Hugging Face: hf_[A-Za-z0-9]{30,}\b
+    if bytes.starts_with(b"hf_") {
+        let body_len = take_while_len(&bytes[3..], |b| b.is_ascii_alphanumeric());
+        let total = 3 + body_len;
+        if body_len >= 30 && (total == bytes.len() || !is_word_byte(bytes[total])) {
+            return Some((total, "[redacted:vendor-api-key]"));
+        }
+    }
+
+    // 14. JWT: eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}
+    if bytes.starts_with(b"eyJ") {
+        let seg1 = 3 + take_while_len(&bytes[3..], is_base64url_byte);
+        if seg1 >= 11 && seg1 < bytes.len() && bytes[seg1] == b'.' {
+            let seg2_len = take_while_len(&bytes[seg1 + 1..], is_base64url_byte);
+            let dot2 = seg1 + 1 + seg2_len;
+            if seg2_len >= 8 && dot2 < bytes.len() && bytes[dot2] == b'.' {
+                let seg3_len = take_while_len(&bytes[dot2 + 1..], is_base64url_byte);
+                if seg3_len >= 8 {
+                    return Some((dot2 + 1 + seg3_len, "[redacted:jwt]"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn redact_token_secrets(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_word_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+        if at_word_boundary {
+            if let Some((matched_len, replacement)) = match_secret_token_at_start(&input[i..]) {
+                out.push_str(replacement);
+                *count += 1;
+                i += matched_len;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_credential_assignments(input: &str, count: &mut usize) -> String {
+    const KEYWORDS: &[&str] = &[
+        "db_passwords",
+        "db-passwords",
+        "dbpasswords",
+        "db_password",
+        "db-password",
+        "dbpassword",
+        "db_pass",
+        "db-pass",
+        "dbpass",
+        "passwords",
+        "password",
+        "passwd",
+        "pwd",
+        "passphrases",
+        "passphrase",
+        "secret_keys",
+        "secret-keys",
+        "secret_key",
+        "secret-key",
+        "access_keys",
+        "access-keys",
+        "access_key",
+        "access-key",
+        "encryption_keys",
+        "encryption-keys",
+        "encryption_key",
+        "encryption-key",
+        "enc_keys",
+        "enc-keys",
+        "enc_key",
+        "enc-key",
+        "client_secrets",
+        "client-secrets",
+        "client_secret",
+        "client-secret",
+        "api_keys",
+        "api-keys",
+        "api_key",
+        "api-key",
+        "apikeys",
+        "apikey",
+        "secrets",
+        "secret",
+        "access_tokens",
+        "access-tokens",
+        "access_token",
+        "access-token",
+        "refresh_tokens",
+        "refresh-tokens",
+        "refresh_token",
+        "refresh-token",
+        "auth_tokens",
+        "auth-tokens",
+        "auth_token",
+        "auth-token",
+        "bearer_tokens",
+        "bearer-tokens",
+        "bearer_token",
+        "bearer-token",
+        "tokens",
+        "token",
+        "private_keys",
+        "private-keys",
+        "private_key",
+        "private-key",
+        "priv_keys",
+        "priv-keys",
+        "priv_key",
+        "priv-key",
+        "credentials",
+        "credential",
+    ];
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let left_ok = i == 0 || !bytes[i - 1].is_ascii_uppercase();
+
+        if left_ok {
+            let mut matched_kw_len = None;
+            for kw in KEYWORDS {
+                if bytes[i..]
+                    .get(..kw.len())
+                    .map(|b| b.eq_ignore_ascii_case(kw.as_bytes()))
+                    .unwrap_or(false)
+                {
+                    matched_kw_len = Some(kw.len());
+                    break;
+                }
+            }
+
+            if let Some(kw_len) = matched_kw_len {
+                let mut p = i + kw_len;
+                if p < bytes.len() && matches!(bytes[p], b'"' | b'\'' | b'`') {
+                    p += 1;
+                }
+                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                    p += 1;
+                }
+                if p < bytes.len() && (bytes[p] == b':' || bytes[p] == b'=') {
+                    p += 1;
+                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                        p += 1;
+                    }
+                    if p < bytes.len() {
+                        let val_bytes = &bytes[p..];
+                        let val_len = if matches!(val_bytes[0], b'"' | b'\'' | b'`') {
+                            let open_q = val_bytes[0];
+                            let mut end_q = 1;
+                            while end_q < val_bytes.len()
+                                && val_bytes[end_q] != open_q
+                                && val_bytes[end_q] != b'\n'
+                            {
+                                end_q += 1;
+                            }
+                            if end_q < val_bytes.len() && val_bytes[end_q] == open_q {
+                                end_q + 1
+                            } else {
+                                0
+                            }
+                        } else {
+                            val_bytes
+                                .iter()
+                                .take_while(|&&b| {
+                                    !b.is_ascii_whitespace() && b != b',' && b != b';'
+                                })
+                                .count()
+                        };
+
+                        if val_len > 0 {
+                            out.push_str(&input[i..p]);
+                            out.push_str("[redacted:credential-assignment]");
+                            *count += 1;
+                            i = p + val_len;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_auth_and_cookie_headers(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let at_word_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+
+        if at_word_boundary {
+            let slice = &bytes[i..];
+            let header_match = if slice
+                .get(..19)
+                .map(|b| b.eq_ignore_ascii_case(b"proxy-authorization"))
+                .unwrap_or(false)
+            {
+                Some(19)
+            } else if slice
+                .get(..13)
+                .map(|b| b.eq_ignore_ascii_case(b"authorization"))
+                .unwrap_or(false)
+            {
+                Some(13)
+            } else {
+                None
+            };
+
+            if let Some(h_len) = header_match {
+                let mut p = i + h_len;
+                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                    p += 1;
+                }
+                if p < bytes.len() && (bytes[p] == b':' || bytes[p] == b'=') {
+                    p += 1;
+                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                        p += 1;
+                    }
+                    let p_sep = p;
+                    let after_sep = &bytes[p..];
+                    let prefix_len = if after_sep
+                        .get(..6)
+                        .map(|b| b.eq_ignore_ascii_case(b"bearer"))
+                        .unwrap_or(false)
+                    {
+                        Some(6)
+                    } else if after_sep
+                        .get(..5)
+                        .map(|b| b.eq_ignore_ascii_case(b"basic"))
+                        .unwrap_or(false)
+                    {
+                        Some(5)
+                    } else if after_sep
+                        .get(..5)
+                        .map(|b| b.eq_ignore_ascii_case(b"token"))
+                        .unwrap_or(false)
+                    {
+                        Some(5)
+                    } else if after_sep
+                        .get(..6)
+                        .map(|b| b.eq_ignore_ascii_case(b"digest"))
+                        .unwrap_or(false)
+                    {
+                        Some(6)
+                    } else {
+                        None
+                    };
+                    if let Some(plen) = prefix_len {
+                        p += plen;
+                        while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                            p += 1;
+                        }
+                    }
+                    let val_len = bytes[p..]
+                        .iter()
+                        .take_while(|&&b| !b.is_ascii_whitespace())
+                        .count();
+                    if val_len > 0 || prefix_len.is_some() {
+                        out.push_str(&input[i..p_sep]);
+                        out.push_str("[redacted:auth-header]");
+                        *count += 1;
+                        i = p + val_len;
+                        continue;
+                    }
+                }
+            }
+
+            let cookie_match = if slice
+                .get(..10)
+                .map(|b| b.eq_ignore_ascii_case(b"set-cookie"))
+                .unwrap_or(false)
+            {
+                Some(10)
+            } else if slice
+                .get(..6)
+                .map(|b| b.eq_ignore_ascii_case(b"cookie"))
+                .unwrap_or(false)
+            {
+                Some(6)
+            } else {
+                None
+            };
+            if let Some(c_len) = cookie_match {
+                let mut p = i + c_len;
+                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                    p += 1;
+                }
+                if p < bytes.len() && (bytes[p] == b':' || bytes[p] == b'=') {
+                    p += 1;
+                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                        p += 1;
+                    }
+                    let mut cp = p;
+                    let first_pair = bytes[cp..]
+                        .iter()
+                        .take_while(|&&b| !b.is_ascii_whitespace() && b != b';')
+                        .count();
+                    if first_pair > 0 {
+                        cp += first_pair;
+                        loop {
+                            let mut look = cp;
+                            while look < bytes.len()
+                                && (bytes[look] == b' ' || bytes[look] == b'\t')
+                            {
+                                look += 1;
+                            }
+                            if look < bytes.len() && bytes[look] == b';' {
+                                look += 1;
+                                while look < bytes.len()
+                                    && (bytes[look] == b' ' || bytes[look] == b'\t')
+                                {
+                                    look += 1;
+                                }
+                                let next_pair = bytes[look..]
+                                    .iter()
+                                    .take_while(|&&b| !b.is_ascii_whitespace() && b != b';')
+                                    .count();
+                                if next_pair > 0 {
+                                    cp = look + next_pair;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        out.push_str(&input[i..p]);
+                        out.push_str("[redacted:auth-header]");
+                        *count += 1;
+                        i = cp;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_seed_phrase(input: &str, count: &mut usize) -> String {
+    const SEED_LABELS: &[&str] = &[
+        "recovery_phrase",
+        "recovery phrase",
+        "secret_phrase",
+        "secret phrase",
+        "mnemonic_phrase",
+        "mnemonic phrase",
+        "recovery_words",
+        "recovery words",
+        "secret_words",
+        "secret words",
+        "mnemonic_words",
+        "mnemonic words",
+        "seed_phrase",
+        "seed phrase",
+        "seedphrase",
+        "seed_words",
+        "seed words",
+        "mnemonic",
+    ];
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let left_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+
+        if left_ok {
+            let mut matched_label_len = None;
+            for label in SEED_LABELS {
+                if bytes[i..]
+                    .get(..label.len())
+                    .map(|b| b.eq_ignore_ascii_case(label.as_bytes()))
+                    .unwrap_or(false)
+                {
+                    matched_label_len = Some(label.len());
+                    break;
+                }
+            }
+
+            if let Some(l_len) = matched_label_len {
+                let mut p = i + l_len;
+                while p < bytes.len() && (p - (i + l_len)) < 4 && !bytes[p].is_ascii_alphanumeric()
+                {
+                    p += 1;
+                }
+                if bytes[p..]
+                    .get(..2)
+                    .map(|b| b.eq_ignore_ascii_case(b"is"))
+                    .unwrap_or(false)
+                {
+                    p += 2;
+                } else if bytes[p..]
+                    .get(..3)
+                    .map(|b| b.eq_ignore_ascii_case(b"are"))
+                    .unwrap_or(false)
+                {
+                    p += 3;
+                }
+                let p_anchor = p;
+                while p < bytes.len() && (p - p_anchor) < 4 && !bytes[p].is_ascii_alphanumeric() {
+                    p += 1;
+                }
+
+                let mut word_count = 0;
+                let mut wp = p;
+                while wp < bytes.len() {
+                    let wlen = bytes[wp..]
+                        .iter()
+                        .take_while(|&&b| b.is_ascii_lowercase())
+                        .count();
+                    if wlen >= 3 && wlen <= 10 {
+                        word_count += 1;
+                        wp += wlen;
+                        if wp < bytes.len() && (bytes[wp] == b' ' || bytes[wp] == b'\t') {
+                            wp += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if word_count >= 11 && word_count <= 24 {
+                    out.push_str(&input[i..p]);
+                    out.push_str("[redacted:seed-phrase]");
+                    *count += 1;
+                    i = wp;
+                    continue;
+                }
+            }
+        }
+
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn contains_credential_label(s: &str) -> bool {
+    const LABELS: &[&str] = &[
+        "delegateprivatekey",
+        "delegate_private_key",
+        "delegate-private-key",
+        "delegate private key",
+        "delegateprivate",
+        "delegate_private",
+        "delegate-private",
+        "delegate private",
+        "privatekey",
+        "private_key",
+        "private-key",
+        "private key",
+        "secretkey",
+        "secret_key",
+        "secret-key",
+        "secret key",
+        "signingkey",
+        "signing_key",
+        "signing-key",
+        "signing key",
+        "privkey",
+        "priv_key",
+        "priv-key",
+        "priv key",
+        "sui.keystore",
+        "sui_keystore",
+        "sui keystore",
+        "encryption_key",
+        "encryption key",
+        "enc_key",
+        "api_key",
+        "api key",
+        "access_key",
+        "access key",
+        "auth_key",
+        "auth key",
+        "db_password",
+        "db password",
+        "db_pass",
+        "db pass",
+        "secret",
+        "seed",
+        "mnemonic",
+        "passphrase",
+    ];
+    let lower = s.to_ascii_lowercase();
+    for kw in LABELS {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_adjacent_credential_label(input: &str, start: usize, end: usize, window: usize) -> bool {
+    let mut before_start = start.saturating_sub(window);
+    while before_start > 0 && !input.is_char_boundary(before_start) {
+        before_start -= 1;
+    }
+    let before_slice = &input[before_start..start];
+    if contains_credential_label(before_slice) {
+        return true;
+    }
+    let mut after_end = (end + window).min(input.len());
+    while after_end < input.len() && !input.is_char_boundary(after_end) {
+        after_end += 1;
+    }
+    let after_slice = &input[end..after_end];
+    if contains_credential_label(after_slice) {
+        return true;
+    }
+    false
+}
+
+fn redact_labelled_key_material(input: &str, count: &mut usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_word_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+        if at_word_boundary {
+            let has_0x = bytes[i..].starts_with(b"0x");
+            let hex_start = if has_0x { i + 2 } else { i };
+            let hex_len = bytes[hex_start..]
+                .iter()
+                .take_while(|&&b| b.is_ascii_hexdigit())
+                .count();
+            if hex_len >= 32 {
+                let total_hex_len = (hex_start - i) + hex_len;
+                let end = i + total_hex_len;
+                let right_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+                if right_ok && has_adjacent_credential_label(input, i, end, 48) {
+                    out.push_str("[redacted:labelled-key-material]");
+                    *count += 1;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn has_salvageable_fact_content(text: &str) -> bool {
+    // Strip `[redacted:...]` placeholders before counting words >= 2 chars.
+    let mut without_placeholders = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[redacted:") {
+        without_placeholders.push_str(&rest[..start]);
+        let after = &rest[start + "[redacted:".len()..];
+        if let Some(end) = after.find(']') {
+            without_placeholders.push(' ');
+            rest = &after[end + 1..];
+        } else {
+            without_placeholders.push_str(&rest[start..]);
+            rest = "";
+            break;
+        }
+    }
+    without_placeholders.push_str(rest);
+
+    let mut word_count = 0usize;
+    let mut current_word_chars = 0usize;
+    for ch in without_placeholders.chars() {
+        if ch.is_alphanumeric() {
+            current_word_chars += 1;
+        } else {
+            if current_word_chars >= 2 {
+                word_count += 1;
+                if word_count >= 3 {
+                    return true;
+                }
+            }
+            current_word_chars = 0;
+        }
+    }
+    if current_word_chars >= 2 {
+        word_count += 1;
+    }
+    word_count >= 3
+}
+
+/// Post-extraction secret screen for a single extracted fact (#435).
+///
+/// Returns `Some(fact_text)` when the fact is clean or still carries a
+/// salvageable fact after redacting secret spans, or `None` when the fact was
+/// purely credential material with no surrounding fact.
+fn screen_fact_text(input: &str) -> Option<String> {
+    let mut count = 0usize;
+    let text = redact_pem_blocks(input, &mut count);
+    let text = redact_url_userinfo(&text, &mut count);
+    let text = redact_auth_and_cookie_headers(&text, &mut count);
+    let text = redact_credential_assignments(&text, &mut count);
+    let text = redact_seed_phrase(&text, &mut count);
+    let text = redact_token_secrets(&text, &mut count);
+    let text = redact_labelled_key_material(&text, &mut count);
+    if count == 0 {
+        return Some(input.to_string());
+    }
+    if !has_salvageable_fact_content(&text) {
+        return None;
+    }
+    Some(text)
+}
+
+/// Screen all extracted facts before embedding and SEAL encryption (#435).
+fn screen_extracted_facts(facts: Vec<ExtractedFact>) -> Vec<ExtractedFact> {
+    facts
+        .into_iter()
+        .filter_map(|mut fact| {
+            let screened = screen_fact_text(&fact.text)?;
+            fact.text = screened;
+            Some(fact)
+        })
+        .collect()
+}
 
 /// Stable per-fact key so an HTTP retry of `/api/analyze` collapses onto the
 /// in-flight or completed upload instead of minting a second Walrus blob.
@@ -430,7 +1337,10 @@ pub async fn analyze(
         .extract_with_context(&body.text, &related_texts, body.occurred_at)
         .await?;
     let raw_fact_count = extracted.raw_count;
-    let facts = extracted.facts;
+    // Screen extracted facts before embedding or SEAL encryption (#435) so any
+    // credential material emitted or re-assembled by the extractor LLM is
+    // redacted or dropped before reaching append-only Walrus storage.
+    let facts = screen_extracted_facts(extracted.facts);
     let reserved_additional_weight = rate_limit::analyze_additional_weight(facts.len());
     tracing::info!(
         "  → Extracted {} facts (accepted={} cap={})",
@@ -1163,5 +2073,122 @@ mod tests {
         // Additional weight is exactly fact_count
         assert_eq!(analyze_additional_weight(0), 0);
         assert_eq!(analyze_additional_weight(20), 20);
+    }
+
+    // ── Post-extraction secret screening (#435) ───────────────────
+
+    #[test]
+    fn post_extraction_redacts_suiprivkey_and_vendor_keys_while_keeping_surrounding_fact() {
+        use super::{screen_extracted_facts, screen_fact_text};
+        use crate::services::extractor::ExtractedFact;
+
+        let repro_key = "suiprivkey1qzfake0000000000000000000000000000000000000000000000000000";
+        let valid_key = "suiprivkey1qqtac0q7an7dcq2vp6axts0c0zt6hw7jznar94qp3ayxdx6axlzpxcetm48";
+
+        // Bare credential with no surrounding fact is dropped completely.
+        assert_eq!(screen_fact_text(repro_key), None);
+        assert_eq!(screen_fact_text(valid_key), None);
+        assert_eq!(
+            screen_fact_text("sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"),
+            None
+        );
+
+        // Fact carrying a credential keeps the surrounding words and redacts the secret.
+        let mixed = format!("User deploys on testnet using {repro_key} from laptop");
+        let screened = screen_fact_text(&mixed).expect("fact around secret should survive");
+        assert!(!screened.contains(repro_key));
+        assert!(screened.contains("[redacted:vendor-api-key]"));
+        assert!(screened.contains("User deploys on testnet"));
+
+        // URL credentials keep host/path and strip userinfo.
+        let url_fact =
+            "Staging database lives at postgres://admin:hunter2@db.internal:5432/app for testing";
+        let screened_url = screen_fact_text(url_fact).expect("url fact should survive");
+        assert!(!screened_url.contains("hunter2"));
+        assert!(screened_url.contains("postgres://[redacted:url-credentials]@db.internal:5432/app"));
+
+        // PEM private key block is redacted.
+        let pem_fact = "User's old box key -----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY----- was rotated";
+        let screened_pem = screen_fact_text(pem_fact).expect("pem fact should survive");
+        assert!(!screened_pem.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(screened_pem.contains("[redacted:private-key-block]"));
+
+        // Credential assignment (#435 review finding from @ducnmm).
+        let assign_fact = "User staging DB password is POSTGRES_PASSWORD=hunter2 for local testing";
+        let screened_assign =
+            screen_fact_text(assign_fact).expect("assignment fact should survive");
+        assert!(!screened_assign.contains("hunter2"));
+        assert!(screened_assign.contains("POSTGRES_PASSWORD=[redacted:credential-assignment]"));
+        assert!(screened_assign.contains("User staging DB password is"));
+
+        // Bare credential assignment with no surrounding fact is dropped.
+        assert_eq!(screen_fact_text("POSTGRES_PASSWORD=hunter2"), None);
+        assert_eq!(screen_fact_text("api_key = secret1234567890"), None);
+
+        // Auth header is redacted.
+        let auth_fact =
+            "User tests endpoint using Authorization: Bearer token1234567890 on dev host";
+        let screened_auth = screen_fact_text(auth_fact).expect("auth header fact should survive");
+        assert!(!screened_auth.contains("token1234567890"));
+        assert!(screened_auth.contains("Authorization: [redacted:auth-header]"));
+
+        // Seed phrase is redacted.
+        let seed_fact = "User wallet seed phrase is apple banana cherry date dog elephant fish goat horse island jungle kite on ledger";
+        let screened_seed = screen_fact_text(seed_fact).expect("seed phrase fact should survive");
+        assert!(!screened_seed.contains("apple banana cherry"));
+        assert!(screened_seed.contains("[redacted:seed-phrase]"));
+
+        // Labelled hex key material is redacted, while unlabelled commit SHA is kept.
+        let labelled_key = "User delegate private key is 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef in backup";
+        let screened_labelled =
+            screen_fact_text(labelled_key).expect("labelled key fact should survive");
+        assert!(!screened_labelled
+            .contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+        assert!(screened_labelled.contains("[redacted:labelled-key-material]"));
+
+        let commit_sha =
+            "User deployed relayer from commit 4f2b8c1e3a5d7f90123456789abcdef012345678 yesterday";
+        let screened_commit =
+            screen_fact_text(commit_sha).expect("clean commit sha should survive");
+        assert!(screened_commit.contains("4f2b8c1e3a5d7f90123456789abcdef012345678"));
+
+        // Multilingual and emoji context windows must not panic on char boundaries (#435).
+        let unicode_fact = format!(
+            "User loves {} and secret is {}",
+            "😀".repeat(13),
+            "a".repeat(64)
+        );
+        let screened_unicode =
+            screen_fact_text(&unicode_fact).expect("unicode fact should survive without panic");
+        assert!(screened_unicode.contains("User loves"));
+        assert!(screened_unicode.contains(&"😀".repeat(13)));
+        assert!(screened_unicode.contains("[redacted:labelled-key-material]"));
+
+        let non_secret_unicode = format!("User status: {} {}", "😀".repeat(13), "a".repeat(64));
+        let screened_non_secret =
+            screen_fact_text(&non_secret_unicode).expect("unlabelled unicode hex fact survives");
+        assert!(screened_non_secret.contains(&"a".repeat(64)));
+
+        // Batch screening drops credential-only facts and preserves clean/redacted facts.
+        let batch = vec![
+            ExtractedFact {
+                text: "User prefers dark mode".to_string(),
+                importance: 0.5,
+            },
+            ExtractedFact {
+                text: repro_key.to_string(),
+                importance: 0.9,
+            },
+            ExtractedFact {
+                text: "User's Sui package id is 0xe80f2feec1c139616a86c9f71210152e2a7ca552b20841f2e192f99f75864437".to_string(),
+                importance: 0.5,
+            },
+        ];
+        let kept = screen_extracted_facts(batch);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "User prefers dark mode");
+        assert!(kept[1]
+            .text
+            .contains("0xe80f2feec1c139616a86c9f71210152e2a7ca552b20841f2e192f99f75864437"));
     }
 }

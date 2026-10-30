@@ -5,6 +5,7 @@ import { TOOL_METADATA } from "./annotations.js";
 import { wrapTool, explorerFooter } from "./util.js";
 import { SECRET_EXCLUSION_RULES, AUTO_SAVE_OPT_IN_RULE } from "./memory-policy.js";
 import {
+    sanitizeFact,
     sanitizePassage,
     redactionNotice,
     refusalNotice,
@@ -108,12 +109,6 @@ export function registerAnalyzeTool(
                     ],
                 };
             }
-            const notice = [
-                redactionNotice(safe.kinds, safe.count),
-                droppedSpanNotice(safe.dropped, safe.segments),
-            ]
-                .filter(Boolean)
-                .join("\n\n");
             const safeText = safe.text;
 
             // `analyze` (not `analyzeAndWait`) returns once extraction is done
@@ -141,10 +136,40 @@ export function registerAnalyzeTool(
                 { idempotent: false, deadlineMs: ANALYZE_EXTRACTION_DEADLINE_MS },
             );
 
+            const facts = accepted.facts ?? [];
+            const mergedKinds = [...safe.kinds];
+            let mergedCount = safe.count;
+            // Screen each extracted fact as a post-extraction defense-in-depth
+            // check (#435): if an extractor ever re-assembles a secret across
+            // split turns or emits credential material in an extracted fact, it
+            // is redacted in the tool output and surfaced in the redaction notice.
+            const entries = accepted.job_ids.map((jobId, i) => {
+                const rawFact = facts[i]?.text ?? "";
+                const screenedFact = sanitizeFact(rawFact);
+                if (screenedFact.changed) {
+                    mergedCount += screenedFact.count;
+                    for (const kind of screenedFact.kinds) {
+                        if (!mergedKinds.includes(kind)) mergedKinds.push(kind);
+                    }
+                }
+                const safeFactText = screenedFact.refusal
+                    ? `[redacted:${screenedFact.kinds[0] ?? "credential-only"}]`
+                    : screenedFact.text;
+                return {
+                    jobId,
+                    text: safeFactText,
+                };
+            });
+
+            const notice = [
+                redactionNotice(mergedKinds, mergedCount),
+                droppedSpanNotice(safe.dropped, safe.segments),
+            ]
+                .filter(Boolean)
+                .join("\n\n");
             const withNotice = (body: string) =>
                 notice ? `${body}\n\n${notice}` : body;
 
-            const facts = accepted.facts ?? [];
             // Nothing to wait on, and nothing to confirm later. Say so plainly
             // rather than handing back an empty job list.
             if (accepted.job_ids.length === 0) {
@@ -159,11 +184,6 @@ export function registerAnalyzeTool(
                     ],
                 };
             }
-
-            const entries = accepted.job_ids.map((jobId, i) => ({
-                jobId,
-                text: facts[i]?.text ?? "",
-            }));
 
             // The extraction result is the part of this call an agent can act
             // on immediately, so it leads — the write status follows it.
