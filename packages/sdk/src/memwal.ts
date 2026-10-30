@@ -93,6 +93,7 @@ import { pollingDelayMs } from "./polling-delay.js";
 import { resolveRecallCall } from "./recall-args.js";
 import {
     MemWalRateLimitedError,
+    MemWalRecallAllDroppedError,
     MemWalRememberJobFailedError,
     MemWalRememberJobNotFoundError,
     MemWalRememberJobTimeoutError,
@@ -1249,6 +1250,16 @@ export class MemWal {
         ) {
             throw new Error("maxDistance must be a non-negative finite number");
         }
+        if (
+            options.onDropped !== undefined
+            && options.onDropped !== "throw"
+            && options.onDropped !== "ignore"
+        ) {
+            throw new TypeError(
+                `onDropped must be "throw" or "ignore", got ${String(options.onDropped)}`,
+            );
+        }
+        const onDropped = options.onDropped ?? "throw";
         const resolvedNamespace = options.namespace ?? this.namespace;
 
 
@@ -1279,7 +1290,36 @@ export class MemWal {
             }, { timeoutMs });
             requireArrayField(result, "results", "POST /api/recall");
 
-            let processed = result;
+            const droppedCount =
+                typeof result.dropped_count === "number" && result.dropped_count > 0
+                    ? result.dropped_count
+                    : 0;
+            const degraded = result.degraded === true || droppedCount > 0;
+            const rawTotal =
+                typeof result.total === "number" && Number.isFinite(result.total)
+                    ? result.total
+                    : result.results.length;
+
+            let processed: RecallResult =
+                result.results.length === 0 && degraded
+                    ? {
+                        ...result,
+                        total: Math.max(rawTotal, droppedCount > 0 ? droppedCount : 1),
+                        dropped_count: droppedCount > 0 ? droppedCount : Math.max(1, rawTotal),
+                        degraded: true,
+                    }
+                    : degraded
+                        ? { ...result, degraded: true }
+                        : result;
+
+            if (result.results.length === 0 && degraded && onDropped === "throw") {
+                throw new MemWalRecallAllDroppedError(
+                    processed.dropped_count!,
+                    processed.total,
+                    resolvedNamespace,
+                );
+            }
+
             if (typeof options.maxDistance === "number") {
                 const filtered = result.results.filter(
                     (memory) =>

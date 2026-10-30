@@ -39,6 +39,12 @@ use super::{FetchTimings, HydratedMemory, MemoryEngine, MemoryRef};
 const BLOB_CACHE_KEY_PREFIX: &str = "memwal:blob:v1:";
 /// SEAL decrypt-batch chunk size (matches the inlined `recall` value).
 const SEAL_DECRYPT_BATCH_SIZE: usize = 25;
+/// Backoff before retrying a transient Walrus aggregator download failure.
+const WALRUS_DOWNLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+/// Backoff before retrying a transient SEAL decrypt-batch failure.
+const SEAL_DECRYPT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+/// Minimum remaining recall deadline budget required after backoff to start a retry.
+const RETRY_MIN_DEADLINE_HEADROOM: Duration = Duration::from_millis(1_000);
 
 /// Production engine — uploads prepared ciphertext to Walrus, indexes
 /// the row in Postgres, serves reads through the Redis blob cache.
@@ -197,15 +203,19 @@ impl WalrusSealEngine {
         if let Some(ciphertext) = self.cache_get(blob_id).await {
             return Some((ciphertext, true));
         }
-        match walrus::download_blob_from_aggregators(
-            &self.http_client,
-            &self.config.walrus_aggregator_urls,
-            blob_id,
-            self.config.walrus_skip_consistency_check,
-            Duration::from_millis(self.config.walrus_aggregator_race_after_ms),
-        )
-        .await
-        {
+        let race_after = Duration::from_millis(self.config.walrus_aggregator_race_after_ms);
+        let skip_consistency = self.config.walrus_skip_consistency_check;
+        let result = download_ciphertext_with_retry(blob_id, || {
+            walrus::download_blob_from_aggregators(
+                &self.http_client,
+                &self.config.walrus_aggregator_urls,
+                blob_id,
+                skip_consistency,
+                race_after,
+            )
+        })
+        .await;
+        match result {
             Ok(ciphertext) => {
                 self.cache_put(blob_id, &ciphertext).await;
                 Some((ciphertext, false))
@@ -458,17 +468,23 @@ impl MemoryEngine for WalrusSealEngine {
             .collect();
         let mut chunk_results = Vec::new();
         for chunk in batch_input.chunks(SEAL_DECRYPT_BATCH_SIZE) {
-            let res = seal::seal_decrypt_batch(
-                &self.http_client,
-                &self.config.seal_sidecar_url,
-                self.config.sidecar_secret.as_deref(),
-                chunk,
-                &credential,
-                &self.config.package_id,
-                &self.config.seal_policy_package_id,
-                &self.config.registry_id,
-                &auth.account_id,
-            )
+            let res = decrypt_chunk_with_retry(chunk, |items| {
+                let credential = credential.clone();
+                async move {
+                    seal::seal_decrypt_batch(
+                        &self.http_client,
+                        &self.config.seal_sidecar_url,
+                        self.config.sidecar_secret.as_deref(),
+                        &items,
+                        &credential,
+                        &self.config.package_id,
+                        &self.config.seal_policy_package_id,
+                        &self.config.registry_id,
+                        &auth.account_id,
+                    )
+                    .await
+                }
+            })
             .await;
             if let Err(ref e) = res {
                 tracing::warn!(
@@ -511,8 +527,124 @@ impl MemoryEngine for WalrusSealEngine {
 }
 
 // ============================================================
-// Pure decrypt-outcome assembly
+// Bounded transient retries + pure decrypt-outcome assembly
 // ============================================================
+
+fn is_retryable_walrus_download_error(err: &AppError) -> bool {
+    match err {
+        AppError::BlobNotFound(_) => false,
+        AppError::UpstreamUnavailable(_) => true,
+        AppError::Internal(msg) => {
+            !msg.starts_with("Invalid Walrus blob id")
+                && !msg.starts_with("Walrus download failed: no aggregator URLs configured")
+                && !msg.starts_with("Invalid Walrus aggregator URL")
+        }
+        _ => false,
+    }
+}
+
+async fn download_ciphertext_with_retry<F, Fut>(
+    blob_id: &str,
+    mut download: F,
+) -> Result<Vec<u8>, AppError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, AppError>>,
+{
+    match download().await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if is_retryable_walrus_download_error(&err) => {
+            if !super::stage::backoff_if_budget_allows(
+                WALRUS_DOWNLOAD_RETRY_BACKOFF,
+                RETRY_MIN_DEADLINE_HEADROOM,
+            )
+            .await
+            {
+                return Err(err);
+            }
+            tracing::warn!(
+                blob_id = %blob_id,
+                error = %err,
+                "Transient Walrus download failure, retrying once within recall deadline"
+            );
+            download().await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn decrypt_chunk_with_retry<F, Fut>(
+    chunk: &[(String, Vec<u8>)],
+    mut decrypt: F,
+) -> Result<Vec<DecryptOutcome>, AppError>
+where
+    F: FnMut(Vec<(String, Vec<u8>)>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<DecryptOutcome>, AppError>>,
+{
+    let initial = decrypt(chunk.to_vec()).await;
+    match initial {
+        Err(err @ AppError::UpstreamUnavailable(_)) => {
+            if !super::stage::backoff_if_budget_allows(
+                SEAL_DECRYPT_RETRY_BACKOFF,
+                RETRY_MIN_DEADLINE_HEADROOM,
+            )
+            .await
+            {
+                return Err(err);
+            }
+            tracing::warn!(
+                items = chunk.len(),
+                error = %err,
+                "Transient SEAL decrypt-batch 503 failure, retrying chunk once within recall deadline"
+            );
+            decrypt(chunk.to_vec()).await
+        }
+        Err(err) => Err(err),
+        Ok(mut outcomes) => {
+            let transient_indices: Vec<usize> = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, outcome)| match outcome {
+                    DecryptOutcome::Failed {
+                        permanent: false, ..
+                    } => Some(idx),
+                    _ => None,
+                })
+                .collect();
+            if transient_indices.is_empty() {
+                return Ok(outcomes);
+            }
+            if !super::stage::backoff_if_budget_allows(
+                SEAL_DECRYPT_RETRY_BACKOFF,
+                RETRY_MIN_DEADLINE_HEADROOM,
+            )
+            .await
+            {
+                return Ok(outcomes);
+            }
+            let retry_items: Vec<(String, Vec<u8>)> = transient_indices
+                .iter()
+                .filter_map(|&idx| chunk.get(idx).cloned())
+                .collect();
+            if retry_items.len() != transient_indices.len() {
+                return Ok(outcomes);
+            }
+            tracing::warn!(
+                transient_items = retry_items.len(),
+                chunk_items = chunk.len(),
+                "Transient per-item SEAL decrypt failure, retrying subset once within recall deadline"
+            );
+            if let Ok(retried) = decrypt(retry_items).await {
+                for (slot_idx, retry_outcome) in transient_indices.into_iter().zip(retried) {
+                    if let Some(slot) = outcomes.get_mut(slot_idx) {
+                        *slot = retry_outcome;
+                    }
+                }
+            }
+            Ok(outcomes)
+        }
+    }
+}
 
 /// Fold per-chunk `seal_decrypt_batch` results across all chunks.
 ///
@@ -663,10 +795,147 @@ fn write_decision(ciphertext_len: usize, max_bytes: usize, ttl_secs: u64) -> Cac
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use super::{
-        assemble_decrypted, fold_decrypt_chunk_results, read_decision, write_decision, AppError,
-        CacheReadDecision, CacheWriteDecision, DecryptOutcome,
+        assemble_decrypted, decrypt_chunk_with_retry, download_ciphertext_with_retry,
+        fold_decrypt_chunk_results, read_decision, write_decision, AppError, CacheReadDecision,
+        CacheWriteDecision, DecryptOutcome,
     };
+
+    // ── transient download & decrypt retries ───────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn walrus_download_retries_transient_error_once_within_deadline() {
+        let marker = super::super::stage::StageMarker::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let attempts = AtomicUsize::new(0);
+
+        let res = super::super::stage::run_with_deadline(&marker, Some(deadline), async {
+            download_ciphertext_with_retry("blob-1", || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(AppError::Internal(
+                            "Walrus download failed across 1 aggregator(s): HTTP 503".into(),
+                        ))
+                    } else {
+                        Ok(b"ciphertext-ok".to_vec())
+                    }
+                }
+            })
+            .await
+        })
+        .await
+        .expect("within deadline");
+
+        assert_eq!(res.expect("retry succeeds"), b"ciphertext-ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn walrus_download_does_not_retry_blob_not_found_or_exhausted_deadline() {
+        let attempts_404 = AtomicUsize::new(0);
+        let res_404 = download_ciphertext_with_retry("blob-404", || {
+            attempts_404.fetch_add(1, Ordering::SeqCst);
+            async { Err(AppError::BlobNotFound("blob-404".into())) }
+        })
+        .await;
+        assert!(matches!(res_404, Err(AppError::BlobNotFound(_))));
+        assert_eq!(attempts_404.load(Ordering::SeqCst), 1);
+
+        let marker = super::super::stage::StageMarker::default();
+        let tight_deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let attempts_tight = AtomicUsize::new(0);
+        let res_tight =
+            super::super::stage::run_with_deadline(&marker, Some(tight_deadline), async {
+                download_ciphertext_with_retry("blob-tight", || {
+                    attempts_tight.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Err(AppError::UpstreamUnavailable(
+                            "aggregator timeout".to_string(),
+                        ))
+                    }
+                })
+                .await
+            })
+            .await
+            .expect("returns immediately without exceeding tight deadline");
+        assert!(res_tight.is_err());
+        assert_eq!(attempts_tight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decrypt_chunk_retries_only_transient_failed_subset() {
+        let chunk = vec![
+            ("blob-ok".to_string(), vec![1]),
+            ("blob-perm".to_string(), vec![2]),
+            ("blob-transient".to_string(), vec![3]),
+        ];
+        let calls = AtomicUsize::new(0);
+
+        let outcomes = decrypt_chunk_with_retry(&chunk, |items| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    assert_eq!(items.len(), 3);
+                    Ok(vec![
+                        DecryptOutcome::Ok(b"alpha".to_vec()),
+                        DecryptOutcome::Failed {
+                            error: "NoAccessError".to_string(),
+                            permanent: true,
+                        },
+                        DecryptOutcome::Failed {
+                            error: "fetch_keys failed: TimeoutError".to_string(),
+                            permanent: false,
+                        },
+                    ])
+                } else {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].0, "blob-transient");
+                    Ok(vec![DecryptOutcome::Ok(b"gamma".to_vec())])
+                }
+            }
+        })
+        .await
+        .expect("chunk decrypt ok");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(&outcomes[0], DecryptOutcome::Ok(b) if b == b"alpha"));
+        assert!(matches!(
+            &outcomes[1],
+            DecryptOutcome::Failed {
+                permanent: true,
+                ..
+            }
+        ));
+        assert!(matches!(&outcomes[2], DecryptOutcome::Ok(b) if b == b"gamma"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decrypt_chunk_retries_upstream_503_once() {
+        let chunk = vec![("blob-a".to_string(), vec![1])];
+        let calls = AtomicUsize::new(0);
+
+        let outcomes = decrypt_chunk_with_retry(&chunk, |_items| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Err(AppError::UpstreamUnavailable(
+                        "seal decrypt-batch failed: 503".to_string(),
+                    ))
+                } else {
+                    Ok(vec![DecryptOutcome::Ok(b"recovered".to_vec())])
+                }
+            }
+        })
+        .await
+        .expect("chunk recovered on retry");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(&outcomes[0], DecryptOutcome::Ok(b) if b == b"recovered"));
+    }
 
     // ── decrypt-chunk folding & assembly ───────────────────────────
 

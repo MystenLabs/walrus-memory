@@ -25,6 +25,7 @@ from memwal.client import (
     MemWalCompatibilityError,
     MemWalError,
     MemWalRateLimited,
+    MemWalRecallAllDropped,
     MemWalRememberJobNotFound,
     MemWalRememberJobTimeout,
     MemWalSync,
@@ -830,7 +831,9 @@ class TestRecall:
         assert result.results[1].blob_id == "b2"
 
     @respx.mock
-    async def test_recall_surfaces_dropped_count(self, memwal_client: MemWal) -> None:
+    async def test_recall_raises_on_all_dropped_by_default_and_supports_ignore(
+        self, memwal_client: MemWal
+    ) -> None:
         mock_seal_session_prereqs()
         respx.post(f"{_TEST_SERVER}/api/recall").mock(
             return_value=httpx.Response(
@@ -838,9 +841,23 @@ class TestRecall:
                 json={"results": [], "total": 0, "dropped_count": 3},
             )
         )
-        result = await memwal_client.recall("coffee")
+        with pytest.raises(MemWalRecallAllDropped) as exc_info:
+            await memwal_client.recall("coffee")
+        assert exc_info.value.code == "RECALL_ALL_DROPPED"
+        assert exc_info.value.dropped_count == 3
+        assert exc_info.value.total == 3
+        assert exc_info.value.namespace == "default"
+
+        with pytest.raises(ValueError, match="on_dropped"):
+            await memwal_client.recall("coffee", on_dropped="warn")
+
+        result = await memwal_client.recall(
+            RecallParams(query="coffee", on_dropped="ignore")
+        )
         assert result.results == []
         assert result.dropped_count == 3
+        assert result.total == 3
+        assert result.degraded is True
 
     @respx.mock
     async def test_recall_preserves_dropped_count_with_max_distance(
@@ -866,6 +883,7 @@ class TestRecall:
         assert [m.blob_id for m in result.results] == ["b1"]
         assert result.total == 2
         assert result.dropped_count == 25
+        assert result.degraded is True
 
     @respx.mock
     async def test_recall_preserves_score_and_created_at(

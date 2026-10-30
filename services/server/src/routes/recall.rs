@@ -286,11 +286,7 @@ async fn recall_pipeline(
             "recall complete: 0 results (no vector hits) for owner={}",
             owner
         );
-        return Ok(RecallResponse {
-            results: vec![],
-            total: 0,
-            dropped_count: 0,
-        });
+        return Ok(build_recall_response(vec![], 0, 0));
     }
 
     // Hydrate the hits through the storage engine: blob cache -> Walrus
@@ -343,7 +339,7 @@ async fn recall_pipeline(
     let ranked = state.ranker.rank(hydrated, weights, chrono::Utc::now());
 
     let results: Vec<RecallResult> = super::recall_results_from_ranked(ranked);
-    let total = results.len();
+    let returned_count = results.len();
 
     // Surface the count of silently-dropped entries (download /
     // decrypt / UTF-8 failures) so clients can distinguish "no matches"
@@ -363,7 +359,7 @@ async fn recall_pipeline(
     // leaves `seal_ms` at 0 — same shape, different mode.
     tracing::info!(
         "recall complete: {} results for owner={} embed={}ms vsearch={}ms walrus={}ms seal={}ms fetch={}ms total={}ms",
-        total,
+        returned_count,
         owner,
         embed_ms,
         vsearch_ms,
@@ -373,11 +369,22 @@ async fn recall_pipeline(
         t0.elapsed().as_millis()
     );
 
-    Ok(RecallResponse {
+    Ok(build_recall_response(results, hit_count, dropped_count))
+}
+
+fn build_recall_response(
+    results: Vec<RecallResult>,
+    hit_count: usize,
+    dropped_count: usize,
+) -> RecallResponse {
+    let total = hit_count.max(results.len().saturating_add(dropped_count));
+    let degraded = dropped_count > 0;
+    RecallResponse {
         results,
         total,
         dropped_count,
-    })
+        degraded,
+    }
 }
 
 /// POST /api/recall/manual
@@ -517,26 +524,42 @@ Available: 10708877";
     }
 
     #[test]
-    fn recall_response_includes_dropped_count_when_nonzero() {
-        let resp = crate::types::RecallResponse {
-            results: vec![],
-            total: 0,
-            dropped_count: 3,
-        };
+    fn recall_response_includes_dropped_count_and_degraded_when_nonzero() {
+        let resp = super::build_recall_response(vec![], 3, 3);
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["results"], serde_json::json!([]));
+        assert_eq!(json["total"], 3);
         assert_eq!(json["dropped_count"], 3);
+        assert_eq!(json["degraded"], true);
     }
 
     #[test]
-    fn recall_response_omits_dropped_count_when_zero() {
-        let resp = crate::types::RecallResponse {
-            results: vec![],
-            total: 0,
-            dropped_count: 0,
-        };
+    fn recall_response_partial_drop_preserves_pre_drop_total() {
+        let resp = super::build_recall_response(
+            vec![crate::types::RecallResult {
+                blob_id: "blob-1".to_string(),
+                text: "survived".to_string(),
+                distance: 0.12,
+                score: None,
+                created_at: None,
+            }],
+            3,
+            2,
+        );
         let json = serde_json::to_value(&resp).unwrap();
-        // skip_serializing_if = "is_zero_usize" → field absent
+        assert_eq!(json["results"].as_array().unwrap().len(), 1);
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["dropped_count"], 2);
+        assert_eq!(json["degraded"], true);
+    }
+
+    #[test]
+    fn recall_response_omits_dropped_count_and_degraded_when_zero() {
+        let resp = super::build_recall_response(vec![], 0, 0);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["total"], 0);
         assert!(json.get("dropped_count").is_none());
+        assert!(json.get("degraded").is_none());
     }
 
     // ── manual recall applies the same ranker as non-manual ───
