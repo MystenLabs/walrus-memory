@@ -94,3 +94,26 @@ Account authorization and application-user authorization operate at different le
 - An application using one account for many users enforces each user's namespace access in its own server. The account contract does not distinguish those application users.
 
 Removing a delegate rotates the account's encryption identity for future writes. It does not take back plaintext the delegate already read, or decryption keys it already obtained. Keep the owner key secure so you can manage and replace delegate keys. See [Delegate key management](/contract/delegate-key-management) for revocation steps.
+
+## Identifiers at a glance
+
+When configuring the SDK, inspecting the dashboard, or checking explorers, four distinct values appear. Only two of them (`accountId` and the delegate private `key`) are passed to `MemWal.create`:
+
+| **Identifier** | **Format** | **Where you see it** | **What it is used for** |
+| --- | --- | --- | --- |
+| **Account ID** (`accountId`) | `0x` + 64 hex chars (Sui object ID) | Dashboard header, `MemWal.create({ accountId })`, Sui explorer object view | Identifies your onchain `MemWalAccount` object that records the owner address and authorized `delegate_keys`. |
+| **Delegate private key** (`key`) | 64-char hex string (`32` bytes) | Shown once when creating a delegate key in the dashboard or CLI; passed to `MemWal.create({ key })` | Signs every authenticated SDK or MCP request with Ed25519. Never shared onchain. |
+| **Delegate public key / Agent ID** | `0x` + 64 hex chars (`32` bytes) | `MemWalAccount.delegate_keys` onchain, dashboard Delegate Keys table, `memwal.getPublicKeyHex()` | The raw 32-byte Ed25519 public key registered in your `MemWalAccount` on Sui and sent in the `x-public-key` request header. |
+| **Derived Sui address** (`delegateAddress`) | `0x` + 64 hex chars (`BLAKE2b-256(0x00 \|\| pubkey)`) | `delegateKeyToSuiAddress(key)`, `memwal-mcp status`, wallet UIs | The Sui address derived from the Ed25519 public key (with the `0x00` Ed25519 scheme flag). Displayed as a human-friendly address label, **not** identical to the raw 32-byte public key stored in `delegate_keys`. |
+
+<Note>
+**Why the Agent ID and derived Sui address differ:** On Sui, an Ed25519 address is the 32-byte `BLAKE2b-256` hash of `0x00 || public_key_bytes`, whereas `MemWalAccount.delegate_keys` stores the raw 32-byte Ed25519 public key (`getPublicKeyHex()`). Both are 32-byte hex strings, so always copy `accountId` and `key` from the dashboard rather than substituting a wallet address.
+</Note>
+
+## Delegate key vs on-chain sender
+
+In the default relayer-backed flow (`MemWal`), your delegate key signs **HTTP requests to the relayer**, not Sui transactions or Walrus storage transactions:
+
+- **Offchain request authentication:** The SDK signs `{timestamp}.{method}.{path}.{body_sha256}.{nonce}.{account_id}` with your delegate private key (`key`), and the relayer verifies that signature against your `MemWalAccount.delegate_keys` on Sui.
+- **Onchain / Walrus transaction sender:** When the managed relayer uploads an encrypted blob to Walrus or submits a sponsored transaction, the relayer's own operational wallet pays gas and WAL storage fees. As a result, looking up a memory's `blob_id` on [Walrus Scan](https://walruscan.com) or inspecting the upload transaction on [Suiscan](https://suiscan.xyz) shows the **relayer's operational wallet** as the transaction sender — not `delegateKeyToSuiAddress(key)` and not your owner wallet.
+- **How ownership is still enforced:** Even though the relayer's wallet submits the storage transaction, the blob's Seal encryption identity is bound to your `MemWalAccount` ID on Sui, and only your account owner or an active registered delegate key on that `MemWalAccount` can satisfy the `seal_approve` access policy to decrypt it.

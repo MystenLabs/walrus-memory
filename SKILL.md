@@ -142,6 +142,8 @@ const stored = await memwal.waitForRememberJob(accepted.job_id, {
 | `withMemWal` | `@mysten-incubation/memwal/ai` | Vercel AI SDK middleware — auto recall + save around AI conversations |
 | Account utils | `@mysten-incubation/memwal/account` | Account creation, delegate key management |
 
+> **Important**: Never pass client-encrypted ciphertext to the default `MemWal.remember(text)` or `rememberAndWait(text)` methods. The relayer generates vector embeddings from `text` before encrypting it with SEAL; passing ciphertext embeds ciphertext bytes and silently breaks semantic `recall()`. For client-side encryption, use `MemWalManual` (`rememberManual` / `recallManual`, see [Manual mode](/sdk/usage/memwal-manual)).
+
 ---
 
 ## API Surface

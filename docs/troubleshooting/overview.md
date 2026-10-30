@@ -75,7 +75,7 @@ This section covers problems that appear before the memory tools work.
 
 **Cause:** No credentials file exists at `~/.memwal/credentials.json`. When an MCP host launches the package without credentials, it starts in an authentication-required mode. The tool list still advertises the core memory tools alongside `memwal_login`, but only `memwal_login` runs until you authenticate; the other tools return an authentication-required error when called, which is why it can look like `memwal_login` is the only tool available.
 
-**Fix:** Ask the agent to call `memwal_login`, which returns a one-time sign-in URL valid for 5 minutes, or run `npx -y @mysten-incubation/memwal-mcp login --prod` in your terminal. Sign in to the wallet you intend to use before you open the URL. If the URL expires, call the tool again to get a fresh one.
+**Fix:** Ask the agent to call `memwal_login`, which returns a one-time sign-in URL valid for 5 minutes, or run `npx -y @mysten-incubation/memwal-mcp login --prod` in your terminal. Sign in to the wallet you intend to use before you open the URL (especially with **Slush Google zkLogin**, where unlocking and signing in with Google in the Slush extension before opening `/connect/mcp` prevents the approval popup from hanging). If the URL expires, call the tool again to get a fresh one.
 
 ### The MCP tools do not appear
 
