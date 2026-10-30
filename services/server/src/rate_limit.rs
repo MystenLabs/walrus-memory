@@ -885,7 +885,7 @@ pub async fn release_storage_quota_one(state: &AppState, id: &str) {
 
 /// Compute a stable i64 hash of a string for use as PG advisory lock key.
 /// Uses FNV-1a (no external dependency needed).
-fn stable_hash_i64(s: &str) -> i64 {
+pub(crate) fn stable_hash_i64(s: &str) -> i64 {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
 
