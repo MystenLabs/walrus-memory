@@ -267,6 +267,7 @@ class MemWalMock:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
+        on_dropped: str = "throw",
     ) -> RecallResult:
         """Token-overlap recall over the in-memory store.
 
@@ -281,6 +282,7 @@ class MemWalMock:
             namespace = query.namespace
             max_distance = query.max_distance
             sort = query.sort
+            on_dropped = query.on_dropped
             query_text = query.query
         else:
             sort = None
@@ -288,6 +290,10 @@ class MemWalMock:
         _validate_text(query_text, "query")
         _check_limit(limit)
         validate_max_distance(max_distance)
+        if on_dropped not in ("throw", "ignore"):
+            raise ValueError(
+                f"on_dropped must be 'throw' or 'ignore', got {on_dropped!r}"
+            )
         if sort not in (None, "relevance", "recent"):
             raise ValueError("sort must be 'relevance' or 'recent'")
         resolved_namespace = self._namespace if namespace is None else namespace
@@ -670,9 +676,16 @@ class MemWalMockSync:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
+        on_dropped: str = "throw",
     ) -> RecallResult:
         return self._run(
-            self._inner.recall(query, limit, namespace, max_distance)
+            self._inner.recall(
+                query,
+                limit,
+                namespace,
+                max_distance,
+                on_dropped=on_dropped,
+            )
         )
 
     def analyze(

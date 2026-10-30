@@ -74,13 +74,45 @@ impl StageMarker {
     }
 }
 
+#[derive(Clone)]
+struct RecallTaskContext {
+    marker: StageMarker,
+    deadline: Option<Instant>,
+}
+
 tokio::task_local! {
-    static CURRENT: StageMarker;
+    static CURRENT: RecallTaskContext;
 }
 
 /// Mark `stage` as running for the recall this task is serving.
 pub fn enter(stage: RecallStage) {
-    let _ = CURRENT.try_with(|marker| marker.set(stage));
+    let _ = CURRENT.try_with(|ctx| ctx.marker.set(stage));
+}
+
+/// Remaining deadline budget for the recall this task is serving, or `None`
+/// when running without a deadline (or outside `run_with_deadline`).
+pub fn remaining_budget() -> Option<Duration> {
+    CURRENT
+        .try_with(|ctx| {
+            ctx.deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        })
+        .ok()
+        .flatten()
+}
+
+/// Sleep `backoff` before retrying transient work only if the remaining recall
+/// deadline still leaves at least `backoff + min_headroom` for the retry to
+/// complete. Returns `true` when the caller should proceed with the retry, or
+/// `false` when insufficient budget remains.
+pub async fn backoff_if_budget_allows(backoff: Duration, min_headroom: Duration) -> bool {
+    if let Some(left) = remaining_budget() {
+        if left < backoff.saturating_add(min_headroom) {
+            return false;
+        }
+    }
+    tokio::time::sleep(backoff).await;
+    true
 }
 
 /// What a caller's deadline leaves for the recall.
@@ -124,7 +156,11 @@ pub async fn run_with_deadline<F: Future>(
     fut: F,
 ) -> Result<F::Output, StageTimedOut> {
     let started = Instant::now();
-    let tracked = CURRENT.scope(marker.clone(), fut);
+    let ctx = RecallTaskContext {
+        marker: marker.clone(),
+        deadline,
+    };
+    let tracked = CURRENT.scope(ctx, fut);
     let Some(deadline) = deadline else {
         return Ok(tracked.await);
     };
@@ -288,5 +324,30 @@ mod tests {
             budget_for(Some(1_500), Duration::from_millis(3_000)),
             Budget::Exhausted
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_respects_remaining_deadline_headroom() {
+        let marker = StageMarker::default();
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+        run_with_deadline(&marker, Some(deadline), async {
+            assert_eq!(remaining_budget(), Some(Duration::from_millis(1_500)));
+            // 200ms backoff + 1000ms headroom = 1200ms <= 1500ms: allowed.
+            let retried =
+                backoff_if_budget_allows(Duration::from_millis(200), Duration::from_millis(1_000))
+                    .await;
+            assert!(retried);
+            assert_eq!(remaining_budget(), Some(Duration::from_millis(1_300)));
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Only 1050ms left (< 1200ms required): skipped immediately without sleeping.
+            let skipped =
+                backoff_if_budget_allows(Duration::from_millis(200), Duration::from_millis(1_000))
+                    .await;
+            assert!(!skipped);
+            assert_eq!(remaining_budget(), Some(Duration::from_millis(1_050)));
+        })
+        .await
+        .expect("within deadline");
     }
 }

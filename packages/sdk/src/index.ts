@@ -24,6 +24,7 @@ export {
 // Typed failures for remember-job waits, catchable with `instanceof`. (WALM-615)
 export {
     MemWalRateLimitedError,
+    MemWalRecallAllDroppedError,
     MemWalRememberJobFailedError,
     MemWalRememberJobNotFoundError,
     MemWalRememberJobTimeoutError,
@@ -66,6 +67,7 @@ export type {
     RememberResult,
     RecallResult,
     RecallMemory,
+    RecallOnDropped,
     RecallOptions,
     RecallParams,
     RecallTokenMeta,
