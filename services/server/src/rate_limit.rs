@@ -266,6 +266,38 @@ where
     // The UUID keeps members distinct across concurrent requests, processes,
     // and replicas even when they share an identical millisecond timestamp.
     let request_id = Uuid::new_v4().to_string();
+    check_and_record_window_with_id(
+        redis,
+        key,
+        window_start,
+        now,
+        limit,
+        weight,
+        ttl_seconds,
+        &request_id,
+    )
+    .await
+}
+
+/// Atomically check the sliding window and record `weight` entries tagged with
+/// a caller-supplied `request_id` (`{request_id}:0 .. {request_id}:{weight-1}`).
+///
+/// Sharing `request_id` across a multi-layer check allows a later layer's denial
+/// to roll back the exact ZSET members recorded by earlier layers via
+/// [`rollback_window_entries`] without disturbing concurrent requests.
+async fn check_and_record_window_with_id<C>(
+    redis: &mut C,
+    key: &str,
+    window_start: f64,
+    now: f64,
+    limit: i64,
+    weight: i64,
+    ttl_seconds: i64,
+    request_id: &str,
+) -> Result<WindowCheckResult, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
     let result: i64 = redis::Script::new(SLIDING_WINDOW_LUA)
         .key(key)
         .arg(window_start)
@@ -282,6 +314,29 @@ where
     } else {
         Ok(WindowCheckResult::Denied)
     }
+}
+
+/// Remove the `weight` ZSET members (`{request_id}:0 .. {request_id}:{weight-1}`)
+/// previously recorded in `key` when a subsequent rate-limit layer denies or errors.
+async fn rollback_window_entries<C>(
+    redis: &mut C,
+    key: &str,
+    request_id: &str,
+    weight: i64,
+) -> Result<(), redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
+    if weight <= 0 {
+        return Ok(());
+    }
+    let mut cmd = redis::cmd("ZREM");
+    cmd.arg(key);
+    for i in 0..weight {
+        cmd.arg(format!("{request_id}:{i}"));
+    }
+    let _: i64 = cmd.query_async(redis).await?;
+    Ok(())
 }
 
 // ============================================================
@@ -406,10 +461,20 @@ fn rate_limiter_unavailable_response() -> Response {
 // Keep only the three request budgets on the hot path. In particular, do not
 // clone the Redis URL or carry storage/bypass settings into owner overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RequestBudgets {
-    max_requests_per_minute: i64,
-    max_requests_per_hour: i64,
-    max_requests_per_delegate_key: i64,
+pub(crate) struct RequestBudgets {
+    pub(crate) max_requests_per_minute: i64,
+    pub(crate) max_requests_per_hour: i64,
+    pub(crate) max_requests_per_delegate_key: i64,
+}
+
+impl From<&RateLimitConfig> for RequestBudgets {
+    fn from(c: &RateLimitConfig) -> Self {
+        Self {
+            max_requests_per_minute: c.max_requests_per_minute,
+            max_requests_per_hour: c.max_requests_per_hour,
+            max_requests_per_delegate_key: c.max_requests_per_delegate_key,
+        }
+    }
 }
 
 fn effective_owner_budgets(
@@ -429,6 +494,130 @@ fn effective_owner_budgets(
             max_requests_per_delegate_key: defaults.max_requests_per_delegate_key,
         },
     }
+}
+
+/// Which layer of the 3-layer authenticated write rate limiter denied a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteRateLimitDenial {
+    DelegateKey,
+    AccountBurst,
+    AccountSustained,
+}
+
+/// Check and record across all three write-path sliding windows
+/// (`rate:dk:{public_key}`, `rate:{owner}`, `rate:hr:{owner}`), rolling back
+/// any earlier layer's recorded ZSET members via `ZREM` if a later layer
+/// denies or encounters a Redis error.
+pub(crate) async fn check_write_rate_limit_windows<C, B>(
+    redis: &mut C,
+    dk_key: &str,
+    burst_key: &str,
+    hourly_key: &str,
+    now: f64,
+    budgets: B,
+    weight: i64,
+) -> Result<Option<WriteRateLimitDenial>, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+    B: Into<RequestBudgets>,
+{
+    let budgets = budgets.into();
+    let (dk_window_start, burst_window_start, hourly_window_start) = sliding_window_starts(now);
+    let request_id = Uuid::new_v4().to_string();
+
+    // Layer 1: Per-delegate-key (burst) — atomic check + record
+    match check_and_record_window_with_id(
+        redis,
+        dk_key,
+        dk_window_start,
+        now,
+        budgets.max_requests_per_delegate_key,
+        weight,
+        120, // TTL 2 min
+        &request_id,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => return Ok(Some(WriteRateLimitDenial::DelegateKey)),
+        Err(e) => {
+            tracing::warn!("rate limit [delegate-key] Redis error: {}", e);
+            return Err(e);
+        }
+        Ok(WindowCheckResult::Allowed) => {}
+    }
+
+    // Layer 2: Per-account burst — atomic check + record
+    match check_and_record_window_with_id(
+        redis,
+        burst_key,
+        burst_window_start,
+        now + 0.1, // slight timestamp offset to avoid member collision
+        budgets.max_requests_per_minute,
+        weight,
+        120, // TTL 2 min
+        &request_id,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => {
+            // Roll back the delegate-key window entries recorded by Layer 1 so
+            // an account-burst denial never spends per-delegate-key budget.
+            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+                tracing::warn!(
+                    "rate limit [burst] rollback of delegate-key entry failed: {}",
+                    e
+                );
+            }
+            return Ok(Some(WriteRateLimitDenial::AccountBurst));
+        }
+        Err(e) => {
+            tracing::warn!("rate limit [burst] Redis error: {}", e);
+            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
+            return Err(e);
+        }
+        Ok(WindowCheckResult::Allowed) => {}
+    }
+
+    // Layer 3: Per-account sustained — atomic check + record
+    match check_and_record_window_with_id(
+        redis,
+        hourly_key,
+        hourly_window_start,
+        now + 0.2, // slight timestamp offset to avoid member collision
+        budgets.max_requests_per_hour,
+        weight,
+        3700, // TTL ~1hr + buffer
+        &request_id,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => {
+            // Roll back both the delegate-key and account-burst entries recorded
+            // by Layers 1 and 2 so an hourly denial never spends minute budgets.
+            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+                tracing::warn!(
+                    "rate limit [sustained] rollback of delegate-key entry failed: {}",
+                    e
+                );
+            }
+            if let Err(e) = rollback_window_entries(redis, burst_key, &request_id, weight).await {
+                tracing::warn!(
+                    "rate limit [sustained] rollback of account-burst entry failed: {}",
+                    e
+                );
+            }
+            return Ok(Some(WriteRateLimitDenial::AccountSustained));
+        }
+        Err(e) => {
+            tracing::warn!("rate limit [sustained] Redis error: {}", e);
+            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
+            let _ = rollback_window_entries(redis, burst_key, &request_id, weight).await;
+            return Err(e);
+        }
+        Ok(WindowCheckResult::Allowed) => {}
+    }
+
+    Ok(None)
 }
 
 /// Multi-layer rate limiting middleware for the write-path authenticated
@@ -497,27 +686,25 @@ pub async fn rate_limit_middleware(
     let burst_key = format!("rate:{}", auth.owner);
     let hourly_key = format!("rate:hr:{}", auth.owner);
 
-    let (dk_window_start, burst_window_start, hourly_window_start) = sliding_window_starts(now);
-
     // --- Atomic check-and-record via Lua script for all 3 layers ---
-    // Each layer is checked+recorded atomically. If Redis is unavailable,
-    // we fall through to the in-memory token-bucket fallback.
+    // Each layer is checked+recorded atomically, and any earlier layer's
+    // recorded entries are rolled back via ZREM if a later layer denies or
+    // errors. If Redis is unavailable, we fall through to the in-memory
+    // token-bucket fallback.
 
-    let mut redis_down = false;
-
-    // Layer 1: Per-delegate-key (burst) — atomic check + record
-    match check_and_record_window(
+    let redis_down = match check_write_rate_limit_windows(
         &mut redis,
         &dk_key,
-        dk_window_start,
+        &burst_key,
+        &hourly_key,
         now,
-        config.max_requests_per_delegate_key,
+        config,
         weight,
-        120, // TTL 2 min
     )
     .await
     {
-        Ok(WindowCheckResult::Denied) => {
+        Ok(None) => false,
+        Ok(Some(WriteRateLimitDenial::DelegateKey)) => {
             tracing::warn!(
                 "rate limit [delegate-key]: key={}... denied (limit={})",
                 &auth.public_key[..16.min(auth.public_key.len())],
@@ -530,82 +717,29 @@ pub async fn rate_limit_middleware(
                 60,
             );
         }
-        Err(e) => {
-            tracing::warn!("rate limit [delegate-key] Redis error: {}", e);
-            redis_down = true;
+        Ok(Some(WriteRateLimitDenial::AccountBurst)) => {
+            tracing::warn!(
+                "rate limit [burst]: owner={} denied (limit={})",
+                auth.owner,
+                config.max_requests_per_minute
+            );
+            return rate_limit_response("account_burst", config.max_requests_per_minute, "min", 60);
         }
-        Ok(WindowCheckResult::Allowed) => {}
-    }
-
-    // Layer 2: Per-account burst — atomic check + record
-    if !redis_down {
-        match check_and_record_window(
-            &mut redis,
-            &burst_key,
-            burst_window_start,
-            now + 0.1, // slight timestamp offset to avoid member collision
-            config.max_requests_per_minute,
-            weight,
-            120, // TTL 2 min
-        )
-        .await
-        {
-            Ok(WindowCheckResult::Denied) => {
-                tracing::warn!(
-                    "rate limit [burst]: owner={} denied (limit={})",
-                    auth.owner,
-                    config.max_requests_per_minute
-                );
-                // Roll back the delegate-key window entry just recorded above
-                // (best-effort; a Lua multi-key script would be fully atomic across keys)
-                return rate_limit_response(
-                    "account_burst",
-                    config.max_requests_per_minute,
-                    "min",
-                    60,
-                );
-            }
-            Err(e) => {
-                tracing::warn!("rate limit [burst] Redis error: {}", e);
-                redis_down = true;
-            }
-            Ok(WindowCheckResult::Allowed) => {}
+        Ok(Some(WriteRateLimitDenial::AccountSustained)) => {
+            tracing::warn!(
+                "rate limit [sustained]: owner={} denied (limit={})",
+                auth.owner,
+                config.max_requests_per_hour
+            );
+            return rate_limit_response(
+                "account_sustained",
+                config.max_requests_per_hour,
+                "hour",
+                300,
+            );
         }
-    }
-
-    // Layer 3: Per-account sustained — atomic check + record
-    if !redis_down {
-        match check_and_record_window(
-            &mut redis,
-            &hourly_key,
-            hourly_window_start,
-            now + 0.2, // slight timestamp offset to avoid member collision
-            config.max_requests_per_hour,
-            weight,
-            3700, // TTL ~1hr + buffer
-        )
-        .await
-        {
-            Ok(WindowCheckResult::Denied) => {
-                tracing::warn!(
-                    "rate limit [sustained]: owner={} denied (limit={})",
-                    auth.owner,
-                    config.max_requests_per_hour
-                );
-                return rate_limit_response(
-                    "account_sustained",
-                    config.max_requests_per_hour,
-                    "hour",
-                    300,
-                );
-            }
-            Err(e) => {
-                tracing::warn!("rate limit [sustained] Redis error: {}", e);
-                redis_down = true;
-            }
-            Ok(WindowCheckResult::Allowed) => {}
-        }
-    }
+        Err(_) => true,
+    };
 
     // --- Fallback path: Redis unreachable — use in-memory token buckets ---
     if redis_down {
@@ -3414,6 +3548,269 @@ mod tests {
         let (b_min, b_hr) = mcp_tenant_rate_keys(&tenant_b);
         let _: i64 = redis::cmd("DEL")
             .arg(&[a_min, a_hr, b_min, b_hr, global_min, global_hr])
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // ---- GH #1002: later-layer denial must roll back earlier layers ----
+
+    #[tokio::test]
+    async fn account_burst_and_sustained_denials_roll_back_earlier_layers() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct RollbackMockRedis {
+            sets: Arc<Mutex<HashMap<String, Vec<(f64, String)>>>>,
+        }
+
+        impl RollbackMockRedis {
+            fn zcard(&self, key: &str) -> usize {
+                self.sets
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+            }
+        }
+
+        impl redis::aio::ConnectionLike for RollbackMockRedis {
+            fn req_packed_command<'a>(
+                &'a mut self,
+                cmd: &'a redis::Cmd,
+            ) -> redis::RedisFuture<'a, redis::Value> {
+                let sets = Arc::clone(&self.sets);
+                let args: Vec<String> = cmd
+                    .args_iter()
+                    .map(|a| match a {
+                        redis::Arg::Simple(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                        redis::Arg::Cursor => "0".to_string(),
+                    })
+                    .collect();
+                Box::pin(async move {
+                    match args.first().map(String::as_str) {
+                        Some("EVAL" | "EVALSHA") => {
+                            let key = &args[3];
+                            let window_start: f64 = args[4].parse().unwrap();
+                            let now: f64 = args[5].parse().unwrap();
+                            let limit: usize = args[6].parse().unwrap();
+                            let weight: usize = args[7].parse().unwrap();
+                            let member_base = &args[9];
+
+                            let mut guard = sets.lock().unwrap();
+                            let entries = guard.entry(key.clone()).or_default();
+                            entries.retain(|(score, _)| *score > window_start);
+                            if entries.len() + weight > limit {
+                                return Ok(redis::Value::Int(0));
+                            }
+                            for i in 0..weight {
+                                entries.push((now, format!("{member_base}:{i}")));
+                            }
+                            Ok(redis::Value::Int(1))
+                        }
+                        Some("ZREM") => {
+                            let key = &args[1];
+                            let members_to_remove = &args[2..];
+                            let mut guard = sets.lock().unwrap();
+                            let mut removed = 0i64;
+                            if let Some(entries) = guard.get_mut(key) {
+                                let before = entries.len();
+                                entries
+                                    .retain(|(_, m)| !members_to_remove.iter().any(|rm| rm == m));
+                                removed = (before - entries.len()) as i64;
+                            }
+                            Ok(redis::Value::Int(removed))
+                        }
+                        other => panic!("unexpected Redis command: {other:?}"),
+                    }
+                })
+            }
+
+            fn req_packed_commands<'a>(
+                &'a mut self,
+                _cmd: &'a redis::Pipeline,
+                _offset: usize,
+                _count: usize,
+            ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn get_db(&self) -> i64 {
+                0
+            }
+        }
+
+        // Case 1 (exact GH #1002 reproducer): delegate-key budget = 10, account burst = 1.
+        // Request 1 is allowed; Request 2 is denied at Layer 2 (`AccountBurst`).
+        // `ZCARD rate:dk:<public_key>` must remain 1 (not 2), and repeated retries in the
+        // same window must keep reporting `AccountBurst` rather than draining `delegate_key`.
+        let mut redis = RollbackMockRedis::default();
+        let config = RateLimitConfig {
+            max_requests_per_delegate_key: 10,
+            max_requests_per_minute: 1,
+            max_requests_per_hour: 500,
+            ..RateLimitConfig::default()
+        };
+        let dk_key = "rate:dk:0xdelegate_pk_1002";
+        let burst_key = "rate:0xowner_1002";
+        let hourly_key = "rate:hr:0xowner_1002";
+        let now = 1_700_000_000_000.0;
+
+        let first = check_write_rate_limit_windows(
+            &mut redis, dk_key, burst_key, hourly_key, now, &config, 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, None, "first request must be allowed by all 3 layers");
+        assert_eq!(redis.zcard(dk_key), 1);
+        assert_eq!(redis.zcard(burst_key), 1);
+        assert_eq!(redis.zcard(hourly_key), 1);
+
+        for attempt in 0..15 {
+            let second = check_write_rate_limit_windows(
+                &mut redis,
+                dk_key,
+                burst_key,
+                hourly_key,
+                now + ((attempt + 1) as f64) * 10.0,
+                &config,
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                second,
+                Some(WriteRateLimitDenial::AccountBurst),
+                "attempt {} must be denied by AccountBurst, never misattributed to DelegateKey",
+                attempt + 2
+            );
+            assert_eq!(
+                redis.zcard(dk_key),
+                1,
+                "AccountBurst denial must roll back the delegate-key ZSET entry"
+            );
+            assert_eq!(redis.zcard(burst_key), 1);
+            assert_eq!(redis.zcard(hourly_key), 1);
+        }
+
+        // Case 2: Multi-weight endpoint (`weight = 5`, e.g. `/api/remember`) denied at Layer 3
+        // (`AccountSustained`) rolls back all 5 weighted members in both Layer 1 (`dk_key`)
+        // and Layer 2 (`burst_key`).
+        let mut redis_sustained = RollbackMockRedis::default();
+        let sustained_config = RateLimitConfig {
+            max_requests_per_delegate_key: 30,
+            max_requests_per_minute: 60,
+            max_requests_per_hour: 5,
+            ..RateLimitConfig::default()
+        };
+        let first_heavy = check_write_rate_limit_windows(
+            &mut redis_sustained,
+            dk_key,
+            burst_key,
+            hourly_key,
+            now,
+            &sustained_config,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_heavy, None);
+        assert_eq!(redis_sustained.zcard(dk_key), 5);
+        assert_eq!(redis_sustained.zcard(burst_key), 5);
+        assert_eq!(redis_sustained.zcard(hourly_key), 5);
+
+        let second_heavy = check_write_rate_limit_windows(
+            &mut redis_sustained,
+            dk_key,
+            burst_key,
+            hourly_key,
+            now + 100.0,
+            &sustained_config,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_heavy, Some(WriteRateLimitDenial::AccountSustained));
+        assert_eq!(
+            redis_sustained.zcard(dk_key),
+            5,
+            "AccountSustained denial must roll back all 5 weighted members from rate:dk:*"
+        );
+        assert_eq!(
+            redis_sustained.zcard(burst_key),
+            5,
+            "AccountSustained denial must roll back all 5 weighted members from rate:*"
+        );
+        assert_eq!(redis_sustained.zcard(hourly_key), 5);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_REDIS_URL pointing to a real Redis instance"]
+    async fn account_burst_denial_does_not_spend_delegate_key_budget_redis() {
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must be set when running Redis integration tests");
+        let client = redis::Client::open(redis_url).expect("valid TEST_REDIS_URL");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect to test Redis");
+
+        let run = Uuid::new_v4();
+        let dk_key = format!("test:rate:dk:{run}");
+        let burst_key = format!("test:rate:{run}");
+        let hourly_key = format!("test:rate:hr:{run}");
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+
+        let config = RateLimitConfig {
+            max_requests_per_delegate_key: 10,
+            max_requests_per_minute: 1,
+            max_requests_per_hour: 500,
+            ..RateLimitConfig::default()
+        };
+
+        assert_eq!(
+            check_write_rate_limit_windows(
+                &mut conn,
+                &dk_key,
+                &burst_key,
+                &hourly_key,
+                now,
+                &config,
+                1
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            check_write_rate_limit_windows(
+                &mut conn,
+                &dk_key,
+                &burst_key,
+                &hourly_key,
+                now + 10.0,
+                &config,
+                1,
+            )
+            .await
+            .unwrap(),
+            Some(WriteRateLimitDenial::AccountBurst)
+        );
+
+        let dk_count: i64 = redis::cmd("ZCARD")
+            .arg(&dk_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            dk_count, 1,
+            "denied request at account_burst must not remain recorded in rate:dk:<public_key>"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&[&dk_key, &burst_key, &hourly_key])
             .query_async(&mut conn)
             .await
             .unwrap();
