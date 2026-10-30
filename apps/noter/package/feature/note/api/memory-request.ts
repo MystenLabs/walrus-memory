@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/shared/lib/db";
 import { users, walletSessions } from "@/shared/db/schema";
 import { requireSharedRedisClient } from "@/shared/lib/shared-redis";
+import { resolveAndMigrateUserDelegateKey } from "@/feature/auth/domain/service";
 import { memoryTextWithinLimit } from "./memory-policy";
 
 export { MAX_MEMORY_TEXT_BYTES } from "./memory-policy";
@@ -126,9 +127,25 @@ export async function resolveMemoryCredentials(req: Request): Promise<{
     );
   }
 
+  let decryptedKey: string;
+  let resolvedAccountId: string;
+  try {
+    const resolved = await resolveAndMigrateUserDelegateKey(db, user);
+    if (!resolved.delegateAccountId) {
+      throw new Error("Missing delegate account ID");
+    }
+    decryptedKey = resolved.plaintextKey;
+    resolvedAccountId = resolved.delegateAccountId;
+  } catch {
+    throw new MemoryRequestError(
+      401,
+      "Session has no Walrus Memory credentials"
+    );
+  }
+
   return {
-    key: user.delegatePrivateKey,
-    accountId: user.delegateAccountId,
+    key: decryptedKey,
+    accountId: resolvedAccountId,
     userId: user.id,
   };
 }
