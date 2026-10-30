@@ -148,3 +148,14 @@ test("--help does not promise that flag order decides a preset override", () => 
     assert.equal(before.relayerUrl, "https://custom.example");
     assert.equal(after.relayerUrl, "https://custom.example");
 });
+
+test("parseArgs recognises status and whoami subcommands and flags", () => {
+    for (const token of ["status", "--status", "whoami", "--whoami"]) {
+        const args = parseArgs([token]);
+        assert.equal(args.status, true, `${token} should set status=true`);
+        assert.deepEqual(args.unknown, []);
+    }
+    const help = helpText();
+    assert.ok(help.includes("memwal-mcp status"), "status missing from --help");
+    assert.ok(help.includes("whoami"), "whoami missing from --help");
+});
