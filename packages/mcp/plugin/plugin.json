@@ -1,8 +1,8 @@
 {
     "id": "memwal",
     "name": "memwal",
-    "version": "0.0.18",
-    "mcpPackageVersion": "0.0.18",
+    "version": "0.0.19",
+    "mcpPackageVersion": "0.0.19",
     "mcpBootstrapVersion": "0.0.17-dev.3",
     "description": "Automatic Walrus Memory for Antigravity \u2014 proactive recall and durable-fact saving via the MemWal MCP + lifecycle hooks.",
     "author": {
