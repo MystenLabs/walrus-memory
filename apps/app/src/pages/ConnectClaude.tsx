@@ -40,6 +40,12 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useSponsoredTransaction } from '../hooks/useSponsoredTransaction'
 import { config } from '../config'
 import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
+import {
+    fetchDelegateKeyCount,
+    isMaxDelegateKeysError,
+    MAX_DELEGATE_KEYS,
+    MAX_DELEGATE_KEYS_CONNECT_MESSAGE,
+} from '../utils/delegateKeys'
 import { fetchAccountIdForOwner } from '../utils/suiClientCompat'
 
 
@@ -337,6 +343,14 @@ export default function ConnectClaude() {
 
             let txDigest = ''
             if (preflight.needs_onchain_registration) {
+                const delegateKeyCount = await fetchDelegateKeyCount(suiClient, accountId)
+                if (delegateKeyCount !== null && delegateKeyCount >= MAX_DELEGATE_KEYS) {
+                    setErrorMsg(MAX_DELEGATE_KEYS_CONNECT_MESSAGE)
+                    setStep('error')
+                    trackEvent('claude_connect_failed', { error_type: 'max_delegate_keys' })
+                    return
+                }
+
                 const tx = new Transaction()
                 tx.moveCall({
                     target: `${config.memwalPackageId}::account::add_delegate_key`,
@@ -349,17 +363,12 @@ export default function ConnectClaude() {
                         tx.object('0x6'),
                     ],
                 })
-                // Deliberately no `account.move` abort-code branches here.
-                // This page signs through `useSponsoredTransaction`, which
-                // throws `new Error(sponsorFailureMessage(...))`, and the
-                // relayer's `sponsor::mask_upstream` collapses any upstream
-                // 5xx into a bare 502 `sponsor_upstream_error` that never
-                // echoes the Move abort. `EDelegateKeyAlreadyExists` (0),
-                // `ETooManyDelegateKeys` (2) and `ENotOwner` (4) therefore all
-                // reach us as the same opaque sponsor string; matching on them
-                // read like recovery while never firing. The duplicate-key
-                // case is settled before this point, by `/account`'s on-chain
-                // check (`resume_pending_registration`).
+                // Deliberately no `EDelegateKeyAlreadyExists` (0) or `ENotOwner` (4)
+                // abort-code branches here. Duplicate keys are settled before this
+                // point by `/account`'s on-chain check (`resume_pending_registration`),
+                // and `ETooManyDelegateKeys` (2) is preflighted above and classified
+                // as `max_delegate_keys` (409) by `/sponsor`. Unclassified 502s remain
+                // terminal errors rather than being guessed as already-registered.
                 const result = await signAndExecute({ transaction: tx })
                 await suiClient.waitForTransaction({ digest: result.digest })
                 txDigest = result.digest
@@ -497,6 +506,17 @@ export default function ConnectClaude() {
                         <div className="setup-classic-intro">
                             <h2 className="setup-classic-title">Something went wrong</h2>
                             <p className="setup-classic-description mcp-error">{errorMsg}</p>
+                            {isMaxDelegateKeysError(errorMsg) && (
+                                <div className="setup-classic-actions">
+                                    <Link
+                                        to="/dashboard"
+                                        className="mcp-btn"
+                                        onClick={() => trackEvent('cta_click', { cta: 'claude_error_dashboard', location: 'connect_claude' })}
+                                    >
+                                        Go to dashboard
+                                    </Link>
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>

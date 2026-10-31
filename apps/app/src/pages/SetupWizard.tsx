@@ -22,11 +22,11 @@ import { Link, useNavigate } from 'react-router-dom'
 import { LogOut, Copy, TriangleAlert } from 'lucide-react'
 import { config } from '../config'
 import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
+import { fetchDelegateKeyCount, isMaxDelegateKeysError, MAX_DELEGATE_KEYS } from '../utils/delegateKeys'
 import { fetchAccountIdForOwner, fetchObjectJson, publicKeyToHex } from '../utils/suiClientCompat'
 
 type Step = 'intro' | 'import-key' | 'generating' | 'show-key' | 'onchain' | 'done' | 'error'
 
-const MAX_DELEGATE_KEYS = 20
 const MAX_DELEGATE_KEYS_ERROR = `this wallet already has ${MAX_DELEGATE_KEYS} delegate keys. go to the dashboard, remove an old key, then create a new delegate key.`
 
 const AUTH_METHOD_KEY = 'memwal_auth_method'
@@ -56,11 +56,6 @@ function consumePendingConnectPath(): string {
     return ''
 }
 
-function isMaxDelegateKeysError(err: unknown): boolean {
-    const message = err instanceof Error ? err.message : String(err)
-    return message.includes('abort code: 2') && message.includes('add_delegate_key')
-}
-
 function normalizePrivateKeyHex(raw: string): string {
     return raw.trim().replace(/^0x/i, '').replace(/\s+/g, '').toLowerCase()
 }
@@ -87,8 +82,7 @@ async function getAccountObjectId(suiClient: ReturnType<typeof useSuiClient>, ow
 type AccountJson = { delegate_keys?: { public_key?: unknown }[] }
 
 async function getDelegateKeyCount(suiClient: ReturnType<typeof useSuiClient>, accountId: string): Promise<number> {
-    const json = await fetchObjectJson(suiClient, accountId) as AccountJson | null
-    return json?.delegate_keys?.length ?? 0
+    return (await fetchDelegateKeyCount(suiClient, accountId)) ?? 0
 }
 
 async function getRegisteredDelegatePublicKeys(suiClient: ReturnType<typeof useSuiClient>, accountId: string): Promise<string[]> {
