@@ -28,8 +28,16 @@ questions:
   - When was bulk remember added to the Walrus Memory SDK?
   - What security improvements have been made to the MemWal SDK?
 answer: >-
-  Version 0.1.12 bounds withMemWal recall queries (preserving both head context and tail question/instructions via strategy: "head-tail") to 16,384 UTF-8 bytes and auto-save analyze inputs to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, preventing HTTP 400 errors on long turns. Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
+  Version 0.1.13 adds MemWalRecallAllDroppedError, degraded response flags, and onDropped options to distinguish transient recall drops from empty namespaces. Version 0.1.12 bounds withMemWal recall queries (preserving both head context and tail question/instructions via strategy: "head-tail") to 16,384 UTF-8 bytes and auto-save analyze inputs to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, preventing HTTP 400 errors on long turns. Version 0.1.11 adds opt-in content-hash deduplication (dedupe: true) for remember(), copies caller-supplied Uint8Array keys on client creation, hardens MemWalManual.destroy() secret cleanup and client invalidation, validates and clamps recalled memory distance before similarity relevance filtering and formatting, validates listNamespaces and listMemories limits before signing, adds AbortSignal cancellation support to analyze() via AnalyzeOptions.signal, and validates manual-mode vector and encryptedData inputs before signing.
 ---
+
+## 0.1.13
+
+### Added
+
+- `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`) is thrown by `recall` and `recallManual` when every vector search match is dropped during Walrus blob download or SEAL decryption. It exposes `total`, `droppedCount`, and `namespace`. (#1036, #1070)
+- `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped. (#1036, #1070)
+- `RecallOptions` accepts `onDropped?: "throw" | "ignore"` (defaulting to `"throw"`). Passing `"ignore"` returns `{ results: [], total, droppedCount, degraded: true }` without throwing. (#1036, #1070)
 
 ## 0.1.12
 
