@@ -24,8 +24,7 @@ use crate::alerts::{
     WalrusUploadExhaustedAlert, WalrusWalletBalanceLowAlert, SIDECAR_WALRUS_DEP_VERSION,
 };
 use crate::storage::walrus::{
-    DurableUploadAdvance, PreparedRegisterTransaction, SetMetadataBatchEntry, UploadBlobError,
-    UploadExecutionIdentity, UploadJournal,
+    DurableUploadAdvance, SetMetadataBatchEntry, UploadBlobError, UploadJournal,
 };
 use crate::types::{configured_walrus_storage_epochs, AppState, BLOB_CACHE_KEY_PREFIX};
 

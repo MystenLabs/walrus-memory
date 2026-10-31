@@ -17,7 +17,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database (PostgreSQL + pgvector)
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "migrate", "macros"] }
-pgvector = { version = "0.4", features = ["sqlx"] }
+pgvector = { version = "=0.4.1", features = ["sqlx"] }
 
 # Auth
 ed25519-dalek = { version = "2", features = ["serde"] }
@@ -25,8 +25,12 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 
-# SEAL encryption is handled by TS sidecar scripts (@mysten/seal)
-# (no Rust crypto deps needed for that path)
+# In-process Walrus & SEAL Rust SDKs (replaces Node.js/TypeScript sidecar)
+walrus-core = { git = "https://github.com/MystenLabs/walrus.git", branch = "main", default-features = false }
+seal-sdk = { git = "https://github.com/MystenLabs/seal.git", tag = "seal-v0.6.16" }
+seal-crypto = { package = "crypto", git = "https://github.com/MystenLabs/seal.git", tag = "seal-v0.6.16" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
+
 
 # MCP OAuth (Claude custom connectors) — AES-256-GCM envelope for
 # server-custodied delegate keys, ported from the reviewed WALM-30/ENG-1783

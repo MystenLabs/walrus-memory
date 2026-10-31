@@ -384,6 +384,9 @@ fn postgres_can_accept_writes(used_bytes: i64, max_bytes: i64) -> bool {
 /// call in this codebase (`storage/walrus.rs`, `storage/seal.rs`) so the
 /// probe's latency and failure rate are measurable.
 async fn probe_sidecar_write_ready(state: &std::sync::Arc<AppState>) -> bool {
+    if crate::storage::walrus_native::is_in_process_sidecar_enabled(&state.config.sidecar_url) {
+        return true;
+    }
     let url = format!("{}/health", state.config.sidecar_url.trim_end_matches('/'));
     let started = std::time::Instant::now();
     match state
@@ -750,14 +753,12 @@ async fn call_ask_llm_inner(
             || status == reqwest::StatusCode::FORBIDDEN
         {
             let _ = alerts
-                .notify_embedding_provider_auth_failed(
-                    crate::alerts::EmbeddingProviderAuthAlert {
-                        sui_network: sui_network.to_string(),
-                        status: status.as_u16(),
-                        api_base: openai_api_base.to_string(),
-                        error: body_text.clone(),
-                    },
-                )
+                .notify_embedding_provider_auth_failed(crate::alerts::EmbeddingProviderAuthAlert {
+                    sui_network: sui_network.to_string(),
+                    status: status.as_u16(),
+                    api_base: openai_api_base.to_string(),
+                    error: body_text.clone(),
+                })
                 .await;
             return Err(AppError::EmbeddingProviderUnavailable(format!(
                 "LLM API upstream error ({}): {}",
@@ -2012,8 +2013,14 @@ mod tests {
         );
 
         for (status, body) in [
-            (401u16, r#"{"error":{"message":"User not found.","code":401}}"#),
-            (402u16, r#"{"error":{"message":"Insufficient credits","code":402}}"#),
+            (
+                401u16,
+                r#"{"error":{"message":"User not found.","code":401}}"#,
+            ),
+            (
+                402u16,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+            ),
             (403u16, r#"{"error":{"message":"Key disabled","code":403}}"#),
         ] {
             let app = axum::Router::new().route(
