@@ -67,6 +67,7 @@ fn importance_changed(existing: f32, incoming: f32) -> bool {
 /// blob, is left untouched: those bytes may already have been submitted.
 fn unpaid_analyze_retry_reset_sql() -> &'static str {
     "UPDATE remember_jobs SET status = 'pending', error_msg = NULL, \
+     congestion_requeues = 0, next_attempt_at = NULL, \
      upload_wallet_index = NULL, upload_wallet_address = NULL, \
      upload_execution_identity = NULL, upload_resume_step = NULL, \
      upload_register_transaction = NULL, updated_at = NOW() \
