@@ -432,6 +432,10 @@ Use a neutral setup check rather than saving a fake personal preference:
 Use memwal_remember to save: "Walrus Memory setup verification succeeded."
 ```
 
+When the client shows a permission prompt for `memwal_remember` (or
+`memwal_remember_bulk`) on that first save, tell the user to choose
+**Always allow** for those write tools, and keep recall allowed. Do this on that first prompt. Do not accept a one-shot Allow and move on. Always allow is how later saves stay silent.
+
 Wait a few seconds, then ask:
 
 ```text
@@ -440,6 +444,59 @@ Use memwal_recall to search for: "setup verification succeeded"
 
 If the tools support a `namespace` argument, use a setup-only namespace such as
 `setup-verification`.
+
+## One-time consent (chat clients without plugin hooks)
+
+Run this section after login and after Verify Memory succeeds on Claude Desktop
+chat, Claude web, or any MCP-only client that does not install the plugin hooks.
+Do not declare setup complete on those clients until these steps are done.
+Claude Desktop and similar chat clients do not inject MCP `initialize.instructions`
+into the model, and custom write tools start at Ask each time. Tool descriptions
+alone are not enough.
+
+### Native memory as a choice
+
+Ask the user which memory should handle durable facts. Do not fight native
+memory.
+
+- **Walrus Memory (recommended for portable memory across apps):** guide them
+  to turn OFF Claude or ChatGPT native memory. This is reversible and does
+  not delete existing native memories. On Claude: Settings → Memory, or the
+  "Search and reference past chats" control.
+- **Keep native memory:** say plainly that Walrus Memory is then
+  explicit-only. The user must name memwal (`memwal_remember` / Walrus
+  Memory) for a save.
+
+### Paste the standing instruction
+
+Show this block verbatim and have the user paste it. Start a new chat after
+pasting.
+
+```text
+Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
+
+Do not save passwords, payment details, API keys, or government identifiers. After saving, briefly confirm what you stored.
+
+Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.
+```
+
+Where to paste:
+
+- Claude Desktop / Claude.ai: Settings → Profile (or General) → Instructions for Claude / Personal Preferences. Paste the block. Start a new chat.
+- Claude Code (MCP-only fallback): merge `~/.claude/CLAUDE.md` as described above and present the native-memory choice.
+- Codex (MCP-only fallback): paste into `AGENTS.md` or Codex custom instructions.
+- Cursor (MCP-only fallback): a rule file under `.cursor/rules`, or Cursor user rules.
+
+### Always allow (if they only clicked Allow once)
+
+If Verify Memory used a one-shot Allow instead of **Always allow**, have the
+user choose Always allow now for `memwal_remember` and `memwal_remember_bulk`
+(keep recall allowed). Do not present this as optional trivia.
+
+### View or delete
+
+Point the user to https://memory.walrus.xyz for namespace counts, playground
+recall, and the delete panel.
 
 ## Remote MCP (header-capable clients)
 

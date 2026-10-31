@@ -24,6 +24,7 @@ import {
 } from "./client-info.js";
 import { randomUUID } from "node:crypto";
 import { ensureCompatibleRelayer, resolveConnectTimeoutMs } from "./compatibility.js";
+import { localPromptReply } from "./consent-instruction.js";
 import {
     describeHealthProbe,
     probeRelayerHealth,
@@ -227,7 +228,7 @@ const FALLBACK_PROTOCOL_VERSION = "2024-11-05";
  * refreshes) would let a client ignore that notification. */
 function buildLocalInitializeResult(params: unknown): {
     protocolVersion: string;
-    capabilities: { tools: { listChanged: boolean } };
+    capabilities: { tools: { listChanged: boolean }; prompts: Record<string, never> };
     serverInfo: { name: string; version: string };
     instructions: string;
 } {
@@ -238,7 +239,7 @@ function buildLocalInitializeResult(params: unknown): {
             : FALLBACK_PROTOCOL_VERSION;
     return {
         protocolVersion,
-        capabilities: { tools: { listChanged: true } },
+        capabilities: { tools: { listChanged: true }, prompts: {} },
         serverInfo: { name: "memwal", version: MEMWAL_MCP_VERSION },
         // The relayer sets `instructions` too, but that reply never reaches the
         // client: this local answer wins and the upstream initialize reply is
@@ -2109,6 +2110,28 @@ export async function runBridge(
                     // Expect exactly one upstream reply to drop for this forward.
                     expectSuppressedReply(msg.id);
                     // Fall through: forward/buffer the initialize upstream too.
+                }
+
+                // The consent prompt is static and identical to the sidecar's.
+                // Answer it locally so Desktop/stdio clients can load
+                // `memwal_enable_proactive` before the relayer session is up
+                // (and without depending on a sidecar deploy).
+                const promptReply = localPromptReply(msg.method, msg.params);
+                if (promptReply && msg.id != null) {
+                    if (promptReply.error) {
+                        writeStdoutMessage({
+                            jsonrpc: "2.0",
+                            id: msg.id,
+                            error: promptReply.error,
+                        });
+                    } else {
+                        writeStdoutMessage({
+                            jsonrpc: "2.0",
+                            id: msg.id,
+                            result: promptReply.result,
+                        });
+                    }
+                    return;
                 }
 
                 // Answer `tools/list` LOCALLY at cold start (before the relayer
