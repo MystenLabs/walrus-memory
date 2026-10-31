@@ -29,6 +29,7 @@ from .client import (
     MemWalError,
     MemWalJsonBodyError,
     MemWalRateLimited,
+    MemWalRecallAllDropped,
     MemWalRememberJobFailed,
     MemWalRememberJobNotFound,
     MemWalRememberJobTimeout,
@@ -87,6 +88,7 @@ __all__ = [
     "MemWalClockDriftError",
     "MemWalJsonBodyError",
     "MemWalRateLimited",
+    "MemWalRecallAllDropped",
     "MemWalRememberJobFailed",
     "MemWalRememberJobNotFound",
     "MemWalRememberJobTimeout",
@@ -132,4 +134,4 @@ __all__ = [
     "RecallManualResult",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"

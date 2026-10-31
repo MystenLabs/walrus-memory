@@ -85,6 +85,27 @@ export function filterByMaxDistance<T extends { distance: number }>(
     return results.filter((memory) => memory.distance < maxDistance);
 }
 
+/** Extract `droppedCount` when the SDK throws `MemWalRecallAllDroppedError`. */
+export function allDroppedCountFromError(err: unknown): number | null {
+    if (err == null || typeof err !== "object") return null;
+    const e = err as {
+        code?: unknown;
+        name?: unknown;
+        droppedCount?: unknown;
+        dropped_count?: unknown;
+    };
+    if (e.code !== "RECALL_ALL_DROPPED" && e.name !== "MemWalRecallAllDropped") {
+        return null;
+    }
+    if (typeof e.droppedCount === "number" && e.droppedCount > 0) {
+        return e.droppedCount;
+    }
+    if (typeof e.dropped_count === "number" && e.dropped_count > 0) {
+        return e.dropped_count;
+    }
+    return 1;
+}
+
 /**
  * Empty-result copy after the maxDistance filter.
  *
@@ -168,11 +189,29 @@ export function registerRecallTool(
             inputSchema: RECALL_INPUT,
         },
         wrapTool<{ query: string; limit: number; namespace?: string; maxDistance?: number }>(session, "memwal_recall", async ({ query, limit, namespace, maxDistance }) => {
-            const result = await session.memwal.recall(query, limit, namespace);
+            let result: Awaited<ReturnType<typeof session.memwal.recall>>;
+            try {
+                result = await session.memwal.recall(query, limit, namespace);
+            } catch (err) {
+                const allDropped = allDroppedCountFromError(err);
+                if (allDropped !== null) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: emptyRecallText(0, allDropped),
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                throw err;
+            }
             const droppedRaw = (result as { dropped_count?: unknown }).dropped_count;
             const dropped = typeof droppedRaw === "number" ? droppedRaw : 0;
             const filtered = filterByMaxDistance(result.results, maxDistance);
             if (filtered.length === 0) {
+                const allDropped = result.results.length === 0 && dropped > 0;
                 return {
                     content: [
                         {
@@ -180,6 +219,7 @@ export function registerRecallTool(
                             text: emptyRecallText(result.results.length, dropped),
                         },
                     ],
+                    ...(allDropped ? { isError: true } : {}),
                 };
             }
             const { unique, collapsed } = collapseDuplicates(filtered);

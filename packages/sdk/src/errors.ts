@@ -73,3 +73,31 @@ export class MemWalRememberJobTimeoutError extends Error {
         this.serverError = serverError;
     }
 }
+
+/**
+ * Thrown by `recall()` when the relayer matched one or more vector entries
+ * (`dropped_count > 0` or `degraded: true`), yet every matched blob failed
+ * Walrus download, SEAL decrypt, or UTF-8 decode (`results.length === 0`).
+ *
+ * Pass `onDropped: "ignore"` to `recall()` when you prefer to inspect the
+ * degraded `RecallResult` (`degraded: true`, `dropped_count`, `total`)
+ * directly without throwing.
+ */
+export class MemWalRecallAllDroppedError extends Error {
+    readonly code = "RECALL_ALL_DROPPED" as const;
+    readonly total: number;
+    readonly droppedCount: number;
+    readonly namespace: string;
+
+    constructor(droppedCount: number, total: number, namespace: string) {
+        const noun = total === 1 ? "match" : "matches";
+        super(
+            `MemWal recall matched ${total} ${noun} in namespace "${namespace}", ` +
+                `but all ${droppedCount} failed to download or decrypt`,
+        );
+        this.name = "MemWalRecallAllDropped";
+        this.total = total;
+        this.droppedCount = droppedCount;
+        this.namespace = namespace;
+    }
+}

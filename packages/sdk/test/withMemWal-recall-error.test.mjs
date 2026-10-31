@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { generateText } from "ai";
 
-import { MemWal } from "../dist/memwal.js";
+import { MemWal, MemWalRecallAllDroppedError } from "../dist/index.js";
 import { withMemWal } from "../dist/ai/middleware.js";
 
 const TEST_KEY = "11".repeat(32);
@@ -133,6 +133,64 @@ test("if onRecallError throws, generation still proceeds", async () => {
         assert.ok(callbackWarn, "expected warning about failing callback");
     } finally {
         MemWal.prototype.recall = originalRecall;
+        console.warn = originalWarn;
+    }
+});
+
+test("all-dropped recall invokes onRecallError and does not cache an empty memory context", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalBuildSeal = MemWal.prototype.buildSealSession;
+    const originalWarn = console.warn;
+
+    let recallCalls = 0;
+    globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/version") {
+            return Response.json({
+                apiVersion: "1.0.0",
+                relayerVersion: "1.0.0",
+                minSupportedSdk: { typescript: "0.0.4" },
+            });
+        }
+        if (path === "/api/config") {
+            return Response.json({ packageId: "0x1", network: "testnet" });
+        }
+        if (path === "/api/recall" && init.method === "POST") {
+            recallCalls += 1;
+            if (recallCalls === 1) {
+                return Response.json({ results: [], total: 2, dropped_count: 2, degraded: true });
+            }
+            return Response.json({
+                results: [{ blob_id: "b1", text: "User is allergic to peanuts", distance: 0.1 }],
+                total: 1,
+            });
+        }
+        throw new Error(`unexpected request ${path}`);
+    };
+    MemWal.prototype.buildSealSession = async () => "test-session";
+    console.warn = () => {};
+
+    const errors = [];
+    try {
+        const model = withMemWal(fakeLanguageModel(), {
+            key: TEST_KEY,
+            accountId: TEST_ACCOUNT_ID,
+            serverUrl: "https://relayer.example",
+            autoSave: false,
+            onRecallError: (err) => errors.push(err),
+        });
+
+        await generateText({ model, prompt: "Recommend a snack" });
+        assert.equal(errors.length, 1);
+        assert.ok(errors[0] instanceof MemWalRecallAllDroppedError);
+        assert.equal(errors[0].droppedCount, 2);
+
+        // Same user turn prompt on a subsequent step must retry recall rather than serving cached ""
+        await generateText({ model, prompt: "Recommend a snack" });
+        assert.equal(recallCalls, 2);
+    } finally {
+        globalThis.fetch = originalFetch;
+        MemWal.prototype.buildSealSession = originalBuildSeal;
         console.warn = originalWarn;
     }
 });

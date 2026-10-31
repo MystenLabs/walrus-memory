@@ -1,5 +1,13 @@
 # @mysten-incubation/memwal
 
+## 0.1.13
+
+### Added
+
+- `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`) is thrown by `recall()` when every vector search match is dropped during Walrus blob download or SEAL decryption. It exposes `total`, `droppedCount`, and `namespace`. (#1036, #1070)
+- `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped. (#1036, #1070)
+- `RecallOptions` accepts `onDropped?: "throw" | "ignore"` (defaulting to `"throw"`). Passing `"ignore"` returns `{ results: [], total, dropped_count, degraded: true }` without throwing. (#1036, #1070)
+
 ## 0.1.12
 
 ### Fixed

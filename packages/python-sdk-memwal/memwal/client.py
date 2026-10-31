@@ -453,6 +453,15 @@ def _check_limit(limit: Any) -> None:
         raise ValueError(f"limit must be a positive integer, got {limit!r}")
 
 
+def _check_on_dropped(on_dropped: Any) -> str:
+    """Validate the recall all-dropped handling policy before signing."""
+    if on_dropped not in ("throw", "ignore"):
+        raise ValueError(
+            f"on_dropped must be 'throw' or 'ignore', got {on_dropped!r}"
+        )
+    return str(on_dropped)
+
+
 def _check_vector(vector: Any) -> None:
     """Reject a vector that is not a non-empty list of finite numbers (#1218).
 
@@ -1175,6 +1184,7 @@ class MemWal:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
+        on_dropped: str = "throw",
     ) -> RecallResult:
         """Recall memories similar to a query.
 
@@ -1200,6 +1210,10 @@ class MemWal:
             max_distance: Optional client-side relevance threshold. Memories
                 with ``distance >= max_distance`` are dropped. Ignored when
                 ``query`` is a :class:`RecallParams`.
+            on_dropped: Policy when every matched memory failed download or
+                decrypt (``"throw"`` by default raises
+                :class:`MemWalRecallAllDropped`, ``"ignore"`` returns the
+                degraded :class:`RecallResult`).
 
         Returns:
             :class:`RecallResult` with decrypted text results.
@@ -1214,15 +1228,18 @@ class MemWal:
             max_distance = params.max_distance
             scoring_weights = params.scoring_weights
             sort = params.sort
+            on_dropped = params.on_dropped
         else:
             query_text = query
         _reject_blank_text(query_text, "query cannot be empty")
         _check_limit(limit)
         validate_max_distance(max_distance)
+        policy = _check_on_dropped(on_dropped)
+        resolved_namespace = self._resolve_namespace(namespace)
         body = {
             "query": query_text,
             "limit": limit,
-            "namespace": self._resolve_namespace(namespace),
+            "namespace": resolved_namespace,
         }
         if scoring_weights is not None:
             body["scoring_weights"] = scoring_weights.to_wire()
@@ -1241,16 +1258,35 @@ class MemWal:
         ]
         raw_dropped = data.get("dropped_count") or 0
         try:
-            dropped = int(raw_dropped)
+            dropped = max(0, int(raw_dropped))
         except (TypeError, ValueError):
             dropped = 0
-        total_count = data.get("total", len(memories))
+        degraded = bool(data.get("degraded")) or dropped > 0
+        raw_total = data.get("total", len(memories))
+        try:
+            total_count = int(raw_total)
+        except (TypeError, ValueError):
+            total_count = len(memories)
+
+        if len(memories) == 0 and degraded:
+            effective_dropped = dropped if dropped > 0 else max(1, total_count)
+            effective_total = max(total_count, effective_dropped)
+            if policy == "throw":
+                raise MemWalRecallAllDropped(
+                    dropped_count=effective_dropped,
+                    total=effective_total,
+                    namespace=resolved_namespace,
+                )
+            dropped = effective_dropped
+            total_count = effective_total
+
         if max_distance is not None:
             memories = [m for m in memories if m.distance < max_distance]
         return RecallResult(
             results=memories,
             total=total_count,
             dropped_count=dropped,
+            degraded=degraded,
         )
 
     async def forget(self, namespace: Optional[str] = None) -> ForgetResult:
@@ -2311,6 +2347,26 @@ class MemWalRememberJobTimeout(MemWalError):
         self.last_refusal = last_refusal
 
 
+class MemWalRecallAllDropped(MemWalError):
+    """Raised by :meth:`MemWal.recall` when every matched memory failed to
+    download or decrypt (``results == []`` and ``dropped_count > 0``).
+
+    Pass ``on_dropped="ignore"`` to inspect the degraded :class:`RecallResult`
+    without raising.
+    """
+
+    def __init__(self, dropped_count: int, total: int, namespace: str) -> None:
+        noun = "match" if total == 1 else "matches"
+        super().__init__(
+            f'MemWal recall matched {total} {noun} in namespace "{namespace}", '
+            f"but all {dropped_count} failed to download or decrypt"
+        )
+        self.code = "RECALL_ALL_DROPPED"
+        self.dropped_count = dropped_count
+        self.total = total
+        self.namespace = namespace
+
+
 async def _discard_http_client(memwal: MemWal) -> None:
     """Close the cached httpx client, and drop it either way.
 
@@ -2502,10 +2558,19 @@ class MemWalSync:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
+        on_dropped: str = "throw",
     ) -> RecallResult:
         """Synchronous version of :meth:`MemWal.recall` (accepts
         :class:`RecallParams` for the recommended object-style call)."""
-        return self._run(self._inner.recall(query, limit, namespace, max_distance))
+        return self._run(
+            self._inner.recall(
+                query,
+                limit,
+                namespace,
+                max_distance,
+                on_dropped=on_dropped,
+            )
+        )
 
     def forget(self, namespace: Optional[str] = None) -> ForgetResult:
         """Synchronous version of :meth:`MemWal.forget`."""

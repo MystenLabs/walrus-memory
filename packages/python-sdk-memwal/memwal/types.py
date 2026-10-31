@@ -121,6 +121,7 @@ class RecallParams:
     max_distance: Optional[float] = None
     scoring_weights: Optional["ScoringWeights"] = None
     sort: Optional[str] = None
+    on_dropped: str = "throw"
 
 
 @dataclass
@@ -132,6 +133,8 @@ class RecallResult:
     # Matches omitted because download or decrypt failed. 0 also means the
     # relayer omitted the field (older servers).
     dropped_count: int = 0
+    # True whenever one or more matched blobs were dropped (dropped_count > 0).
+    degraded: bool = False
 
 
 @dataclass
