@@ -1,5 +1,13 @@
 # memwal
 
+## 0.2.3
+
+### Added
+
+- `MemWalRecallAllDropped` (`code = "RECALL_ALL_DROPPED"`) is raised by `recall()` across `MemWal`, `AsyncMemWal`, `MemWalSync`, `MockMemWal`, and `AsyncMockMemWal` when all vector search matches are dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
+- `RecallResult` gains `degraded: bool = False`, set to `True` whenever one or more vector matches were dropped. (#1036, #1070)
+- `recall()` accepts `on_dropped: str = "throw"` (`"throw"` or `"ignore"`). When set to `"ignore"`, it returns an empty result with `degraded=True` without raising. (#1036, #1070)
+
 ## 0.2.2
 
 Unreleased.

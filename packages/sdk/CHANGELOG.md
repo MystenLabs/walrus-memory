@@ -2,6 +2,12 @@
 
 ## 0.1.13
 
+### Added
+
+- `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`) is thrown by `recall` and `recallManual` when every vector search match is dropped during Walrus blob download or SEAL decryption. It exposes `total`, `droppedCount`, and `namespace`. (#1036, #1070)
+- `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped. (#1036, #1070)
+- `RecallOptions` accepts `onDropped?: "throw" | "ignore"` (defaulting to `"throw"`). Passing `"ignore"` returns `{ results: [], total, droppedCount, degraded: true }` without throwing. (#1036, #1070)
+
 ### Fixed
 
 - `MemWal` and `MemWalMock` share input validation on `remember*`, `rememberBulk*`, `analyze*`, `embed`, `recall`, `restore`, and `listNamespaces`, rejecting invalid `idempotencyKey` values before signing and rejecting `limit: 0` consistently. On read paths (`recall`, `recallManual`, `restore`, and `listMemories`), empty string `""` is rejected while whitespace namespaces remain readable to match the server's namespace validation. (Refs #978)
