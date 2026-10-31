@@ -42,6 +42,12 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useSponsoredTransaction } from '../hooks/useSponsoredTransaction'
 import { config } from '../config'
 import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
+import {
+    fetchDelegateKeyCount,
+    isMaxDelegateKeysError,
+    MAX_DELEGATE_KEYS,
+    MAX_DELEGATE_KEYS_CONNECT_MESSAGE,
+} from '../utils/delegateKeys'
 import { fetchAccountIdForOwner } from '../utils/suiClientCompat'
 
 
@@ -336,6 +342,14 @@ export default function ConnectMcp() {
                 return
             }
 
+            const delegateKeyCount = await fetchDelegateKeyCount(suiClient, accountId)
+            if (delegateKeyCount !== null && delegateKeyCount >= MAX_DELEGATE_KEYS) {
+                setErrorMsg(MAX_DELEGATE_KEYS_CONNECT_MESSAGE)
+                trackEvent('mcp_connect_failed', { error_type: 'max_delegate_keys' })
+                setStep('error')
+                return
+            }
+
             // Build + sign add_delegate_key tx.
             const tx = new Transaction()
             tx.moveCall({
@@ -364,9 +378,11 @@ export default function ConnectMcp() {
                     setStep('error')
                     return
                 }
-                if (m.includes('abort code: 2') && m.includes('add_delegate_key')) {
+                if (isMaxDelegateKeysError(txErr)) {
                     setErrorMsg(
-                        `This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.`
+                        m.includes('maximum number of delegate keys (20)')
+                            ? m
+                            : MAX_DELEGATE_KEYS_CONNECT_MESSAGE,
                     )
                     trackEvent('mcp_connect_failed', { error_type: 'max_delegate_keys' })
                     setStep('error')
@@ -552,8 +568,17 @@ export default function ConnectMcp() {
                             <h2 className="setup-classic-title">Something went wrong</h2>
                             <p className="setup-classic-description mcp-error">{errorMsg}</p>
                             <div className="setup-classic-actions">
+                                {isMaxDelegateKeysError(errorMsg) && (
+                                    <Link
+                                        to="/dashboard"
+                                        className="mcp-btn"
+                                        onClick={() => trackEvent('cta_click', { cta: 'mcp_error_dashboard', location: 'connect_mcp' })}
+                                    >
+                                        Go to dashboard
+                                    </Link>
+                                )}
                                 <button
-                                    className="mcp-btn"
+                                    className={isMaxDelegateKeysError(errorMsg) ? 'mcp-btn mcp-btn--ghost' : 'mcp-btn'}
                                     onClick={() => {
                                         trackEvent('cta_click', { cta: 'mcp_retry', location: 'connect_mcp' })
                                         setErrorMsg('')

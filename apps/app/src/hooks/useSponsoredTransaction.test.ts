@@ -115,6 +115,23 @@ describe('sponsorFailureMessage', () => {
         expect(sponsorFailureMessage(err)).toContain('traceId: req-20')
     })
 
+    it('reports the 20 delegate-key limit instead of a generic sponsor error', () => {
+        const err = new SponsorHttpError(
+            'sponsor',
+            409,
+            bodyFor({
+                error: 'This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.',
+                code: 'max_delegate_keys',
+                traceId: 'req-21',
+            }),
+        )
+        const message = sponsorFailureMessage(err)
+        expect(message).toContain('maximum number of delegate keys (20)')
+        expect(message).toContain('/dashboard')
+        expect(message).toContain('traceId: req-21')
+        expect(message).not.toContain('temporarily unavailable')
+    })
+
     it('reports a masked upstream rejection with its traceId', () => {
         const err = new SponsorHttpError(
             'sponsor',

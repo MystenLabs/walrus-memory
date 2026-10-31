@@ -83,8 +83,8 @@ fn mask_upstream(status: u16) -> (axum::http::StatusCode, &'static str, &'static
     }
 }
 
-/// A known `reactivate_account` abort. The sidecar names it with a stable
-/// code; the raw upstream body stays in the log and never reaches the client.
+/// A known `account` MoveAbort classified by the sidecar with a stable code.
+/// The raw upstream body stays in the log and never reaches the client.
 fn reactivate_rejection(
     body: &[u8],
 ) -> Option<(axum::http::StatusCode, &'static str, &'static str)> {
@@ -99,6 +99,11 @@ fn reactivate_rejection(
             axum::http::StatusCode::CONFLICT,
             "account_quarantined",
             "This account is still locked, so it cannot be reactivated yet.",
+        )),
+        "max_delegate_keys" => Some((
+            axum::http::StatusCode::CONFLICT,
+            "max_delegate_keys",
+            "This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.",
         )),
         _ => None,
     }
@@ -1134,6 +1139,20 @@ nonce: 00000000-0000-4000-8000-000000000000"
             "This account is still locked, so it cannot be reactivated yet."
         );
         assert!(!msg.contains("upstream"));
+    }
+
+    #[test]
+    fn test_max_delegate_keys_is_its_own_message() {
+        let raw = br#"{"error":"MoveAbort in 1st command, abort code: 2, in '0xabc::account::add_delegate_key'","code":"max_delegate_keys"}"#;
+        let (status, code, msg) = reactivate_rejection(raw).unwrap();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(code, "max_delegate_keys");
+        assert_eq!(
+            msg,
+            "This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again."
+        );
+        assert!(!msg.contains("MoveAbort"));
+        assert!(!msg.contains("0xabc"));
     }
 
     #[test]

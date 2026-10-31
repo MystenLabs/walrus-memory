@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
     address: '0xowner',
     accountId: '0xaccount',
+    accountObjectJson: null as Record<string, unknown> | null,
     signAndExecute: vi.fn(),
 }))
 
@@ -28,6 +29,7 @@ vi.mock('../hooks/useSponsoredTransaction', () => ({
 }))
 vi.mock('../utils/suiClientCompat', () => ({
     fetchAccountIdForOwner: vi.fn().mockResolvedValue(mocks.accountId),
+    fetchObjectJson: vi.fn(async () => mocks.accountObjectJson),
 }))
 vi.mock('../utils/analytics', () => ({
     trackEvent: vi.fn(),
@@ -73,6 +75,7 @@ async function signIn() {
 
 beforeEach(() => {
     vi.clearAllMocks()
+    mocks.accountObjectJson = null
     mocks.signAndExecute.mockResolvedValue({ digest: '0xdigest' })
 })
 
@@ -186,5 +189,50 @@ describe('MCP sign-in hand-off', () => {
             'href',
             'https://docs.test/troubleshooting/overview#sign-in-succeeds-but-credentials-are-not-saved',
         )
+    })
+
+    it('fails fast on preflight when the account already holds 20 delegate keys', async () => {
+        stubListener(async () => new Response('{}', { status: 200 }))
+        mocks.accountObjectJson = {
+            delegate_keys: Array.from({ length: 20 }, (_, idx) => ({ public_key: `key_${idx}` })),
+        }
+        await signIn()
+
+        expect(
+            await screen.findByText(
+                /already has the maximum number of delegate keys \(20\)\. Go to \/dashboard and revoke an unused key/i,
+            ),
+        ).toBeInTheDocument()
+        expect(screen.getByRole('link', { name: /go to dashboard/i })).toHaveAttribute('href', '/dashboard')
+        expect(mocks.signAndExecute).not.toHaveBeenCalled()
+    })
+
+    it('surfaces the 20 delegate-key limit when sponsor rejects with max_delegate_keys', async () => {
+        const { SponsorHttpError, sponsorFailureMessage } = await vi.importActual<
+            typeof import('../hooks/useSponsoredTransaction')
+        >('../hooks/useSponsoredTransaction')
+        stubListener(async () => new Response('{}', { status: 200 }))
+        mocks.signAndExecute.mockRejectedValue(
+            new Error(
+                sponsorFailureMessage(
+                    new SponsorHttpError(
+                        'sponsor',
+                        409,
+                        JSON.stringify({
+                            error: 'This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.',
+                            code: 'max_delegate_keys',
+                            traceId: 'tr_limit_1',
+                        }),
+                    ),
+                ),
+            ),
+        )
+        await signIn()
+
+        expect(
+            await screen.findByText(/already has the maximum number of delegate keys \(20\)/i),
+        ).toBeInTheDocument()
+        expect(screen.getByText(/traceId: tr_limit_1/i)).toBeInTheDocument()
+        expect(screen.getByRole('link', { name: /go to dashboard/i })).toHaveAttribute('href', '/dashboard')
     })
 })
