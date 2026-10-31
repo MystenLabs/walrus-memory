@@ -6577,8 +6577,8 @@ the checkpoint it replied about",
     }
 
     #[tokio::test]
-    async fn burst_inflow_41_per_minute_against_5_wallets_completes_via_congestion_requeues_with_zero_failures(
-    ) {
+    async fn saturation_and_congestion_requeue_lifecycle_tracks_overflow_and_clears_on_completion()
+    {
         use crate::sidecar_saturation::{QueueCheck, SaturationTracker};
 
         let pool = test_pool().await;
@@ -6633,22 +6633,22 @@ the checkpoint it replied about",
         for (idx, job_id) in job_ids.iter().enumerate() {
             let initial_wallet = idx % WALLET_COUNT;
             if idx < INITIAL_WINDOW_CAPACITY {
-                // Admitted in the first minute without congestion requeue.
-                sqlx::query(
-                    "UPDATE remember_jobs
-                     SET status = 'done',
-                         blob_id = $2,
-                         upload_wallet_index = $3,
-                         next_attempt_at = NULL,
-                         updated_at = NOW()
-                     WHERE id = $1",
+                // Admitted in the first window without congestion requeue.
+                persist_uploaded_state(
+                    &pool,
+                    job_id,
+                    &format!("blob-direct-{idx}"),
+                    Some("0xobj-direct"),
                 )
-                .bind(job_id)
-                .bind(format!("blob-direct-{idx}"))
-                .bind(initial_wallet as i32)
-                .execute(&pool)
                 .await
                 .unwrap();
+                // Pin the initial wallet on the completed row.
+                sqlx::query("UPDATE remember_jobs SET upload_wallet_index = $2 WHERE id = $1")
+                    .bind(job_id)
+                    .bind(initial_wallet as i32)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             } else {
                 // Excess jobs hit slot congestion, park with backoff and rotated wallet,
                 // and complete on the subsequent drain wave without burning the 5-attempt budget.
@@ -6682,19 +6682,13 @@ the checkpoint it replied about",
                     .await;
                 }
 
-                // Drain wave completes the job.
-                sqlx::query(
-                    "UPDATE remember_jobs
-                     SET status = 'done',
-                         blob_id = $2,
-                         error_msg = NULL,
-                         next_attempt_at = NULL,
-                         updated_at = NOW()
-                     WHERE id = $1",
+                // Drain wave completes the upload via worker persistence helper.
+                persist_uploaded_state(
+                    &pool,
+                    job_id,
+                    &format!("blob-requeued-{idx}"),
+                    Some("0xobj-requeued"),
                 )
-                .bind(job_id)
-                .bind(format!("blob-requeued-{idx}"))
-                .execute(&pool)
                 .await
                 .unwrap();
             }
@@ -6722,13 +6716,16 @@ the checkpoint it replied about",
 
         assert_eq!(rows.len(), BURST_JOBS);
         let failed_count = rows.iter().filter(|r| r.1 == "failed").count();
-        let done_count = rows.iter().filter(|r| r.1 == "done").count();
+        let uploaded_count = rows
+            .iter()
+            .filter(|r| r.1 == "uploaded" || r.1 == "done")
+            .count();
         let requeued_count = rows.iter().filter(|r| r.2 > 0).count();
         assert_eq!(
             failed_count, 0,
             "zero jobs may be marked failed for congestion"
         );
-        assert_eq!(done_count, BURST_JOBS, "all 41 burst jobs must finish");
+        assert_eq!(uploaded_count, BURST_JOBS, "all 41 burst jobs must finish");
         assert_eq!(
             requeued_count,
             BURST_JOBS - INITIAL_WINDOW_CAPACITY,
