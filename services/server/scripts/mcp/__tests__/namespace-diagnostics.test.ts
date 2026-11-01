@@ -311,9 +311,70 @@ test("memwal_namespaces tool lists namespaces with memory counts and storage use
     assert.match(text, /next_cursor="cursor-2"/);
 });
 
-test("formatNamespacesResult reports when an account has no populated namespaces", () => {
+test("formatNamespacesResult reports when an account has no populated namespaces on a final page", () => {
     assert.equal(
         formatNamespacesResult({ namespaces: [], has_more: false, next_cursor: null }),
         "No namespaces with stored memories found for this account.",
     );
+    assert.equal(
+        formatNamespacesResult({
+            namespaces: [{ name: "tombstone-only", memory_count: 0 }],
+            has_more: false,
+            next_cursor: null,
+        }),
+        "No namespaces with stored memories found for this account.",
+    );
+});
+
+test("formatNamespacesResult preserves next_cursor on tombstone-only non-final pages", async (t) => {
+    const page1Text = formatNamespacesResult({
+        namespaces: [
+            { name: "retired-a", memory_count: 0 },
+            { name: "retired-b", memory_count: 0 },
+        ],
+        has_more: true,
+        next_cursor: "cursor_page_2",
+    });
+    assert.doesNotMatch(
+        page1Text,
+        /No namespaces with stored memories found for this account/,
+    );
+    assert.match(page1Text, /No non-empty namespaces found on this page\./);
+    assert.match(page1Text, /next_cursor="cursor_page_2"/);
+    assert.match(page1Text, /cursor="cursor_page_2"/);
+
+    const client = await openTestClient(t, {
+        listNamespaces: async ({ cursor }: { cursor?: string }) => {
+            if (!cursor) {
+                return {
+                    namespaces: [{ id: "ns-dead", name: "dead-ns", memory_count: 0 }],
+                    has_more: true,
+                    next_cursor: "cursor_page_2",
+                    snapshot_version: 1,
+                };
+            }
+            assert.equal(cursor, "cursor_page_2");
+            return {
+                namespaces: [{ id: "ns-live", name: "active-ns", memory_count: 9 }],
+                has_more: false,
+                next_cursor: null,
+                snapshot_version: 1,
+            };
+        },
+    });
+
+    const firstPage = textFromResult(
+        await client.callTool({ name: "memwal_namespaces", arguments: { limit: 1 } }),
+    );
+    assert.match(firstPage, /No non-empty namespaces found on this page\./);
+    assert.match(firstPage, /next_cursor="cursor_page_2"/);
+
+    const secondPage = textFromResult(
+        await client.callTool({
+            name: "memwal_namespaces",
+            arguments: { limit: 1, cursor: "cursor_page_2" },
+        }),
+    );
+    assert.match(secondPage, /^Namespaces \(1\):/);
+    assert.match(secondPage, /- "active-ns": 9 memories/);
 });

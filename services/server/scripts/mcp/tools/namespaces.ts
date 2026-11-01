@@ -217,11 +217,27 @@ export function formatNamespacesResult(page: NamespacesPage): string {
     const nonEmpty = (page.namespaces ?? []).filter(
         (ns) => typeof ns?.name === "string" && (ns.memory_count ?? 0) > 0,
     );
+    const nextCursor =
+        typeof page.next_cursor === "string" && page.next_cursor.length > 0
+            ? page.next_cursor
+            : null;
+    const hasMorePages = page.has_more === true || nextCursor !== null;
+
     if (nonEmpty.length === 0) {
+        if (hasMorePages) {
+            if (nextCursor) {
+                return (
+                    `No non-empty namespaces found on this page.\n\n` +
+                    `More namespaces available (next_cursor="${nextCursor}"). ` +
+                    `Call memwal_namespaces with cursor="${nextCursor}" to inspect the next page.`
+                );
+            }
+            return "No non-empty namespaces found on this page. More namespaces exist on later pages.";
+        }
         return "No namespaces with stored memories found for this account.";
     }
     const lines = [
-        `Namespaces (${nonEmpty.length}${page.has_more ? "+" : ""}):`,
+        `Namespaces (${nonEmpty.length}${hasMorePages ? "+" : ""}):`,
         ...nonEmpty.map((ns) => {
             const bytes =
                 typeof ns.storage_used === "number"
@@ -234,8 +250,8 @@ export function formatNamespacesResult(page: NamespacesPage): string {
             return `- "${ns.name}": ${formatMemoryCount(ns.memory_count)}${bytes}${updated}`;
         }),
     ];
-    if (page.has_more && page.next_cursor) {
-        lines.push(`\nMore namespaces available (next_cursor="${page.next_cursor}").`);
+    if (hasMorePages && nextCursor) {
+        lines.push(`\nMore namespaces available (next_cursor="${nextCursor}").`);
     }
     return lines.join("\n");
 }
