@@ -100,6 +100,7 @@ struct McpSessionRateLimiter {
     config: SessionLimitConfig,
     per_ip: HashMap<String, IpSessionState>,
     total_active: usize,
+    last_prune: Option<Instant>,
 }
 
 impl McpSessionRateLimiter {
@@ -108,10 +109,43 @@ impl McpSessionRateLimiter {
             config,
             per_ip: HashMap::new(),
             total_active: 0,
+            last_prune: None,
         }
     }
 
+    pub(crate) fn prune_inactive(&mut self, now: Instant) -> usize {
+        self.expire_inactive(now)
+    }
+
+    pub(crate) fn expire_inactive(&mut self, now: Instant) -> usize {
+        self.last_prune = Some(now);
+        let window = Duration::from_secs(60);
+        let before = self.per_ip.len();
+        self.per_ip.retain(|_, state| {
+            state
+                .opens
+                .retain(|&opened| now.saturating_duration_since(opened) < window);
+            state.active > 0 || !state.opens.is_empty()
+        });
+        before.saturating_sub(self.per_ip.len())
+    }
+
     fn acquire(&mut self, ip: &str, now: Instant) -> Result<(), SessionDenyReason> {
+        let should_prune = match self.last_prune {
+            None => {
+                self.last_prune = Some(now);
+                false
+            }
+            Some(last) => {
+                now.saturating_duration_since(last) >= Duration::from_secs(10)
+                    || (self.per_ip.len() > 64
+                        && now.saturating_duration_since(last) >= Duration::from_secs(1))
+            }
+        };
+        if should_prune {
+            self.expire_inactive(now);
+        }
+
         if self.total_active >= self.config.max_total_sessions {
             return Err(SessionDenyReason::Global);
         }
@@ -148,6 +182,20 @@ impl McpSessionRateLimiter {
         if let Some(state) = self.per_ip.get_mut(ip) {
             state.active = state.active.saturating_sub(1);
             self.total_active = self.total_active.saturating_sub(1);
+            if state.active == 0 && state.opens.is_empty() {
+                self.per_ip.remove(ip);
+            }
+        }
+    }
+
+    fn release_at(&mut self, ip: &str, now: Instant) {
+        if let Some(state) = self.per_ip.get_mut(ip) {
+            state.active = state.active.saturating_sub(1);
+            self.total_active = self.total_active.saturating_sub(1);
+            let window = Duration::from_secs(60);
+            state
+                .opens
+                .retain(|&opened| now.saturating_duration_since(opened) < window);
             if state.active == 0 && state.opens.is_empty() {
                 self.per_ip.remove(ip);
             }
@@ -260,6 +308,7 @@ static MCP_STREAMABLE_SESSIONS: LazyLock<RwLock<HashMap<String, McpStreamableSes
 static STREAMABLE_REAPER_STARTED: OnceLock<()> = OnceLock::new();
 
 fn reap_idle_streamable_sessions_at(now: Instant) -> usize {
+    let _ = reap_expired_session_limits_at(now);
     let Ok(mut guard) = MCP_STREAMABLE_SESSIONS.write() else {
         return 0;
     };
@@ -267,6 +316,14 @@ fn reap_idle_streamable_sessions_at(now: Instant) -> usize {
     guard
         .retain(|_, entry| now.saturating_duration_since(entry.last_active) <= STREAMABLE_IDLE_TTL);
     before.saturating_sub(guard.len())
+}
+
+pub(crate) fn reap_expired_session_limits_at(now: Instant) -> usize {
+    if let Ok(mut limiter) = MCP_SESSION_LIMITER.lock() {
+        limiter.expire_inactive(now)
+    } else {
+        0
+    }
 }
 
 fn ensure_streamable_reaper_started() {
@@ -4417,6 +4474,57 @@ mod tests {
             limiter.acquire("198.51.100.1", t0 + Duration::from_secs(61)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn session_rate_limiter_expires_inactive_per_ip_entries_after_burst_window() {
+        let mut limiter = McpSessionRateLimiter::new(SessionLimitConfig {
+            max_total_sessions: 20_000,
+            max_sessions_per_ip: 16,
+            max_new_sessions_per_ip_per_min: 30,
+        });
+        let t0 = Instant::now();
+
+        // 10,000 distinct sequential IPs acquire and release a session at t0.
+        for i in 0..10_000 {
+            let ip = format!("10.0.{}.{}", i / 256, i % 256);
+            assert_eq!(limiter.acquire(&ip, t0), Ok(()));
+            if i % 2 == 0 {
+                limiter.release(&ip);
+            } else {
+                limiter.release_at(&ip, t0);
+            }
+        }
+
+        assert_eq!(limiter.total_active, 0);
+        assert_eq!(limiter.per_ip.len(), 10_000);
+
+        // Within the 60s burst window, entries must be preserved to prevent burst abuse.
+        let mid = t0 + Duration::from_secs(30);
+        let expired_mid = limiter.expire_inactive(mid);
+        assert_eq!(expired_mid, 0);
+        assert_eq!(limiter.per_ip.len(), 10_000);
+
+        // After the 60s burst window, all inactive entries must expire cleanly.
+        let after = t0 + Duration::from_secs(61);
+        let expired_after = limiter.prune_inactive(after);
+        assert_eq!(expired_after, 10_000);
+        assert_eq!(limiter.per_ip.len(), 0);
+        assert_eq!(limiter.total_active, 0);
+
+        // Verify periodic expiry also triggers automatically during subsequent acquire.
+        for i in 0..1_000 {
+            let ip = format!("192.168.{}.{}", i / 256, i % 256);
+            assert_eq!(limiter.acquire(&ip, after), Ok(()));
+            limiter.release(&ip);
+        }
+        assert_eq!(limiter.per_ip.len(), 1_000);
+
+        let t2 = after + Duration::from_secs(65);
+        assert_eq!(limiter.acquire("203.0.113.1", t2), Ok(()));
+        // The 1,000 inactive IPs were automatically pruned during acquire at t2.
+        assert_eq!(limiter.per_ip.len(), 1);
+        assert_eq!(limiter.total_active, 1);
     }
 
     #[test]
