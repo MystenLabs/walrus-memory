@@ -69,6 +69,42 @@ test("recall surfaces dropped_count when the relayer omitted matches", async () 
     assert.equal(result.results.length, 0);
 });
 
+test("recall preserves dropped_count when maxDistance and maxTokens are applied", async () => {
+    const hits = [
+        { blob_id: "b1", text: chars(40), distance: 0.1 },
+        { blob_id: "b2", text: chars(40), distance: 0.2 },
+        { blob_id: "b3", text: chars(40), distance: 0.9 },
+    ];
+    globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/version") {
+            return Response.json({
+                apiVersion: "1.0.0",
+                relayerVersion: "1.0.0",
+                minSupportedSdk: { typescript: "0.0.4" },
+            });
+        }
+        if (path === "/api/config") {
+            return Response.json({ packageId: "0x1", network: "testnet" });
+        }
+        if (path === "/api/recall" && init.method === "POST") {
+            return Response.json({ results: hits, total: 3, dropped_count: 25 });
+        }
+        throw new Error(`unexpected request ${path}`);
+    };
+    const result = await client().recall({
+        query: "x",
+        namespace: "default",
+        maxDistance: 0.5,
+        maxTokens: 10,
+    });
+    assert.equal(result.dropped_count, 25);
+    assert.equal(result.total, 3);
+    assert.equal(result.results.length, 1);
+    assert.equal(result.results[0].blob_id, "b1");
+    assert.equal(result.meta?.truncated, true);
+});
+
 test("recall omits dropped_count when the relayer does", async () => {
     stubRecall([]);
     const result = await client().recall({ query: "x", namespace: "default" });

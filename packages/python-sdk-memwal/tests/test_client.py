@@ -843,6 +843,31 @@ class TestRecall:
         assert result.dropped_count == 3
 
     @respx.mock
+    async def test_recall_preserves_dropped_count_with_max_distance(
+        self, memwal_client: MemWal
+    ) -> None:
+        mock_seal_session_prereqs()
+        respx.post(f"{_TEST_SERVER}/api/recall").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"blob_id": "b1", "text": "near hit", "distance": 0.1},
+                        {"blob_id": "b2", "text": "far hit", "distance": 0.9},
+                    ],
+                    "total": 2,
+                    "dropped_count": 25,
+                },
+            )
+        )
+        result = await memwal_client.recall(
+            RecallParams(query="coffee", max_distance=0.5)
+        )
+        assert [m.blob_id for m in result.results] == ["b1"]
+        assert result.total == 2
+        assert result.dropped_count == 25
+
+    @respx.mock
     async def test_recall_preserves_score_and_created_at(
         self, memwal_client: MemWal
     ) -> None:

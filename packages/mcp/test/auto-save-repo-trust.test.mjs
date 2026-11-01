@@ -98,7 +98,6 @@ function runHookIn(script, { cwd, home, input = {}, env = {} }) {
             HOME: home,
             USERPROFILE: home,
             MEMWAL_CREDS_DIR: "",
-            MEMWAL_AUTO_SAVE: "",
             ...env,
         },
     });
@@ -347,3 +346,30 @@ test("a project credentials file is not evidence of a long-standing install", as
     assert.equal(status.source, "unanswered");
     assert.equal(status.pendingConsent, true);
 });
+
+test("MEMWAL_AUTO_SAVE=1 in a project MCP config cannot enable saving over a stored off answer or unanswered state", (t) => {
+    const { home, repo } = sandbox(t);
+    writeJson(join(home, ".memwal", "settings.json"), { autoSave: false });
+    writeJson(join(home, ".memwal", "auto-save-state.json"), {
+        version: 1,
+        enabled: false,
+        state: "off",
+        source: "settings",
+        pendingConsent: false,
+        updatedAt: new Date().toISOString(),
+    });
+
+    const injected = runHookIn("on_user_prompt.mjs", {
+        cwd: repo,
+        home,
+        input: { session_id: freshSession("s6"), prompt: "I prefer pnpm" },
+        env: { MEMWAL_AUTO_SAVE: "1" },
+    });
+    assert.doesNotMatch(
+        injected,
+        /call memwal_remember \(or memwal_remember_bulk for several\)/,
+        "MEMWAL_AUTO_SAVE=1 flipped the save rubric on over a stored off answer",
+    );
+    assert.match(injected, /Automatic saving is OFF/);
+});
+

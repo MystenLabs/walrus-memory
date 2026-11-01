@@ -744,7 +744,7 @@ pub async fn list_owner_agents(
     // `walrus_epoch()` rather than being left uncached — repeated /agents
     // calls for the same account within the TTL window don't re-hit the
     // chain.
-    let keys = crate::storage::sui::list_delegate_keys_cached(
+    let keys = match crate::storage::sui::list_delegate_keys_cached(
         &state.delegate_keys_cache,
         &state.http_client,
         &state.config.sui_rpc_url,
@@ -753,7 +753,30 @@ pub async fn list_owner_agents(
         &state.config.package_id,
     )
     .await
-    .map_err(|e| AppError::Internal(format!("Failed to list delegate keys: {}", e)))?;
+    {
+        Ok(keys) => keys,
+        Err(
+            crate::storage::sui::OnchainVerifyError::AccountDeactivated(_)
+            | crate::storage::sui::OnchainVerifyError::NotFound(_)
+            | crate::storage::sui::OnchainVerifyError::WrongObjectType(_),
+        ) => {
+            return Err(AppError::Unauthorized(
+                "MemWalAccount is not active".to_string(),
+            ));
+        }
+        Err(e) if e.is_unavailable() => {
+            return Err(AppError::UpstreamUnavailable(format!(
+                "Failed to list delegate keys: {}",
+                e
+            )));
+        }
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "Failed to list delegate keys: {}",
+                e
+            )));
+        }
+    };
 
     let agents = keys
         .into_iter()
@@ -772,19 +795,8 @@ pub async fn list_owner_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::db::VectorDb;
+    use crate::storage::db::{VectorDb, DB_SETUP_LOCK};
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::OnceLock;
-
-    // Guards concurrent test threads in THIS module from racing on
-    // `CREATE EXTENSION IF NOT EXISTS vector` (001_init.sql) — Postgres
-    // does not make that statement safe under concurrent execution
-    // despite IF NOT EXISTS (two sessions can both pass the existence
-    // check before either commits, then collide on the unique index on
-    // pg_extension). Mirrors the same pattern already used in
-    // `services/server/src/jobs.rs` (`DB_SETUP_LOCK`) and
-    // `services/server/src/storage/db.rs` (`VECTOR_SCHEMA_SETUP_LOCK`).
-    static DB_SETUP_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     fn test_database_url() -> String {
         std::env::var("DATABASE_URL")

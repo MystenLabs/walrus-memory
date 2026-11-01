@@ -1,3 +1,4 @@
+import "./verify-package-version-bumps.test.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -100,4 +101,32 @@ test("publication ends the old-pin window and requires retargeting the launcher"
     const result = checkRegistry(t, true);
     assert.notEqual(result.status, 0);
     assert.match(result.stdout, /pending-release window has ended/);
+});
+
+test("an invalid or future bootstrap cannot bypass release validation", (t) => {
+    for (const bootstrap of ["latest", "99.0.0"]) {
+        const result = check(t, directory => edit(directory, "packages/mcp/plugin/plugin.json", text => {
+            const manifest = JSON.parse(text); manifest.mcpBootstrapVersion = bootstrap; return JSON.stringify(manifest);
+        }));
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /bootstrap/i);
+    }
+});
+
+test("the pending exact stable release can use its explicit published bootstrap", (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "memwal-bootstrap-check-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const version = "0.0.18", bootstrap = "0.0.17-dev.3";
+    for (const [file, value] of [["packages/mcp/package.json", { version }], ["packages/mcp/plugin/plugin.json", { version, mcpPackageVersion: version, mcpBootstrapVersion: bootstrap }]]) {
+        mkdirSync(dirname(join(directory, file)), { recursive: true });
+        writeFileSync(join(directory, file), JSON.stringify(value));
+    }
+    for (const stablePublished of [false, true]) {
+        const versions = { [bootstrap]: {} };
+        if (stablePublished) versions[version] = {};
+        const packument = { versions, "dist-tags": { latest: stablePublished ? version : "0.0.17" } };
+        const code = `globalThis.fetch = async () => ({ok:true,json:async()=>(${JSON.stringify(packument)})});await import(${JSON.stringify(resolve("scripts/check-mcp-pin.mjs"))});`;
+        const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: directory, encoding: "utf8", env: { ...process.env, GITHUB_BASE_REF: "dev", GITHUB_STEP_SUMMARY: "" } });
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+    }
 });

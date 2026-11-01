@@ -65,10 +65,111 @@ export interface WithMemWalOptions extends MemWalConfig {
 // ============================================================
 
 /**
+ * Maximum UTF-8 byte length sent by `withMemWal` to `recall()`.
+ * Matches the relayer embedder's `MAX_EMBED_INPUT_BYTES` (16,384 bytes).
+ */
+export const MAX_EMBED_INPUT_BYTES = 16_384;
+
+/**
+ * Maximum UTF-8 byte length sent by `withMemWal` to `analyze()`.
+ * Matches the relayer's `MAX_ANALYZE_TEXT_BYTES` (65,536 bytes / 64 KiB).
+ */
+export const MAX_ANALYZE_INPUT_BYTES = 65_536;
+
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+
+function sliceUtf8Prefix(encoded: Uint8Array, maxBytes: number): string {
+    let end = Math.min(maxBytes, encoded.byteLength);
+    // In UTF-8, continuation bytes match 0b10xxxxxx ((byte & 0xc0) === 0x80).
+    // Step back to the leading byte so we never slice mid-codepoint.
+    while (end > 0 && (encoded[end]! & 0xc0) === 0x80) {
+        end--;
+    }
+    return utf8Decoder.decode(encoded.subarray(0, end));
+}
+
+function sliceUtf8Suffix(encoded: Uint8Array, maxBytes: number): string {
+    let start = Math.max(0, encoded.byteLength - maxBytes);
+    // In UTF-8, continuation bytes match 0b10xxxxxx ((byte & 0xc0) === 0x80).
+    // Step forward to the start of the next codepoint so we never slice mid-codepoint.
+    while (start < encoded.byteLength && (encoded[start]! & 0xc0) === 0x80) {
+        start++;
+    }
+    return utf8Decoder.decode(encoded.subarray(start));
+}
+
+export interface TruncateUtf8Options {
+    /**
+     * Truncation strategy:
+     * - `head`: retains the start of the text up to maxBytes.
+     * - `head-tail`: retains both the start and end of the text joined by `\n...\n`,
+     *   ensuring questions or instructions placed at the end of large pasted context
+     *   are preserved for embedding and similarity search.
+     * Defaults to `head`.
+     */
+    strategy?: "head" | "head-tail";
+}
+
+/**
+ * Bound `text` to at most `maxBytes` UTF-8 bytes without splitting a
+ * multi-byte UTF-8 codepoint across the boundary. (#1037)
+ */
+export function truncateUtf8Bytes(
+    text: string,
+    maxBytes: number = MAX_EMBED_INPUT_BYTES,
+    options?: TruncateUtf8Options,
+): string {
+    const encoded = utf8Encoder.encode(text);
+    if (encoded.byteLength <= maxBytes) {
+        return text;
+    }
+
+    if (options?.strategy === "head-tail") {
+        const separator = "\n...\n";
+        const separatorBytes = 5;
+        if (maxBytes <= separatorBytes + 4) {
+            return sliceUtf8Prefix(encoded, maxBytes);
+        }
+
+        let workingEncoded = encoded;
+        if (text.startsWith(" ") || text.startsWith("\t") || text.startsWith("\n")) {
+            const trimmed = text.trimStart();
+            if (trimmed.length > 0) {
+                const trimmedEncoded = utf8Encoder.encode(trimmed);
+                if (trimmedEncoded.byteLength <= maxBytes) {
+                    return trimmed;
+                }
+                workingEncoded = trimmedEncoded;
+            }
+        }
+
+        const available = maxBytes - separatorBytes;
+        const headBytes = Math.floor(available / 2);
+        const tailBytes = available - headBytes;
+        const head = sliceUtf8Prefix(workingEncoded, headBytes);
+        const tail = sliceUtf8Suffix(workingEncoded, tailBytes);
+        return `${head}${separator}${tail}`;
+    }
+
+    const truncated = sliceUtf8Prefix(encoded, maxBytes);
+    if (truncated.trim().length === 0) {
+        const trimmed = text.trimStart();
+        if (trimmed.length > 0) {
+            const trimmedEncoded = utf8Encoder.encode(trimmed);
+            return trimmedEncoded.byteLength <= maxBytes
+                ? trimmed
+                : sliceUtf8Prefix(trimmedEncoded, maxBytes);
+        }
+    }
+    return truncated;
+}
+
+/**
  * Wrap an AI SDK model with Walrus Memory management
  *
  * BEFORE each LLM call:
- * - Uses the last user message as a search query
+ * - Uses the last user message as a search query (bounded to 16 KiB UTF-8)
  * - Recalls relevant memories (server: search → download → decrypt)
  * - Injects relevant memories as nonce-delimited, untrusted user data
  *
@@ -101,8 +202,9 @@ export function withMemWal(
     let cachedRecall: { key: string; context: string } | null = null;
 
     function saveInBackground(userMessage: string): void {
+        const boundedMessage = truncateUtf8Bytes(userMessage, MAX_ANALYZE_INPUT_BYTES);
         const savePromise = memwal
-            .analyze(userMessage)
+            .analyze(boundedMessage)
             .catch((err: unknown) => {
                 log("Auto-save failed:", err);
                 if (saveFailures.length < 8) {
@@ -153,7 +255,10 @@ export function withMemWal(
                     const lastUserMessage = findLastUserMessage(params.prompt);
                     if (!lastUserMessage) return params;
 
-                    const recallResult = await memwal.recall(lastUserMessage, maxMemories);
+                    const recallQuery = truncateUtf8Bytes(lastUserMessage, MAX_EMBED_INPUT_BYTES, {
+                        strategy: "head-tail",
+                    });
+                    const recallResult = await memwal.recall(recallQuery, maxMemories);
                     const relevant = recallResult.results.filter((m: RecallMemory) => {
                         const relevance = memoryRelevance(m?.distance);
                         return relevance !== null && relevance >= minRelevance;

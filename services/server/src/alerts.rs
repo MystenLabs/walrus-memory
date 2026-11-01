@@ -23,6 +23,8 @@ const POSTGRES_STORAGE_ALERT_DEDUP_SECS_ENV: &str = "POSTGRES_STORAGE_ALERT_DEDU
 const POSTGRES_STORAGE_ALERT_DEDUP_DEFAULT: Duration = Duration::from_secs(1800);
 const EMBEDDING_PROVIDER_ALERT_DEDUP_SECS_ENV: &str = "EMBEDDING_PROVIDER_ALERT_DEDUP_SECS";
 const EMBEDDING_PROVIDER_ALERT_DEDUP_DEFAULT: Duration = Duration::from_secs(600);
+// A failed provider request must not wait for the shared HTTP client's 30s deadline.
+const EMBEDDING_PROVIDER_ALERT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Mirrors the `@mysten/walrus` dep version in
 /// `services/server/scripts/package.json`. Bump this constant in lockstep
@@ -317,7 +319,12 @@ impl AlertManager {
             return Ok(());
         }
         let payload = SlackPayload::for_embedding_provider_auth_failed(&alert);
-        slack.send_payload(&payload).await
+        tokio::time::timeout(
+            EMBEDDING_PROVIDER_ALERT_TIMEOUT,
+            slack.send_payload(&payload),
+        )
+        .await
+        .map_err(|_| AlertError::Transport("embedding provider alert delivery timed out".into()))?
     }
 
     fn should_suppress_wallet_balance_low(&self, alert: &WalletBalanceLowAlert) -> bool {
@@ -1676,6 +1683,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(received.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn embedding_provider_alert_timeout_does_not_change_shared_client_deadline() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        let app = axum::Router::new()
+            .route(
+                "/slack",
+                axum::routing::post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }),
+            )
+            .route(
+                "/probe",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(
+                        EMBEDDING_PROVIDER_ALERT_TIMEOUT + Duration::from_millis(100),
+                    )
+                    .await;
+                    axum::http::StatusCode::OK
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let manager =
+            AlertManager::from_webhook_value(client.clone(), Some(&format!("http://{addr}/slack")));
+        let alert = || EmbeddingProviderAuthAlert {
+            sui_network: "mainnet".into(),
+            status: 401,
+            api_base: "https://provider.example/v1".into(),
+            error: "provider rejected credentials".into(),
+        };
+
+        // The outer deadline catches a stalled delivery well before the
+        // shared client's timeout. A later alert remains deduplicated.
+        let result = tokio::time::timeout(
+            EMBEDDING_PROVIDER_ALERT_TIMEOUT + Duration::from_secs(2),
+            manager.notify_embedding_provider_auth_failed(alert()),
+        )
+        .await
+        .expect("provider alert must not wait for the shared 30s deadline");
+        assert!(
+            matches!(result, Err(AlertError::Transport(message)) if message.contains("timed out"))
+        );
+        manager
+            .notify_embedding_provider_auth_failed(alert())
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+
+        // Requests using the same client may still exceed the alert deadline.
+        assert!(client
+            .get(format!("http://{addr}/probe"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        server.abort();
     }
 
     #[derive(Debug)]

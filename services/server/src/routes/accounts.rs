@@ -42,9 +42,10 @@ use crate::types::*;
 /// deactivated account is intentionally kept permanently in the registry
 /// too), which is supporting context for why this is an acceptable
 /// property to leave as-is rather than an oversight to fix — but it is not
-/// itself why the off-chain table behaves this way. Live active/usable
-/// status gating belongs to WALM-297's token issuance, not this existence
-/// check.
+/// itself why the off-chain table behaves this way. Live on-chain `active`
+/// gating is enforced both at owner-token issuance
+/// (`routes::owner_token::issue_token`) and on owner-token reads in
+/// `auth::verify_read_api_auth`, not in this existence check.
 pub async fn account_exists(
     State(state): State<Arc<AppState>>,
     Path(owner): Path<String>,

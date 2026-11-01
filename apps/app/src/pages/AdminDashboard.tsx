@@ -7,6 +7,7 @@ import { AdminKeyEntry } from '../components/AdminKeyEntry'
 import { AdminWalletBalances } from '../components/AdminWalletBalances'
 import { AdminUploadErrors } from '../components/AdminUploadErrors'
 import { AdminConfig } from '../components/AdminConfig'
+import { AdminRateLimits } from '../components/AdminRateLimits'
 import { fetchAdminConfig } from '../utils/admin-api'
 
 const ADMIN_KEY_STORAGE = 'admin_api_key'
@@ -118,6 +119,7 @@ export default function AdminDashboard() {
               adminKey={adminKey ?? ''}
               onInvalidKey={handleInvalidKey}
               preview={activityPreview && !adminKey}
+              afterMemories={adminKey ? <AdminRateLimits adminKey={adminKey} onInvalidKey={handleInvalidKey} /> : undefined}
             />
             {adminKey && (
               <>

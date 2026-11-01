@@ -666,6 +666,55 @@ pub async fn verify_read_api_auth(
         }
     };
 
+    // Enforce live on-chain `active == true` (cached via `DelegateVerifyCache` /
+    // `DelegateRejectCache`) so a deactivated account cannot keep serving metadata
+    // over `/v1/owners/{owner}/{namespaces,memories,agents}` using an unexpired
+    // owner token (#1051).
+    match crate::storage::sui::verify_account_active_cached(
+        &state.delegate_verify_cache,
+        &state.delegate_reject_cache,
+        &state.http_client,
+        &state.config.sui_rpc_url,
+        state.sui_grpc_client.as_ref(),
+        &account_id,
+        &state.config.package_id,
+    )
+    .await
+    {
+        Ok(onchain_owner) => {
+            if !crate::security_delete_auth::same_owner(Some(&onchain_owner), &claims.owner_address)
+            {
+                tracing::warn!(
+                    account_id = %account_id,
+                    token_owner = %claims.owner_address,
+                    onchain_owner = %onchain_owner,
+                    "owner token account owner mismatch on-chain"
+                );
+                state.delegate_keys_cache.write().await.remove(&account_id);
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+        Err(e) if e.is_unavailable() => {
+            tracing::warn!(
+                account_id = %account_id,
+                owner = %claims.owner_address,
+                error = %e,
+                "owner token account active verification unavailable"
+            );
+            return Ok(upstream_unavailable());
+        }
+        Err(e) => {
+            tracing::warn!(
+                account_id = %account_id,
+                owner = %claims.owner_address,
+                error = %e,
+                "owner token account active verification rejected"
+            );
+            state.delegate_keys_cache.write().await.remove(&account_id);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     let mut request = request;
     request
         .extensions_mut()

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Card } from './Card'
 import { CopyableText } from './CopyableText'
@@ -16,6 +17,7 @@ interface AdminActivityProps {
   onInvalidKey: () => void
   /** Local-only sample, so the spend layout can be reviewed without the API. */
   preview?: boolean
+  afterMemories?: ReactNode
 }
 
 const WINDOWS = [
@@ -289,10 +291,11 @@ const PREVIEW_ACTIVITY: AdminActivity = {
   },
 }
 
-function ActivityBody({ data, hours, onHours }: {
+function ActivityBody({ data, hours, onHours, afterMemories }: {
   data: AdminActivity
   hours: number
   onHours: (hours: number) => void
+  afterMemories?: ReactNode
 }) {
   const { actions } = data
   return (
@@ -339,6 +342,8 @@ function ActivityBody({ data, hours, onHours }: {
       >
         <MemoryChart days={actions.memoriesByDay} hours={actions.memoriesByHour} />
       </Card>
+
+      {afterMemories}
 
       <Card
         title="Actions"
@@ -420,7 +425,7 @@ function ActivityBody({ data, hours, onHours }: {
   )
 }
 
-export function AdminActivityPanel({ adminKey, onInvalidKey, preview = false }: AdminActivityProps) {
+export function AdminActivityPanel({ adminKey, onInvalidKey, preview = false, afterMemories }: AdminActivityProps) {
   const [hours, setHours] = useState<number>(24)
   const { data, isLoading, error } = useQuery({
     queryKey: ['admin', 'activity', hours],
@@ -440,26 +445,32 @@ export function AdminActivityPanel({ adminKey, onInvalidKey, preview = false }: 
   }, [isInvalidKey, onInvalidKey])
 
   if (preview) {
-    return <ActivityBody data={PREVIEW_ACTIVITY} hours={hours} onHours={setHours} />
+    return <ActivityBody data={PREVIEW_ACTIVITY} hours={hours} onHours={setHours} afterMemories={afterMemories} />
   }
 
   if (isLoading) {
     return (
-      <Card title="Wallet outflow" className="dashboard-keys-card sept-section admin-activity-card">
-        <div className="admin-loading">Loading spend and activity...</div>
-      </Card>
+      <div className="admin-activity-section">
+        <Card title="Wallet outflow" className="dashboard-keys-card sept-section admin-activity-card">
+          <div className="admin-loading">Loading spend and activity...</div>
+        </Card>
+        {afterMemories}
+      </div>
     )
   }
 
   if (error || !data) {
     return (
-      <Card title="Wallet outflow" className="dashboard-keys-card sept-section admin-activity-card">
-        <div className="admin-error">
-          {isInvalidKey ? 'Invalid API key — signing out...' : 'Failed to load spend and activity'}
-        </div>
-      </Card>
+      <div className="admin-activity-section">
+        <Card title="Wallet outflow" className="dashboard-keys-card sept-section admin-activity-card">
+          <div className="admin-error">
+            {isInvalidKey ? 'Invalid API key — signing out...' : 'Failed to load spend and activity'}
+          </div>
+        </Card>
+        {afterMemories}
+      </div>
     )
   }
 
-  return <ActivityBody data={data} hours={hours} onHours={setHours} />
+  return <ActivityBody data={data} hours={hours} onHours={setHours} afterMemories={afterMemories} />
 }

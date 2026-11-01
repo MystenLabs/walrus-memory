@@ -44,7 +44,6 @@ test("a repo-relative MEMWAL_CREDS_DIR cannot publish the hook's consent answer"
             HOME: home,
             USERPROFILE: home,
             MEMWAL_CREDS_DIR: ".memwal",
-            MEMWAL_AUTO_SAVE: "",
         },
     });
     assert.equal(result.status, 0, `on_user_prompt.mjs exited ${result.status}: ${result.stderr}`);

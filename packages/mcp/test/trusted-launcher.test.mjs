@@ -821,3 +821,25 @@ test("a subdirectory of the home directory is a project again", (t) => {
     assert.match(result.stderr, /inside the project tree/);
     assert.doesNotMatch(result.stdout, new RegExp(LOCAL_MARKER));
 });
+
+test("stable pin bootstrap is used only for the exact unpublished version", async () => {
+    const { resolvePinnedEntry, isMissingPinnedVersion } = await import("../plugin/scripts/lib/mcp-launch.mjs");
+    const preferred = "0.0.18", bootstrap = "0.0.17-dev.3";
+    const missing = Object.assign(new Error("missing"), { code: "MCP_VERSION_UNAVAILABLE", version: preferred });
+    const calls = [];
+    assert.equal(resolvePinnedEntry(preferred, bootstrap, version => {
+        calls.push(version);
+        if (version === preferred) throw missing;
+        return "trusted-bootstrap";
+    }), "trusted-bootstrap");
+    assert.deepEqual(calls, [preferred, bootstrap]);
+    assert.equal(resolvePinnedEntry(preferred, bootstrap, () => "cached-stable"), "cached-stable");
+    for (const error of [new Error("network"), Object.assign(new Error("dependency"), { code: "MCP_VERSION_UNAVAILABLE", version: "other" })]) {
+        assert.throws(() => resolvePinnedEntry(preferred, bootstrap, () => { throw error; }), value => value === error);
+    }
+    const result = error => ({ stdout: JSON.stringify({ error }) });
+    assert.equal(isMissingPinnedVersion(result({ code: "ETARGET", summary: `No matching version found for ${MCP_PACKAGE_NAME}@${preferred}.` }), preferred), true);
+    assert.equal(isMissingPinnedVersion(result({ code: "ETARGET", summary: "No matching version found for dependency@99.0.0." }), preferred), false);
+    assert.equal(isMissingPinnedVersion(result({ code: "ECONNRESET", summary: "network" }), preferred), false);
+    assert.equal(isMissingPinnedVersion({ stdout: "not json" }, preferred), false);
+});

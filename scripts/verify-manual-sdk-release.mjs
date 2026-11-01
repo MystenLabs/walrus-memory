@@ -96,6 +96,18 @@ if (pinOverride !== undefined) {
         );
     }
 }
+const bootstrap = JSON.parse(readFileSync("packages/mcp/plugin/plugin.json", "utf8")).mcpBootstrapVersion;
+if (bootstrap !== undefined) {
+    if (pinOverride !== mcpVersion || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(bootstrap)) {
+        throw new Error("MCP bootstrap requires an exact preferred release pin and a semver bootstrap");
+    }
+    const parts = bootstrap.split("-")[0].split(".").map(Number);
+    const release = mcpVersion.split(".").map(Number);
+    const difference = parts.findIndex((value, i) => value !== release[i]);
+    if (difference !== -1 && parts[difference] > release[difference]) {
+        throw new Error("MCP bootstrap must not be newer than the preferred release");
+    }
+}
 const LAUNCHER = "scripts/launch_mcp.mjs";
 for (const [pluginPath, rootPlaceholder] of [
     ["packages/mcp/plugin/.mcp.json", "${CLAUDE_PLUGIN_ROOT}"],

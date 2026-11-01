@@ -190,10 +190,12 @@ npx -y @mysten-incubation/memwal-mcp auto-save off
 npx -y @mysten-incubation/memwal-mcp auto-save        # report the current setting
 ```
 
-The answer is stored as `{"autoSave": true}` in `settings.json` next to your
-credentials file, so it follows the same project-local-beats-global resolution.
-To pin one MCP client instead, set the environment variable — it overrides the
-file and skips the question:
+The answer is stored as `{"autoSave": true}` in `~/.memwal/settings.json` (or
+`$MEMWAL_CREDS_DIR/settings.json`), outside every repository. To turn automatic
+saving off for one MCP client without changing your stored answer, set
+`MEMWAL_AUTO_SAVE=0` in that client's `env` block (a truthy value in `env` is
+ignored so a project's MCP config cannot enable automatic saving without your
+consent):
 
 ```json
 {
@@ -201,7 +203,7 @@ file and skips the question:
     "memwal": {
       "command": "npx",
       "args": ["-y", "@mysten-incubation/memwal-mcp"],
-      "env": { "MEMWAL_AUTO_SAVE": "1" }
+      "env": { "MEMWAL_AUTO_SAVE": "0" }
     }
   }
 }

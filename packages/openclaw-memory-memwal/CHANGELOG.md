@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Bound auto-capture state to 1,000 recent session scopes and expire scopes after 30 idle minutes, preserving in-flight requests while preventing long-lived gateways from retaining every past session.
 - Auto-capture tracks a per-session message watermark so already-captured turns are not re-analyzed on every subsequent turn, and anchors `occurredAt` to each message's creation timestamp instead of the hook execution clock.
 - `withTimeout` passes an `AbortSignal` that aborts the underlying HTTP request when `requestTimeoutMs` expires, `withRetry` does not retry timed-out calls, and an in-flight guard prevents overlapping auto-capture requests across turns.
 - `memory_store` no longer reports `"Stored N facts"` when `/api/analyze` has only accepted asynchronous remember jobs (`status: "pending"`). It polls `waitForRememberJobs` when available within `requestTimeoutMs`, surfaces post-acceptance upload failures, and reports `"Accepted N fact(s) (not stored yet; job_ids=...)"` when jobs remain pending.
