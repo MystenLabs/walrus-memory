@@ -13,7 +13,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "memwal": {
       "type": "local",
-      "command": ["npx", "-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "OpenCode"],
+      "command": ["npx", "-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "OpenCode"],
       "enabled": true
     }
   }
@@ -27,7 +27,7 @@ Optional namespace:
   "mcp": {
     "memwal": {
       "type": "local",
-      "command": ["npx", "-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "OpenCode"],
+      "command": ["npx", "-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "OpenCode"],
       "environment": {
         "MEMWAL_NAMESPACE": "work"
       },
@@ -50,7 +50,7 @@ Add to `~/.cursor/mcp.json`:
   "mcpServers": {
     "memwal": {
       "command": "npx",
-      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "Cursor"]
+      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "Cursor"]
     }
   }
 }
@@ -63,7 +63,7 @@ Optional namespace:
   "mcpServers": {
     "memwal": {
       "command": "npx",
-      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "Cursor"],
+      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "Cursor"],
       "env": {
         "MEMWAL_NAMESPACE": "work"
       }
@@ -86,7 +86,7 @@ Add to Claude Desktop's config:
   "mcpServers": {
     "memwal": {
       "command": "npx",
-      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "Claude Desktop"]
+      "args": ["-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "Claude Desktop"]
     }
   }
 }

@@ -110,6 +110,7 @@ for (const [file, variable] of Object.entries({
 }
 
 let pin = "";
+let bootstrapUsed = "";
 if (existsSync("plugin.json")) {
     const pluginManifest = JSON.parse(readFileSync("plugin.json", "utf8"));
     pin = pluginManifest.mcpPackageVersion ?? pluginManifest.version;
@@ -122,10 +123,23 @@ if (existsSync("plugin.json")) {
         } else {
             const packument = await response.json();
             if (!packument.versions?.[pin]) {
-                fail(
-                    `plugin.json pins ${PACKAGE}@${pin}, which npm does not carry. The launcher ` +
-                        `installs that exact version, so every fresh install would fail.`,
-                );
+                const bootstrap = pluginManifest.mcpBootstrapVersion;
+                if (typeof bootstrap === "string" && bootstrap !== pin && packument.versions?.[bootstrap]) {
+                    bootstrapUsed = bootstrap;
+                    if (process.env.GITHUB_ACTIONS) {
+                        console.log(
+                            `::warning::Preferred ${PACKAGE}@${pin} is not published yet; the launcher can bootstrap from published ${PACKAGE}@${bootstrap}.`,
+                        );
+                    }
+                    console.log(
+                        `WARNING: Preferred ${PACKAGE}@${pin} is not published yet; the launcher can bootstrap from published ${PACKAGE}@${bootstrap}.`,
+                    );
+                } else {
+                    fail(
+                        `plugin.json pins ${PACKAGE}@${pin}, which npm does not carry. The launcher ` +
+                            `installs that exact version, so every fresh install would fail.`,
+                    );
+                }
             }
         }
     }
@@ -205,4 +219,10 @@ if (problems.length > 0) {
     process.exit(1);
 }
 
-console.log(`plugin tree OK; ${PACKAGE}@${pin} is published`);
+if (bootstrapUsed) {
+    console.log(
+        `plugin tree OK; preferred ${PACKAGE}@${pin} is pending, bootstrap ${PACKAGE}@${bootstrapUsed} is published`,
+    );
+} else {
+    console.log(`plugin tree OK; ${PACKAGE}@${pin} is published`);
+}

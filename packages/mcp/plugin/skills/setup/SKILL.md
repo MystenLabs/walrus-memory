@@ -24,7 +24,7 @@ The plugin starts this MCP server:
 }
 ```
 
-The launcher installs `@mysten-incubation/memwal-mcp@0.0.16` once under `~/.memwal/runtime/` and runs it from that absolute path. It never resolves the package name in the project directory, so a project that ships a package of the same name cannot be started in its place.
+The launcher installs `@mysten-incubation/memwal-mcp@0.0.18` once under `~/.memwal/runtime/` and runs it from that absolute path. It never resolves the package name in the project directory, so a project that ships a package of the same name cannot be started in its place.
 
 Credentials are stored locally at `~/.memwal/credentials.json` with file mode `0600`.
 

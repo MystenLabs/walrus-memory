@@ -28,8 +28,11 @@ function generate(outDir, cwd = ROOT) {
     return listing(outDir);
 }
 
-function runCheckPluginTree(cwd, pin = "0.0.16") {
-    const packument = { versions: { [pin]: {} }, "dist-tags": { latest: pin } };
+function runCheckPluginTree(cwd, published = "0.0.16") {
+    const versionList = Array.isArray(published) ? published : [published];
+    const versions = Object.fromEntries(versionList.map((version) => [version, {}]));
+    const latest = versionList[0] ?? "0.0.16";
+    const packument = { versions, "dist-tags": { latest } };
     const entry = pathToFileURL(path.join(cwd, ".github/scripts/check-plugin-tree.mjs")).href;
     const code =
         `globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => (${JSON.stringify(packument)}) }); ` +
@@ -273,5 +276,53 @@ test("committed plugin markdown drift or unresolved placeholders fail --check an
         assert.equal(readFileSync(rememberPath, "utf8"), originalRemember);
     } finally {
         rmSync(tempParent, { recursive: true, force: true });
+    }
+});
+
+test("check-plugin-tree accepts pending mcpPackageVersion when mcpBootstrapVersion is published on npm", () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), "memwal-plugin-bootstrap-"));
+    try {
+        const outDir = path.join(workspace, "generated");
+        generate(outDir);
+
+        const manifestPath = path.join(outDir, "plugin.json");
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        const currentPin = manifest.mcpPackageVersion ?? manifest.version;
+        const bootstrapVersion = "0.0.0-bootstrap.1";
+        manifest.mcpBootstrapVersion = bootstrapVersion;
+        writeFileSync(manifestPath, JSON.stringify(manifest, null, 4) + "\n", "utf8");
+
+        const pendingWithBootstrap = runCheckPluginTree(outDir, [bootstrapVersion]);
+        assert.equal(pendingWithBootstrap.status, 0, pendingWithBootstrap.stderr);
+        assert.ok(
+            pendingWithBootstrap.stdout.includes(
+                `WARNING: Preferred @mysten-incubation/memwal-mcp@${currentPin} is not published yet`,
+            ),
+        );
+        assert.ok(
+            pendingWithBootstrap.stdout.includes(
+                `bootstrap @mysten-incubation/memwal-mcp@${bootstrapVersion} is published`,
+            ),
+        );
+
+        const pendingMissingBootstrap = runCheckPluginTree(outDir, ["0.0.0-other.1"]);
+        assert.notEqual(pendingMissingBootstrap.status, 0);
+        assert.ok(
+            pendingMissingBootstrap.stderr.includes(
+                `plugin.json pins @mysten-incubation/memwal-mcp@${currentPin}, which npm does not carry`,
+            ),
+        );
+
+        delete manifest.mcpBootstrapVersion;
+        writeFileSync(manifestPath, JSON.stringify(manifest, null, 4) + "\n", "utf8");
+        const pendingWithoutBootstrap = runCheckPluginTree(outDir, [bootstrapVersion]);
+        assert.notEqual(pendingWithoutBootstrap.status, 0);
+        assert.ok(
+            pendingWithoutBootstrap.stderr.includes(
+                `plugin.json pins @mysten-incubation/memwal-mcp@${currentPin}, which npm does not carry`,
+            ),
+        );
+    } finally {
+        rmSync(workspace, { recursive: true, force: true });
     }
 });

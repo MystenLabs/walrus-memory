@@ -11,7 +11,7 @@ Add to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.memwal]
 command = "npx"
-args = ["-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "Codex"]
+args = ["-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "Codex"]
 ```
 
 Optional namespace:
@@ -19,7 +19,7 @@ Optional namespace:
 ```toml
 [mcp_servers.memwal]
 command = "npx"
-args = ["-y", "@mysten-incubation/memwal-mcp@0.0.16", "--label", "Codex", "--namespace", "work"]
+args = ["-y", "@mysten-incubation/memwal-mcp@0.0.18", "--label", "Codex", "--namespace", "work"]
 ```
 
 `npx` resolves a package name against the directory Codex starts the server in. Use Option B if you want the trusted absolute-path launcher this plugin installs instead.
