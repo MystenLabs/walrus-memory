@@ -7,8 +7,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, LazyLock, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::IpAddr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, LazyLock, Mutex, OnceLock, RwLock,
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
@@ -22,6 +26,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::types::AppState;
+
+const MCP_MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const STREAMABLE_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const STREAMABLE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct McpNativeSession {
@@ -44,8 +52,237 @@ impl std::fmt::Debug for McpNativeSession {
     }
 }
 
-static MCP_NATIVE_SESSIONS: LazyLock<RwLock<HashMap<String, McpNativeSession>>> =
+#[derive(Clone, Debug)]
+struct McpStreamableSession {
+    session: McpNativeSession,
+    last_active: Instant,
+    _slot_guard: Arc<SessionSlotGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionLimitConfig {
+    max_total_sessions: usize,
+    max_sessions_per_ip: usize,
+    max_new_sessions_per_ip_per_min: usize,
+}
+
+impl SessionLimitConfig {
+    fn from_env() -> Self {
+        fn parse_pos(name: &str, fallback: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(fallback)
+        }
+        Self {
+            max_total_sessions: parse_pos("MCP_MAX_TOTAL_SESSIONS", 1000),
+            max_sessions_per_ip: parse_pos("MCP_MAX_SESSIONS_PER_IP", 16),
+            max_new_sessions_per_ip_per_min: parse_pos("MCP_MAX_NEW_SESSIONS_PER_IP_PER_MIN", 30),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionDenyReason {
+    Global,
+    IpActive,
+    IpBurst { retry_after_secs: u64 },
+}
+
+#[derive(Default)]
+struct IpSessionState {
+    active: usize,
+    opens: Vec<Instant>,
+}
+
+struct McpSessionRateLimiter {
+    config: SessionLimitConfig,
+    per_ip: HashMap<String, IpSessionState>,
+    total_active: usize,
+}
+
+impl McpSessionRateLimiter {
+    fn new(config: SessionLimitConfig) -> Self {
+        Self {
+            config,
+            per_ip: HashMap::new(),
+            total_active: 0,
+        }
+    }
+
+    fn acquire(&mut self, ip: &str, now: Instant) -> Result<(), SessionDenyReason> {
+        if self.total_active >= self.config.max_total_sessions {
+            return Err(SessionDenyReason::Global);
+        }
+        let window = Duration::from_secs(60);
+        let state = self.per_ip.entry(ip.to_owned()).or_default();
+        state
+            .opens
+            .retain(|&opened| now.saturating_duration_since(opened) < window);
+
+        if state.active >= self.config.max_sessions_per_ip {
+            if state.active == 0 && state.opens.is_empty() {
+                self.per_ip.remove(ip);
+            }
+            return Err(SessionDenyReason::IpActive);
+        }
+        if state.opens.len() >= self.config.max_new_sessions_per_ip_per_min {
+            let oldest = state.opens.first().copied().unwrap_or(now);
+            let elapsed = now.saturating_duration_since(oldest);
+            let remaining = window.saturating_sub(elapsed);
+            let retry_after_secs = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            return Err(SessionDenyReason::IpBurst { retry_after_secs });
+        }
+
+        state.opens.push(now);
+        state.active += 1;
+        self.total_active += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, ip: &str) {
+        if let Some(state) = self.per_ip.get_mut(ip) {
+            state.active = state.active.saturating_sub(1);
+            self.total_active = self.total_active.saturating_sub(1);
+            if state.active == 0 && state.opens.is_empty() {
+                self.per_ip.remove(ip);
+            }
+        }
+    }
+}
+
+static MCP_SESSION_LIMITER: LazyLock<Mutex<McpSessionRateLimiter>> =
+    LazyLock::new(|| Mutex::new(McpSessionRateLimiter::new(SessionLimitConfig::from_env())));
+
+struct SessionSlotGuard {
+    ip: String,
+    released: AtomicBool,
+}
+
+impl std::fmt::Debug for SessionSlotGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSlotGuard")
+            .field("ip", &self.ip)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SessionSlotGuard {
+    fn drop(&mut self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            if let Ok(mut limiter) = MCP_SESSION_LIMITER.lock() {
+                limiter.release(&self.ip);
+            }
+        }
+    }
+}
+
+fn canonical_client_ip(headers: &req_headers::HeaderMap) -> String {
+    if let Some(raw) = extract_header_str(headers, "x-forwarded-for") {
+        if !raw.contains(',') && raw.parse::<IpAddr>().is_ok() {
+            return raw;
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn acquire_session_slot(
+    headers: &req_headers::HeaderMap,
+) -> Result<Arc<SessionSlotGuard>, Box<Response>> {
+    let ip = canonical_client_ip(headers);
+    let outcome = MCP_SESSION_LIMITER
+        .lock()
+        .map_err(|_| {
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session limiter unavailable",
+                )
+                    .into_response(),
+            )
+        })?
+        .acquire(&ip, Instant::now());
+    match outcome {
+        Ok(()) => Ok(Arc::new(SessionSlotGuard {
+            ip,
+            released: AtomicBool::new(false),
+        })),
+        Err(reason) => Err(Box::new(session_rate_limit_response(reason))),
+    }
+}
+
+fn session_rate_limit_response(reason: SessionDenyReason) -> Response {
+    let (code_str, retry_after) = match reason {
+        SessionDenyReason::Global => ("global_cap", None),
+        SessionDenyReason::IpActive => ("ip_active_cap", None),
+        SessionDenyReason::IpBurst { retry_after_secs } => ("ip_burst_cap", Some(retry_after_secs)),
+    };
+    let message = match retry_after {
+        None => format!("MCP rate limit: {code_str}. Close another MCP session, then retry."),
+        Some(secs) => format!("MCP rate limit: {code_str}. Try again in {secs}s."),
+    };
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32000,
+            "message": message,
+        },
+        "id": Value::Null,
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Some(secs) = retry_after {
+        if let Ok(hv) = HeaderValue::from_str(&secs.to_string()) {
+            headers.insert(axum::http::header::RETRY_AFTER, hv);
+        }
+    }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        serde_json::to_vec(&payload).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+static MCP_SSE_SESSIONS: LazyLock<RwLock<HashMap<String, McpNativeSession>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static MCP_STREAMABLE_SESSIONS: LazyLock<RwLock<HashMap<String, McpStreamableSession>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static STREAMABLE_REAPER_STARTED: OnceLock<()> = OnceLock::new();
+
+fn reap_idle_streamable_sessions_at(now: Instant) -> usize {
+    let Ok(mut guard) = MCP_STREAMABLE_SESSIONS.write() else {
+        return 0;
+    };
+    let before = guard.len();
+    guard
+        .retain(|_, entry| now.saturating_duration_since(entry.last_active) <= STREAMABLE_IDLE_TTL);
+    before.saturating_sub(guard.len())
+}
+
+fn ensure_streamable_reaper_started() {
+    STREAMABLE_REAPER_STARTED.get_or_init(|| {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut interval = tokio::time::interval(STREAMABLE_REAPER_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let _ = reap_idle_streamable_sessions_at(Instant::now());
+                }
+            });
+        }
+    });
+}
 
 fn extract_header_str(headers: &req_headers::HeaderMap, name: &str) -> Option<String> {
     headers
@@ -103,8 +340,70 @@ fn is_known_mcp_tool(tool_name: &str) -> bool {
     )
 }
 
+fn normalize_oauth_scope(scope: &str) -> String {
+    let mut tokens: Vec<&str> = scope.split_whitespace().collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens.join(" ")
+}
+
+fn delegate_pubkey_hex(private_key_hex: &str) -> Option<String> {
+    let key_bytes: [u8; 32] = hex::decode(private_key_hex).ok()?.try_into().ok()?;
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    Some(hex::encode(signing_key.verifying_key().to_bytes()))
+}
+
+fn session_matches_caller(
+    session: &McpNativeSession,
+    caller_key_hex: &str,
+    caller_account_id: &str,
+    caller_oauth_scope: &str,
+) -> bool {
+    let Some(expected_pub) = delegate_pubkey_hex(&session.delegate_key_hex) else {
+        return false;
+    };
+    let Some(caller_pub) = delegate_pubkey_hex(caller_key_hex) else {
+        return false;
+    };
+    expected_pub == caller_pub
+        && session.account_id.eq_ignore_ascii_case(caller_account_id)
+        && normalize_oauth_scope(&session.oauth_scope) == normalize_oauth_scope(caller_oauth_scope)
+}
+
+fn mcp_rpc_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let code = if status == StatusCode::UNAUTHORIZED {
+        -32001
+    } else {
+        -32603
+    };
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+        "id": Value::Null,
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if status == StatusCode::UNAUTHORIZED {
+        headers.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"memwal\", error=\"invalid_token\""),
+        );
+    }
+    (
+        status,
+        headers,
+        serde_json::to_vec(&payload).unwrap_or_default(),
+    )
+        .into_response()
+}
+
 fn resolve_session_credentials(
-    state: &AppState,
     forwarded: &req_headers::HeaderMap,
 ) -> Result<(String, String, String, String), (StatusCode, &'static str)> {
     let bearer_key = extract_header_str(forwarded, "authorization")
@@ -114,16 +413,16 @@ fn resolve_session_credentials(
                 .map(str::trim)
                 .map(str::to_owned)
         })
-        .map(|k| k.strip_prefix("0x").unwrap_or(&k).to_owned())
-        .filter(|k| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()))
-        .or_else(|| {
-            state
-                .config
-                .sui_private_key
-                .as_deref()
-                .map(str::trim)
-                .map(|k| k.strip_prefix("0x").unwrap_or(k).to_owned())
-                .filter(|k| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|k| {
+            k.strip_prefix("0x")
+                .or_else(|| k.strip_prefix("0X"))
+                .unwrap_or(&k)
+                .to_ascii_lowercase()
+        })
+        .filter(|k| {
+            k.len() == 64
+                && k.chars().all(|c| c.is_ascii_hexdigit())
+                && delegate_pubkey_hex(k).is_some()
         });
 
     let Some(delegate_key_hex) = bearer_key else {
@@ -133,14 +432,22 @@ fn resolve_session_credentials(
         ));
     };
 
-    let account_id = extract_header_str(forwarded, "x-memwal-internal-oauth-account-id")
+    let raw_account_id = extract_header_str(forwarded, "x-memwal-internal-oauth-account-id")
         .or_else(|| extract_header_str(forwarded, "x-memwal-account-id"))
-        .or_else(|| state.config.memwal_account_id.clone())
         .unwrap_or_default();
 
-    if account_id.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "Missing X-MemWal-Account-Id"));
-    }
+    let valid_account = raw_account_id
+        .strip_prefix("0x")
+        .or_else(|| raw_account_id.strip_prefix("0X"))
+        .filter(|rest| rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|rest| format!("0x{}", rest.to_ascii_lowercase()));
+
+    let Some(account_id) = valid_account else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Missing or malformed X-MemWal-Account-Id header",
+        ));
+    };
 
     let default_namespace =
         extract_header_str(forwarded, "x-memwal-namespace").unwrap_or_else(|| "default".to_owned());
@@ -3124,7 +3431,7 @@ async fn execute_mcp_tool(
 }
 
 async fn handle_jsonrpc_envelope(
-    state: &AppState,
+    state: Option<&AppState>,
     delegate_key_hex: &str,
     account_id: &str,
     default_namespace: &str,
@@ -3162,6 +3469,16 @@ async fn handle_jsonrpc_envelope(
         "ping" => json!({}),
         "tools/list" => mcp_tools_list(oauth_scope),
         "tools/call" => {
+            let Some(app_state) = state else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": "Relayer state unavailable for tool execution"
+                    }
+                }));
+            };
             let tool_name = params
                 .get("name")
                 .and_then(Value::as_str)
@@ -3171,7 +3488,7 @@ async fn handle_jsonrpc_envelope(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             execute_mcp_tool(
-                state,
+                app_state,
                 delegate_key_hex,
                 account_id,
                 default_namespace,
@@ -3201,13 +3518,18 @@ async fn handle_jsonrpc_envelope(
 }
 
 pub async fn handle_sse_in_process(
-    state: Arc<AppState>,
+    _state: Arc<AppState>,
     forwarded: req_headers::HeaderMap,
 ) -> Response {
+    let slot_guard = match acquire_session_slot(&forwarded) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
+
     let (delegate_key_hex, account_id, default_namespace, oauth_scope) =
-        match resolve_session_credentials(&state, &forwarded) {
+        match resolve_session_credentials(&forwarded) {
             Ok(creds) => creds,
-            Err(err) => return err.into_response(),
+            Err((status, msg)) => return mcp_rpc_error_response(status, msg),
         };
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -3225,12 +3547,13 @@ pub async fn handle_sse_in_process(
         sse_tx: Some(tx.clone()),
     };
 
-    if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
+    if let Ok(mut guard) = MCP_SSE_SESSIONS.write() {
         guard.insert(session_id.clone(), session);
     }
 
     let cleanup_session_id = session_id.clone();
     tokio::spawn(async move {
+        let _slot_guard = slot_guard;
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         // Skip the immediate initial tick so we only ping every 10s while watching `tx.closed()`.
         interval.tick().await;
@@ -3244,7 +3567,7 @@ pub async fn handle_sse_in_process(
                 }
             }
         }
-        if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
+        if let Ok(mut guard) = MCP_SSE_SESSIONS.write() {
             guard.remove(&cleanup_session_id);
         }
     });
@@ -3270,36 +3593,39 @@ pub async fn handle_messages_in_process(
     forwarded: req_headers::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let session = MCP_NATIVE_SESSIONS
+    let session = MCP_SSE_SESSIONS
         .read()
         .ok()
         .and_then(|guard| guard.get(&session_id).cloned());
 
     let Some(session) = session else {
-        return (StatusCode::NOT_FOUND, "Unknown or expired MCP session").into_response();
+        return mcp_rpc_error_response(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
     };
 
-    let (caller_key, caller_account, _, _) = match resolve_session_credentials(&state, &forwarded) {
-        Ok(creds) => creds,
-        Err(err) => return err.into_response(),
-    };
+    let (caller_key, caller_account, _, caller_scope) =
+        match resolve_session_credentials(&forwarded) {
+            Ok(creds) => creds,
+            Err((status, msg)) => return mcp_rpc_error_response(status, msg),
+        };
 
-    if caller_key != session.delegate_key_hex || caller_account != session.account_id {
-        return (
+    if !session_matches_caller(&session, &caller_key, &caller_account, &caller_scope) {
+        return mcp_rpc_error_response(
             StatusCode::FORBIDDEN,
             "sessionId does not match authenticated caller",
-        )
-            .into_response();
+        );
+    }
+
+    if body.len() > MCP_MAX_REQUEST_BODY_BYTES {
+        return mcp_rpc_error_response(StatusCode::PAYLOAD_TOO_LARGE, "MCP request body too large");
     }
 
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return (
+            return mcp_rpc_error_response(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid JSON-RPC body: {e}"),
-            )
-                .into_response();
+            );
         }
     };
 
@@ -3307,7 +3633,7 @@ pub async fn handle_messages_in_process(
         if let Some(arr) = parsed.as_array() {
             for item in arr {
                 if let Some(resp) = handle_jsonrpc_envelope(
-                    &state,
+                    Some(&state),
                     &session.delegate_key_hex,
                     &session.account_id,
                     &session.default_namespace,
@@ -3324,7 +3650,7 @@ pub async fn handle_messages_in_process(
                 }
             }
         } else if let Some(resp) = handle_jsonrpc_envelope(
-            &state,
+            Some(&state),
             &session.delegate_key_hex,
             &session.account_id,
             &session.default_namespace,
@@ -3348,142 +3674,336 @@ pub async fn handle_streamable_in_process(
     forwarded: req_headers::HeaderMap,
     body: Bytes,
 ) -> Response {
-    match method {
-        Method::DELETE => {
-            if let Some(session_id) = extract_header_str(&forwarded, "mcp-session-id") {
-                if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
-                    guard.remove(&session_id);
-                }
-            }
-            (StatusCode::NO_CONTENT, ()).into_response()
-        }
-        Method::GET => handle_sse_in_process(state, forwarded).await,
-        Method::POST => {
-            let (delegate_key_hex, account_id, default_namespace, oauth_scope) =
-                match resolve_session_credentials(&state, &forwarded) {
-                    Ok(creds) => creds,
-                    Err(err) => return err.into_response(),
+    handle_streamable_core(Some(state), method, forwarded, body).await
+}
+
+async fn handle_streamable_core(
+    state: Option<Arc<AppState>>,
+    method: Method,
+    forwarded: req_headers::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !matches!(method, Method::GET | Method::POST | Method::DELETE) {
+        return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response();
+    }
+
+    ensure_streamable_reaper_started();
+    let now = Instant::now();
+    let _ = reap_idle_streamable_sessions_at(now);
+
+    let (delegate_key_hex, account_id, default_namespace, oauth_scope) =
+        match resolve_session_credentials(&forwarded) {
+            Ok(creds) => creds,
+            Err((status, msg)) => return mcp_rpc_error_response(status, msg),
+        };
+
+    if let Some(session_id) = extract_header_str(&forwarded, "mcp-session-id") {
+        match method {
+            Method::DELETE => {
+                let outcome = match MCP_STREAMABLE_SESSIONS.write() {
+                    Ok(mut guard) => match guard.get(&session_id) {
+                        None => Err(mcp_rpc_error_response(
+                            StatusCode::NOT_FOUND,
+                            "Unknown or expired mcp-session-id",
+                        )),
+                        Some(existing)
+                            if !session_matches_caller(
+                                &existing.session,
+                                &delegate_key_hex,
+                                &account_id,
+                                &oauth_scope,
+                            ) =>
+                        {
+                            Err(mcp_rpc_error_response(
+                                StatusCode::FORBIDDEN,
+                                "mcp-session-id does not match authenticated caller",
+                            ))
+                        }
+                        Some(_) => Ok(guard.remove(&session_id)),
+                    },
+                    Err(_) => {
+                        return mcp_rpc_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "session store unavailable",
+                        );
+                    }
                 };
-            let parsed: Value = match serde_json::from_slice(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Invalid JSON-RPC body: {e}"),
-                    )
-                        .into_response();
-                }
-            };
-            let existing_session_id = extract_header_str(&forwarded, "mcp-session-id");
-            let mut effective_scope = oauth_scope.clone();
-            if let Some(ref sid) = existing_session_id {
-                if let Some(existing) = MCP_NATIVE_SESSIONS
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.get(sid).cloned())
-                {
-                    if existing.delegate_key_hex != delegate_key_hex
-                        || existing.account_id != account_id
-                    {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            "mcp-session-id does not match authenticated caller",
-                        )
-                            .into_response();
-                    }
-                    // Preserve the intersection of session scope and current request scope so a
-                    // read-only session cannot escalate to write, nor can a narrowed token use a
-                    // broader cached session scope.
-                    let (sess_read, sess_write) = parse_granted_oauth_scopes(&existing.oauth_scope);
-                    let (req_read, req_write) = parse_granted_oauth_scopes(&oauth_scope);
-                    let mut scopes = Vec::new();
-                    if sess_read && req_read {
-                        scopes.push("memwal:read");
-                    }
-                    if sess_write && req_write {
-                        scopes.push("memwal:write");
-                    }
-                    effective_scope = scopes.join(" ");
-                }
+                return match outcome {
+                    Ok(_evicted) => (StatusCode::NO_CONTENT, ()).into_response(),
+                    Err(resp) => resp,
+                };
             }
-            let session_id =
-                existing_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            if let Ok(mut guard) = MCP_NATIVE_SESSIONS.write() {
-                guard
-                    .entry(session_id.clone())
-                    .or_insert_with(|| McpNativeSession {
-                        delegate_key_hex: delegate_key_hex.clone(),
-                        account_id: account_id.clone(),
-                        default_namespace: default_namespace.clone(),
-                        oauth_scope: effective_scope.clone(),
-                        sse_tx: None,
-                    });
-            }
-
-            let response_value = if let Some(arr) = parsed.as_array() {
-                if arr.is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "Empty JSON-RPC batch is not allowed",
-                    )
-                        .into_response();
-                }
-                let mut responses = Vec::with_capacity(arr.len());
-                for item in arr {
-                    if let Some(resp) = handle_jsonrpc_envelope(
-                        &state,
-                        &delegate_key_hex,
-                        &account_id,
-                        &default_namespace,
-                        &effective_scope,
-                        item,
-                    )
-                    .await
-                    {
-                        responses.push(resp);
+            Method::GET => {
+                let checked = match MCP_STREAMABLE_SESSIONS.write() {
+                    Ok(mut guard) => match guard.get_mut(&session_id) {
+                        None => Err(mcp_rpc_error_response(
+                            StatusCode::NOT_FOUND,
+                            "Unknown or expired mcp-session-id",
+                        )),
+                        Some(existing)
+                            if !session_matches_caller(
+                                &existing.session,
+                                &delegate_key_hex,
+                                &account_id,
+                                &oauth_scope,
+                            ) =>
+                        {
+                            Err(mcp_rpc_error_response(
+                                StatusCode::FORBIDDEN,
+                                "mcp-session-id does not match authenticated caller",
+                            ))
+                        }
+                        Some(existing) => {
+                            existing.last_active = now;
+                            Ok(())
+                        }
+                    },
+                    Err(_) => {
+                        return mcp_rpc_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "session store unavailable",
+                        );
                     }
+                };
+                if let Err(resp) = checked {
+                    return resp;
                 }
-                if responses.is_empty() {
-                    None
-                } else {
-                    Some(Value::Array(responses))
-                }
-            } else {
-                handle_jsonrpc_envelope(
-                    &state,
-                    &delegate_key_hex,
-                    &account_id,
-                    &default_namespace,
-                    &effective_scope,
-                    &parsed,
-                )
-                .await
-            };
 
-            if let Some(resp) = response_value {
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
+                let (tx, rx) = mpsc::unbounded_channel::<String>();
+                let _ = tx.send(": keepalive\n\n".to_owned());
+                let tracked_session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(15));
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            () = tx.closed() => break,
+                            _ = interval.tick() => {
+                                let still_present = MCP_STREAMABLE_SESSIONS
+                                    .write()
+                                    .ok()
+                                    .and_then(|mut guard| {
+                                        let entry = guard.get_mut(&tracked_session_id)?;
+                                        entry.last_active = Instant::now();
+                                        Some(())
+                                    })
+                                    .is_some();
+                                if !still_present || tx.send(": ping\n\n".to_owned()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let stream = stream::unfold(rx, |mut rx| async move {
+                    let chunk = rx.recv().await?;
+                    Some((Ok::<Bytes, Infallible>(Bytes::from(chunk)), rx))
+                });
+
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache, no-transform")
+                    .header("connection", "keep-alive")
+                    .header("x-accel-buffering", "no");
                 if let Ok(hv) = HeaderValue::from_str(&session_id) {
-                    headers.insert("mcp-session-id", hv);
+                    builder = builder.header("mcp-session-id", hv);
                 }
-                (
-                    StatusCode::OK,
-                    headers,
-                    serde_json::to_vec(&resp).unwrap_or_default(),
+                return builder
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            Method::POST => {
+                if body.len() > MCP_MAX_REQUEST_BODY_BYTES {
+                    return mcp_rpc_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "MCP request body too large",
+                    );
+                }
+                let session = match MCP_STREAMABLE_SESSIONS.write() {
+                    Ok(mut guard) => match guard.get_mut(&session_id) {
+                        None => {
+                            return mcp_rpc_error_response(
+                                StatusCode::NOT_FOUND,
+                                "Unknown or expired mcp-session-id",
+                            );
+                        }
+                        Some(existing)
+                            if !session_matches_caller(
+                                &existing.session,
+                                &delegate_key_hex,
+                                &account_id,
+                                &oauth_scope,
+                            ) =>
+                        {
+                            return mcp_rpc_error_response(
+                                StatusCode::FORBIDDEN,
+                                "mcp-session-id does not match authenticated caller",
+                            );
+                        }
+                        Some(existing) => {
+                            existing.last_active = now;
+                            existing.session.clone()
+                        }
+                    },
+                    Err(_) => {
+                        return mcp_rpc_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "session store unavailable",
+                        );
+                    }
+                };
+                return execute_streamable_post_body(
+                    state.as_deref(),
+                    &session_id,
+                    &session,
+                    &body,
                 )
-                    .into_response()
-            } else {
-                let mut headers = HeaderMap::new();
-                if let Ok(hv) = HeaderValue::from_str(&session_id) {
-                    headers.insert("mcp-session-id", hv);
-                }
-                (StatusCode::ACCEPTED, headers, ()).into_response()
+                .await;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    if method != Method::POST {
+        return mcp_rpc_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing mcp-session-id: open a new session with an initial POST",
+        );
+    }
+
+    if body.len() > MCP_MAX_REQUEST_BODY_BYTES {
+        return mcp_rpc_error_response(StatusCode::PAYLOAD_TOO_LARGE, "MCP request body too large");
+    }
+
+    let slot_guard = match acquire_session_slot(&forwarded) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
+
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return mcp_rpc_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON-RPC body: {e}"),
+            );
+        }
+    };
+    if parsed.as_array().is_some_and(Vec::is_empty) {
+        return mcp_rpc_error_response(
+            StatusCode::BAD_REQUEST,
+            "Empty JSON-RPC batch is not allowed",
+        );
+    }
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let session = McpNativeSession {
+        delegate_key_hex,
+        account_id,
+        default_namespace,
+        oauth_scope,
+        sse_tx: None,
+    };
+    if let Ok(mut guard) = MCP_STREAMABLE_SESSIONS.write() {
+        guard.insert(
+            session_id.clone(),
+            McpStreamableSession {
+                session: session.clone(),
+                last_active: now,
+                _slot_guard: slot_guard,
+            },
+        );
+    }
+
+    execute_streamable_parsed(state.as_deref(), &session_id, &session, &parsed).await
+}
+
+async fn execute_streamable_post_body(
+    state: Option<&AppState>,
+    session_id: &str,
+    session: &McpNativeSession,
+    body: &Bytes,
+) -> Response {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return mcp_rpc_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON-RPC body: {e}"),
+            );
+        }
+    };
+    if parsed.as_array().is_some_and(Vec::is_empty) {
+        return mcp_rpc_error_response(
+            StatusCode::BAD_REQUEST,
+            "Empty JSON-RPC batch is not allowed",
+        );
+    }
+    execute_streamable_parsed(state, session_id, session, &parsed).await
+}
+
+async fn execute_streamable_parsed(
+    state: Option<&AppState>,
+    session_id: &str,
+    session: &McpNativeSession,
+    parsed: &Value,
+) -> Response {
+    let response_value = if let Some(arr) = parsed.as_array() {
+        let mut responses = Vec::with_capacity(arr.len());
+        for item in arr {
+            if let Some(resp) = handle_jsonrpc_envelope(
+                state,
+                &session.delegate_key_hex,
+                &session.account_id,
+                &session.default_namespace,
+                &session.oauth_scope,
+                item,
+            )
+            .await
+            {
+                responses.push(resp);
             }
         }
-        _ => (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response(),
+        if responses.is_empty() {
+            None
+        } else {
+            Some(Value::Array(responses))
+        }
+    } else {
+        handle_jsonrpc_envelope(
+            state,
+            &session.delegate_key_hex,
+            &session.account_id,
+            &session.default_namespace,
+            &session.oauth_scope,
+            parsed,
+        )
+        .await
+    };
+
+    if let Some(resp) = response_value {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Ok(hv) = HeaderValue::from_str(session_id) {
+            headers.insert("mcp-session-id", hv);
+        }
+        (
+            StatusCode::OK,
+            headers,
+            serde_json::to_vec(&resp).unwrap_or_default(),
+        )
+            .into_response()
+    } else {
+        let mut headers = HeaderMap::new();
+        if let Ok(hv) = HeaderValue::from_str(session_id) {
+            headers.insert("mcp-session-id", hv);
+        }
+        (StatusCode::ACCEPTED, headers, ()).into_response()
     }
 }
 
@@ -3855,5 +4375,375 @@ mod tests {
             "128 KiB clean text sanitization took too long: {} ms",
             elapsed.as_millis()
         );
+    }
+
+    #[test]
+    fn session_rate_limiter_enforces_active_burst_and_global_caps() {
+        let mut limiter = McpSessionRateLimiter::new(SessionLimitConfig {
+            max_total_sessions: 3,
+            max_sessions_per_ip: 2,
+            max_new_sessions_per_ip_per_min: 3,
+        });
+        let t0 = Instant::now();
+
+        assert_eq!(limiter.acquire("198.51.100.1", t0), Ok(()));
+        assert_eq!(limiter.acquire("198.51.100.1", t0), Ok(()));
+        assert_eq!(
+            limiter.acquire("198.51.100.1", t0),
+            Err(SessionDenyReason::IpActive)
+        );
+
+        assert_eq!(limiter.acquire("198.51.100.2", t0), Ok(()));
+        assert_eq!(
+            limiter.acquire("198.51.100.3", t0),
+            Err(SessionDenyReason::Global)
+        );
+
+        limiter.release("198.51.100.1");
+        assert_eq!(
+            limiter.acquire("198.51.100.1", t0 + Duration::from_secs(10)),
+            Ok(())
+        );
+        limiter.release("198.51.100.1");
+
+        match limiter.acquire("198.51.100.1", t0 + Duration::from_secs(20)) {
+            Err(SessionDenyReason::IpBurst { retry_after_secs }) => {
+                assert!((1..=60).contains(&retry_after_secs));
+            }
+            other => panic!("expected IpBurst, got {other:?}"),
+        }
+
+        assert_eq!(
+            limiter.acquire("198.51.100.1", t0 + Duration::from_secs(61)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reap_idle_streamable_sessions_evicts_stale_entries_and_releases_slots() {
+        let ip = "203.0.113.249";
+        let mut hdrs = req_headers::HeaderMap::new();
+        hdrs.insert("x-forwarded-for", req_headers::HeaderValue::from_static(ip));
+        let guard = acquire_session_slot(&hdrs).expect("slot must acquire");
+        let stale_sid = format!("test-stale-{}", uuid::Uuid::new_v4());
+        let fresh_sid = format!("test-fresh-{}", uuid::Uuid::new_v4());
+        let guard_fresh = acquire_session_slot(&hdrs).expect("second slot must acquire");
+        let now = Instant::now();
+
+        {
+            let mut map = MCP_STREAMABLE_SESSIONS.write().unwrap();
+            map.insert(
+                stale_sid.clone(),
+                McpStreamableSession {
+                    session: McpNativeSession {
+                        delegate_key_hex: "11".repeat(32),
+                        account_id: format!("0x{}", "a".repeat(64)),
+                        default_namespace: "default".to_owned(),
+                        oauth_scope: "memwal:read".to_owned(),
+                        sse_tx: None,
+                    },
+                    last_active: now,
+                    _slot_guard: guard,
+                },
+            );
+            map.insert(
+                fresh_sid.clone(),
+                McpStreamableSession {
+                    session: McpNativeSession {
+                        delegate_key_hex: "22".repeat(32),
+                        account_id: format!("0x{}", "b".repeat(64)),
+                        default_namespace: "default".to_owned(),
+                        oauth_scope: "memwal:read".to_owned(),
+                        sse_tx: None,
+                    },
+                    last_active: now + Duration::from_secs(10 * 60),
+                    _slot_guard: guard_fresh,
+                },
+            );
+        }
+
+        let evicted =
+            reap_idle_streamable_sessions_at(now + STREAMABLE_IDLE_TTL + Duration::from_secs(1));
+        assert!(evicted >= 1);
+
+        {
+            let mut map = MCP_STREAMABLE_SESSIONS.write().unwrap();
+            assert!(!map.contains_key(&stale_sid));
+            assert!(map.remove(&fresh_sid).is_some());
+        }
+    }
+
+    fn build_test_headers(
+        key_hex: &str,
+        account_id: &str,
+        scope: Option<&str>,
+        session_id: Option<&str>,
+        ip: &str,
+    ) -> req_headers::HeaderMap {
+        let mut h = req_headers::HeaderMap::new();
+        h.insert(
+            "authorization",
+            req_headers::HeaderValue::from_str(&format!("Bearer {key_hex}")).unwrap(),
+        );
+        h.insert(
+            "x-memwal-account-id",
+            req_headers::HeaderValue::from_str(account_id).unwrap(),
+        );
+        h.insert(
+            "x-forwarded-for",
+            req_headers::HeaderValue::from_str(ip).unwrap(),
+        );
+        if let Some(sc) = scope {
+            h.insert(
+                "x-memwal-internal-oauth-scope",
+                req_headers::HeaderValue::from_str(sc).unwrap(),
+            );
+        }
+        if let Some(sid) = session_id {
+            h.insert(
+                "mcp-session-id",
+                req_headers::HeaderValue::from_str(sid).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn streamable_http_enforces_auth_session_binding_scope_and_protocol() {
+        use futures::StreamExt;
+
+        let key_a = "33".repeat(32);
+        let acct_a = format!("0x{}", "1".repeat(64));
+        let key_b = "44".repeat(32);
+        let acct_b = format!("0x{}", "2".repeat(64));
+        let init_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-03-26" }
+            }))
+            .unwrap(),
+        );
+
+        // 1. Open valid session for Caller A with read+write scope
+        let init_resp = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                None,
+                "198.51.100.90",
+            ),
+            init_body.clone(),
+        )
+        .await;
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // 2. Unauthenticated DELETE must fail with 401 + www-authenticate and keep session alive
+        let mut unauth_del_headers = req_headers::HeaderMap::new();
+        unauth_del_headers.insert(
+            "mcp-session-id",
+            req_headers::HeaderValue::from_str(&sid).unwrap(),
+        );
+        let unauth_del =
+            handle_streamable_core(None, Method::DELETE, unauth_del_headers, Bytes::new()).await;
+        assert_eq!(unauth_del.status(), StatusCode::UNAUTHORIZED);
+        assert!(unauth_del
+            .headers()
+            .contains_key(axum::http::header::WWW_AUTHENTICATE));
+
+        // 3. Cross-tenant DELETE, POST, and GET by Caller B must fail with 403
+        let cross_del = handle_streamable_core(
+            None,
+            Method::DELETE,
+            build_test_headers(
+                &key_b,
+                &acct_b,
+                Some("memwal:read memwal:write"),
+                Some(&sid),
+                "198.51.100.91",
+            ),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(cross_del.status(), StatusCode::FORBIDDEN);
+
+        let ping_body = Bytes::from(
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).unwrap(),
+        );
+        let cross_post = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_b,
+                &acct_b,
+                Some("memwal:read memwal:write"),
+                Some(&sid),
+                "198.51.100.91",
+            ),
+            ping_body.clone(),
+        )
+        .await;
+        assert_eq!(cross_post.status(), StatusCode::FORBIDDEN);
+
+        // 4. Narrowed or dropped OAuth scope on existing session must fail with 403
+        let narrowed_post = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read"),
+                Some(&sid),
+                "198.51.100.90",
+            ),
+            ping_body.clone(),
+        )
+        .await;
+        assert_eq!(narrowed_post.status(), StatusCode::FORBIDDEN);
+
+        let dropped_scope_post = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(&key_a, &acct_a, None, Some(&sid), "198.51.100.90"),
+            ping_body.clone(),
+        )
+        .await;
+        assert_eq!(dropped_scope_post.status(), StatusCode::FORBIDDEN);
+
+        // 5. Forged / unknown mcp-session-id on POST must fail with 404
+        let forged_post = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                Some("forged-session-id"),
+                "198.51.100.90",
+            ),
+            ping_body.clone(),
+        )
+        .await;
+        assert_eq!(forged_post.status(), StatusCode::NOT_FOUND);
+
+        // 6. GET and DELETE without mcp-session-id must fail with 400
+        let get_missing_sid = handle_streamable_core(
+            None,
+            Method::GET,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                None,
+                "198.51.100.90",
+            ),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(get_missing_sid.status(), StatusCode::BAD_REQUEST);
+
+        let del_missing_sid = handle_streamable_core(
+            None,
+            Method::DELETE,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                None,
+                "198.51.100.90",
+            ),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(del_missing_sid.status(), StatusCode::BAD_REQUEST);
+
+        // 7. Valid GET with matching mcp-session-id streams keepalive SSE without legacy endpoint event
+        let get_ok = handle_streamable_core(
+            None,
+            Method::GET,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:write memwal:read"),
+                Some(&sid),
+                "198.51.100.90",
+            ),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(get_ok.status(), StatusCode::OK);
+        assert_eq!(
+            get_ok.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let mut data_stream = get_ok.into_body().into_data_stream();
+        let first_frame = data_stream
+            .next()
+            .await
+            .expect("first SSE frame")
+            .expect("frame ok");
+        let first_str = std::str::from_utf8(&first_frame).unwrap();
+        assert_eq!(first_str, ": keepalive\n\n");
+        assert!(!first_str.contains("/api/mcp/messages"));
+        drop(data_stream);
+
+        // 8. Oversized POST body returns 413 Payload Too Large
+        let oversized = Bytes::from(vec![b' '; MCP_MAX_REQUEST_BODY_BYTES + 1]);
+        let too_large = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                Some(&sid),
+                "198.51.100.90",
+            ),
+            oversized,
+        )
+        .await;
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 9. Owner DELETE returns 204 and subsequent POST returns 404
+        let owner_del = handle_streamable_core(
+            None,
+            Method::DELETE,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                Some(&sid),
+                "198.51.100.90",
+            ),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(owner_del.status(), StatusCode::NO_CONTENT);
+
+        let after_del = handle_streamable_core(
+            None,
+            Method::POST,
+            build_test_headers(
+                &key_a,
+                &acct_a,
+                Some("memwal:read memwal:write"),
+                Some(&sid),
+                "198.51.100.90",
+            ),
+            ping_body,
+        )
+        .await;
+        assert_eq!(after_del.status(), StatusCode::NOT_FOUND);
     }
 }
