@@ -13,6 +13,9 @@ test("shouldCapture rejects explicit conversational opt-out directives before TR
   const optOutTurns = [
     "Please do not remember or save this conversation (off the record): we are acquiring WidgetCorp on Friday.",
     "Do not save this: I prefer working from Tokyo next month.",
+    "Please don't save any of this: I prefer working from Tokyo next month",
+    "Please don’t save any of this: I prefer working from Tokyo next month",
+    "Do not save or remember this: my temporary medical appointment is at 3 PM.",
     "Please don't remember my temporary medical appointment at 3 PM.",
     "Never store this in memory: our internal codename is Project Aurora.",
     "Never memorize my temporary hotel room number 412.",
@@ -169,4 +172,53 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     { sessionKey: "agent:main:test-short-optout" },
   );
   assert.equal(analyzedPayloads.length, 1, "short [no-save] user turn must suppress assistant reply");
+
+  // 4. Hook-level regression: phrases like "don't save any of this" or "save or remember this" suppress echoes.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u4",
+          role: "user",
+          content: "Please don’t save any of this: I prefer working from Tokyo next month",
+        },
+        {
+          id: "a4",
+          role: "assistant",
+          content: "Noted, I will not store your Tokyo remote work preference in memory.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-tokyo-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    1,
+    "opt-out phrases like 'don't save any of this' must suppress assistant echoes from reaching analyze()",
+  );
+
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u5",
+          role: "user",
+          content: "Do not save or remember this: my temporary medical appointment is at 3 PM.",
+        },
+        {
+          id: "a5",
+          role: "assistant",
+          content: "Understood, your 3 PM appointment will not be stored in Walrus Memory.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-medical-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    1,
+    "opt-out phrases like 'save or remember this' must suppress assistant echoes from reaching analyze()",
+  );
 });
