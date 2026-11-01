@@ -153,7 +153,7 @@ test("MemWal.ask supports positional signature ask(question, limit?, namespace?)
     });
 });
 
-test("MemWal.ask validates question, limit, scoringWeights, and response shape", async () => {
+test("MemWal.ask validates question, namespace, limit, scoringWeights, and response shape", async () => {
     let called = false;
     globalThis.fetch = async () => {
         called = true;
@@ -165,6 +165,16 @@ test("MemWal.ask validates question, limit, scoringWeights, and response shape",
         await assert.rejects(() => client.ask(blank), {
             name: "Error",
             message: "question cannot be empty",
+        });
+    }
+    for (const badNamespace of ["", "   ", "\u200B"]) {
+        await assert.rejects(() => client.ask({ question: "valid?", namespace: badNamespace }), {
+            name: "Error",
+            message: "namespace cannot be empty",
+        });
+        await assert.rejects(() => client.ask("valid?", 5, badNamespace), {
+            name: "Error",
+            message: "namespace cannot be empty",
         });
     }
     for (const badLimit of [0, -1, 2.5, NaN, "5", null]) {
@@ -223,6 +233,16 @@ test("MemWalMock.ask returns joined memory texts or fallback when empty and vali
         name: "Error",
         message: "question cannot be empty",
     });
+    for (const badNamespace of ["", "   ", "\u200B"]) {
+        await assert.rejects(() => mock.ask({ question: "valid?", namespace: badNamespace }), {
+            name: "Error",
+            message: "namespace cannot be empty",
+        });
+        await assert.rejects(() => mock.ask("valid?", 5, badNamespace), {
+            name: "Error",
+            message: "namespace cannot be empty",
+        });
+    }
     await assert.rejects(() => mock.ask({ question: "coffee?", limit: 0 }), {
         name: "TypeError",
         message: /limit must be a positive integer/,

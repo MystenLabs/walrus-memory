@@ -1513,6 +1513,9 @@ export class MemWal {
             namespace,
         );
         assertNonBlankText(question, "question cannot be empty");
+        const resolvedNamespace =
+            options.namespace === undefined ? this.namespace : options.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         const limit = options.limit !== undefined ? options.limit : 5;
         assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(options.scoringWeights);
@@ -1523,7 +1526,7 @@ export class MemWal {
             {
                 question,
                 limit,
-                namespace: options.namespace ?? this.namespace,
+                namespace: resolvedNamespace,
                 scoring_weights: scoringWeightsToWire(options.scoringWeights),
             },
             { timeoutMs: options.timeoutMs },

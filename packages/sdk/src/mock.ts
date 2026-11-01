@@ -578,6 +578,9 @@ export class MemWalMock {
             namespace,
         );
         assertNonBlankText(question, "question cannot be empty");
+        const resolvedNamespace =
+            options.namespace === undefined ? this.namespace : options.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         const limit = options.limit !== undefined ? options.limit : 5;
         assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(options.scoringWeights);
@@ -585,7 +588,7 @@ export class MemWalMock {
         const recalled = await this.recall({
             query: question,
             limit,
-            namespace: options.namespace ?? this.namespace,
+            namespace: resolvedNamespace,
             scoringWeights: options.scoringWeights,
         });
         const memories: AskMemory[] = recalled.results.map((memory) => ({
