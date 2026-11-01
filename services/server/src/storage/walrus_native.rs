@@ -47,12 +47,12 @@ use crate::storage::walrus::{
     UploadExecutionIdentity, UploadJournal, UploadResult,
 };
 use crate::sui::enoki::{
-    derive_sui_address, enoki_execute_sponsored_transaction, enoki_is_enabled,
-    enoki_sponsor_transaction_kind_with_addresses, fetch_executed_transaction_outcome,
-    parse_sui_private_key, shared_sui_grpc_client, sign_transaction_bytes, submit_wallet_ptb,
-    submit_wallet_ptb_with_allowed_addresses, verify_sponsored_transaction_matches_ptb,
-    CreatedObjectInfo, EffectsFetchMode, EnokiError, EnokiExecuteOutput, SponsorshipMode,
-    WalletTxOutcome,
+    derive_sui_address, durable_enoki_register_enabled, enoki_execute_sponsored_transaction,
+    enoki_fallback_to_direct_sign, enoki_is_enabled, enoki_sponsor_transaction_kind_with_addresses,
+    fetch_executed_transaction_outcome, parse_sui_private_key, shared_sui_grpc_client,
+    sign_transaction_bytes, submit_wallet_ptb, submit_wallet_ptb_with_allowed_addresses,
+    verify_sponsored_transaction_matches_ptb, CreatedObjectInfo, EffectsFetchMode, EnokiError,
+    EnokiExecuteOutput, SponsorshipMode, WalletTxOutcome,
 };
 use crate::types::{AppError, Config};
 
@@ -1967,7 +1967,7 @@ pub(crate) async fn prepare_register_transaction_in_process(
     let tx_kind_bytes =
         bcs::to_bytes(&tx_kind).map_err(|e| format!("failed to BCS-encode PTB kind: {e}"))?;
 
-    if enoki_is_enabled() {
+    if enoki_is_enabled() && durable_enoki_register_enabled() {
         let tx_kind_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_kind_bytes);
         match enoki_sponsor_transaction_kind_with_addresses(
             http,
@@ -2001,11 +2001,11 @@ pub(crate) async fn prepare_register_transaction_in_process(
                     sponsor_digest: Some(sponsored.digest),
                 });
             }
-            Err(err) if err.is_fallback_eligible() => {
+            Err(err) if err.is_fallback_eligible() && enoki_fallback_to_direct_sign() => {
                 tracing::warn!(
                     sender = %sender,
                     error = %err,
-                    "Enoki sponsor failed during register prepare with fallback-eligible error; falling back to direct address-balance transaction"
+                    "Enoki sponsor failed during register prepare with fallback-eligible error and ENOKI_FALLBACK_TO_DIRECT_SIGN is enabled; falling back to direct address-balance transaction"
                 );
             }
             Err(err) => return Err(err.to_string()),
@@ -5853,6 +5853,35 @@ mod tests {
         })
         .expect("serialize HashedAuthPackage");
         assert_eq!(auth_pkg_bcs.len(), 72);
+
+        // 5. Production (`main`) V2 Committee SEAL KeyServer + expected committee identity on live Mainnet
+        std::env::set_var(
+            "SEAL_SERVER_CONFIGS",
+            r#"[{"objectId":"0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595","weight":1,"aggregatorUrl":"https://seal-aggregator-mainnet.mystenlabs.com","apiKeyName":"x-api-key","apiKey":"probe-only"}]"#,
+        );
+        std::env::set_var("SEAL_THRESHOLD", "1");
+        let expected_prod_committee = serde_json::json!({
+            "servers": [{
+                "objectId": "0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595",
+                "weight": 1
+            }],
+            "threshold": 1
+        });
+        let (prod_servers, prod_threshold) = crate::storage::seal_native::resolve_seal_key_servers(
+            "https://mysten-rpc.mainnet.sui.io",
+            Some(&expected_prod_committee),
+        )
+        .await
+        .expect("resolve live production Mainnet V2 Committee SEAL KeyServer");
+        std::env::remove_var("SEAL_SERVER_CONFIGS");
+        std::env::remove_var("SEAL_THRESHOLD");
+        assert_eq!(prod_threshold, 1);
+        assert_eq!(prod_servers.len(), 1);
+        assert_eq!(
+            prod_servers[0].url,
+            "https://seal-aggregator-mainnet.mystenlabs.com"
+        );
+        assert_eq!(prod_servers[0].api_key_name.as_deref(), Some("x-api-key"));
     }
 
     #[test]

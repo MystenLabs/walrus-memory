@@ -219,6 +219,42 @@ pub fn enoki_is_enabled() -> bool {
     enoki_api_key().is_some()
 }
 
+/// Resolves the target Enoki network (`ENOKI_NETWORK` override if non-empty, else `fallback_network`,
+/// else `"mainnet"`), matching `ENOKI_NETWORK` in `services/server/scripts/sidecar/config.ts`.
+#[must_use]
+pub fn effective_enoki_network(fallback_network: &str) -> String {
+    std::env::var("ENOKI_NETWORK")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            let trimmed = fallback_network.trim().to_ascii_lowercase();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or_else(|| "mainnet".to_owned())
+}
+
+/// Returns true when `DURABLE_ENOKI_REGISTER_ENABLED` is enabled (`1`, `true`, `yes`),
+/// matching `DURABLE_ENOKI_REGISTER_ENABLED` in `services/server/scripts/sidecar/config.ts`.
+#[must_use]
+pub fn durable_enoki_register_enabled() -> bool {
+    std::env::var("DURABLE_ENOKI_REGISTER_ENABLED")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Returns true when `ENOKI_FALLBACK_TO_DIRECT_SIGN` explicitly opts into direct signing after
+/// an Enoki sponsor failure (`false` by default in both `dev` and `production`), matching
+/// `ENOKI_FALLBACK_TO_DIRECT_SIGN` in `services/server/scripts/sidecar/config.ts`.
+#[must_use]
+pub fn enoki_fallback_to_direct_sign() -> bool {
+    std::env::var("ENOKI_FALLBACK_TO_DIRECT_SIGN")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+}
+
 fn enoki_api_key() -> Option<String> {
     std::env::var("ENOKI_API_KEY")
         .ok()
@@ -515,9 +551,10 @@ pub async fn enoki_sponsor_transaction_kind_with_addresses(
     let api_key = enoki_api_key().ok_or(EnokiError::NotConfigured)?;
     let api_url = enoki_api_url();
     let url = format!("{api_url}/v1/transaction-blocks/sponsor");
+    let target_network = effective_enoki_network(network);
 
     let mut payload = serde_json::json!({
-        "network": network,
+        "network": target_network,
         "transactionBlockKindBytes": tx_kind_bytes_b64,
         "sender": sender,
     });
@@ -1165,21 +1202,17 @@ pub async fn submit_wallet_ptb_with_allowed_addresses(
                             used_enoki: true,
                         });
                     }
-                    Err(err) if err.is_fallback_eligible() => {
-                        tracing::warn!(
-                            sender = %sender,
-                            error = %err,
-                            "Enoki execute failed with fallback-eligible error; falling back to direct address-balance execution"
-                        );
-                    }
+                    // Once sponsorship begins and Enoki receives a signed transaction, never submit
+                    // a second direct transaction after an ambiguous execute response
+                    // (`DURABLE_WALLET_FALLBACK_POLICY.directSignAfterSponsorFailure = false`).
                     Err(err) => return Err(err.to_string()),
                 }
             }
-            Err(err) if err.is_fallback_eligible() => {
+            Err(err) if err.is_fallback_eligible() && enoki_fallback_to_direct_sign() => {
                 tracing::warn!(
                     sender = %sender,
                     error = %err,
-                    "Enoki sponsor failed with fallback-eligible error; falling back to direct address-balance execution"
+                    "Enoki sponsor failed with fallback-eligible error and ENOKI_FALLBACK_TO_DIRECT_SIGN is enabled; falling back to direct address-balance execution"
                 );
             }
             Err(err) => return Err(err.to_string()),
@@ -1420,6 +1453,35 @@ mod tests {
             .unwrap();
         assert_eq!(raw_sig.len(), 97);
         assert_eq!(raw_sig[0], 0x00); // Ed25519 scheme flag
+    }
+
+    #[test]
+    fn enoki_env_flags_match_sidecar_config_semantics() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("ENOKI_NETWORK");
+        std::env::remove_var("DURABLE_ENOKI_REGISTER_ENABLED");
+        std::env::remove_var("ENOKI_FALLBACK_TO_DIRECT_SIGN");
+
+        assert_eq!(effective_enoki_network("testnet"), "testnet");
+        assert_eq!(effective_enoki_network(""), "mainnet");
+        assert!(!durable_enoki_register_enabled());
+        assert!(!enoki_fallback_to_direct_sign());
+
+        std::env::set_var("ENOKI_NETWORK", "mainnet");
+        std::env::set_var("DURABLE_ENOKI_REGISTER_ENABLED", "true");
+        std::env::set_var("ENOKI_FALLBACK_TO_DIRECT_SIGN", "false");
+        assert_eq!(effective_enoki_network("testnet"), "mainnet");
+        assert!(durable_enoki_register_enabled());
+        assert!(!enoki_fallback_to_direct_sign());
+
+        std::env::set_var("ENOKI_FALLBACK_TO_DIRECT_SIGN", "true");
+        assert!(enoki_fallback_to_direct_sign());
+
+        std::env::remove_var("ENOKI_NETWORK");
+        std::env::remove_var("DURABLE_ENOKI_REGISTER_ENABLED");
+        std::env::remove_var("ENOKI_FALLBACK_TO_DIRECT_SIGN");
     }
 
     #[test]
