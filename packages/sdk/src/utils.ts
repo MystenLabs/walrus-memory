@@ -411,8 +411,8 @@ export function validateIdempotencyKey(key: string | undefined): void {
 /**
  * Resolve the target namespace for `forget()` / `forgetNamespace()`.
  *
- * `undefined` uses `defaultNamespace`. Any provided value must be a non-empty,
- * non-whitespace string — `""` or whitespace-only throws
+ * `undefined` uses `defaultNamespace`. Any provided value must be a non-blank
+ * string: empty, whitespace-only, or zero-width text throws
  * `Error("namespace cannot be empty")` instead of silently falling back to the
  * default namespace and wiping it (#1043).
  */
@@ -421,9 +421,7 @@ export function resolveForgetNamespace(
     defaultNamespace: string,
 ): string {
     const resolved = namespace === undefined ? defaultNamespace : namespace;
-    if (typeof resolved !== "string" || resolved.trim().length === 0) {
-        throw new Error("namespace cannot be empty");
-    }
+    assertNonBlankText(resolved, "namespace cannot be empty");
     return resolved;
 }
 

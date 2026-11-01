@@ -169,7 +169,7 @@ test("MemWalManual.forget and MemWalManual.forgetNamespace call POST /api/forget
     }
 });
 
-test("forget and forgetNamespace reject empty or whitespace-only namespaces before any HTTP request (#1043)", async () => {
+test("forget and forgetNamespace reject empty, whitespace-only, or zero-width namespaces before any HTTP request (#1043)", async () => {
     let fetchCount = 0;
     globalThis.fetch = async () => {
         fetchCount += 1;
@@ -180,7 +180,7 @@ test("forget and forgetNamespace reject empty or whitespace-only namespaces befo
     const manual = createManualClient("default-manual-ns");
     const mock = MemWalMock.create({ namespace: "default-mock-ns" });
 
-    for (const invalid of ["", "   ", "\t\n"]) {
+    for (const invalid of ["", "   ", "\t\n", "\u200B", "\u200C", "\u200D", "\u2060", "\uFEFF", " \u200B "]) {
         await assert.rejects(() => memwal.forget(invalid), {
             message: /namespace cannot be empty/,
         });

@@ -1158,7 +1158,7 @@ export class MemWalManual {
      *
      * Does not build or attach a SEAL session (`x-seal-session`).
      *
-     * @param namespace - Namespace to clear (defaults to the client's configured namespace)
+     * @param namespace Namespace to clear (defaults to the client's configured namespace)
      * @returns ForgetResult with `deleted` count, `namespace`, and `owner`
      */
     async forget(namespace?: string): Promise<ForgetResult> {
@@ -1175,7 +1175,7 @@ export class MemWalManual {
     /**
      * Alias for {@link forget} matching {@link MemWalMock.forgetNamespace}.
      *
-     * @param namespace - Namespace to clear (defaults to the client's configured namespace)
+     * @param namespace Namespace to clear (defaults to the client's configured namespace)
      * @returns ForgetResult with `deleted` count, `namespace`, and `owner`
      */
     async forgetNamespace(namespace?: string): Promise<ForgetResult> {

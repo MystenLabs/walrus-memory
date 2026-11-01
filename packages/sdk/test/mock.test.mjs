@@ -723,11 +723,14 @@ test("MemWalMock.forgetNamespace clears a namespace and returns ForgetResult whi
     assert.equal((await mock.recall({ query: "custom", namespace: "custom-ns" })).total, 0);
     assert.equal((await mock.recall({ query: "other", namespace: "other-ns" })).total, 1);
 
-    // Empty / whitespace namespace throws and does not touch default-ns.
+    // Empty, whitespace, or zero-width namespace throws and does not touch default-ns.
     assert.throws(() => mock.forgetNamespace(""), {
         message: /namespace cannot be empty/,
     });
     assert.throws(() => mock.forgetNamespace("   "), {
+        message: /namespace cannot be empty/,
+    });
+    assert.throws(() => mock.forgetNamespace("\u200B"), {
         message: /namespace cannot be empty/,
     });
     assert.equal((await mock.recall({ query: "default" })).total, 2);
