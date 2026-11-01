@@ -927,7 +927,7 @@ class MemWal:
                     )
                 self._failed_remember_keys[base_key] = fail_count + 1
             raise
-        # MemWalRememberJobTimeout is intentionally NOT caught here —
+        # MemWalRememberJobTimeout is intentionally NOT caught here:
         # the job may still complete, so the key stays for a retry call.
         if generated_key:
             self._pending_remember_keys.pop(request_identity, None)
