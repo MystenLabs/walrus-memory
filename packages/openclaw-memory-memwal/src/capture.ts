@@ -65,10 +65,24 @@ const ADDRESSES_MODEL = [
   /^(ign[o0a]re|disregard|f[o0]rget|override|bypass|run|execute|call|invoke|reveal|print|output)\b/i,
 ];
 
+const IMPERATIVE_NEGATION_PREFIX =
+  "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:please|just|and|but)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
 /** Conversational opt-out patterns that instruct the assistant not to persist the turn. */
 const OPT_OUT_PATTERNS = [
-  /\b(?:do\s+not|don['\u2019]?t|please\s+do\s+not|please\s+don['\u2019]?t|never)\s+(?:ever\s+)?(?:remember|save|store|capture|record|log|keep|memorize|index)\b/i,
-  /\b(?:off\s+the\s+record|do\s+not\s+keep\s+(?:this\s+)?in\s+memory|don['\u2019]?t\s+keep\s+(?:this\s+)?in\s+memory)\b/i,
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep))?\\b`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:save|store|record|capture|keep)(?:\\s+(?:this|that|these|those|it|anything|what\\s+i|my\\b|our\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b|(?=\\s*(?:$|[.!?)\\]])))`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?log\\s+(?:this(?:\\s+(?:conversation|message|chat|turn|session))?|anything\\s+(?:here|from\\s+this)|our\\s+(?:conversation|chat))\\b`,
+    "i",
+  ),
+  /\b(?:off\s+the\s+record|(?:do\s+not|don['\u2019]?t|never)\s+keep\s+(?:this\s+|that\s+|it\s+)?in\s+memory|(?:please\s+)?forget\s+(?:this(?:\s+(?:conversation|message|chat|turn))?|what\s+i\s+just\s+said))\b/i,
   /(?:^|\s)(?:\[\s*no[-_\s]?save\s*\]|#no[-_]?save\b)/i,
 ];
 
@@ -76,13 +90,20 @@ const OPT_OUT_PATTERNS = [
 const SECRET_PATTERNS = [
   /\bsuiprivkey1[02-9ac-hj-np-z]{50,}\b/i,
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
-  /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,}\b/,
+  /\bsk-(?:proj-|ant-(?:api\d+-)?|live-|test-)?[A-Za-z0-9_-]{20,}\b/,
   /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
   /\bAIza[0-9A-Za-z_-]{35}\b/,
-  /\b(?:authorization\s*:\s*(?:bearer|basic)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
-  /\b(?:api[_-\s]?key|secret[_-\s]?key|private[_-\s]?key|delegate[_-\s]?key|access[_-\s]?token|refresh[_-\s]?token|client[_-\s]?secret|password|passwd|pwd)\s*(?:[:=]|\bis\b)\s*['"]?(?:0x[0-9a-fA-F]{64}|[0-9a-fA-F]{64}|[^\s'",;]{8,})/i,
+  /\b(?:glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{36}|[sprk]k_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{30,})\b/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  /[A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/[^\s/@:?=&]+:[^\s/@?=&]+@/,
+  /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+  /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
+  /\btoken["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{8,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{12,})/i,
+  /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|api[\s_-]*key|seed)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{64}\b/i,
+  /\b(?:0x)?[0-9a-fA-F]{64}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
+  /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4}(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}\b/i,
 ];
 
 /** Memory trigger patterns — always capture if matched. */
@@ -138,11 +159,16 @@ export function looksLikeInjection(text: string): boolean {
 }
 
 /** Check if text contains an explicit conversational opt-out directive. */
-export function looksLikeOptOut(text: string): boolean {
+export function hasCaptureOptOut(text: string): boolean {
   if (!text) return false;
   if (OPT_OUT_PATTERNS.some((p) => p.test(text))) return true;
   const normalized = normalizeForInjectionCheck(text);
   return Boolean(normalized && OPT_OUT_PATTERNS.some((p) => p.test(normalized)));
+}
+
+/** Alias for `hasCaptureOptOut` kept for callers checking opt-out predicates. */
+export function looksLikeOptOut(text: string): boolean {
+  return hasCaptureOptOut(text);
 }
 
 /** Check if text contains high-confidence inline credentials or secret keys. */
@@ -161,7 +187,7 @@ export function shouldCapture(text: string): boolean {
   if (emojiCount > MAX_EMOJI_COUNT) return false;
 
   if (looksLikeInjection(text)) return false;
-  if (looksLikeOptOut(text)) return false;
+  if (hasCaptureOptOut(text)) return false;
   if (looksLikeSecret(text)) return false;
   if (TRIGGER_PATTERNS.some((p) => p.test(text))) return true;
 

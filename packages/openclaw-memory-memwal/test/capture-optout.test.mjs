@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { looksLikeOptOut, looksLikeSecret, shouldCapture } from "../dist/capture.js";
+import {
+  hasCaptureOptOut,
+  looksLikeOptOut,
+  looksLikeSecret,
+  shouldCapture,
+} from "../dist/capture.js";
 import { registerCaptureHook } from "../dist/hooks/capture.js";
 
 test("shouldCapture rejects explicit conversational opt-out directives before TRIGGER_PATTERNS", () => {
@@ -10,14 +15,20 @@ test("shouldCapture rejects explicit conversational opt-out directives before TR
     "Do not save this: I prefer working from Tokyo next month.",
     "Please don't remember my temporary medical appointment at 3 PM.",
     "Never store this in memory: our internal codename is Project Aurora.",
+    "Never memorize my temporary hotel room number 412.",
+    "Do not record this conversation about executive compensation.",
+    "Don't capture this message about the upcoming reorg.",
     "This is off the record, I am interviewing at another company.",
+    "Forget this conversation: we are considering a pivot next quarter.",
+    "Do not log this chat: our acquisition target is WidgetCorp.",
     "Don't keep this in memory: my backup email is user@example.com.",
     "[no-save] I decided to switch our database vendor.",
     "I prefer Rust #nosave",
   ];
 
   for (const turn of optOutTurns) {
-    assert.equal(looksLikeOptOut(turn), true, `Expected opt-out match for: "${turn}"`);
+    assert.equal(hasCaptureOptOut(turn), true, `Expected hasCaptureOptOut=true for: "${turn}"`);
+    assert.equal(looksLikeOptOut(turn), true, `Expected looksLikeOptOut=true for: "${turn}"`);
     assert.equal(shouldCapture(turn), false, `Expected shouldCapture=false for: "${turn}"`);
   }
 });
@@ -33,7 +44,12 @@ test("shouldCapture rejects turns containing inline secrets and credentials", ()
     "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
     "-----BEGIN ED25519 PRIVATE KEY----- AAAAC3NzaC1lZDI1NTE5",
     "My delegate_key = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "My delegate private key is 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    'Config uses api_key = "sk-1234567890abcdefghijklmnop" in local tests',
+    "Staging test account uses password: hunter2 for integration runs",
+    'Service webhook uses secret="my_super_secret_123" for local verification',
     "Remember that api_key: superSecretProductionTokenValue12345",
+    "My seed phrase is witch collapse practice feed shame open despair creek road again ice least",
   ];
 
   for (const turn of secretTurns) {
@@ -42,12 +58,36 @@ test("shouldCapture rejects turns containing inline secrets and credentials", ()
   }
 });
 
-test("registerCaptureHook skips analyze() when turn messages match opt-out or secret filters", async () => {
-  let analyzeCalls = 0;
+test("ordinary developer conversations and bare identifier mentions are captured", () => {
+  const developerTurns = [
+    "We never log request bodies in production",
+    "Do not index that JSONB column",
+    "Our api_key is configured via Railway",
+    "Check that pwd is writable in the container",
+    "Always pass token via header to the gateway",
+    "I don't remember why we chose Redis for rate limiting",
+    `My Sui account id is 0x${"ab".repeat(32)}`,
+  ];
+
+  for (const turn of developerTurns) {
+    assert.equal(hasCaptureOptOut(turn), false, `Unexpected opt-out match for: "${turn}"`);
+    assert.equal(looksLikeSecret(turn), false, `Unexpected secret match for: "${turn}"`);
+    assert.equal(shouldCapture(turn), true, `Expected shouldCapture=true for: "${turn}"`);
+  }
+
+  // Exact shorter prose phrases (< 30 chars MIN_CAPTURE_LENGTH) are also free of false-positive matches.
+  for (const shortPhrase of ["Check that pwd is writable", "pass token via header"]) {
+    assert.equal(hasCaptureOptOut(shortPhrase), false);
+    assert.equal(looksLikeSecret(shortPhrase), false);
+  }
+});
+
+test("registerCaptureHook suppresses both opted-out user turn and trailing assistant reply", async () => {
+  const analyzedPayloads = [];
   const mockClient = {
-    analyze: async () => {
-      analyzeCalls += 1;
-      return { facts: [{ id: "1", text: "should not happen" }] };
+    analyze: async (text) => {
+      analyzedPayloads.push(text);
+      return { facts: [{ id: String(analyzedPayloads.length), text }] };
     },
   };
 
@@ -65,23 +105,68 @@ test("registerCaptureHook skips analyze() when turn messages match opt-out or se
     requestTimeoutMs: 5_000,
   });
 
+  // 1. Opted-out user turn followed by an assistant acknowledgement echoing WidgetCorp.
+  const history = [
+    {
+      id: "u1",
+      role: "user",
+      content:
+        "Please do not remember this (off the record): we are acquiring WidgetCorp on Friday.",
+    },
+    {
+      id: "a1",
+      role: "assistant",
+      content:
+        "Understood, regarding WidgetCorp acquisition on Friday, I will keep that out of memory.",
+    },
+  ];
+
+  await handler(
+    { success: true, messages: [...history] },
+    { sessionKey: "agent:main:test-optout-turn" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    0,
+    "analyze() must not be called when the turn opted out, even when assistant echoes the topic",
+  );
+
+  // 2. Subsequent normal user turn is captured, while the earlier opted-out turn and its assistant reply stay excluded.
+  history.push(
+    {
+      id: "u2",
+      role: "user",
+      content: "We never log request bodies in production and our api_key is configured via Railway.",
+    },
+    {
+      id: "a2",
+      role: "assistant",
+      content: "Got it, request bodies are never logged and api_key comes from Railway.",
+    },
+  );
+
+  await handler(
+    { success: true, messages: [...history] },
+    { sessionKey: "agent:main:test-optout-turn" },
+  );
+  assert.equal(analyzedPayloads.length, 1);
+  assert.ok(!analyzedPayloads[0].includes("WidgetCorp"), "opted-out topic must never leak on later turns");
+  assert.ok(analyzedPayloads[0].includes("We never log request bodies in production"));
+
+  // 3. Short opt-out marker ("[no-save]") also suppresses trailing assistant reply.
   await handler(
     {
       success: true,
       messages: [
+        { id: "u3", role: "user", content: "[no-save]" },
         {
-          role: "user",
-          content: "Please do not remember this: I prefer dark mode in all my editors.",
-        },
-        {
-          role: "user",
-          content:
-            "Here is my key suiprivkey1qp3000000000000000000000000000000000000000000000000000000000",
+          id: "a3",
+          role: "assistant",
+          content: "Understood, regarding Project Aurora, nothing from this turn will be stored.",
         },
       ],
     },
-    { sessionKey: "agent:main:test-optout" },
+    { sessionKey: "agent:main:test-short-optout" },
   );
-
-  assert.equal(analyzeCalls, 0, "analyze() must not be called when all messages are filtered");
+  assert.equal(analyzedPayloads.length, 1, "short [no-save] user turn must suppress assistant reply");
 });
