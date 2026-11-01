@@ -178,6 +178,7 @@ impl McpSessionRateLimiter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn release(&mut self, ip: &str) {
         if let Some(state) = self.per_ip.get_mut(ip) {
             state.active = state.active.saturating_sub(1);
@@ -223,7 +224,7 @@ impl Drop for SessionSlotGuard {
     fn drop(&mut self) {
         if !self.released.swap(true, Ordering::AcqRel) {
             if let Ok(mut limiter) = MCP_SESSION_LIMITER.lock() {
-                limiter.release(&self.ip);
+                limiter.release_at(&self.ip, Instant::now());
             }
         }
     }
@@ -241,6 +242,7 @@ fn canonical_client_ip(headers: &req_headers::HeaderMap) -> String {
 fn acquire_session_slot(
     headers: &req_headers::HeaderMap,
 ) -> Result<Arc<SessionSlotGuard>, Box<Response>> {
+    ensure_streamable_reaper_started();
     let ip = canonical_client_ip(headers);
     let outcome = MCP_SESSION_LIMITER
         .lock()
@@ -308,14 +310,17 @@ static MCP_STREAMABLE_SESSIONS: LazyLock<RwLock<HashMap<String, McpStreamableSes
 static STREAMABLE_REAPER_STARTED: OnceLock<()> = OnceLock::new();
 
 fn reap_idle_streamable_sessions_at(now: Instant) -> usize {
-    let _ = reap_expired_session_limits_at(now);
-    let Ok(mut guard) = MCP_STREAMABLE_SESSIONS.write() else {
-        return 0;
+    let reaped_sessions = if let Ok(mut guard) = MCP_STREAMABLE_SESSIONS.write() {
+        let before = guard.len();
+        guard.retain(|_, entry| {
+            now.saturating_duration_since(entry.last_active) <= STREAMABLE_IDLE_TTL
+        });
+        before.saturating_sub(guard.len())
+    } else {
+        0
     };
-    let before = guard.len();
-    guard
-        .retain(|_, entry| now.saturating_duration_since(entry.last_active) <= STREAMABLE_IDLE_TTL);
-    before.saturating_sub(guard.len())
+    let _ = reap_expired_session_limits_at(now);
+    reaped_sessions
 }
 
 pub(crate) fn reap_expired_session_limits_at(now: Instant) -> usize {
@@ -4525,6 +4530,11 @@ mod tests {
         // The 1,000 inactive IPs were automatically pruned during acquire at t2.
         assert_eq!(limiter.per_ip.len(), 1);
         assert_eq!(limiter.total_active, 1);
+
+        // Long-lived session closing after the 60s burst window removes its IP entry immediately.
+        limiter.release_at("203.0.113.1", t2 + Duration::from_secs(61));
+        assert_eq!(limiter.per_ip.len(), 0);
+        assert_eq!(limiter.total_active, 0);
     }
 
     #[test]
