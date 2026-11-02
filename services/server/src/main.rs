@@ -2331,25 +2331,25 @@ async fn main() {
         || config.deletion_reconciler_enabled
         || config.deletion_object_resolver_enabled;
     let legacy_db = if security_delete_component_enabled {
-        Some(Arc::new(
-            LegacyDb::new(
-                config
-                    .legacy_db_url
-                    .as_deref()
-                    .expect("boot guard requires LEGACY_DB_URL"),
-            )
-            .await
-            .expect("Failed to initialize legacy security-delete database"),
-        ))
+        match config.legacy_db_url.as_deref() {
+            Some(legacy_url) => Some(Arc::new(
+                LegacyDb::new(legacy_url)
+                    .await
+                    .expect("Failed to initialize legacy security-delete database"),
+            )),
+            None => None,
+        }
     } else {
         None
     };
-    if legacy_db.is_some() {
-        // The legacy migrations that just ran are what create
-        // `delete_blobs_tracking`, and they run *after* `VectorDb::new()`
-        // probed for it. Re-probe now so the first boot that enables
-        // security deletion already hides claimed-for-deletion memories from
-        // recall, instead of waiting for the next restart (WALM-592).
+    if security_delete_component_enabled {
+        storage::security_delete_store::ensure_post_migration_schema(db.pool())
+            .await
+            .expect("Failed to initialize post-migration security-delete schema");
+        // Both `LegacyDb` (single-DB mode) and `ensure_post_migration_schema`
+        // (two-DB or post-migration-only mode) create `delete_blobs_tracking`
+        // after `VectorDb::new()` probed for it. Re-probe now so the first boot
+        // immediately hides claimed-for-deletion memories from recall.
         db.refresh_pending_delete_filter().await;
     }
 

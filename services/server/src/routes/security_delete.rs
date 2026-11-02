@@ -136,11 +136,28 @@ async fn rate_limit(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeletionScope {
+    Legacy,
+    Current,
+}
+
+impl DeletionScope {
+    fn parse(raw: Option<&str>) -> Result<Self, SdError> {
+        match raw {
+            None | Some("legacy") => Ok(Self::Legacy),
+            Some("current") => Ok(Self::Current),
+            Some(_) => Err(invalid_request()),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ListQuery {
     pub state: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<i64>,
+    pub scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -232,18 +249,38 @@ fn parse_states(raw: Option<&str>) -> Result<Vec<&str>, SdError> {
     Ok(states)
 }
 
+fn empty_list_response(delete_batch_max: usize) -> ListResponse {
+    ListResponse {
+        items: Vec::new(),
+        counts: CountsJson {
+            total: 0,
+            deletable: 0,
+            deleting: 0,
+            deleted: 0,
+            deleted_external: 0,
+            not_owner: 0,
+            expired: 0,
+        },
+        limits: LimitsJson { delete_batch_max },
+        next_cursor: None,
+    }
+}
+
 pub async fn list_deletable_blobs(
     State(state): State<Arc<AppState>>,
     SdOwner(owner): SdOwner,
     SdQuery(query): SdQuery<ListQuery>,
 ) -> Result<Json<ListResponse>, SdError> {
+    let scope = DeletionScope::parse(query.scope.as_deref())?;
     let states = parse_states(query.state.as_deref())?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=LIST_MAX).contains(&limit) {
         return Err(invalid_request());
     }
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let pool = legacy_pool(&state)?;
+    let Some(pool) = scope_pool(&state, scope, &owner).await? else {
+        return Ok(Json(empty_list_response(state.config.delete_batch_max)));
+    };
     let mut rows = store::list_blobs(pool, &owner, &states, cursor, limit + 1)
         .await
         .map_err(SdError::internal)?;
@@ -288,6 +325,7 @@ pub async fn list_deletable_blobs(
 pub struct PrepareRequest {
     mode: String,
     blob_ids: Option<Vec<String>>,
+    scope: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -322,6 +360,7 @@ pub async fn prepare_deletion(
     SdOwner(owner): SdOwner,
     SdJson(request): SdJson<PrepareRequest>,
 ) -> Result<Json<PrepareResponse>, SdError> {
+    let scope = DeletionScope::parse(request.scope.as_deref())?;
     let selection = match request.mode.as_str() {
         "all" if request.blob_ids.is_none() => None,
         "selection" => {
@@ -338,7 +377,9 @@ pub async fn prepare_deletion(
         }
         _ => return Err(invalid_request()),
     };
-    let pool = legacy_pool(&state)?;
+    let Some(pool) = scope_pool(&state, scope, &owner).await? else {
+        return Ok(nothing(Vec::new()));
+    };
     if store::counts(pool, &owner)
         .await
         .map_err(SdError::internal)?
@@ -662,8 +703,7 @@ pub async fn submit_deletion(
     headers: HeaderMap,
     SdJson(request): SdJson<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, SdError> {
-    let pool = legacy_pool(&state)?;
-    let batch = require_batch(pool, batch_id, &owner).await?;
+    let (pool, batch) = resolve_batch_pool(&state, batch_id, &owner).await?;
     match batch.state.as_str() {
         store::BATCH_ROLLED_BACK => {
             return Err(SdError::new(SdCode::BatchExpired, "Deletion batch expired"))
@@ -1052,8 +1092,7 @@ pub async fn cancel_deletion(
     SdOwner(owner): SdOwner,
     SdBatchId(batch_id): SdBatchId,
 ) -> Result<Json<StatusResponse>, SdError> {
-    let pool = legacy_pool(&state)?;
-    let batch = require_batch(pool, batch_id, &owner).await?;
+    let (pool, batch) = resolve_batch_pool(&state, batch_id, &owner).await?;
     if batch.state != store::BATCH_AWAITING_SIGNATURE {
         return Err(resolved(&batch.state));
     }
@@ -1078,9 +1117,8 @@ pub async fn deletion_status(
     SdOwner(owner): SdOwner,
     SdBatchId(batch_id): SdBatchId,
 ) -> Result<Json<StatusResponse>, SdError> {
-    Ok(Json(status_response(
-        require_batch(legacy_pool(&state)?, batch_id, &owner).await?,
-    )))
+    let (_, batch) = resolve_batch_pool(&state, batch_id, &owner).await?;
+    Ok(Json(status_response(batch)))
 }
 
 fn status_response(batch: store::BatchRow) -> StatusResponse {
@@ -1111,12 +1149,66 @@ fn resolved(state: &str) -> SdError {
     )
 }
 
-fn legacy_pool(state: &AppState) -> Result<&sqlx::PgPool, SdError> {
-    state
-        .legacy_db
-        .as_deref()
-        .map(|db| db.pool())
-        .ok_or_else(|| SdError::new(SdCode::FeatureDisabled, "Feature disabled"))
+async fn scope_pool<'a>(
+    state: &'a AppState,
+    scope: DeletionScope,
+    owner: &str,
+) -> Result<Option<&'a sqlx::PgPool>, SdError> {
+    if !crate::types::security_delete_routes_enabled(&state.config) {
+        return Err(SdError::new(SdCode::FeatureDisabled, "Feature disabled"));
+    }
+    match scope {
+        DeletionScope::Legacy => Ok(state.legacy_db.as_deref().map(|db| db.pool())),
+        DeletionScope::Current => {
+            let pool = state.db.pool();
+            store::sync_owner_post_migration_blobs(pool, owner)
+                .await
+                .map_err(SdError::internal)?;
+            Ok(Some(pool))
+        }
+    }
+}
+
+fn candidate_batch_pools(state: &AppState) -> Result<Vec<&sqlx::PgPool>, SdError> {
+    if !crate::types::security_delete_routes_enabled(&state.config) {
+        return Err(SdError::new(SdCode::FeatureDisabled, "Feature disabled"));
+    }
+    let mut pools = Vec::with_capacity(2);
+    if let Some(legacy_db) = state.legacy_db.as_deref() {
+        pools.push(legacy_db.pool());
+    }
+    if state.config.legacy_db_url.as_deref() != Some(state.config.database_url.as_str()) {
+        pools.push(state.db.pool());
+    }
+    Ok(pools)
+}
+
+async fn find_batch_in_pools<'a>(
+    pools: &[&'a sqlx::PgPool],
+    batch_id: Uuid,
+    owner: &str,
+) -> Result<(&'a sqlx::PgPool, store::BatchRow), SdError> {
+    for &pool in pools {
+        if let Some(batch) = store::get_batch(pool, batch_id, owner)
+            .await
+            .map_err(SdError::internal)?
+        {
+            return Ok((pool, batch));
+        }
+    }
+    Err(SdError::new(
+        SdCode::BatchNotFound,
+        "Deletion batch not found",
+    ))
+}
+
+async fn resolve_batch_pool<'a>(
+    state: &'a AppState,
+    batch_id: Uuid,
+    owner: &str,
+) -> Result<(&'a sqlx::PgPool, store::BatchRow), SdError> {
+    let pools = candidate_batch_pools(state)?;
+    find_batch_in_pools(&pools, batch_id, owner).await
 }
 
 fn security_delete_sui(state: &AppState) -> Result<&dyn SuiApi, SdError> {
@@ -1822,5 +1914,268 @@ mod tests {
             .execute(&admin)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn deletion_scope_parses_legacy_default_current_and_rejects_unknown() {
+        assert_eq!(DeletionScope::parse(None).unwrap(), DeletionScope::Legacy);
+        assert_eq!(
+            DeletionScope::parse(Some("legacy")).unwrap(),
+            DeletionScope::Legacy
+        );
+        assert_eq!(
+            DeletionScope::parse(Some("current")).unwrap(),
+            DeletionScope::Current
+        );
+        assert_eq!(
+            DeletionScope::parse(Some("all")).unwrap_err().code,
+            SdCode::InvalidRequest
+        );
+        assert_eq!(
+            DeletionScope::parse(Some("")).unwrap_err().code,
+            SdCode::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn post_migration_scope_isolates_pools_syncs_object_ids_and_clears_idempotency() {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::str::FromStr;
+
+        let Some(url) = std::env::var("TEST_LEGACY_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+        let Ok(admin) = sqlx::PgPool::connect(&url).await else {
+            return;
+        };
+        let legacy_schema = format!("sd_legacy_{}", Uuid::new_v4().simple());
+        let primary_schema = format!("sd_primary_{}", Uuid::new_v4().simple());
+        for schema in [&legacy_schema, &primary_schema] {
+            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+                .execute(&admin)
+                .await
+                .unwrap();
+        }
+
+        let legacy_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                PgConnectOptions::from_str(&url)
+                    .unwrap()
+                    .options([("search_path", legacy_schema.as_str())]),
+            )
+            .await
+            .unwrap();
+        let primary_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                PgConnectOptions::from_str(&url)
+                    .unwrap()
+                    .options([("search_path", primary_schema.as_str())]),
+            )
+            .await
+            .unwrap();
+
+        for pool in [&legacy_pool, &primary_pool] {
+            sqlx::raw_sql(
+                "CREATE TABLE vector_entries (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT 'default',
+                    blob_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE TABLE memory_tombstones (
+                    memory_id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    blob_id TEXT NOT NULL,
+                    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            store::ensure_post_migration_schema(pool).await.unwrap();
+        }
+        // Calling ensure_post_migration_schema a second time must be idempotent.
+        store::ensure_post_migration_schema(&primary_pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TABLE remember_jobs (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                namespace TEXT NOT NULL DEFAULT 'default',
+                status TEXT NOT NULL DEFAULT 'done',
+                blob_id TEXT,
+                blob_object_id TEXT,
+                idempotency_key TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+        )
+        .execute(&primary_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO delete_blobs_tracking (owner, blob_id, object_id, created_at)
+             VALUES ($1, 'legacy-blob', '0x11', NOW())",
+        )
+        .bind(OWNER)
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id)
+             VALUES ('mem-post-1', $1, 'agent', 'post-blob-1')",
+        )
+        .bind(OWNER)
+        .execute(&primary_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, idempotency_key)
+             VALUES ('job-post-1', $1, 'agent', 'done', 'post-blob-1', '0xABC', 'idem-post-1')",
+        )
+        .bind(OWNER)
+        .execute(&primary_pool)
+        .await
+        .unwrap();
+
+        store::sync_owner_post_migration_blobs(&primary_pool, OWNER)
+            .await
+            .unwrap();
+
+        let primary_rows =
+            store::list_blobs(&primary_pool, OWNER, &[store::BLOB_DELETABLE], None, 10)
+                .await
+                .unwrap();
+        assert_eq!(primary_rows.len(), 1);
+        assert_eq!(primary_rows[0].blob_id, "post-blob-1");
+        assert_eq!(
+            primary_rows[0].object_id.as_deref(),
+            Some("0x0000000000000000000000000000000000000000000000000000000000000abc")
+        );
+
+        let legacy_rows =
+            store::list_blobs(&legacy_pool, OWNER, &[store::BLOB_DELETABLE], None, 10)
+                .await
+                .unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert_eq!(legacy_rows[0].blob_id, "legacy-blob");
+
+        let legacy_batch_id = Uuid::new_v4();
+        let current_batch_id = Uuid::new_v4();
+        store::create_batch_and_claim_selection(
+            &legacy_pool,
+            OWNER,
+            legacy_batch_id,
+            &["legacy-blob".into()],
+            16,
+        )
+        .await
+        .unwrap();
+        store::create_batch_and_claim_selection(
+            &primary_pool,
+            OWNER,
+            current_batch_id,
+            &["post-blob-1".into()],
+            16,
+        )
+        .await
+        .unwrap();
+
+        let pools = [&legacy_pool, &primary_pool];
+        let (_, found_legacy) = find_batch_in_pools(&pools, legacy_batch_id, OWNER)
+            .await
+            .unwrap();
+        assert_eq!(found_legacy.id, legacy_batch_id);
+        let (_, found_current) = find_batch_in_pools(&pools, current_batch_id, OWNER)
+            .await
+            .unwrap();
+        assert_eq!(found_current.id, current_batch_id);
+        assert_eq!(
+            find_batch_in_pools(&pools, Uuid::new_v4(), OWNER)
+                .await
+                .unwrap_err()
+                .code,
+            SdCode::BatchNotFound
+        );
+
+        store::set_batch_prepared(
+            &primary_pool,
+            current_batch_id,
+            "digest-post-1",
+            &[1, 2, 3],
+            &bcs::to_bytes(&vec!["post-blob-1".to_string()]).unwrap(),
+            1,
+            7,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store::begin_batch_execution(&primary_pool, current_batch_id, &[vec![1], vec![2]])
+                .await
+                .unwrap()
+        );
+        let deleted = store::finalize_batch_deleted(
+            &primary_pool,
+            current_batch_id,
+            store::BATCH_EXECUTING,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, Some(1));
+
+        let remaining_vectors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vector_entries WHERE owner = $1")
+                .bind(OWNER)
+                .fetch_one(&primary_pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_vectors, 0);
+
+        let tombstone_ns: Option<String> = sqlx::query_scalar(
+            "SELECT namespace FROM memory_tombstones WHERE memory_id = 'mem-post-1'",
+        )
+        .fetch_optional(&primary_pool)
+        .await
+        .unwrap();
+        assert_eq!(tombstone_ns.as_deref(), Some("agent"));
+
+        let idempotency_after: Option<String> = sqlx::query_scalar(
+            "SELECT idempotency_key FROM remember_jobs WHERE id = 'job-post-1'",
+        )
+        .fetch_one(&primary_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            idempotency_after, None,
+            "finalizing post-migration deletion must release remember_jobs.idempotency_key"
+        );
+
+        // Re-syncing after deletion must preserve the terminal `deleted` state.
+        store::sync_owner_post_migration_blobs(&primary_pool, OWNER)
+            .await
+            .unwrap();
+        let counts = store::counts(&primary_pool, OWNER).await.unwrap();
+        assert_eq!(counts.deletable, 0);
+        assert_eq!(counts.deleted, 1);
+
+        drop(legacy_pool);
+        drop(primary_pool);
+        for schema in [&legacy_schema, &primary_schema] {
+            sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .execute(&admin)
+                .await
+                .unwrap();
+        }
     }
 }

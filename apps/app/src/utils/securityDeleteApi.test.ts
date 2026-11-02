@@ -13,10 +13,17 @@ describe('securityDeleteApi', () => {
     it('sends bearer and encoded list query', async () => {
         const fetchMock = vi.fn().mockReturnValue(ok({ items: [], counts, limits: { deleteBatchMax: 900 }, nextCursor: null }))
         vi.stubGlobal('fetch', fetchMock)
-        await listBlobs('tok', { state: 'deletable', cursor: 'a+b/c=', limit: 50 })
+        await listBlobs('tok', { state: 'deletable', cursor: 'a+b/c=', limit: 50, scope: 'current' })
         const [url, init] = fetchMock.mock.calls[0]
-        expect(String(url)).toContain('state=deletable&cursor=a%2Bb%2Fc%3D&limit=50')
+        expect(String(url)).toContain('state=deletable&cursor=a%2Bb%2Fc%3D&limit=50&scope=current')
         expect(new Headers(init.headers).get('Authorization')).toBe('Bearer tok')
+    })
+
+    it('forwards scope in prepareDeletion when specified', async () => {
+        const fetchMock = vi.fn().mockReturnValue(ok({ batchId: null, txBytes: null, included: 0, excluded: [], expiresAt: null }))
+        vi.stubGlobal('fetch', fetchMock)
+        await prepareDeletion('tok', { mode: 'selection', blobIds: ['blob-1'], scope: 'current' })
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mode: 'selection', blobIds: ['blob-1'], scope: 'current' })
     })
 
     it('propagates the opaque challengeId exactly', async () => {

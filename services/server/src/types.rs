@@ -1341,9 +1341,6 @@ pub fn validate_security_delete_config(config: &Config) -> Result<(), String> {
     }
 
     let mut missing = Vec::new();
-    if config.legacy_db_url.is_none() {
-        missing.push("LEGACY_DB_URL");
-    }
     if config.sui_grpc_url.is_none() {
         missing.push("SUI_GRPC_URL");
     }
@@ -3399,6 +3396,18 @@ mod tests {
         let mut config = security_delete_test_config();
         config.deletion_object_resolver_enabled = true;
         config.legacy_db_url = Some("postgres://legacy".into());
+        assert!(validate_security_delete_config(&config).is_ok());
+    }
+
+    #[test]
+    fn security_delete_boot_guard_allows_post_migration_without_legacy_db() {
+        let mut config = security_delete_test_config();
+        config.enable_memory_deletion = true;
+        config.enable_security_delete = true;
+        config.legacy_db_url = None;
+        config.deletion_token_secret = Some("secret".into());
+        config.sponsor_private_key =
+            Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32]));
         assert!(validate_security_delete_config(&config).is_ok());
     }
 

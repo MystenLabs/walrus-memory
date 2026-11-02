@@ -1707,7 +1707,12 @@ asyncio.run(main())`
 
                 {config.enableMemoryDeletion && (
                     config.securityDeleteEnabled
-                        && <SecurityDeleteSection accountObjectId={securityDeleteAccountObjectId} />
+                        && (
+                            <SecurityDeleteSection
+                                accountObjectId={securityDeleteAccountObjectId}
+                                currentAccountObjectId={effectiveAccountObjectId}
+                            />
+                        )
                 )}
 
                 {removeKeysConfirm && (

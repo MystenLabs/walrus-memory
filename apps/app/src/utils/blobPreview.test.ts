@@ -2,21 +2,36 @@ import { beforeEach, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
     create: vi.fn(), readBlob: vi.fn(), decrypt: vi.fn(), build: vi.fn(),
-    computeBlobMetadata: vi.fn(),
+    computeBlobMetadata: vi.fn(), moveCall: vi.fn(), sealClientOptions: vi.fn(),
+    parseEncryptedObject: vi.fn<() => { id: string; services?: [string, number][] }>(() => ({ id: '00'.repeat(32) })),
 }))
-const config = vi.hoisted(() => ({ suiNetwork: 'testnet' as const, memwalPackageId: '0x1', legacyMemwalPackageId: '0x1', sealKeyServers: [] as string[], legacySealKeyServers: [] as string[], walrusAggregatorUrl: '' }))
+const config = vi.hoisted(() => ({
+    suiNetwork: 'testnet' as const,
+    memwalPackageId: '0x1',
+    memwalSealPolicyPackageId: '0x1',
+    memwalRegistryId: '0xreg',
+    legacyMemwalPackageId: '0x1',
+    sealServerConfigs: [] as { objectId: string; weight: number; aggregatorUrl?: string }[],
+    legacySealServerConfigs: [] as { objectId: string; weight: number; aggregatorUrl?: string }[],
+    sealKeyServers: [] as string[],
+    legacySealKeyServers: [] as string[],
+    walrusAggregatorUrl: '',
+}))
 vi.mock('../config', () => ({ config }))
 vi.mock('./walrusBlobs', () => ({ getWalrusClient: () => ({ readBlob: mocks.readBlob, computeBlobMetadata: mocks.computeBlobMetadata }) }))
 vi.mock('@mysten/sui/transactions', () => ({ Transaction: class {
-    pure = vi.fn(() => 'pure')
-    object = vi.fn(() => 'object')
-    moveCall = vi.fn()
+    pure = vi.fn((_type: string, value: unknown) => ({ kind: 'pure', value }))
+    object = vi.fn((id: string) => ({ kind: 'object', id }))
+    moveCall = mocks.moveCall
     build = mocks.build
 } }))
 vi.mock('@mysten/seal', () => ({
-    EncryptedObject: { parse: () => ({ id: '00'.repeat(32) }) },
+    EncryptedObject: { parse: mocks.parseEncryptedObject },
     SessionKey: { create: mocks.create },
-    SealClient: class { decrypt = mocks.decrypt },
+    SealClient: class {
+        constructor(options: unknown) { mocks.sealClientOptions(options) }
+        decrypt = mocks.decrypt
+    },
 }))
 
 import { clearSealSession, fetchAndDecryptBlob } from './blobPreview'
@@ -28,6 +43,7 @@ const newSession = () => ({
 beforeEach(() => {
     clearSealSession(); vi.clearAllMocks()
     config.walrusAggregatorUrl = ''
+    mocks.parseEncryptedObject.mockReturnValue({ id: '00'.repeat(32) })
     mocks.create.mockImplementation(async ({ signer }: { signer: { signPersonalMessage: (message: Uint8Array) => Promise<unknown> } }) => {
         await signer.signPersonalMessage(new TextEncoder().encode('seal message'))
         return newSession()
@@ -138,4 +154,66 @@ it('binds the Seal session to the LEGACY package id at cutover', async () => {
     } finally {
         config.legacyMemwalPackageId = '0x1'
     }
+})
+
+it('binds post-migration preview sessions to memwalPackageId without colliding with legacy cache', async () => {
+    config.legacyMemwalPackageId = '0xold'
+    config.memwalPackageId = '0xcurrent'
+    config.memwalSealPolicyPackageId = '0xcurrent'
+    try {
+        const sign = vi.fn(async () => ({ signature: 'sig' }))
+        const base = {
+            suiClient: {} as never,
+            address: '0x1',
+            accountObjectId: '0x2',
+            blobId: 'a',
+            signPersonalMessage: sign,
+        }
+        await fetchAndDecryptBlob({ ...base, scope: 'legacy' })
+        await fetchAndDecryptBlob({ ...base, scope: 'current' })
+        expect(mocks.create).toHaveBeenNthCalledWith(1, expect.objectContaining({ packageId: '0xold' }))
+        expect(mocks.create).toHaveBeenNthCalledWith(2, expect.objectContaining({ packageId: '0xcurrent' }))
+        expect(mocks.moveCall).toHaveBeenNthCalledWith(1, {
+            target: '0xold::account::seal_approve',
+            arguments: [
+                expect.objectContaining({ kind: 'pure' }),
+                { kind: 'object', id: '0x2' },
+            ],
+        })
+        expect(mocks.moveCall).toHaveBeenNthCalledWith(2, {
+            target: '0xcurrent::account::seal_approve',
+            arguments: [
+                expect.objectContaining({ kind: 'pure' }),
+                { kind: 'object', id: '0xreg' },
+                { kind: 'object', id: '0x2' },
+            ],
+        })
+        expect(sign).toHaveBeenCalledTimes(2)
+    } finally {
+        config.legacyMemwalPackageId = '0x1'
+        config.memwalPackageId = '0x1'
+        config.memwalSealPolicyPackageId = '0x1'
+    }
+})
+
+it('selects the Mysten testnet committee aggregator when the ciphertext header references it', async () => {
+    mocks.parseEncryptedObject.mockReturnValue({
+        id: '00'.repeat(32),
+        services: [['0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98', 1]],
+    })
+    await fetchAndDecryptBlob({
+        suiClient: {} as never,
+        address: '0x1',
+        accountObjectId: '0x2',
+        blobId: 'a',
+        scope: 'current',
+        signPersonalMessage: vi.fn(async () => ({ signature: 'sig' })),
+    })
+    expect(mocks.sealClientOptions).toHaveBeenCalledWith(expect.objectContaining({
+        serverConfigs: [{
+            objectId: '0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98',
+            weight: 1,
+            aggregatorUrl: 'https://seal-aggregator-testnet.mystenlabs.com',
+        }],
+    }))
 })

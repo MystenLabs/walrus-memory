@@ -3,6 +3,7 @@ import { config } from '../config'
 export type SdAction = 'REAUTH' | 'REFETCH' | 'RE_PREPARE' | 'RETRY_AFTER' | 'NONE'
 export type BlobState = 'deletable' | 'deleting' | 'deleted' | 'deleted_external' | 'not_owner' | 'expired'
 export type BatchState = 'awaiting_signature' | 'executing' | 'completed' | 'failed' | 'rolled_back'
+export type DeletionScope = 'legacy' | 'current'
 
 export class SdApiError extends Error {
     code: string
@@ -122,11 +123,12 @@ export async function verifyChallenge(challengeId: string, address: string, sign
     return v as unknown as { token: string; expiresInSecs: number }
 }
 
-export async function listBlobs(token: string, opts: { state?: string; cursor?: string; limit?: number }): Promise<ListResponse> {
+export async function listBlobs(token: string, opts: { state?: string; cursor?: string; limit?: number; scope?: DeletionScope }): Promise<ListResponse> {
     const query = new URLSearchParams()
     if (opts.state) query.set('state', opts.state)
     if (opts.cursor) query.set('cursor', opts.cursor)
     if (opts.limit !== undefined) query.set('limit', String(opts.limit))
+    if (opts.scope) query.set('scope', opts.scope)
     const v = await sdFetch(`/api/security-deletable-blobs${query.size ? `?${query}` : ''}`, {}, token)
     if (!isRecord(v) || !Array.isArray(v.items) || v.items.length > 200 || !isRecord(v.counts) || !isRecord(v.limits) || !isPositiveInt(v.limits.deleteBatchMax) || v.limits.deleteBatchMax > 900 || !isNullableString(v.nextCursor)) malformed()
     const counts = v.counts
@@ -138,7 +140,10 @@ export async function listBlobs(token: string, opts: { state?: string; cursor?: 
     return v as unknown as ListResponse
 }
 
-export async function prepareDeletion(token: string, body: { mode: 'all' } | { mode: 'selection'; blobIds: string[] }): Promise<PrepareResponse> {
+export async function prepareDeletion(
+    token: string,
+    body: ({ mode: 'all' } | { mode: 'selection'; blobIds: string[] }) & { scope?: DeletionScope },
+): Promise<PrepareResponse> {
     const v = await sdFetch('/api/security-deletions', { method: 'POST', body: JSON.stringify(body) }, token)
     if (!isRecord(v) || !isNullableString(v.batchId) || !isNullableString(v.txBytes) || !isNonnegativeInt(v.included) || !Array.isArray(v.excluded) || !isNullableString(v.expiresAt)) malformed()
     if ((v.batchId === null) !== (v.txBytes === null)) malformed()

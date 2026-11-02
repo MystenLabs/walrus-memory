@@ -190,6 +190,182 @@ fn valid_batch_state(state: &str) -> bool {
     )
 }
 
+const POST_MIGRATION_DELETION_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS deletion_batches (
+    id UUID PRIMARY KEY,
+    owner TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN
+        ('awaiting_signature','executing','completed','failed','rolled_back')),
+    digest TEXT,
+    tx_bytes BYTEA,
+    input_blob_ids BYTEA,
+    blob_count INT NOT NULL DEFAULT 0,
+    nonce BIGINT NOT NULL DEFAULT 0 CHECK (nonce BETWEEN 0 AND 4294967295),
+    expire_epoch BIGINT NOT NULL DEFAULT 0,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    signatures BYTEA,
+    executing_at TIMESTAMPTZ,
+    last_submit_at TIMESTAMPTZ,
+    submit_attempts INT NOT NULL DEFAULT 0,
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_active_batches_owner ON deletion_batches (owner)
+    WHERE state IN ('awaiting_signature', 'executing');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deletion_nonce_epoch ON deletion_batches (expire_epoch, nonce)
+    WHERE tx_bytes IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_deletion_batches_retry
+    ON deletion_batches ((COALESCE(last_submit_at, executing_at, claimed_at)), id)
+    WHERE state = 'executing';
+
+CREATE SEQUENCE IF NOT EXISTS delete_blobs_tracking_resolver_seq AS BIGINT;
+
+CREATE TABLE IF NOT EXISTS delete_blobs_tracking (
+    owner TEXT NOT NULL,
+    blob_id TEXT NOT NULL,
+    object_id TEXT,
+    state TEXT NOT NULL DEFAULT 'deletable' CHECK (state IN
+        ('deletable','deleting','deleted','deleted_external','not_owner','expired')),
+    batch_id UUID REFERENCES deletion_batches(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    tracked_seq BIGINT NOT NULL DEFAULT nextval('delete_blobs_tracking_resolver_seq')
+        CHECK (tracked_seq > 0),
+    tracked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (owner, blob_id)
+);
+ALTER TABLE delete_blobs_tracking
+    ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES deletion_batches(id);
+ALTER TABLE delete_blobs_tracking
+    ADD COLUMN IF NOT EXISTS tracked_seq BIGINT NOT NULL DEFAULT nextval('delete_blobs_tracking_resolver_seq');
+ALTER TABLE delete_blobs_tracking
+    ADD COLUMN IF NOT EXISTS tracked_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_tracking_owner_state_created
+    ON delete_blobs_tracking (owner, state, created_at, blob_id);
+CREATE INDEX IF NOT EXISTS idx_tracking_batch ON delete_blobs_tracking (batch_id)
+    WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tracking_resolver_pending
+    ON delete_blobs_tracking (owner, tracked_seq)
+    WHERE state = 'deletable' AND object_id IS NULL;
+
+ALTER SEQUENCE delete_blobs_tracking_resolver_seq
+    OWNED BY delete_blobs_tracking.tracked_seq;
+
+CREATE TABLE IF NOT EXISTS deletion_job_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS deletion_batch_members (
+    batch_id UUID NOT NULL REFERENCES deletion_batches(id),
+    owner TEXT NOT NULL,
+    blob_id TEXT NOT NULL,
+    object_id TEXT,
+    outcome TEXT NOT NULL DEFAULT 'claimed' CHECK (outcome IN
+        ('claimed','deleted','deleted_external','not_owner','expired','released')),
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    PRIMARY KEY (batch_id, owner, blob_id),
+    FOREIGN KEY (owner, blob_id) REFERENCES delete_blobs_tracking (owner, blob_id),
+    CONSTRAINT deletion_batch_members_resolution_check
+        CHECK ((outcome = 'claimed') = (resolved_at IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_members_owner_blob ON deletion_batch_members (owner, blob_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_members_one_active_claim
+    ON deletion_batch_members (owner, blob_id) WHERE outcome = 'claimed';
+CREATE INDEX IF NOT EXISTS idx_members_outcome_audit
+    ON deletion_batch_members (outcome, owner, blob_id);
+";
+
+/// Ensures the primary database holds the security-delete tracking and batch
+/// tables used by `scope=current` post-migration memory deletion.
+///
+/// Called after `LegacyDb::new()` so single-database deployments (`LEGACY_DB_URL == DATABASE_URL`)
+/// apply sqlx's `migrations_legacy` first without any `already exists` conflict, while two-database
+/// deployments (`LEGACY_DB_URL != DATABASE_URL`) and post-migration-only deployments get the full
+/// idempotent schema on the primary database with zero boot-time table scans.
+pub async fn ensure_post_migration_schema(pool: &PgPool) -> Result<(), AppError> {
+    sqlx::raw_sql(POST_MIGRATION_DELETION_SCHEMA_SQL)
+        .execute(pool)
+        .await
+        .map_err(|error| storage("ensure post-migration deletion schema", error))?;
+    Ok(())
+}
+
+/// Enrolls post-migration `vector_entries` rows for `owner` into `delete_blobs_tracking`
+/// on demand, copying known `blob_object_id` values from `remember_jobs` when available.
+///
+/// Existing tracking rows retain their current `state` (`deleting`, `deleted`, `deleted_external`,
+/// `not_owner`, `expired`); only missing `object_id` values are backfilled.
+pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Result<u64, AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| storage("begin post-migration blob sync", error))?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(
+            $1,
+            hashtext(current_schema() || ':' || $2::text)
+        )",
+    )
+    .bind(RESOLVER_OWNER_LOCK_NAMESPACE)
+    .bind(owner)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| storage("lock owner for post-migration blob sync", error))?;
+
+    let has_remember_jobs: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'remember_jobs'
+              AND column_name = 'blob_object_id'
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| storage("probe remember_jobs blob_object_id", error))?;
+
+    let sql = if has_remember_jobs {
+        "INSERT INTO delete_blobs_tracking (owner, blob_id, object_id, created_at)
+         SELECT
+             $1,
+             v.blob_id,
+             MAX(
+                 CASE
+                     WHEN j.blob_object_id ~ '^0x[0-9a-fA-F]{1,64}$'
+                     THEN '0x' || lpad(lower(substr(j.blob_object_id, 3)), 64, '0')
+                 END
+             ),
+             MIN(v.created_at)
+         FROM vector_entries v
+         LEFT JOIN remember_jobs j
+           ON j.owner = v.owner AND j.blob_id = v.blob_id
+         WHERE v.owner = $1
+         GROUP BY v.blob_id
+         ON CONFLICT (owner, blob_id) DO UPDATE
+         SET object_id = COALESCE(delete_blobs_tracking.object_id, EXCLUDED.object_id),
+             updated_at = CASE
+                 WHEN delete_blobs_tracking.object_id IS NULL AND EXCLUDED.object_id IS NOT NULL
+                 THEN NOW()
+                 ELSE delete_blobs_tracking.updated_at
+             END"
+    } else {
+        "INSERT INTO delete_blobs_tracking (owner, blob_id, created_at)
+         SELECT $1, v.blob_id, MIN(v.created_at)
+         FROM vector_entries v
+         WHERE v.owner = $1
+         GROUP BY v.blob_id
+         ON CONFLICT (owner, blob_id) DO NOTHING"
+    };
+
+    let result = sqlx::query(sql)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("sync post-migration blobs", error))?;
+    tx.commit()
+        .await
+        .map_err(|error| storage("commit post-migration blob sync", error))?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_blobs(
     pool: &PgPool,
     owner: &str,
@@ -695,28 +871,85 @@ pub async fn finalize_batch_deleted(
     // namespace. Tracking has no namespace column — PK is (owner, blob_id) —
     // and a shared blob_id across namespaces is unreadable after the blob is
     // gone, so every matching row is purged.
-    sqlx::query(
-        "WITH tracked AS (
-            SELECT v.id, v.owner, v.namespace, v.blob_id
-            FROM delete_blobs_tracking t
-            INNER JOIN vector_entries v
-              ON v.owner = t.owner AND v.blob_id = t.blob_id
-            WHERE t.batch_id=$1 AND t.state='deleting'
-         ),
-         removed AS (
-            DELETE FROM vector_entries v
-            USING tracked t
-            WHERE v.id = t.id
-            RETURNING v.id, v.owner, v.namespace, v.blob_id
-         )
-         INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-         SELECT id, owner, namespace, blob_id FROM removed
-         ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+    let has_tombstones_and_namespace: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'vector_entries'
+              AND column_name = 'namespace'
+        ) AND EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = 'memory_tombstones'
+        )",
     )
-    .bind(batch_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|error| storage("tombstone security-delete rows", error))?;
+    .map_err(|error| storage("probe memory_tombstones schema", error))?;
+    if has_tombstones_and_namespace {
+        sqlx::query(
+            "WITH tracked AS (
+                SELECT v.id, v.owner, v.namespace, v.blob_id
+                FROM delete_blobs_tracking t
+                INNER JOIN vector_entries v
+                  ON v.owner = t.owner AND v.blob_id = t.blob_id
+                WHERE t.batch_id=$1 AND t.state='deleting'
+             ),
+             removed AS (
+                DELETE FROM vector_entries v
+                USING tracked t
+                WHERE v.id = t.id
+                RETURNING v.id, v.owner, v.namespace, v.blob_id
+             )
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+             SELECT id, owner, namespace, blob_id FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("tombstone security-delete rows", error))?;
+    } else {
+        sqlx::query(
+            "DELETE FROM vector_entries v
+             USING delete_blobs_tracking t
+             WHERE t.batch_id = $1
+               AND t.state = 'deleting'
+               AND v.owner = t.owner
+               AND v.blob_id = t.blob_id",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("delete legacy vector rows", error))?;
+    }
+    let has_remember_idempotency: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'remember_jobs'
+              AND column_name = 'idempotency_key'
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| storage("probe remember_jobs idempotency_key", error))?;
+    if has_remember_idempotency {
+        sqlx::query(
+            "UPDATE remember_jobs j
+             SET idempotency_key = NULL, updated_at = NOW()
+             FROM delete_blobs_tracking t
+             WHERE t.batch_id = $1
+               AND t.state = 'deleting'
+               AND j.owner = t.owner
+               AND j.blob_id = t.blob_id
+               AND j.idempotency_key IS NOT NULL",
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("clear deleted blob idempotency keys", error))?;
+    }
     let rows = sqlx::query(
         "UPDATE delete_blobs_tracking SET state='deleted', batch_id=NULL, updated_at=NOW()
          WHERE batch_id=$1 AND state='deleting'",

@@ -617,6 +617,17 @@ fn sui_error(error: SuiErr) -> AppError {
     AppError::UpstreamUnavailable(format!("security-delete Sui RPC: {error}"))
 }
 
+fn background_deletion_pools(state: &AppState) -> Vec<(&'static str, &PgPool)> {
+    let mut pools = Vec::with_capacity(2);
+    if let Some(legacy_db) = state.legacy_db.as_deref() {
+        pools.push(("legacy", legacy_db.pool()));
+    }
+    if state.config.legacy_db_url.as_deref() != Some(state.config.database_url.as_str()) {
+        pools.push(("current", state.db.pool()));
+    }
+    pools
+}
+
 pub fn spawn_reconciler(state: Arc<AppState>) {
     if !state.config.deletion_reconciler_enabled {
         return;
@@ -628,11 +639,15 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
             if !state.config.deletion_reconciler_enabled {
                 continue;
             }
-            let (Some(db), Some(sui)) = (&state.legacy_db, &state.security_delete_background_sui)
-            else {
+            let Some(sui) = &state.security_delete_background_sui else {
                 tracing::error!("security-delete reconciler dependencies unavailable");
                 continue;
             };
+            let pools = background_deletion_pools(&state);
+            if pools.is_empty() {
+                tracing::error!("security-delete reconciler has no configured database pools");
+                continue;
+            }
             let sponsor_address = state.config.sponsor_private_key.as_deref().and_then(|key| {
                 crate::sui::tx_build::sponsor_address(key)
                     .map_err(|error| tracing::error!(%error, "invalid security-delete sponsor key"))
@@ -646,16 +661,22 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                 sponsor_address,
                 sponsor_min_balance: state.config.sponsor_min_balance_alert,
             };
-            match run_reconciler_tick(
-                db.pool(),
-                sui.as_ref(),
-                state.security_delete_execution_gate.as_ref(),
-                &cfg,
-            )
-            .await
-            {
-                Ok(report) => tracing::info!(?report, "security-delete reconciler tick completed"),
-                Err(error) => tracing::error!(%error, "security-delete reconciler tick failed"),
+            for (scope, pool) in pools {
+                match run_reconciler_tick(
+                    pool,
+                    sui.as_ref(),
+                    state.security_delete_execution_gate.as_ref(),
+                    &cfg,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        tracing::info!(scope, ?report, "security-delete reconciler tick completed")
+                    }
+                    Err(error) => {
+                        tracing::error!(scope, %error, "security-delete reconciler tick failed")
+                    }
+                }
             }
         }
     });
@@ -672,14 +693,24 @@ pub fn spawn_object_resolver(state: Arc<AppState>) {
             if !state.config.deletion_object_resolver_enabled {
                 continue;
             }
-            let (Some(db), Some(sui)) = (&state.legacy_db, &state.security_delete_background_sui)
-            else {
+            let Some(sui) = &state.security_delete_background_sui else {
                 tracing::error!("security-delete resolver dependencies unavailable");
                 continue;
             };
-            match run_resolver_tick(db.pool(), sui.as_ref(), 25).await {
-                Ok(report) => tracing::info!(?report, "security-delete resolver tick completed"),
-                Err(error) => tracing::error!(%error, "security-delete resolver tick failed"),
+            let pools = background_deletion_pools(&state);
+            if pools.is_empty() {
+                tracing::error!("security-delete resolver has no configured database pools");
+                continue;
+            }
+            for (scope, pool) in pools {
+                match run_resolver_tick(pool, sui.as_ref(), 25).await {
+                    Ok(report) => {
+                        tracing::info!(scope, ?report, "security-delete resolver tick completed")
+                    }
+                    Err(error) => {
+                        tracing::error!(scope, %error, "security-delete resolver tick failed")
+                    }
+                }
             }
         }
     });
