@@ -379,7 +379,7 @@ pub fn parse_granted_oauth_scopes(oauth_scope: &str) -> (bool, bool) {
 pub fn is_mcp_tool_permitted(tool_name: &str, oauth_scope: &str) -> bool {
     let (can_read, can_write) = parse_granted_oauth_scopes(oauth_scope);
     match tool_name {
-        "memwal_health" | "memwal_recall" => can_read,
+        "memwal_health" | "memwal_recall" | "memwal_namespaces" => can_read,
         "memwal_remember"
         | "memwal_remember_status"
         | "memwal_remember_bulk"
@@ -394,6 +394,7 @@ fn is_known_mcp_tool(tool_name: &str) -> bool {
         tool_name,
         "memwal_health"
             | "memwal_recall"
+            | "memwal_namespaces"
             | "memwal_remember"
             | "memwal_remember_status"
             | "memwal_remember_bulk"
@@ -598,6 +599,395 @@ async fn call_local_relayer(
     Ok((status, parsed))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceEntry {
+    pub name: String,
+    pub memory_count: u64,
+    pub storage_used: Option<u64>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespacesPage {
+    pub namespaces: Vec<NamespaceEntry>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNamespaces {
+    pub namespaces: Vec<NamespaceEntry>,
+    pub has_more: bool,
+}
+
+/// Standard Levenshtein edit distance between two strings (case-folded and character-aware).
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let s: Vec<char> = a.to_lowercase().chars().collect();
+    let t: Vec<char> = b.to_lowercase().chars().collect();
+    if s == t {
+        return 0;
+    }
+    if s.is_empty() {
+        return t.len();
+    }
+    if t.is_empty() {
+        return s.len();
+    }
+
+    let mut prev: Vec<usize> = (0..=t.len()).collect();
+    let mut curr = vec![0; t.len() + 1];
+
+    for i in 1..=s.len() {
+        curr[0] = i;
+        for j in 1..=t.len() {
+            let cost = if s[i - 1] == t[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        prev.clone_from_slice(&curr);
+    }
+    prev[t.len()]
+}
+
+/// Check whether `candidate` is a close typo/prefix/substring match for `target`.
+pub fn is_close_namespace_match(target: &str, candidate: &str) -> bool {
+    let a = target.trim().to_lowercase();
+    let b = candidate.trim().to_lowercase();
+    if a.is_empty() || b.is_empty() || a == b {
+        return false;
+    }
+    if edit_distance(&a, &b) <= 3 {
+        return true;
+    }
+    if a.chars().count() >= 3 && b.chars().count() >= 3 && (a.contains(&b) || b.contains(&a)) {
+        return true;
+    }
+    false
+}
+
+fn format_memory_count(count: u64) -> String {
+    format!("{count} {}", if count == 1 { "memory" } else { "memories" })
+}
+
+pub fn rank_namespace_suggestions(
+    target_namespace: &str,
+    namespaces: &[NamespaceEntry],
+) -> (Vec<NamespaceEntry>, Vec<NamespaceEntry>) {
+    let non_empty = namespaces
+        .iter()
+        .filter(|ns| !ns.name.is_empty() && ns.name != target_namespace && ns.memory_count > 0);
+
+    let mut close = Vec::new();
+    let mut others = Vec::new();
+    for ns in non_empty {
+        if is_close_namespace_match(target_namespace, &ns.name) {
+            close.push(ns.clone());
+        } else {
+            others.push(ns.clone());
+        }
+    }
+
+    close.sort_by(|x, y| {
+        edit_distance(target_namespace, &x.name)
+            .cmp(&edit_distance(target_namespace, &y.name))
+            .then_with(|| y.memory_count.cmp(&x.memory_count))
+    });
+    others.sort_by_key(|y| std::cmp::Reverse(y.memory_count));
+
+    (close, others)
+}
+
+pub fn format_namespace_suggestion_hint(
+    target_namespace: &str,
+    namespaces: &[NamespaceEntry],
+    max_listed: usize,
+) -> String {
+    let (close, others) = rank_namespace_suggestions(target_namespace, namespaces);
+    if close.is_empty() && others.is_empty() {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !close.is_empty() {
+        let top: Vec<&NamespaceEntry> = close.iter().take(3).collect();
+        if top.len() == 1 {
+            parts.push(format!(
+                "Did you mean namespace \"{}\" ({})?",
+                top[0].name,
+                format_memory_count(top[0].memory_count)
+            ));
+        } else {
+            let formatted = top
+                .iter()
+                .map(|ns| format!("\"{}\" ({})", ns.name, format_memory_count(ns.memory_count)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Did you mean: {formatted}?"));
+        }
+    }
+
+    let combined: Vec<&NamespaceEntry> =
+        close.iter().chain(others.iter()).take(max_listed).collect();
+    let list_str = combined
+        .iter()
+        .map(|ns| format!("\"{}\" ({})", ns.name, ns.memory_count))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more_count = (close.len() + others.len()).saturating_sub(combined.len());
+    let more_suffix = if more_count > 0 {
+        format!(", +{more_count} more")
+    } else {
+        String::new()
+    };
+    parts.push(format!("Existing namespaces: {list_str}{more_suffix}."));
+
+    parts.join(" ")
+}
+
+pub fn format_namespaces_result(page: &NamespacesPage) -> String {
+    let non_empty: Vec<&NamespaceEntry> = page
+        .namespaces
+        .iter()
+        .filter(|ns| !ns.name.is_empty() && ns.memory_count > 0)
+        .collect();
+    let next_cursor = page.next_cursor.as_deref().filter(|s| !s.is_empty());
+    let has_more_pages = page.has_more || next_cursor.is_some();
+
+    if non_empty.is_empty() {
+        if has_more_pages {
+            if let Some(cursor) = next_cursor {
+                return format!(
+                    "No non-empty namespaces found on this page.\n\nMore namespaces available (next_cursor=\"{cursor}\"). Call memwal_namespaces with cursor=\"{cursor}\" to inspect the next page."
+                );
+            }
+            return "No non-empty namespaces found on this page. More namespaces exist on later pages.".to_owned();
+        }
+        return "No namespaces with stored memories found for this account.".to_owned();
+    }
+
+    let mut lines = Vec::with_capacity(non_empty.len() + 2);
+    lines.push(format!(
+        "Namespaces ({}{}):",
+        non_empty.len(),
+        if has_more_pages { "+" } else { "" }
+    ));
+    for ns in non_empty {
+        let bytes = ns
+            .storage_used
+            .map(|b| format!(", storage_used={b}B"))
+            .unwrap_or_default();
+        let updated = ns
+            .updated_at
+            .as_deref()
+            .and_then(|s| s.get(..10))
+            .map(|prefix| format!(", updated={prefix}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- \"{}\": {}{}{}",
+            ns.name,
+            format_memory_count(ns.memory_count),
+            bytes,
+            updated
+        ));
+    }
+    if has_more_pages {
+        if let Some(cursor) = next_cursor {
+            lines.push(format!(
+                "\nMore namespaces available (next_cursor=\"{cursor}\")."
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+async fn resolve_caller_owner(
+    state: &AppState,
+    delegate_key_hex: &str,
+    account_id: &str,
+    default_namespace: &str,
+) -> Result<String, String> {
+    let (status, body) = call_local_relayer(
+        state,
+        delegate_key_hex,
+        account_id,
+        Method::POST,
+        "/api/stats",
+        Some(&json!({ "namespace": default_namespace })),
+        &[],
+    )
+    .await?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "POST /api/stats failed (HTTP {}): {body}",
+            status.as_u16()
+        ));
+    }
+
+    body.get("owner")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "POST /api/stats returned no owner".to_owned())
+}
+
+fn parse_namespaces_page_json(body: &Value) -> Result<NamespacesPage, String> {
+    let raw_namespaces = body
+        .get("namespaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "namespaces array missing in response".to_owned())?;
+
+    let namespaces = raw_namespaces
+        .iter()
+        .map(|item| {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let memory_count = item
+                .get("memory_count")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                })
+                .unwrap_or(0);
+            let storage_used = item.get("storage_used").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+            });
+            let updated_at = item
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            NamespaceEntry {
+                name,
+                memory_count,
+                storage_used,
+                updated_at,
+            }
+        })
+        .collect();
+
+    let next_cursor = body
+        .get("next_cursor")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let has_more = body
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(NamespacesPage {
+        namespaces,
+        next_cursor,
+        has_more,
+    })
+}
+
+async fn fetch_namespaces_page_for_owner(
+    state: &AppState,
+    delegate_key_hex: &str,
+    account_id: &str,
+    owner: &str,
+    limit: u64,
+    cursor: Option<&str>,
+) -> Result<NamespacesPage, String> {
+    let path_and_query = match cursor {
+        Some(c) => {
+            let encoded_cursor =
+                percent_encoding::utf8_percent_encode(c, percent_encoding::NON_ALPHANUMERIC);
+            format!("/v1/owners/{owner}/namespaces?limit={limit}&updated_after={encoded_cursor}")
+        }
+        None => format!("/v1/owners/{owner}/namespaces?limit={limit}"),
+    };
+
+    let (status, body) = call_local_relayer(
+        state,
+        delegate_key_hex,
+        account_id,
+        Method::GET,
+        &path_and_query,
+        None,
+        &[],
+    )
+    .await?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "GET /v1/owners/{owner}/namespaces failed (HTTP {}): {body}",
+            status.as_u16()
+        ));
+    }
+
+    parse_namespaces_page_json(&body)
+}
+
+async fn fetch_namespaces_page(
+    state: &AppState,
+    delegate_key_hex: &str,
+    account_id: &str,
+    default_namespace: &str,
+    limit: u64,
+    cursor: Option<&str>,
+) -> Result<NamespacesPage, String> {
+    let owner =
+        resolve_caller_owner(state, delegate_key_hex, account_id, default_namespace).await?;
+    fetch_namespaces_page_for_owner(state, delegate_key_hex, account_id, &owner, limit, cursor)
+        .await
+}
+
+async fn try_list_namespaces(
+    state: &AppState,
+    delegate_key_hex: &str,
+    account_id: &str,
+    default_namespace: &str,
+    target_namespace: Option<&str>,
+    limit: u64,
+    max_pages: usize,
+) -> Option<DiscoveredNamespaces> {
+    let owner = resolve_caller_owner(state, delegate_key_hex, account_id, default_namespace)
+        .await
+        .ok()?;
+
+    let mut all: Vec<NamespaceEntry> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut has_more = false;
+
+    for _ in 0..max_pages {
+        let page = fetch_namespaces_page_for_owner(
+            state,
+            delegate_key_hex,
+            account_id,
+            &owner,
+            limit,
+            cursor.as_deref(),
+        )
+        .await
+        .ok()?;
+
+        all.extend(page.namespaces);
+        has_more = page.has_more;
+
+        if !has_more || page.next_cursor.is_none() {
+            break;
+        }
+
+        if let Some(target) = target_namespace {
+            if all.iter().any(|ns| ns.name == target) {
+                break;
+            }
+        }
+
+        cursor = page.next_cursor;
+    }
+
+    Some(DiscoveredNamespaces {
+        namespaces: all,
+        has_more,
+    })
+}
+
 const REMEMBER_RETRY_BUCKET_MS: u64 = 30 * 60 * 1000;
 
 /// Derives a 30-minute bucketed idempotency key (`r1-<64hex>`) matching
@@ -691,10 +1081,11 @@ fn format_collapsed_duplicates_note(duplicates: &[CollapsedDuplicate]) -> String
     )
 }
 
-pub(crate) fn format_recall_output(
+pub(crate) fn format_recall_output_with_namespaces(
     results: &[Value],
     max_distance: Option<f64>,
     dropped_count: u64,
+    namespace_context: Option<(&str, &DiscoveredNamespaces)>,
 ) -> String {
     let filtered: Vec<&Value> = results
         .iter()
@@ -767,6 +1158,46 @@ pub(crate) fn format_recall_output(
                 "No matching memories could be returned ({dropped_count} match(es) failed to decrypt)."
             );
         }
+        if let Some((active_namespace, discovery)) = namespace_context {
+            if let Some(active_entry) = discovery
+                .namespaces
+                .iter()
+                .find(|ns| ns.name == active_namespace)
+            {
+                if active_entry.memory_count == 0 {
+                    let hint = format_namespace_suggestion_hint(
+                        active_namespace,
+                        &discovery.namespaces,
+                        5,
+                    );
+                    let suffix = if hint.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {hint}")
+                    };
+                    return format!(
+                        "No matching memories found (namespace \"{active_namespace}\" currently holds 0 memories).{suffix}"
+                    );
+                } else {
+                    return format!(
+                        "No matching memories found in namespace \"{active_namespace}\" (0 matches among {}).",
+                        format_memory_count(active_entry.memory_count)
+                    );
+                }
+            }
+            if discovery.has_more {
+                return format!("No matching memories found in namespace \"{active_namespace}\".");
+            }
+            let hint = format_namespace_suggestion_hint(active_namespace, &discovery.namespaces, 5);
+            let suffix = if hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {hint}")
+            };
+            return format!(
+                "No matching memories found (namespace \"{active_namespace}\" currently holds 0 memories).{suffix}"
+            );
+        }
         return "No matching memories found.".to_owned();
     }
 
@@ -804,7 +1235,20 @@ pub(crate) fn format_recall_output(
     out
 }
 
-pub(crate) fn format_restore_output(body: &Value, resolved_namespace: &str) -> String {
+#[allow(dead_code)]
+pub(crate) fn format_recall_output(
+    results: &[Value],
+    max_distance: Option<f64>,
+    dropped_count: u64,
+) -> String {
+    format_recall_output_with_namespaces(results, max_distance, dropped_count, None)
+}
+
+pub(crate) fn format_restore_output_with_namespaces(
+    body: &Value,
+    resolved_namespace: &str,
+    namespaces: Option<&[NamespaceEntry]>,
+) -> String {
     let Some(total) = body.get("total").and_then(Value::as_u64) else {
         return body.to_string();
     };
@@ -826,6 +1270,21 @@ pub(crate) fn format_restore_output(body: &Value, resolved_namespace: &str) -> S
     let mut lines = vec![format!(
         "{headline} namespace={resolved_namespace} total={total} restored={restored} skipped={skipped} failed={failed} truncated={truncated}"
     )];
+
+    let is_empty = !truncated && total == 0 && restored == 0 && skipped == 0 && failed == 0;
+    if is_empty {
+        let suggestion_hint = namespaces
+            .map(|ns_list| format_namespace_suggestion_hint(resolved_namespace, ns_list, 5))
+            .unwrap_or_default();
+        let hint_suffix = if suggestion_hint.is_empty() {
+            String::new()
+        } else {
+            format!(" {suggestion_hint}")
+        };
+        lines.push(format!(
+            "Namespace \"{resolved_namespace}\" holds 0 on-chain blobs.{hint_suffix}"
+        ));
+    }
 
     if truncated {
         let cursor_hint = next_cursor
@@ -862,8 +1321,13 @@ pub(crate) fn format_restore_output(body: &Value, resolved_namespace: &str) -> S
     lines.join("\n")
 }
 
+#[allow(dead_code)]
+pub(crate) fn format_restore_output(body: &Value, resolved_namespace: &str) -> String {
+    format_restore_output_with_namespaces(body, resolved_namespace, None)
+}
+
 // ============================================================================
-// Credential Redaction & Write-Time Sanitization (WALM-642)
+// Credential Redaction & Write-Time Sanitization
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2904,6 +3368,32 @@ fn mcp_tools_list(oauth_scope: &str) -> Value {
             }
         }),
         json!({
+            "name": "memwal_namespaces",
+            "title": "List Memory Namespaces",
+            "description": "List the namespaces that hold memories in this Walrus Memory account, with each namespace's memory count and storage used (metadata only, no decryption). Call this when memwal_recall or memwal_restore reports 0 memories in a namespace, or when connecting to an unfamiliar account so you can discover existing namespaces instead of guessing.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 100,
+                        "description": "Max number of namespaces to return per page (1-500)."
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Pagination cursor (`next_cursor` from a previous call)."
+                    }
+                }
+            }
+        }),
+        json!({
             "name": "memwal_analyze",
             "description": "Extract durable facts from conversation text and save them to Walrus Memory.",
             "inputSchema": {
@@ -3354,7 +3844,26 @@ async fn execute_mcp_tool(
                         .get("dropped_count")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let rendered = format_recall_output(results, max_distance, dropped_count);
+                    let discovery = if results.is_empty() && dropped_count == 0 {
+                        try_list_namespaces(
+                            state,
+                            delegate_key_hex,
+                            account_id,
+                            default_namespace,
+                            Some(namespace),
+                            50,
+                            5,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    let rendered = format_recall_output_with_namespaces(
+                        results,
+                        max_distance,
+                        dropped_count,
+                        discovery.as_ref().map(|d| (namespace, d)),
+                    );
                     json!({
                         "content": [{ "type": "text", "text": rendered }]
                     })
@@ -3467,7 +3976,36 @@ async fn execute_mcp_tool(
             .await
             {
                 Ok((status, body)) if status.is_success() => {
-                    let rendered = format_restore_output(&body, namespace);
+                    let total = body.get("total").and_then(Value::as_u64).unwrap_or(0);
+                    let restored = body.get("restored").and_then(Value::as_u64).unwrap_or(0);
+                    let skipped = body.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+                    let failed = body.get("failed").and_then(Value::as_u64).unwrap_or(0);
+                    let truncated = body
+                        .get("truncated")
+                        .or_else(|| body.get("has_more"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let is_empty =
+                        !truncated && total == 0 && restored == 0 && skipped == 0 && failed == 0;
+                    let discovery = if is_empty {
+                        try_list_namespaces(
+                            state,
+                            delegate_key_hex,
+                            account_id,
+                            default_namespace,
+                            Some(namespace),
+                            50,
+                            5,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    let rendered = format_restore_output_with_namespaces(
+                        &body,
+                        namespace,
+                        discovery.as_ref().map(|d| d.namespaces.as_slice()),
+                    );
                     json!({
                         "content": [{ "type": "text", "text": rendered }]
                     })
@@ -3479,6 +4017,55 @@ async fn execute_mcp_tool(
                 Err(e) => json!({
                     "isError": true,
                     "content": [{ "type": "text", "text": format!("memwal_restore error: {e}") }]
+                }),
+            }
+        }
+        "memwal_namespaces" => {
+            let limit = if let Some(limit_val) = args.get("limit").filter(|v| !v.is_null()) {
+                let parsed_num = limit_val
+                    .as_i64()
+                    .or_else(|| limit_val.as_u64().and_then(|u| i64::try_from(u).ok()));
+                match parsed_num {
+                    Some(n) if (1..=500).contains(&n) => n as u64,
+                    _ => {
+                        return json!({
+                            "isError": true,
+                            "content": [{
+                                "type": "text",
+                                "text": "limit must be an integer between 1 and 500"
+                            }]
+                        });
+                    }
+                }
+            } else {
+                100
+            };
+
+            let cursor = args
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            match fetch_namespaces_page(
+                state,
+                delegate_key_hex,
+                account_id,
+                default_namespace,
+                limit,
+                cursor,
+            )
+            .await
+            {
+                Ok(page) => {
+                    let rendered = format_namespaces_result(&page);
+                    json!({
+                        "content": [{ "type": "text", "text": rendered }]
+                    })
+                }
+                Err(e) => json!({
+                    "isError": true,
+                    "content": [{ "type": "text", "text": format!("memwal_namespaces error: {e}") }]
                 }),
             }
         }
@@ -4096,10 +4683,11 @@ mod tests {
     fn mcp_tools_list_exposes_only_read_tools_for_memwal_read_scope() {
         assert_eq!(
             tool_names_for_scope("memwal:read"),
-            vec!["memwal_health", "memwal_recall"]
+            vec!["memwal_health", "memwal_recall", "memwal_namespaces"]
         );
         assert!(is_mcp_tool_permitted("memwal_health", "memwal:read"));
         assert!(is_mcp_tool_permitted("memwal_recall", "memwal:read"));
+        assert!(is_mcp_tool_permitted("memwal_namespaces", "memwal:read"));
         for write_tool in [
             "memwal_remember",
             "memwal_remember_status",
@@ -4133,6 +4721,7 @@ mod tests {
                 "memwal_remember_status",
                 "memwal_remember_bulk",
                 "memwal_recall",
+                "memwal_namespaces",
                 "memwal_analyze",
                 "memwal_restore",
             ]
@@ -4144,6 +4733,270 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty()));
         }
+    }
+
+    #[test]
+    fn edit_distance_and_is_close_namespace_match_detect_typos_and_case_prefix_matches() {
+        assert_eq!(edit_distance("pcl301", "pcl302"), 1);
+        assert_eq!(edit_distance("study-note", "study-notes"), 1);
+        assert_eq!(edit_distance("PCL301", "pcl302"), 1);
+        assert_eq!(edit_distance("café", "cafe"), 1);
+
+        assert!(is_close_namespace_match("pcl301", "pcl302"));
+        assert!(is_close_namespace_match("pcl3o2", "pcl302"));
+        assert!(is_close_namespace_match("study", "study-notes"));
+        assert!(is_close_namespace_match("PCL301", "pcl302"));
+        assert!(is_close_namespace_match("  study-note  ", "study-notes"));
+
+        assert!(!is_close_namespace_match(
+            "pcl301",
+            "completely-different-bucket"
+        ));
+        assert!(!is_close_namespace_match("pcl301", "pcl301"));
+        assert!(!is_close_namespace_match("", "pcl301"));
+        assert!(!is_close_namespace_match("pcl301", ""));
+    }
+
+    #[test]
+    fn format_namespace_suggestion_hint_prioritizes_close_edit_distance_matches() {
+        let namespaces = vec![
+            NamespaceEntry {
+                name: "work-projects".to_owned(),
+                memory_count: 50,
+                storage_used: Some(1024),
+                updated_at: None,
+            },
+            NamespaceEntry {
+                name: "study-notes".to_owned(),
+                memory_count: 12,
+                storage_used: Some(2400),
+                updated_at: None,
+            },
+            NamespaceEntry {
+                name: "default".to_owned(),
+                memory_count: 3,
+                storage_used: None,
+                updated_at: None,
+            },
+        ];
+
+        let hint = format_namespace_suggestion_hint("study-note", &namespaces, 5);
+        assert!(hint.contains("Did you mean namespace \"study-notes\" (12 memories)?"));
+        assert!(hint.contains(
+            "Existing namespaces: \"study-notes\" (12), \"work-projects\" (50), \"default\" (3)."
+        ));
+
+        let empty_hint = format_namespace_suggestion_hint("study-note", &[], 5);
+        assert!(empty_hint.is_empty());
+
+        let multiple_close = vec![
+            NamespaceEntry {
+                name: "pcl302".to_owned(),
+                memory_count: 10,
+                storage_used: None,
+                updated_at: None,
+            },
+            NamespaceEntry {
+                name: "pcl303".to_owned(),
+                memory_count: 5,
+                storage_used: None,
+                updated_at: None,
+            },
+        ];
+        let multi_hint = format_namespace_suggestion_hint("pcl301", &multiple_close, 5);
+        assert!(
+            multi_hint.contains("Did you mean: \"pcl302\" (10 memories), \"pcl303\" (5 memories)?")
+        );
+
+        let many = (1..=7)
+            .map(|i| NamespaceEntry {
+                name: format!("ns-{i}"),
+                memory_count: i,
+                storage_used: None,
+                updated_at: None,
+            })
+            .collect::<Vec<_>>();
+        let truncated_hint = format_namespace_suggestion_hint("other", &many, 3);
+        assert!(truncated_hint.contains(", +4 more."));
+    }
+
+    #[test]
+    fn format_recall_output_with_namespaces_distinguishes_empty_and_populated_namespaces() {
+        let namespaces = vec![NamespaceEntry {
+            name: "pcl302".to_owned(),
+            memory_count: 15,
+            storage_used: Some(4096),
+            updated_at: None,
+        }];
+
+        let discovery = DiscoveredNamespaces {
+            namespaces: namespaces.clone(),
+            has_more: false,
+        };
+
+        // 1. Empty/misspelled namespace with suggestion
+        let empty_out =
+            format_recall_output_with_namespaces(&[], None, 0, Some(("pcl301", &discovery)));
+        assert!(empty_out.contains(
+            "No matching memories found (namespace \"pcl301\" currently holds 0 memories)."
+        ));
+        assert!(empty_out.contains("Did you mean namespace \"pcl302\" (15 memories)?"));
+
+        // 2. Populated namespace with 0 semantic hits
+        let populated_out =
+            format_recall_output_with_namespaces(&[], None, 0, Some(("pcl302", &discovery)));
+        assert_eq!(
+            populated_out,
+            "No matching memories found in namespace \"pcl302\" (0 matches among 15 memories)."
+        );
+
+        // 3. Incomplete page where target was not seen
+        let discovery_has_more = DiscoveredNamespaces {
+            namespaces,
+            has_more: true,
+        };
+        let incomplete_out = format_recall_output_with_namespaces(
+            &[],
+            None,
+            0,
+            Some(("other-ns", &discovery_has_more)),
+        );
+        assert_eq!(
+            incomplete_out,
+            "No matching memories found in namespace \"other-ns\"."
+        );
+    }
+
+    #[test]
+    fn format_restore_output_with_namespaces_reports_empty_namespace_and_suggestions() {
+        let empty_restore = json!({
+            "total": 0,
+            "restored": 0,
+            "skipped": 0,
+            "failed": 0,
+            "truncated": false
+        });
+
+        let namespaces = vec![NamespaceEntry {
+            name: "study-notes".to_owned(),
+            memory_count: 12,
+            storage_used: Some(2400),
+            updated_at: Some("2026-08-20T10:00:00Z".to_owned()),
+        }];
+
+        let out =
+            format_restore_output_with_namespaces(&empty_restore, "study-note", Some(&namespaces));
+        assert!(out.contains("Namespace \"study-note\" holds 0 on-chain blobs."));
+        assert!(out.contains("Did you mean namespace \"study-notes\" (12 memories)?"));
+        assert!(out.contains("Existing namespaces: \"study-notes\" (12)."));
+
+        let out_no_ns = format_restore_output_with_namespaces(&empty_restore, "study-note", None);
+        assert!(out_no_ns.contains("Namespace \"study-note\" holds 0 on-chain blobs."));
+        assert!(!out_no_ns.contains("Did you mean"));
+    }
+
+    #[test]
+    fn format_namespaces_result_lists_entries_and_handles_pagination_edge_cases() {
+        let page = NamespacesPage {
+            namespaces: vec![
+                NamespaceEntry {
+                    name: "pcl302".to_owned(),
+                    memory_count: 15,
+                    storage_used: Some(4096),
+                    updated_at: Some("2026-08-20T10:00:00Z".to_owned()),
+                },
+                NamespaceEntry {
+                    name: "default".to_owned(),
+                    memory_count: 1,
+                    storage_used: Some(256),
+                    updated_at: Some("2026-08-18T09:30:00Z".to_owned()),
+                },
+            ],
+            next_cursor: Some("cursor-2".to_owned()),
+            has_more: true,
+        };
+
+        let rendered = format_namespaces_result(&page);
+        assert!(rendered.starts_with("Namespaces (2+):"));
+        assert!(
+            rendered.contains("- \"pcl302\": 15 memories, storage_used=4096B, updated=2026-08-20")
+        );
+        assert!(rendered.contains("- \"default\": 1 memory, storage_used=256B, updated=2026-08-18"));
+        assert!(rendered.contains("More namespaces available (next_cursor=\"cursor-2\")."));
+
+        // Final empty page
+        let empty_page = NamespacesPage {
+            namespaces: vec![],
+            next_cursor: None,
+            has_more: false,
+        };
+        assert_eq!(
+            format_namespaces_result(&empty_page),
+            "No namespaces with stored memories found for this account."
+        );
+
+        // Tombstone-only final page
+        let tombstone_final = NamespacesPage {
+            namespaces: vec![NamespaceEntry {
+                name: "tombstone".to_owned(),
+                memory_count: 0,
+                storage_used: None,
+                updated_at: None,
+            }],
+            next_cursor: None,
+            has_more: false,
+        };
+        assert_eq!(
+            format_namespaces_result(&tombstone_final),
+            "No namespaces with stored memories found for this account."
+        );
+
+        // Tombstone-only non-final page preserving next_cursor
+        let tombstone_non_final = NamespacesPage {
+            namespaces: vec![NamespaceEntry {
+                name: "tombstone".to_owned(),
+                memory_count: 0,
+                storage_used: None,
+                updated_at: None,
+            }],
+            next_cursor: Some("cursor-next".to_owned()),
+            has_more: true,
+        };
+        let tombstone_rendered = format_namespaces_result(&tombstone_non_final);
+        assert!(tombstone_rendered.contains("No non-empty namespaces found on this page."));
+        assert!(tombstone_rendered.contains("next_cursor=\"cursor-next\""));
+        assert!(tombstone_rendered.contains(
+            "Call memwal_namespaces with cursor=\"cursor-next\" to inspect the next page."
+        ));
+        assert!(!tombstone_rendered
+            .contains("No namespaces with stored memories found for this account."));
+    }
+
+    #[test]
+    fn parse_namespaces_page_json_parses_valid_payload() {
+        let payload = json!({
+            "namespaces": [
+                {
+                    "name": "project-x",
+                    "memory_count": 42,
+                    "storage_used": 8192,
+                    "updated_at": "2026-09-01T12:00:00Z"
+                }
+            ],
+            "next_cursor": "cursor-abc",
+            "has_more": true
+        });
+        let parsed = parse_namespaces_page_json(&payload).expect("should parse");
+        assert_eq!(parsed.namespaces.len(), 1);
+        assert_eq!(parsed.namespaces[0].name, "project-x");
+        assert_eq!(parsed.namespaces[0].memory_count, 42);
+        assert_eq!(parsed.namespaces[0].storage_used, Some(8192));
+        assert_eq!(
+            parsed.namespaces[0].updated_at.as_deref(),
+            Some("2026-09-01T12:00:00Z")
+        );
+        assert_eq!(parsed.next_cursor.as_deref(), Some("cursor-abc"));
+        assert!(parsed.has_more);
     }
 
     #[test]
