@@ -121,7 +121,7 @@ class RecallParams:
     max_distance: Optional[float] = None
     scoring_weights: Optional["ScoringWeights"] = None
     sort: Optional[str] = None
-    on_dropped: str = "throw"
+    on_dropped: str = "ignore"
 
 
 @dataclass

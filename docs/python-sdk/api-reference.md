@@ -130,6 +130,7 @@ RememberBulkResult(
 
 Search memories matching a natural-language query, scoped to `owner + namespace`.
 When `max_distance` is set, the client drops weak matches where `distance >= max_distance`.
+By default (`on_dropped="ignore"`), an all-dropped response where matched blobs failed download or decryption returns the degraded `RecallResult` (`results=[]`, `degraded=True`, `dropped_count`, and pre-drop `total`). Pass `on_dropped="throw"` (on `RecallParams` or `recall()`) to raise `MemWalRecallAllDropped` instead.
 
 Preferred form:
 
@@ -141,12 +142,14 @@ result = await memwal.recall(
 )
 ```
 
-The legacy positional form `recall(query, limit=10, namespace=None, max_distance=None)` remains supported for backwards compatibility.
+The legacy positional form `recall(query, limit=10, namespace=None, max_distance=None, on_dropped="ignore")` remains supported for backwards compatibility.
 
 ```python
 RecallResult(
     results: list[RecallMemory],  # RecallMemory(blob_id, text, distance)
     total: int,
+    dropped_count: int = 0,
+    degraded: bool = False,
 )
 ```
 
@@ -276,6 +279,7 @@ Both wrap an existing LLM client with automatic recall + save and accept: `key`,
 ```python
 from memwal import (
     MemWalError,
+    MemWalRecallAllDropped,
     MemWalRememberJobNotFound,
     MemWalRememberJobFailed,
     MemWalRememberJobTimeout,
@@ -286,6 +290,7 @@ from memwal import (
 | Exception | `.status` | Meaning |
 | --- | --- | --- |
 | `MemWalError` | — | Base class for all SDK errors |
+| `MemWalRecallAllDropped` | `None` | Raised when `on_dropped="throw"` and all matched memories failed download or decrypt (`.code == "RECALL_ALL_DROPPED"`, `.dropped_count`, `.total`, `.namespace`) |
 | `MemWalRememberJobNotFound` | `404` | Job unknown or not owned by the caller |
 | `MemWalRememberJobFailed` | `500` | Job reached terminal `failed` (`.error`) |
 | `MemWalRememberJobTimeout` | `504` | Polling exceeded `.timeout_ms` |

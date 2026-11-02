@@ -126,12 +126,13 @@ Submit a bulk remember request and wait until every job reaches a terminal state
 
 Search for memories matching a natural language query, scoped to `owner + namespace`.
 
-- Preferred form: `recall({ query, limit?, topK?, namespace?, maxDistance?, sort?, scoringWeights? })`
+- Preferred form: `recall({ query, limit?, topK?, namespace?, maxDistance?, sort?, scoringWeights?, onDropped? })`
 - `limit` defaults to `10` (relayer caps at `100`); `topK` is an alias and wins when both are set
 - Legacy positional forms still work: `recall(query)`, `recall(query, limit)`, `recall(query, limit, namespace)`, and `recall(query, options)`. `recall(query, namespace)` throws `TypeError`; namespace is not a valid second argument.
 - `maxDistance` filters weak matches client-side by dropping results where `distance >= maxDistance`
 - `sort` picks the ordering: `"relevance"` (default) or `"recent"` for newest-among-matches
 - `scoringWeights` blends recency and importance into the ranking (see [Ordering](#ordering) below)
+- `onDropped` controls how `recall()` handles an all-dropped response where matched blobs failed download or decryption: `"ignore"` (default) returns the degraded `RecallResult` with `results: []`, `degraded: true`, `dropped_count`, and the pre-drop `total`; `"throw"` throws `MemWalRecallAllDroppedError` (`code = "RECALL_ALL_DROPPED"`).
 - `timeoutMs` overrides the client's `recallTimeoutMs` for this call. `0` disables the deadline. On expiry
   recall throws `MemWalRequestTimeout` (status 504). `isTimeoutError(err)` is true for that error
   and for a preflight `TimeoutError` whose `phase` names the stalled round-trip.
@@ -147,6 +148,8 @@ Search for memories matching a natural language query, scoped to `owner + namesp
     created_at?: string; // RFC3339 write-time; absent on older relayers
   }>;
   total: number;
+  dropped_count?: number; // Matches omitted due to download or decrypt failure
+  degraded?: boolean;     // True whenever one or more matches were dropped
 }
 ```
 

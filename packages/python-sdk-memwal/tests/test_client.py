@@ -831,7 +831,7 @@ class TestRecall:
         assert result.results[1].blob_id == "b2"
 
     @respx.mock
-    async def test_recall_raises_on_all_dropped_by_default_and_supports_ignore(
+    async def test_recall_returns_degraded_result_by_default_and_raises_on_throw(
         self, memwal_client: MemWal
     ) -> None:
         mock_seal_session_prereqs()
@@ -841,23 +841,54 @@ class TestRecall:
                 json={"results": [], "total": 0, "dropped_count": 3},
             )
         )
+        omitted = await memwal_client.recall("coffee")
+        assert omitted.results == []
+        assert omitted.dropped_count == 3
+        assert omitted.total == 3
+        assert omitted.degraded is True
+
+        omitted_params = await memwal_client.recall(RecallParams(query="coffee"))
+        assert omitted_params.results == []
+        assert omitted_params.dropped_count == 3
+        assert omitted_params.total == 3
+        assert omitted_params.degraded is True
+
+        explicit_ignore = await memwal_client.recall(
+            RecallParams(query="coffee", on_dropped="ignore")
+        )
+        assert explicit_ignore.results == []
+        assert explicit_ignore.dropped_count == 3
+        assert explicit_ignore.total == 3
+        assert explicit_ignore.degraded is True
+
         with pytest.raises(MemWalRecallAllDropped) as exc_info:
-            await memwal_client.recall("coffee")
+            await memwal_client.recall("coffee", on_dropped="throw")
         assert exc_info.value.code == "RECALL_ALL_DROPPED"
         assert exc_info.value.dropped_count == 3
         assert exc_info.value.total == 3
         assert exc_info.value.namespace == "default"
 
+        with pytest.raises(MemWalRecallAllDropped) as params_exc:
+            await memwal_client.recall(
+                RecallParams(query="coffee", namespace="profile", on_dropped="throw")
+            )
+        assert params_exc.value.code == "RECALL_ALL_DROPPED"
+        assert params_exc.value.dropped_count == 3
+        assert params_exc.value.total == 3
+        assert params_exc.value.namespace == "profile"
+
+        sync_client = MemWalSync(memwal_client)
+        sync_default = sync_client.recall("coffee")
+        assert sync_default.results == []
+        assert sync_default.dropped_count == 3
+        assert sync_default.total == 3
+        assert sync_default.degraded is True
+
+        with pytest.raises(MemWalRecallAllDropped):
+            sync_client.recall("coffee", on_dropped="throw")
+
         with pytest.raises(ValueError, match="on_dropped"):
             await memwal_client.recall("coffee", on_dropped="warn")
-
-        result = await memwal_client.recall(
-            RecallParams(query="coffee", on_dropped="ignore")
-        )
-        assert result.results == []
-        assert result.dropped_count == 3
-        assert result.total == 3
-        assert result.degraded is True
 
     @respx.mock
     async def test_recall_preserves_dropped_count_with_max_distance(

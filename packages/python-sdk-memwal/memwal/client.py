@@ -1184,7 +1184,7 @@ class MemWal:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
-        on_dropped: str = "throw",
+        on_dropped: str = "ignore",
     ) -> RecallResult:
         """Recall memories similar to a query.
 
@@ -1211,9 +1211,10 @@ class MemWal:
                 with ``distance >= max_distance`` are dropped. Ignored when
                 ``query`` is a :class:`RecallParams`.
             on_dropped: Policy when every matched memory failed download or
-                decrypt (``"throw"`` by default raises
-                :class:`MemWalRecallAllDropped`, ``"ignore"`` returns the
-                degraded :class:`RecallResult`).
+                decrypt (``"ignore"`` by default returns the degraded
+                :class:`RecallResult` with ``degraded=True`` and
+                ``dropped_count``; ``"throw"`` raises
+                :class:`MemWalRecallAllDropped`).
 
         Returns:
             :class:`RecallResult` with decrypted text results.
@@ -2348,11 +2349,12 @@ class MemWalRememberJobTimeout(MemWalError):
 
 
 class MemWalRecallAllDropped(MemWalError):
-    """Raised by :meth:`MemWal.recall` when every matched memory failed to
-    download or decrypt (``results == []`` and ``dropped_count > 0``).
+    """Raised by :meth:`MemWal.recall` when ``on_dropped="throw"`` is set and
+    every matched memory failed to download or decrypt (``results == []`` and
+    ``dropped_count > 0``).
 
-    Pass ``on_dropped="ignore"`` to inspect the degraded :class:`RecallResult`
-    without raising.
+    By default (``on_dropped="ignore"``), :meth:`MemWal.recall` returns the
+    degraded :class:`RecallResult` without raising.
     """
 
     def __init__(self, dropped_count: int, total: int, namespace: str) -> None:
@@ -2558,7 +2560,7 @@ class MemWalSync:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
-        on_dropped: str = "throw",
+        on_dropped: str = "ignore",
     ) -> RecallResult:
         """Synchronous version of :meth:`MemWal.recall` (accepts
         :class:`RecallParams` for the recommended object-style call)."""

@@ -268,10 +268,10 @@ export interface RecallOptions {
      * memories (`dropped_count > 0` or `degraded: true`) and none survived
      * download or decrypt (`results.length === 0`).
      *
-     * Defaults to `"throw"`, which throws `MemWalRecallAllDroppedError` so
-     * callers and middleware never mistake a storage or decrypt failure for an
-     * empty namespace. Set `"ignore"` to return the degraded `RecallResult`
-     * (`results: []`, `degraded: true`, `dropped_count`, pre-drop `total`).
+     * Defaults to `"ignore"`, which returns the degraded `RecallResult`
+     * (`results: []`, `degraded: true`, `dropped_count`, pre-drop `total`) so
+     * callers can inspect the failure without catching an exception. Set
+     * `"throw"` to throw `MemWalRecallAllDroppedError` instead.
      */
     onDropped?: RecallOnDropped;
 }

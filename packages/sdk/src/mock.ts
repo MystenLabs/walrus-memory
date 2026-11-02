@@ -431,11 +431,8 @@ export class MemWalMock {
         ) {
             throw new Error("maxDistance must be a non-negative finite number");
         }
-        if (
-            options.onDropped !== undefined
-            && options.onDropped !== "throw"
-            && options.onDropped !== "ignore"
-        ) {
+        const onDropped = options.onDropped ?? "ignore";
+        if (onDropped !== "throw" && onDropped !== "ignore") {
             throw new TypeError(
                 `onDropped must be "throw" or "ignore", got ${String(options.onDropped)}`,
             );

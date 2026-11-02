@@ -23,6 +23,7 @@
 
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import { wrapLanguageModel } from "ai";
+import { MemWalRecallAllDroppedError } from "../errors.js";
 import { MemWal } from "../memwal.js";
 import type { MemWalConfig, RecallMemory } from "../types.js";
 import {
@@ -259,6 +260,17 @@ export function withMemWal(
                         strategy: "head-tail",
                     });
                     const recallResult = await memwal.recall(recallQuery, maxMemories);
+                    if (recallResult.results.length === 0 && recallResult.degraded) {
+                        const droppedCount =
+                            typeof recallResult.dropped_count === "number" && recallResult.dropped_count > 0
+                                ? recallResult.dropped_count
+                                : Math.max(1, recallResult.total ?? 1);
+                        throw new MemWalRecallAllDroppedError(
+                            droppedCount,
+                            Math.max(recallResult.total ?? 0, droppedCount),
+                            options.namespace ?? "default",
+                        );
+                    }
                     const relevant = recallResult.results.filter((m: RecallMemory) => {
                         const relevance = memoryRelevance(m?.distance);
                         return relevance !== null && relevance >= minRelevance;

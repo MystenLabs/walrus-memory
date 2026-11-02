@@ -1260,7 +1260,7 @@ export class MemWal {
                 `onDropped must be "throw" or "ignore", got ${String(options.onDropped)}`,
             );
         }
-        const onDropped = options.onDropped ?? "throw";
+        const onDropped = options.onDropped ?? "ignore";
         const resolvedNamespace = options.namespace ?? this.namespace;
         assertReadableNamespace(resolvedNamespace);
 

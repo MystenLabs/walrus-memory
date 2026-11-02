@@ -267,7 +267,7 @@ class MemWalMock:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
-        on_dropped: str = "throw",
+        on_dropped: str = "ignore",
     ) -> RecallResult:
         """Token-overlap recall over the in-memory store.
 
@@ -676,7 +676,7 @@ class MemWalMockSync:
         limit: int = 10,
         namespace: Optional[str] = None,
         max_distance: Optional[float] = None,
-        on_dropped: str = "throw",
+        on_dropped: str = "ignore",
     ) -> RecallResult:
         return self._run(
             self._inner.recall(

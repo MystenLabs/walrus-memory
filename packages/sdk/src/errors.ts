@@ -75,13 +75,13 @@ export class MemWalRememberJobTimeoutError extends Error {
 }
 
 /**
- * Thrown by `recall()` when the relayer matched one or more vector entries
- * (`dropped_count > 0` or `degraded: true`), yet every matched blob failed
- * Walrus download, SEAL decrypt, or UTF-8 decode (`results.length === 0`).
+ * Thrown by `recall()` when `onDropped: "throw"` is set and the relayer matched
+ * one or more vector entries (`dropped_count > 0` or `degraded: true`), yet
+ * every matched blob failed Walrus download, SEAL decrypt, or UTF-8 decode
+ * (`results.length === 0`).
  *
- * Pass `onDropped: "ignore"` to `recall()` when you prefer to inspect the
- * degraded `RecallResult` (`degraded: true`, `dropped_count`, `total`)
- * directly without throwing.
+ * By default (`onDropped: "ignore"`), `recall()` returns the degraded
+ * `RecallResult` (`degraded: true`, `dropped_count`, `total`) without throwing.
  */
 export class MemWalRecallAllDroppedError extends Error {
     readonly code = "RECALL_ALL_DROPPED" as const;

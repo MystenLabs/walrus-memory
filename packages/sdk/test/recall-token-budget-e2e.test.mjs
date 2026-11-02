@@ -46,7 +46,7 @@ function client() {
 
 const chars = (n) => "a".repeat(n);
 
-test("recall throws MemWalRecallAllDroppedError by default when all matches are dropped, unless onDropped is ignore", async () => {
+test("recall returns degraded result by default when all matches are dropped and throws on explicit onDropped throw", async () => {
     globalThis.fetch = async (url, init = {}) => {
         const path = new URL(url).pathname;
         if (path === "/version") {
@@ -65,17 +65,17 @@ test("recall throws MemWalRecallAllDroppedError by default when all matches are 
         throw new Error(`unexpected request ${path}`);
     };
 
-    await assert.rejects(
-        () => client().recall({ query: "x", namespace: "default" }),
-        (err) => {
-            assert.ok(err instanceof MemWalRecallAllDroppedError);
-            assert.equal(err.code, "RECALL_ALL_DROPPED");
-            assert.equal(err.droppedCount, 3);
-            assert.equal(err.total, 3);
-            assert.equal(err.namespace, "default");
-            return true;
-        },
-    );
+    const byDefault = await client().recall({ query: "x", namespace: "default" });
+    assert.equal(byDefault.dropped_count, 3);
+    assert.equal(byDefault.total, 3);
+    assert.equal(byDefault.degraded, true);
+    assert.equal(byDefault.results.length, 0);
+
+    const positionalDefault = await client().recall("x", 10, "default");
+    assert.equal(positionalDefault.dropped_count, 3);
+    assert.equal(positionalDefault.total, 3);
+    assert.equal(positionalDefault.degraded, true);
+    assert.equal(positionalDefault.results.length, 0);
 
     const ignored = await client().recall({
         query: "x",
@@ -86,9 +86,21 @@ test("recall throws MemWalRecallAllDroppedError by default when all matches are 
     assert.equal(ignored.total, 3);
     assert.equal(ignored.degraded, true);
     assert.equal(ignored.results.length, 0);
+
+    await assert.rejects(
+        () => client().recall({ query: "x", namespace: "default", onDropped: "throw" }),
+        (err) => {
+            assert.ok(err instanceof MemWalRecallAllDroppedError);
+            assert.equal(err.code, "RECALL_ALL_DROPPED");
+            assert.equal(err.droppedCount, 3);
+            assert.equal(err.total, 3);
+            assert.equal(err.namespace, "default");
+            return true;
+        },
+    );
 });
 
-test("recall normalizes legacy all-dropped total=0 response and validates onDropped", async () => {
+test("recall normalizes legacy all-dropped total=0 response by default, throws on explicit throw, and validates onDropped", async () => {
     globalThis.fetch = async (url, init = {}) => {
         const path = new URL(url).pathname;
         if (path === "/version") {
@@ -112,14 +124,26 @@ test("recall normalizes legacy all-dropped total=0 response and validates onDrop
         TypeError,
     );
 
-    const ignored = await client().recall({
+    const omitted = await client().recall({
         query: "x",
         namespace: "profile",
-        onDropped: "ignore",
     });
-    assert.equal(ignored.total, 2);
-    assert.equal(ignored.dropped_count, 2);
-    assert.equal(ignored.degraded, true);
+    assert.equal(omitted.results.length, 0);
+    assert.equal(omitted.total, 2);
+    assert.equal(omitted.dropped_count, 2);
+    assert.equal(omitted.degraded, true);
+
+    await assert.rejects(
+        () => client().recall({ query: "x", namespace: "profile", onDropped: "throw" }),
+        (err) => {
+            assert.ok(err instanceof MemWalRecallAllDroppedError);
+            assert.equal(err.code, "RECALL_ALL_DROPPED");
+            assert.equal(err.droppedCount, 2);
+            assert.equal(err.total, 2);
+            assert.equal(err.namespace, "profile");
+            return true;
+        },
+    );
 });
 
 test("recall preserves dropped_count when maxDistance and maxTokens are applied", async () => {
