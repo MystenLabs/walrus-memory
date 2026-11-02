@@ -15,6 +15,8 @@ test("shouldCapture rejects explicit conversational opt-out directives before TR
     "Do not save this: I prefer working from Tokyo next month.",
     "Please don't save any of this: I prefer working from Tokyo next month",
     "Please don’t save any of this: I prefer working from Tokyo next month",
+    "Do not remember the following: I prefer working from Tokyo next month.",
+    "Please don't remember where I live: 123 Example Street.",
     "Do not save or remember this: my temporary medical appointment is at 3 PM.",
     "Please don't remember my temporary medical appointment at 3 PM.",
     "Never store this in memory: our internal codename is Project Aurora.",
@@ -220,5 +222,54 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     analyzedPayloads.length,
     1,
     "opt-out phrases like 'save or remember this' must suppress assistant echoes from reaching analyze()",
+  );
+
+  // 5. Hook-level regression: explicit remember imperatives with other objects ("remember the following", "remember where I live") suppress echoes.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u6",
+          role: "user",
+          content: "Do not remember the following: I prefer working from Tokyo next month.",
+        },
+        {
+          id: "a6",
+          role: "assistant",
+          content: "Understood, I will not store your Tokyo remote work arrangement.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-tokyo-remember-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    1,
+    "opt-out phrases like 'do not remember the following' must suppress assistant echoes from reaching analyze()",
+  );
+
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u7",
+          role: "user",
+          content: "Please don't remember where I live: 123 Example Street.",
+        },
+        {
+          id: "a7",
+          role: "assistant",
+          content: "Got it, I will not store your home address in memory.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-address-remember-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    1,
+    "opt-out phrases like 'please don't remember where I live' must suppress assistant echoes from reaching analyze()",
   );
 });
