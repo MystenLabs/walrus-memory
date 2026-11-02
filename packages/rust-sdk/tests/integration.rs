@@ -440,7 +440,7 @@ async fn remember_status_rejects_path_traversal_without_network_call() -> memwal
     assert!(matches!(wait_err, Error::JobNotFound { .. }));
 
     let received = server.received_requests().await.expect("requests");
-    assert!(received.is_empty());
+    assert_eq!(received.len(), 0);
 
     Ok(())
 }
@@ -986,7 +986,7 @@ async fn memwal_mock_supports_full_offline_lifecycle() -> memwal::Result<()> {
     assert_eq!(batch.succeeded, 2);
 
     let recalled = mock.recall("espresso in Hanoi").await?;
-    assert!(!recalled.results.is_empty());
+    assert_eq!(recalled.results.len(), 2);
     assert!(recalled.results[0].text.contains("espresso"));
 
     let ns_page = mock.list_namespaces(&ListNamespacesOptions::new()).await?;
@@ -998,7 +998,7 @@ async fn memwal_mock_supports_full_offline_lifecycle() -> memwal::Result<()> {
     let mem_page = mock
         .list_memories(&ListMemoriesOptions::new().with_namespace("agent-test"))
         .await?;
-    assert!(mem_page.memories.is_empty());
+    assert_eq!(mem_page.memories.len(), 0);
     assert_eq!(mem_page.deleted.len(), 2);
 
     let _ = RememberOptions::new().with_dedupe(DedupeMode::RetryWindow);
