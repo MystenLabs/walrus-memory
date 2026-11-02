@@ -30,7 +30,7 @@ The Walrus Memory Rust SDK (`memwal`) provides an idiomatic, async Tokio client 
 
 ## Prerequisites and Installation
 
-The crate targets Rust `1.85` or newer (Edition 2024) and uses `rustls` by default so cross-compilation requires no system OpenSSL headers.
+The crate targets Rust `1.88` or newer (Edition 2024) and uses `rustls` by default so cross-compilation requires no system OpenSSL headers.
 
 Add `memwal` and `tokio` to your `Cargo.toml`:
 

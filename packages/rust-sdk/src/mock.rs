@@ -144,13 +144,12 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid input or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn remember_with(
         &self,
         text: &str,
         opts: &RememberOptions,
     ) -> Result<RememberAccepted> {
-        self.check_alive()?;
+        self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let ns = self.resolve_ns(opts.namespace.as_deref())?;
         let entry = self.insert_entry(text, &ns, opts.dedupe == DedupeMode::ContentHash);
@@ -175,13 +174,12 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid input or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn remember_and_wait_with(
         &self,
         text: &str,
         opts: &RememberWaitOptions,
     ) -> Result<RememberResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let ns = self.resolve_ns(opts.remember.namespace.as_deref())?;
         let entry = self.insert_entry(text, &ns, opts.remember.dedupe == DedupeMode::ContentHash);
@@ -199,9 +197,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn remember_status(&self, job_id: &str) -> Result<RememberJobStatus> {
-        self.check_alive()?;
+        self.check_alive().await?;
         if !validate_job_id(job_id) {
             return Ok(RememberJobStatus {
                 job_id: job_id.to_owned(),
@@ -239,13 +236,12 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::JobNotFound`] when `job_id` is unknown or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn wait_for_remember_job(
         &self,
         job_id: &str,
         _opts: &WaitOptions,
     ) -> Result<RememberResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         let found = guard
             .entries
@@ -268,9 +264,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `items` is empty, exceeds `20`, or has blank text.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn remember_bulk(&self, items: &[RememberBulkItem]) -> Result<RememberBulkAccepted> {
-        self.check_alive()?;
+        self.check_alive().await?;
         if items.is_empty() || items.len() > MAX_BULK_ITEMS {
             return Err(Error::InvalidArgument(format!(
                 "items must contain between 1 and {MAX_BULK_ITEMS} entries"
@@ -322,12 +317,11 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn remember_bulk_status(
         &self,
         job_ids: &[String],
     ) -> Result<RememberBulkStatusResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         let results = job_ids
             .iter()
@@ -411,9 +405,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid parameters or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn recall(&self, params: impl Into<RecallParams>) -> Result<RecallResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         let params = params.into();
         validate_non_blank(&params.query, "query")?;
         validate_positive_limit(params.limit, "limit")?;
@@ -492,9 +485,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `namespace` is invalid or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn forget(&self, namespace: Option<&str>) -> Result<ForgetResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         let ns = self.resolve_ns(namespace)?;
         let now = Utc::now().to_rfc3339();
         let mut guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -526,9 +518,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `text` is blank or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn embed(&self, text: &str) -> Result<EmbedResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let digest = Sha256::digest(text.as_bytes());
         let vector = digest
@@ -543,9 +534,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid input or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn analyze(&self, text: &str, opts: &AnalyzeOptions) -> Result<AnalyzeResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let ns = self.resolve_ns(opts.namespace.as_deref())?;
         if let Some(ts) = &opts.occurred_at {
@@ -646,9 +636,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid input or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn restore(&self, namespace: &str, limit: usize) -> Result<RestoreResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         validate_namespace(namespace)?;
         validate_positive_limit(limit, "limit")?;
         let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -673,9 +662,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `opts.limit == Some(0)` or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn list_namespaces(&self, opts: &ListNamespacesOptions) -> Result<NamespacesPage> {
-        self.check_alive()?;
+        self.check_alive().await?;
         if let Some(limit) = opts.limit {
             validate_positive_limit(limit, "limit")?;
         }
@@ -720,9 +708,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] on invalid options or [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn list_memories(&self, opts: &ListMemoriesOptions) -> Result<MemoriesPage> {
-        self.check_alive()?;
+        self.check_alive().await?;
         if let Some(limit) = opts.limit {
             validate_positive_limit(limit, "limit")?;
         }
@@ -774,9 +761,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn whoami(&self) -> Result<WhoamiResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         Ok(WhoamiResult {
             account_id: self.0.account_id.clone(),
             owner: self.0.owner.clone(),
@@ -790,9 +776,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn health(&self) -> Result<HealthResult> {
-        self.check_alive()?;
+        self.check_alive().await?;
         Ok(HealthResult {
             status: "ok".to_owned(),
             version: SDK_VERSION.to_owned(),
@@ -813,9 +798,8 @@ impl MemWalMock {
     /// # Errors
     ///
     /// Returns [`Error::Destroyed`] if destroyed.
-    #[expect(clippy::unused_async, reason = "matches async MemWal signature")]
     pub async fn compatibility(&self) -> Result<VersionInfo> {
-        self.check_alive()?;
+        self.check_alive().await?;
         Ok(VersionInfo {
             relayer_version: SDK_VERSION.to_owned(),
             api_version: "1.0.0".to_owned(),
@@ -826,7 +810,8 @@ impl MemWalMock {
         })
     }
 
-    fn check_alive(&self) -> Result<()> {
+    async fn check_alive(&self) -> Result<()> {
+        tokio::task::yield_now().await;
         if self.is_destroyed() {
             Err(Error::Destroyed)
         } else {

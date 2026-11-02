@@ -65,23 +65,23 @@ jobs:
         run: cargo package --locked
 
   msrv:
-    name: MSRV Check (Rust 1.85.0)
+    name: MSRV Check (Rust 1.88.0)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust 1.85.0 toolchain
+      - name: Setup Rust 1.88.0 toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.88.0'
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/rust-sdk
-          key: msrv-1.85.0
+          key: msrv-1.88.0
 
-      - name: Check against MSRV 1.85.0
+      - name: Check against MSRV 1.88.0
         run: cargo check --all-targets --all-features --locked

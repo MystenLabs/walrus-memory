@@ -2,7 +2,7 @@
 name = "memwal"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Official Rust SDK for Walrus Memory: encrypted decentralized memory for AI agents on Sui and Walrus"
 license = "Apache-2.0"
 repository = "https://github.com/MystenLabs/MemWal"
