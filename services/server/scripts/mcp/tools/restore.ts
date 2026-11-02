@@ -66,7 +66,7 @@ export function formatRestoreResult(
             ? formatNamespaceSuggestionHint(result.namespace, namespaces)
             : "";
     const emptyLine = isEmpty
-        ? `\n  Namespace "${result.namespace}" holds 0 on-chain blobs.${suggestionHint ? ` ${suggestionHint}` : ""}`
+        ? `\n  This restore query discovered 0 matching blobs in namespace "${result.namespace}".${suggestionHint ? ` ${suggestionHint}` : ""}`
         : "";
     const hint = !truncated
         ? `${emptyLine}\n  truncated=false is not proof the sidecar saw every blob.`

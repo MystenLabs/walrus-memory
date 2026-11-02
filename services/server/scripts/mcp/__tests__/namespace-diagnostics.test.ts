@@ -264,7 +264,7 @@ test("memwal_restore on a misspelled namespace reports 0 blobs and suggests clos
     });
     const text = textFromResult(res);
 
-    assert.match(text, /Namespace "study-note" holds 0 on-chain blobs\./);
+    assert.match(text, /This restore query discovered 0 matching blobs in namespace "study-note"\./);
     assert.match(text, /Did you mean namespace "study-notes" \(12 memories\)\?/);
     assert.match(text, /Existing namespaces: "study-notes" \(12\)\./);
 });
@@ -324,6 +324,23 @@ test("formatNamespacesResult reports when an account has no populated namespaces
         }),
         "No namespaces with stored memories found for this account.",
     );
+    // Final page with a terminal watermark cursor (`has_more: false`, `next_cursor: "..."`)
+    // must NOT claim more namespaces exist.
+    assert.equal(
+        formatNamespacesResult({
+            namespaces: [{ name: "tombstone-only", memory_count: 0 }],
+            has_more: false,
+            next_cursor: "terminal_watermark_cursor",
+        }),
+        "No namespaces with stored memories found for this account.",
+    );
+    const finalPopulatedPage = formatNamespacesResult({
+        namespaces: [{ name: "active-ns", memory_count: 3 }],
+        has_more: false,
+        next_cursor: "terminal_watermark_cursor",
+    });
+    assert.match(finalPopulatedPage, /^Namespaces \(1\):/);
+    assert.doesNotMatch(finalPopulatedPage, /More namespaces available/);
 });
 
 test("formatNamespacesResult preserves next_cursor on tombstone-only non-final pages", async (t) => {

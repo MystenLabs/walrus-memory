@@ -221,7 +221,9 @@ export function formatNamespacesResult(page: NamespacesPage): string {
         typeof page.next_cursor === "string" && page.next_cursor.length > 0
             ? page.next_cursor
             : null;
-    const hasMorePages = page.has_more === true || nextCursor !== null;
+    // `/api/namespaces` always returns `next_cursor` as the last row's watermark
+    // when `rows.length > 0`, even on the final page (`has_more: false`).
+    const hasMorePages = page.has_more === true;
 
     if (nonEmpty.length === 0) {
         if (hasMorePages) {

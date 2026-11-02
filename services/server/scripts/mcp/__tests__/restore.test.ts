@@ -152,7 +152,7 @@ test("memwal_restore states 0 on-chain blobs and suggests close namespaces when 
         ],
     );
 
-    assert.match(text, /Namespace "pcl301" holds 0 on-chain blobs\./);
+    assert.match(text, /This restore query discovered 0 matching blobs in namespace "pcl301"\./);
     assert.match(text, /Did you mean namespace "pcl302" \(15 memories\)\?/);
     assert.match(text, /Existing namespaces: "pcl302" \(15\), "work" \(8\)\./);
 });
