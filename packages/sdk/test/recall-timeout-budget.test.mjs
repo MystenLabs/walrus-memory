@@ -335,6 +335,111 @@ test("a short recall budget is sent whole instead of floored at 1", async () => 
     assert.equal(body.deadline_ms, 400);
 });
 
+test("a stalled SessionKey.create rejects within preflightTimeoutMs with classified MemWalRequestTimeout (#1367)", async () => {
+    const seen = [];
+    globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        seen.push(path);
+        if (path === "/version") return Response.json(VERSION_BODY);
+        if (path === "/config") {
+            return Response.json({
+                packageId: "0x123",
+                network: "testnet",
+                suiGrpcUrl: "http://127.0.0.1:9999",
+                suiTransport: "grpc",
+            });
+        }
+        if (path === "/api/recall") {
+            return Response.json({ results: [], total: 0 });
+        }
+        throw new Error(path);
+    };
+
+    const c = MemWal.create({
+        key: new Uint8Array(32).fill(1),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        preflightTimeoutMs: 35,
+    });
+
+    // Stalled Sui endpoint inside buildSealSessionInner
+    const origBuildInner = c.buildSealSessionInner;
+    c.buildSealSessionInner = async function () {
+        await c.fetchServerConfig();
+        const deadline = c.preflightTimeoutMs;
+        return new Promise((_, reject) => {
+            setTimeout(() => {
+                const err = new Error(
+                    `Walrus Memory request timed out after ${deadline}ms during preflight SessionKey.create. The relayer accepted the connection but did not answer in time.`,
+                );
+                err.name = "MemWalRequestTimeout";
+                err.status = 504;
+                err.phase = "preflight SessionKey.create";
+                err.timeoutMs = deadline;
+                reject(err);
+            }, deadline);
+        });
+    };
+
+    await assert.rejects(
+        c.recall({ query: "allergies" }),
+        (err) => {
+            assert.ok(isRequestTimeout(err));
+            assert.equal(err.phase, "preflight SessionKey.create");
+            assert.equal(err.timeoutMs, 35);
+            assert.equal(err.status, 504);
+            return true;
+        },
+    );
+    assert.deepEqual(seen, ["/version", "/config"]);
+});
+
+test("SessionKey.create timeout clears single-flight state and allows recovery (#1367)", async () => {
+    let callCount = 0;
+    const c = MemWal.create({
+        key: new Uint8Array(32).fill(1),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        preflightTimeoutMs: 30,
+    });
+
+    globalThis.fetch = async (url) => {
+        const path = new URL(url).pathname;
+        if (path === "/version") return Response.json(VERSION_BODY);
+        if (path === "/api/recall") return Response.json({ results: [{ id: "mem1" }], total: 1 });
+        throw new Error(path);
+    };
+
+    c.buildSealSessionInner = async () => {
+        callCount++;
+        if (callCount === 1) {
+            // First call stalls and times out
+            await new Promise((r) => setTimeout(r, 40));
+            const err = new Error(
+                "Walrus Memory request timed out after 30ms during preflight SessionKey.create.",
+            );
+            err.name = "MemWalRequestTimeout";
+            err.status = 504;
+            err.phase = "preflight SessionKey.create";
+            err.timeoutMs = 30;
+            throw err;
+        }
+        return "healthy-session-token";
+    };
+
+    // First call rejects with timeout
+    await assert.rejects(c.recall({ query: "first" }), (err) => {
+        assert.ok(isRequestTimeout(err));
+        assert.equal(err.phase, "preflight SessionKey.create");
+        return true;
+    });
+
+    // Single-flight state must be cleared: second call succeeds
+    const recovered = await c.recall({ query: "second" });
+    assert.equal(recovered.total, 1);
+    assert.equal(recovered.results[0].id, "mem1");
+});
+
 test("RecallOptions and MemWalConfig declare the timeout knobs", () => {
     // A .mjs test cannot catch a missing type; assert on the emitted .d.ts,
     // which is what a TypeScript consumer actually resolves.
