@@ -71,6 +71,9 @@ test("ordinary developer conversations and bare identifier mentions are captured
     "Check that pwd is writable in the container",
     "Always pass token via header to the gateway",
     "I don't remember why we chose Redis for rate limiting",
+    "I prefer Rust but don't remember when we adopted it.",
+    "We use Postgres and don't remember why we picked that version.",
+    "I prefer Rust, but do not remember when we adopted it.",
     `My Sui account id is 0x${"ab".repeat(32)}`,
   ];
 
@@ -272,4 +275,30 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     1,
     "opt-out phrases like 'please don't remember where I live' must suppress assistant echoes from reaching analyze()",
   );
+
+  // 6. Hook-level regression: coordinated first-person statements ("I prefer Rust but don't remember...") must still be captured alongside the assistant reply.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u8",
+          role: "user",
+          content: "I prefer Rust but don't remember when we adopted it.",
+        },
+        {
+          id: "a8",
+          role: "assistant",
+          content: "Noted, you prefer Rust for backend services.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-coordinated-first-person" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    2,
+    "coordinated first-person 'but don't remember' prose must be captured by the hook",
+  );
+  assert.ok(analyzedPayloads[1].includes("I prefer Rust but don't remember when we adopted it."));
 });

@@ -65,13 +65,20 @@ const ADDRESSES_MODEL = [
   /^(ign[o0a]re|disregard|f[o0]rget|override|bypass|run|execute|call|invoke|reveal|print|output)\b/i,
 ];
 
+const CLAUSE_IMPERATIVE_PREFIX =
+  "(?:^|[.!?;:(\\[\\n]\\s*|\\b(?:please|just)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
 const IMPERATIVE_NEGATION_PREFIX =
   "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:please|just|and|but)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
 
 /** Conversational opt-out patterns that instruct the assistant not to persist the turn. */
 const OPT_OUT_PATTERNS = [
   new RegExp(
-    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep))?\\b`,
+    `${CLAUSE_IMPERATIVE_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep))?\\b`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep)\\b|\\s+(?:any(?:\\s+of)?(?:\\s+(?:this|that|these|those|it))?|anything(?:\\s+(?:here|from\\s+this))?|this|that|these|those|it|the\\s+following\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b)`,
     "i",
   ),
   new RegExp(
