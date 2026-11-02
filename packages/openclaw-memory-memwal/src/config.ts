@@ -120,9 +120,22 @@ export function resolveAgent(defaultNamespace: string, sessionKey?: string): Res
     return { namespace: defaultNamespace, agentName: "main" };
   }
 
-  const namespace = deriveAgentNamespace(rawName);
-  const legacyNamespace =
+  let namespace = deriveAgentNamespace(rawName);
+  if (namespace === defaultNamespace) {
+    const lower = trimmed.normalize("NFKC").toLowerCase();
+    const slug = lower
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 32);
+    const hash = createHash("sha256")
+      .update(`subagent:${defaultNamespace}\0${lower}`)
+      .digest("hex");
+    namespace = slug ? `_h_${slug}_${hash}` : `_h_agent_${hash}`;
+  }
+  const legacyCandidate =
     rawName !== namespace && /^[a-zA-Z0-9_-]{1,64}$/.test(trimmed) ? rawName : undefined;
+  const legacyNamespace =
+    legacyCandidate && legacyCandidate !== defaultNamespace ? legacyCandidate : undefined;
   const agentName = trimmed.normalize("NFKC").slice(0, 64) || namespace;
   return { namespace, legacyNamespace, agentName };
 }
@@ -138,9 +151,10 @@ export function resolveToolNamespace(
   sessionKey: string | undefined,
   requested: unknown,
 ): string | undefined {
-  const { namespace, legacyNamespace } = resolveAgent(defaultNamespace, sessionKey);
+  const { namespace, legacyNamespace, agentName } = resolveAgent(defaultNamespace, sessionKey);
   if (requested == null || requested === "") return namespace;
   if (typeof requested !== "string") return undefined;
+  if (agentName !== "main" && requested === defaultNamespace) return undefined;
   if (requested === namespace || requested === legacyNamespace) return requested;
   return undefined;
 }
