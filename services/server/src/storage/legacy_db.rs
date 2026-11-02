@@ -21,7 +21,7 @@ impl LegacyDb {
         Self::new_with_search_path(database_url, None).await
     }
 
-    async fn new_with_search_path(
+    pub(crate) async fn new_with_search_path(
         database_url: &str,
         search_path: Option<&str>,
     ) -> Result<Self, AppError> {
@@ -431,6 +431,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
+        let pre_scope: String = sqlx::query_scalar(
+            "SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'pre'",
+        )
+        .fetch_one(legacy.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_scope, "legacy");
+        let post_scope: String = sqlx::query_scalar(
+            "SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'post'",
+        )
+        .fetch_one(legacy.pool())
+        .await
+        .unwrap();
+        assert_eq!(post_scope, "current");
         let url = std::env::var("TEST_LEGACY_DATABASE_URL").unwrap();
         let reopened = LegacyDb::new_with_search_path(&url, Some(&schema))
             .await
@@ -440,7 +454,7 @@ pub(crate) mod tests {
                 .fetch_all(reopened.pool())
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
         drop(reopened);
         drop(legacy);
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

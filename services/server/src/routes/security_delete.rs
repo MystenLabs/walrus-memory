@@ -2250,34 +2250,105 @@ mod tests {
         .await
         .unwrap();
 
-        store::ensure_post_migration_schema(&shared_pool).await.unwrap();
-
-        // Seed a pre-migration row (scope=legacy default).
-        sqlx::query(
-            "INSERT INTO delete_blobs_tracking (owner, blob_id, object_id, created_at, scope)
-             VALUES ($1, 'legacy-row', '0xaaa', NOW() - INTERVAL '1 day', 'legacy')",
-        )
-        .bind(OWNER)
-        .execute(&shared_pool)
-        .await
-        .unwrap();
-
-        // Insert a post-migration memory into vector_entries.
+        // Seed a pre-migration row into vector_entries BEFORE running the
+        // legacy migrations, matching the real shared-DB (LEGACY_DB_URL == DATABASE_URL)
+        // startup path where migration 002 backfills existing rows as scope=legacy
+        // and migration 001/003 installs trg_track_deletable on vector_entries.
         sqlx::query(
             "INSERT INTO vector_entries (id, owner, namespace, blob_id, created_at)
-             VALUES ('mem-post-1', $1, 'agent', 'current-row', NOW())",
+             VALUES ('mem-legacy-1', $1, 'default', 'legacy-row', NOW() - INTERVAL '1 day')",
         )
         .bind(OWNER)
         .execute(&shared_pool)
         .await
         .unwrap();
 
-        // Syncing enrolled the post-migration memory with scope=current.
+        let legacy_on_shared = crate::storage::legacy_db::LegacyDb::new_with_search_path(
+            &url,
+            Some(&shared_schema),
+        )
+        .await
+        .unwrap();
+        store::ensure_post_migration_schema(&shared_pool).await.unwrap();
+
+        let trigger_installed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_trigger t
+                JOIN pg_class c ON c.oid = t.tgrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND c.relname = 'vector_entries'
+                  AND t.tgname = 'trg_track_deletable'
+                  AND NOT t.tgisinternal
+            )",
+        )
+        .fetch_one(&shared_pool)
+        .await
+        .unwrap();
+        assert!(trigger_installed, "trg_track_deletable must be active on vector_entries");
+
+        // Resolve the pre-migration row's object_id so it is claimable by legacy delete-all.
+        store::set_object_ids(&shared_pool, OWNER, &[("legacy-row".into(), "0xaaa".into())])
+            .await
+            .unwrap();
+
+        // 1. Insert a post-migration memory while remember_jobs does not exist yet
+        //    (covers the no-remember-jobs sync branch with trg_track_deletable installed).
+        sqlx::query(
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id, created_at)
+             VALUES ('mem-post-no-job', $1, 'agent', 'current-no-job', NOW())",
+        )
+        .bind(OWNER)
+        .execute(&shared_pool)
+        .await
+        .unwrap();
+
         store::sync_owner_post_migration_blobs(&shared_pool, OWNER)
             .await
             .unwrap();
 
-        // 1. list_blobs with scope=legacy must only see the legacy row.
+        // 2. Add remember_jobs with blob_object_id and insert a second post-migration
+        //    memory through trg_track_deletable, then verify sync backfills object_id
+        //    without reverting scope to legacy.
+        sqlx::raw_sql(
+            "CREATE TABLE remember_jobs (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                blob_id TEXT,
+                blob_object_id TEXT
+            );",
+        )
+        .execute(&shared_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id, created_at)
+             VALUES ('mem-post-1', $1, 'agent', 'current-row', NOW() + INTERVAL '1 second')",
+        )
+        .bind(OWNER)
+        .execute(&shared_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, blob_id, blob_object_id)
+             VALUES ('job-post-1', $1, 'current-row', '0xbbb')",
+        )
+        .bind(OWNER)
+        .execute(&shared_pool)
+        .await
+        .unwrap();
+
+        store::sync_owner_post_migration_blobs(&shared_pool, OWNER)
+            .await
+            .unwrap();
+
+        // Also assign an object_id to current-no-job so both current rows are claimable.
+        store::set_object_ids(&shared_pool, OWNER, &[("current-no-job".into(), "0xccc".into())])
+            .await
+            .unwrap();
+
+        // 3. list_blobs with scope=legacy must only see the legacy row.
         let legacy_list = store::list_blobs(&shared_pool, OWNER, "legacy", &[store::BLOB_DELETABLE], None, 10)
             .await
             .unwrap();
@@ -2285,24 +2356,29 @@ mod tests {
         assert_eq!(legacy_list[0].blob_id, "legacy-row");
         assert_eq!(legacy_list[0].scope, "legacy");
 
-        // 2. list_blobs with scope=current must only see the current row.
+        // 4. list_blobs with scope=current must see both trigger-captured post-migration rows.
         let current_list = store::list_blobs(&shared_pool, OWNER, "current", &[store::BLOB_DELETABLE], None, 10)
             .await
             .unwrap();
-        assert_eq!(current_list.len(), 1);
-        assert_eq!(current_list[0].blob_id, "current-row");
+        assert_eq!(current_list.len(), 2);
+        assert_eq!(current_list[0].blob_id, "current-no-job");
         assert_eq!(current_list[0].scope, "current");
+        assert_eq!(current_list[0].object_id.as_deref(), Some("0xccc"));
+        assert_eq!(current_list[1].blob_id, "current-row");
+        assert_eq!(current_list[1].scope, "current");
+        let expected_obj = format!("0x{:0>64}", "bbb");
+        assert_eq!(current_list[1].object_id.as_deref(), Some(expected_obj.as_str()));
 
-        // 3. counts per scope must be isolated.
+        // 5. counts per scope must be isolated.
         let legacy_counts = store::counts(&shared_pool, OWNER, "legacy").await.unwrap();
         assert_eq!(legacy_counts.total, 1);
         assert_eq!(legacy_counts.deletable, 1);
 
         let current_counts = store::counts(&shared_pool, OWNER, "current").await.unwrap();
-        assert_eq!(current_counts.total, 1);
-        assert_eq!(current_counts.deletable, 1);
+        assert_eq!(current_counts.total, 2);
+        assert_eq!(current_counts.deletable, 2);
 
-        // 4. Pre-migration delete-all must NOT claim post-migration memories.
+        // 6. Pre-migration delete-all must NOT claim post-migration memories.
         let legacy_batch_id = Uuid::new_v4();
         let claim_legacy = store::create_batch_and_claim_all(&shared_pool, OWNER, "legacy", legacy_batch_id, 10, 5)
             .await
@@ -2310,21 +2386,25 @@ mod tests {
         assert_eq!(claim_legacy.rows.len(), 1);
         assert_eq!(claim_legacy.rows[0].blob_id, "legacy-row");
 
-        // Current row must still be deletable and untouched.
+        // Both post-migration rows must still be deletable and untouched in scope=current.
         let current_after_legacy_claim = store::list_blobs(&shared_pool, OWNER, "current", &[store::BLOB_DELETABLE], None, 10)
             .await
             .unwrap();
-        assert_eq!(current_after_legacy_claim.len(), 1);
-        assert_eq!(current_after_legacy_claim[0].blob_id, "current-row");
+        assert_eq!(current_after_legacy_claim.len(), 2);
+        assert_eq!(current_after_legacy_claim[0].blob_id, "current-no-job");
+        assert_eq!(current_after_legacy_claim[1].blob_id, "current-row");
 
-        // 5. Post-migration claim claims the current row.
+        // 7. Post-migration claim claims the current rows.
         let current_batch_id = Uuid::new_v4();
         let claim_current = store::create_batch_and_claim_all(&shared_pool, OWNER, "current", current_batch_id, 10, 5)
             .await
             .unwrap();
-        assert_eq!(claim_current.rows.len(), 1);
-        assert_eq!(claim_current.rows[0].blob_id, "current-row");
+        let mut claimed_current_ids: Vec<&str> =
+            claim_current.rows.iter().map(|r| r.blob_id.as_str()).collect();
+        claimed_current_ids.sort_unstable();
+        assert_eq!(claimed_current_ids, vec!["current-no-job", "current-row"]);
 
+        drop(legacy_on_shared);
         drop(shared_pool);
         sqlx::query(&format!("DROP SCHEMA {shared_schema} CASCADE"))
             .execute(&admin)

@@ -377,7 +377,8 @@ pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Resu
                  WHEN delete_blobs_tracking.object_id IS NULL AND EXCLUDED.object_id IS NOT NULL
                  THEN NOW()
                  ELSE delete_blobs_tracking.updated_at
-             END"
+             END
+         WHERE delete_blobs_tracking.scope = 'current'"
     } else {
         "INSERT INTO delete_blobs_tracking (owner, blob_id, created_at, scope)
          SELECT $1, v.blob_id, MIN(v.created_at), 'current'
