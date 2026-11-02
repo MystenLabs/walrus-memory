@@ -5997,6 +5997,18 @@ mod tests {
     ///    `register_tx_digest = Hfa3q2sJh5iygs8LkNZhfzAwucLqLAdjJ5ysSwVwH9Fd`,
     ///    `certify_tx_digest = GSuvQv1m7hkygHPhyBZJwPUSagxsjhCCRSZiAktpoH2`,
     ///    `metadata_tx_digest = Da8gSf4Ezj9m6mfRcZVGXtwWSCa9D8EchsKKFkUQMJay`.
+    /// 4. Full Mainnet Relayer and Playground E2E (`MEMWAL_RUST_IN_PROCESS=true` on `localhost:8000` and `localhost:5173`):
+    ///    `owner = 0x657b36b4ec56243d3eb5159924a8271443fcabb25dde392304dc73b4ae80746e`,
+    ///    `account_id = 0x4c4be30a1e03e09f491fa1756ab4f855898e2124a97b78cd91b50f034ce89044`
+    ///    (`create_account` tx `6rNKwiBJJ35e6j6Rrxh2N1uLPcE6iaLqRZu8zAfiLqgv`, `add_delegate_key` tx
+    ///    `HUSdecBTiba1KexEYgWP2LwSqvDwFZp6bdrm4PEotGfU`),
+    ///    Single `remember` (`job_id = 2801306a-6e82-40a9-8fa9-4fc55b71a74a`):
+    ///    `blob_id = aiHmWsnNbHVna18yk3qVelrruge_smqd1kJtpect2jI`,
+    ///    Parallel `remember_bulk` (`14.03s` and `15.88s` end-to-end across wallets `4` and `5`):
+    ///    `blob_id = IyH_RfSOqkQDyle6v5S2ZXw1EX93pdMj367XgvwPKvM` (`job_id = 2f7451bb-70a7-4f65-ba1f-9276aaf49ebf`)
+    ///    and `blob_id = nHioLgEs3fU1HluBwNClr8jYVBdxoehhBffQCHPIGEQ` (`job_id = 924bff81-dc60-4ab9-9fb0-0029e7821c1f`),
+    ///    plus `POST /api/recall` (`3` blobs decrypted in-process), `POST /api/restore` (`525 ms`, `3` blobs verified),
+    ///    and `POST /api/mcp` (`memwal_recall` returning all `3` Mainnet memories).
     #[tokio::test]
     #[ignore = "hits live Sui Mainnet gRPC and Walrus Mainnet Upload Relay"]
     async fn live_mainnet_walrus_upload_relay_and_seal_pipeline_verification() {
