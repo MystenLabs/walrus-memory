@@ -1007,7 +1007,7 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, batch, &["a".into()], 16)
+        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", batch, &["a".into()], 16)
             .await
             .unwrap();
         sqlx::query(
@@ -1055,7 +1055,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
         {
-            store::create_batch_and_claim_selection(legacy.pool(), OWNER, id, &[blob.into()], 16)
+            store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", id, &[blob.into()], 16)
                 .await
                 .unwrap();
             store::set_batch_prepared(
@@ -1129,7 +1129,7 @@ mod tests {
         };
         seed(legacy.pool(), "retry", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, batch, &["retry".into()], 16)
+        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", batch, &["retry".into()], 16)
             .await
             .unwrap();
         let (built, object) = prepared_blob_tx("retry", "0x1");
@@ -1204,6 +1204,7 @@ mod tests {
         store::create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             batch,
             &["missing".into()],
             16,
@@ -1423,7 +1424,7 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let old = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, old, &["a".into()], 16)
+        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", old, &["a".into()], 16)
             .await
             .unwrap();
         store::set_batch_prepared(
@@ -1490,7 +1491,7 @@ mod tests {
         .await
         .unwrap());
         let new = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, new, &["a".into()], 16)
+        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", new, &["a".into()], 16)
             .await
             .unwrap();
         resume.notify_one();

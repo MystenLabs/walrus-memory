@@ -138,13 +138,16 @@ You can verify that a memory blob was permanently deleted across all three layer
 
 ## Limits involving caches and copies
 
-Deleting a deletable Walrus `Blob` destroys the onchain object, stops future Seal key
-release for deleted records, and removes the memory from MemWal's search index, with the
-following boundaries:
+Deleting a deletable Walrus `Blob` destroys the onchain object and removes the memory
+from MemWal's search index, with the following boundaries:
 
-- **Aggregator and HTTP caches**: Public Walrus HTTP aggregators, CDNs, or intermediate
-  proxies that recently served the encrypted blob bytes may continue returning cached
-  ciphertext until their cache TTL expires.
+- **Aggregator caches and Seal decryption**: Public Walrus HTTP aggregators, CDNs, or
+  intermediate proxies that recently served the encrypted blob bytes may continue
+  returning cached ciphertext until their cache TTL expires. Destroying a Walrus `Blob`
+  does not revoke future Seal key release under the current contract because `account::seal_approve`
+  authorizes the account owner or active delegates rather than checking blob deletion state.
+  An authorized account can therefore still decrypt cached ciphertext retained by an
+  aggregator after deletion.
 - **Storage-node reclamation timing**: Destroying the onchain `Blob` object marks the
   storage resource as deleted on Sui immediately, while physical erasure of encrypted
   slivers on individual Walrus storage nodes completes asynchronously as nodes process

@@ -28,6 +28,8 @@ pub const MEMBER_RELEASED: &str = "released";
 // Two-key advisory locks use a separate keyspace from the bigint locks used
 // elsewhere. 21316 is ASCII "SD" (security delete).
 const RESOLVER_OWNER_LOCK_NAMESPACE: i32 = 21_316;
+// 21317 is used for serializing post-migration schema creation across concurrent replicas.
+const SCHEMA_INIT_LOCK_ID: i64 = 21_317;
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct BlobRow {
@@ -41,6 +43,9 @@ pub struct BlobRow {
     pub state: String,
     #[allow(dead_code)] // exposed for generation diagnostics and race assertions
     pub batch_id: Option<Uuid>,
+    #[allow(dead_code)] // exposed for scope-isolation diagnostics
+    #[sqlx(default)]
+    pub scope: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,6 +76,8 @@ pub struct BatchRow {
     pub id: Uuid,
     pub owner: String,
     pub state: String,
+    #[allow(dead_code)] // retained for scope diagnostics
+    pub scope: String,
     pub digest: Option<String>,
     pub tx_bytes: Option<Vec<u8>>,
     pub input_blob_ids: Option<Vec<String>>,
@@ -94,6 +101,8 @@ struct BatchDbRow {
     id: Uuid,
     owner: String,
     state: String,
+    #[sqlx(default)]
+    scope: Option<String>,
     digest: Option<String>,
     tx_bytes: Option<Vec<u8>>,
     input_blob_ids: Option<Vec<u8>>,
@@ -132,6 +141,7 @@ impl TryFrom<BatchDbRow> for BatchRow {
             id: row.id,
             owner: row.owner,
             state: row.state,
+            scope: row.scope.unwrap_or_else(|| "legacy".to_string()),
             digest: row.digest,
             tx_bytes: row.tx_bytes,
             input_blob_ids,
@@ -196,6 +206,7 @@ CREATE TABLE IF NOT EXISTS deletion_batches (
     owner TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN
         ('awaiting_signature','executing','completed','failed','rolled_back')),
+    scope TEXT NOT NULL DEFAULT 'legacy' CHECK (scope IN ('legacy', 'current')),
     digest TEXT,
     tx_bytes BYTEA,
     input_blob_ids BYTEA,
@@ -209,8 +220,11 @@ CREATE TABLE IF NOT EXISTS deletion_batches (
     submit_attempts INT NOT NULL DEFAULT 0,
     resolved_at TIMESTAMPTZ
 );
+ALTER TABLE deletion_batches
+    ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'legacy';
 CREATE INDEX IF NOT EXISTS idx_active_batches_owner ON deletion_batches (owner)
     WHERE state IN ('awaiting_signature', 'executing');
+CREATE INDEX IF NOT EXISTS idx_batches_owner_scope ON deletion_batches (owner, scope, state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deletion_nonce_epoch ON deletion_batches (expire_epoch, nonce)
     WHERE tx_bytes IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_deletion_batches_retry
@@ -226,6 +240,7 @@ CREATE TABLE IF NOT EXISTS delete_blobs_tracking (
     state TEXT NOT NULL DEFAULT 'deletable' CHECK (state IN
         ('deletable','deleting','deleted','deleted_external','not_owner','expired')),
     batch_id UUID REFERENCES deletion_batches(id),
+    scope TEXT NOT NULL DEFAULT 'legacy' CHECK (scope IN ('legacy', 'current')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     tracked_seq BIGINT NOT NULL DEFAULT nextval('delete_blobs_tracking_resolver_seq')
         CHECK (tracked_seq > 0),
@@ -239,8 +254,12 @@ ALTER TABLE delete_blobs_tracking
     ADD COLUMN IF NOT EXISTS tracked_seq BIGINT NOT NULL DEFAULT nextval('delete_blobs_tracking_resolver_seq');
 ALTER TABLE delete_blobs_tracking
     ADD COLUMN IF NOT EXISTS tracked_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE delete_blobs_tracking
+    ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'legacy';
 CREATE INDEX IF NOT EXISTS idx_tracking_owner_state_created
     ON delete_blobs_tracking (owner, state, created_at, blob_id);
+CREATE INDEX IF NOT EXISTS idx_tracking_owner_scope_state_created
+    ON delete_blobs_tracking (owner, scope, state, created_at, blob_id);
 CREATE INDEX IF NOT EXISTS idx_tracking_batch ON delete_blobs_tracking (batch_id)
     WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tracking_resolver_pending
@@ -281,10 +300,22 @@ CREATE INDEX IF NOT EXISTS idx_members_outcome_audit
 /// deployments (`LEGACY_DB_URL != DATABASE_URL`) and post-migration-only deployments get the full
 /// idempotent schema on the primary database with zero boot-time table scans.
 pub async fn ensure_post_migration_schema(pool: &PgPool) -> Result<(), AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| storage("begin ensure post-migration deletion schema", error))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SCHEMA_INIT_LOCK_ID)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("lock post-migration deletion schema init", error))?;
     sqlx::raw_sql(POST_MIGRATION_DELETION_SCHEMA_SQL)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|error| storage("ensure post-migration deletion schema", error))?;
+    tx.commit()
+        .await
+        .map_err(|error| storage("commit ensure post-migration deletion schema", error))?;
     Ok(())
 }
 
@@ -323,7 +354,7 @@ pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Resu
     .map_err(|error| storage("probe remember_jobs blob_object_id", error))?;
 
     let sql = if has_remember_jobs {
-        "INSERT INTO delete_blobs_tracking (owner, blob_id, object_id, created_at)
+        "INSERT INTO delete_blobs_tracking (owner, blob_id, object_id, created_at, scope)
          SELECT
              $1,
              v.blob_id,
@@ -333,7 +364,8 @@ pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Resu
                      THEN '0x' || lpad(lower(substr(j.blob_object_id, 3)), 64, '0')
                  END
              ),
-             MIN(v.created_at)
+             MIN(v.created_at),
+             'current'
          FROM vector_entries v
          LEFT JOIN remember_jobs j
            ON j.owner = v.owner AND j.blob_id = v.blob_id
@@ -347,8 +379,8 @@ pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Resu
                  ELSE delete_blobs_tracking.updated_at
              END"
     } else {
-        "INSERT INTO delete_blobs_tracking (owner, blob_id, created_at)
-         SELECT $1, v.blob_id, MIN(v.created_at)
+        "INSERT INTO delete_blobs_tracking (owner, blob_id, created_at, scope)
+         SELECT $1, v.blob_id, MIN(v.created_at), 'current'
          FROM vector_entries v
          WHERE v.owner = $1
          GROUP BY v.blob_id
@@ -369,6 +401,7 @@ pub async fn sync_owner_post_migration_blobs(pool: &PgPool, owner: &str) -> Resu
 pub async fn list_blobs(
     pool: &PgPool,
     owner: &str,
+    scope: &str,
     states: &[&str],
     cursor: Option<(DateTime<Utc>, String)>,
     limit: i64,
@@ -381,13 +414,14 @@ pub async fn list_blobs(
         .map(|(time, blob)| (Some(time), Some(blob)))
         .unwrap_or((None, None));
     sqlx::query_as::<_, BlobRow>(
-        "SELECT blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id
+        "SELECT blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id, scope
          FROM delete_blobs_tracking
-         WHERE owner=$1 AND (cardinality($2::text[])=0 OR state=ANY($2))
-           AND ($3::timestamptz IS NULL OR (created_at, blob_id) > ($3, $4))
-         ORDER BY created_at, blob_id LIMIT $5",
+         WHERE owner=$1 AND scope=$2 AND (cardinality($3::text[])=0 OR state=ANY($3))
+           AND ($4::timestamptz IS NULL OR (created_at, blob_id) > ($4, $5))
+         ORDER BY created_at, blob_id LIMIT $6",
     )
     .bind(owner)
+    .bind(scope)
     .bind(states)
     .bind(cursor_time)
     .bind(cursor_blob)
@@ -397,7 +431,7 @@ pub async fn list_blobs(
     .map_err(|error| storage("list blobs", error))
 }
 
-pub async fn counts(pool: &PgPool, owner: &str) -> Result<Counts, AppError> {
+pub async fn counts(pool: &PgPool, owner: &str, scope: &str) -> Result<Counts, AppError> {
     let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*),
           count(*) FILTER (WHERE state='deletable'),
@@ -406,9 +440,10 @@ pub async fn counts(pool: &PgPool, owner: &str) -> Result<Counts, AppError> {
           count(*) FILTER (WHERE state='deleted_external'),
           count(*) FILTER (WHERE state='not_owner'),
           count(*) FILTER (WHERE state='expired')
-         FROM delete_blobs_tracking WHERE owner=$1",
+         FROM delete_blobs_tracking WHERE owner=$1 AND scope=$2",
     )
     .bind(owner)
+    .bind(scope)
     .fetch_one(pool)
     .await
     .map_err(|error| storage("count blobs", error))?;
@@ -463,13 +498,15 @@ async fn insert_batch(
     tx: &mut Transaction<'_, Postgres>,
     owner: &str,
     batch_id: Uuid,
+    scope: &str,
 ) -> Result<(), ClaimError> {
     sqlx::query(
-        "INSERT INTO deletion_batches (id, owner, state)
-         VALUES ($1,$2,'awaiting_signature')",
+        "INSERT INTO deletion_batches (id, owner, state, scope)
+         VALUES ($1,$2,'awaiting_signature',$3)",
     )
     .bind(batch_id)
     .bind(owner)
+    .bind(scope)
     .execute(&mut **tx)
     .await
     .map_err(|error| ClaimError::Storage(storage("insert batch", error)))?;
@@ -500,6 +537,7 @@ async fn insert_claimed_members(
 pub async fn create_batch_and_claim_selection(
     pool: &PgPool,
     owner: &str,
+    scope: &str,
     batch_id: Uuid,
     blob_ids: &[String],
     active_cap: i64,
@@ -509,13 +547,14 @@ pub async fn create_batch_and_claim_selection(
         .await
         .map_err(|error| ClaimError::Storage(storage("begin claim", error)))?;
     lock_and_check_cap(&mut tx, owner, active_cap).await?;
-    insert_batch(&mut tx, owner, batch_id).await?;
+    insert_batch(&mut tx, owner, batch_id, scope).await?;
     let rows = sqlx::query_as::<_, BlobRow>(
-        "UPDATE delete_blobs_tracking SET state='deleting', batch_id=$3, updated_at=NOW()
-         WHERE owner=$1 AND blob_id=ANY($2::text[]) AND state='deletable'
-         RETURNING blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id",
+        "UPDATE delete_blobs_tracking SET state='deleting', batch_id=$4, updated_at=NOW()
+         WHERE owner=$1 AND scope=$2 AND blob_id=ANY($3::text[]) AND state='deletable'
+         RETURNING blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id, scope",
     )
     .bind(owner)
+    .bind(scope)
     .bind(blob_ids)
     .bind(batch_id)
     .fetch_all(&mut *tx)
@@ -549,6 +588,7 @@ pub async fn create_batch_and_claim_selection(
 pub async fn create_batch_and_claim_all(
     pool: &PgPool,
     owner: &str,
+    scope: &str,
     batch_id: Uuid,
     max: i64,
     active_cap: i64,
@@ -558,19 +598,20 @@ pub async fn create_batch_and_claim_all(
         .await
         .map_err(|error| ClaimError::Storage(storage("begin claim all", error)))?;
     lock_and_check_cap(&mut tx, owner, active_cap).await?;
-    insert_batch(&mut tx, owner, batch_id).await?;
+    insert_batch(&mut tx, owner, batch_id, scope).await?;
     let rows = sqlx::query_as::<_, BlobRow>(
         "UPDATE delete_blobs_tracking tracking
          SET state='deleting', batch_id=$2, updated_at=NOW()
          WHERE (tracking.owner, tracking.blob_id) IN (
            SELECT owner, blob_id FROM delete_blobs_tracking
-           WHERE owner=$1 AND state='deletable' ORDER BY created_at, blob_id
+           WHERE owner=$1 AND scope=$4 AND state='deletable' ORDER BY created_at, blob_id
            LIMIT $3 FOR UPDATE SKIP LOCKED)
-         RETURNING blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id",
+         RETURNING blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id, scope",
     )
     .bind(owner)
     .bind(batch_id)
     .bind(max)
+    .bind(scope)
     .fetch_all(&mut *tx)
     .await
     .map_err(|error| ClaimError::Storage(storage("claim all", error)))?;
@@ -599,7 +640,7 @@ pub async fn batch_blobs(
     owner: &str,
 ) -> Result<Vec<BlobRow>, AppError> {
     sqlx::query_as(
-        "SELECT blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id
+        "SELECT blob_id, object_id, created_at, tracked_at, tracked_seq, state, batch_id, scope
          FROM delete_blobs_tracking WHERE batch_id=$1 AND owner=$2
          ORDER BY created_at, blob_id",
     )
@@ -893,7 +934,7 @@ pub async fn finalize_batch_deleted(
                 FROM delete_blobs_tracking t
                 INNER JOIN vector_entries v
                   ON v.owner = t.owner AND v.blob_id = t.blob_id
-                WHERE t.batch_id=$1 AND t.state='deleting'
+                WHERE t.batch_id=$1 AND t.state='deleting' AND t.scope = 'current'
              ),
              removed AS (
                 DELETE FROM vector_entries v
@@ -941,6 +982,7 @@ pub async fn finalize_batch_deleted(
              FROM delete_blobs_tracking t
              WHERE t.batch_id = $1
                AND t.state = 'deleting'
+               AND t.scope = 'current'
                AND j.owner = t.owner
                AND j.blob_id = t.blob_id
                AND j.idempotency_key IS NOT NULL",
@@ -989,7 +1031,7 @@ pub async fn get_batch(
     owner: &str,
 ) -> Result<Option<BatchRow>, AppError> {
     sqlx::query_as::<_, BatchDbRow>(
-        "SELECT id,owner,state,digest,tx_bytes,input_blob_ids,blob_count,nonce,
+        "SELECT id,owner,state,scope,digest,tx_bytes,input_blob_ids,blob_count,nonce,
                 expire_epoch,claimed_at,signatures,executing_at,last_submit_at,
                 submit_attempts,resolved_at
          FROM deletion_batches WHERE id=$1 AND owner=$2",
@@ -1011,7 +1053,7 @@ pub async fn stuck_batches(
     let awaiting_before = Utc::now() - awaiting_older_than;
     let executing_before = Utc::now() - executing_older_than;
     let rows = sqlx::query_as::<_, BatchDbRow>(
-        "SELECT id,owner,state,digest,tx_bytes,input_blob_ids,blob_count,nonce,
+        "SELECT id,owner,state,scope,digest,tx_bytes,input_blob_ids,blob_count,nonce,
                 expire_epoch,claimed_at,signatures,executing_at,last_submit_at,
                 submit_attempts,resolved_at FROM deletion_batches
          WHERE (state='awaiting_signature' AND claimed_at<$1)
@@ -1341,13 +1383,14 @@ mod tests {
         };
         seed(legacy.pool(), &["a", "b", "c"]).await;
         let first = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, first, &["b".into()], 16)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", first, &["b".into()], 16)
             .await
             .unwrap();
         let second = Uuid::new_v4();
         let result = create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             second,
             &["a".into(), "b".into(), "c".into()],
             16,
@@ -1367,7 +1410,7 @@ mod tests {
         .await
         .unwrap());
         let third = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, third, &["b".into()], 16)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", third, &["b".into()], 16)
             .await
             .unwrap();
         assert!(
@@ -1409,6 +1452,7 @@ mod tests {
         let result = create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             batch,
             &["wallet-owned-but-untracked".into()],
             16,
@@ -1440,16 +1484,16 @@ mod tests {
             return;
         };
         seed(legacy.pool(), &["a", "b", "c", "d", "e"]).await;
-        let first = list_blobs(legacy.pool(), OWNER, &[BLOB_DELETABLE], None, 2)
+        let first = list_blobs(legacy.pool(), OWNER, "legacy", &[BLOB_DELETABLE], None, 2)
             .await
             .unwrap();
         let cursor = (first[1].created_at, first[1].blob_id.clone());
-        let second = list_blobs(legacy.pool(), OWNER, &[BLOB_DELETABLE], Some(cursor), 10)
+        let second = list_blobs(legacy.pool(), OWNER, "legacy", &[BLOB_DELETABLE], Some(cursor), 10)
             .await
             .unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 3);
-        let counts = counts(legacy.pool(), OWNER).await.unwrap();
+        let counts = counts(legacy.pool(), OWNER, "legacy").await.unwrap();
         assert_eq!(counts.total, 5);
         assert_eq!(counts.deletable, 5);
         drop(legacy);
@@ -1467,12 +1511,13 @@ mod tests {
         };
         seed(legacy.pool(), &["a", "b"]).await;
         let first = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, first, &["a".into()], 1)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", first, &["a".into()], 1)
             .await
             .unwrap();
         let blocked = create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             Uuid::new_v4(),
             &["b".into()],
             1,
@@ -1494,7 +1539,7 @@ mod tests {
             Some(1)
         );
         let second = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, second, &["b".into()], 1)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", second, &["b".into()], 1)
             .await
             .unwrap();
         assert!(rollback_batch(
@@ -1550,6 +1595,7 @@ mod tests {
         create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             batch,
             &["a".into(), "b".into()],
             16,
@@ -1619,6 +1665,7 @@ mod tests {
         create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             batch,
             &["a".into(), "b".into()],
             16,
@@ -1662,7 +1709,7 @@ mod tests {
         };
         seed(legacy.pool(), &["a"]).await;
         let first = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, first, &["a".into()], 16)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", first, &["a".into()], 16)
             .await
             .unwrap();
         assert!(rollback_batch(
@@ -1681,7 +1728,7 @@ mod tests {
         // Re-claim after rollback appends a SECOND member row (new batch);
         // the released row is history and is never rewritten.
         let second = Uuid::new_v4();
-        create_batch_and_claim_selection(legacy.pool(), OWNER, second, &["a".into()], 16)
+        create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", second, &["a".into()], 16)
             .await
             .unwrap();
         assert!(cas_batch_state(
@@ -1722,8 +1769,8 @@ mod tests {
         seed(legacy.pool(), &["a"]).await;
         let contested: Vec<String> = vec!["a".into()];
         let (left, right) = tokio::join!(
-            create_batch_and_claim_selection(legacy.pool(), OWNER, Uuid::new_v4(), &contested, 16),
-            create_batch_and_claim_selection(legacy.pool(), OWNER, Uuid::new_v4(), &contested, 16),
+            create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", Uuid::new_v4(), &contested, 16),
+            create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", Uuid::new_v4(), &contested, 16),
         );
         assert_eq!(
             [&left, &right].iter().filter(|r| r.is_ok()).count(),
@@ -1759,8 +1806,8 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let (left, right) = tokio::join!(
-            create_batch_and_claim_all(legacy.pool(), OWNER, a, 6, 16),
-            create_batch_and_claim_all(legacy.pool(), OWNER, b, 6, 16),
+            create_batch_and_claim_all(legacy.pool(), OWNER, "legacy", a, 6, 16),
+            create_batch_and_claim_all(legacy.pool(), OWNER, "legacy", b, 6, 16),
         );
         let left: HashSet<String> = left
             .unwrap()
@@ -1805,7 +1852,7 @@ mod tests {
                 let pool = pool.clone();
                 async move {
                     let blobs = vec![blob.to_owned()];
-                    create_batch_and_claim_selection(&pool, OWNER, batch, &blobs, 2).await
+                    create_batch_and_claim_selection(&pool, OWNER, "legacy", batch, &blobs, 2).await
                 }
             });
         let results = futures::future::join_all(futures).await;
