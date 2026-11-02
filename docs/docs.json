@@ -167,6 +167,18 @@
         ]
       },
       {
+        "tab": "Rust SDK",
+        "groups": [
+          {
+            "group": "Rust SDK",
+            "pages": [
+              "rust-sdk/quick-start",
+              "rust-sdk/api-reference"
+            ]
+          }
+        ]
+      },
+      {
         "tab": "Relayer",
         "groups": [
           {

@@ -1,0 +1,47 @@
+[package]
+name = "memwal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Official Rust SDK for Walrus Memory: encrypted decentralized memory for AI agents on Sui and Walrus"
+license = "Apache-2.0"
+repository = "https://github.com/MystenLabs/MemWal"
+homepage = "https://memory.walrus.xyz"
+documentation = "https://docs.rs/memwal"
+readme = "README.md"
+keywords = ["walrus", "memory", "sui", "ai", "agent"]
+categories = ["api-bindings", "asynchronous", "cryptography"]
+
+[dependencies]
+base64 = "0.22"
+blake2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+hex = "0.4"
+percent-encoding = "2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+pedantic = { level = "warn", priority = -1 }
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unwrap_used = "deny"

@@ -1,0 +1,57 @@
+name: Release Rust SDK
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'packages/rust-sdk/**'
+      - '.github/workflows/release-rust-sdk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: release-rust-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: packages/rust-sdk
+
+jobs:
+  package-and-release:
+    name: Package & Optional crates.io Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/rust-sdk
+
+      - name: Run test suite
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Verify publishable crate archive
+        run: cargo package --locked
+
+      - name: Publish to crates.io (gated)
+        if: github.ref == 'refs/heads/main' && vars.ENABLE_CRATES_IO_PUBLISH == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Report gated crates.io state
+        if: github.ref != 'refs/heads/main' || vars.ENABLE_CRATES_IO_PUBLISH != 'true'
+        run: |
+          echo "Crate archive verified via cargo package --locked."
+          echo "Live crates.io publish is gated until vars.ENABLE_CRATES_IO_PUBLISH == 'true' on main."
