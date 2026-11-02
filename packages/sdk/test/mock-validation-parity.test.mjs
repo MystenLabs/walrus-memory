@@ -71,6 +71,72 @@ function assertSameSyncThrow(label, runOnClass) {
     assert.equal(mockErr.message, realErr.message, `${label}: error message must match`);
 }
 
+function createAcceptanceClients() {
+    let networkCalls = 0;
+    globalThis.fetch = async (url) => {
+        networkCalls++;
+        const path = new URL(url).pathname;
+        if (path === "/version") {
+            return Response.json({
+                apiVersion: "1.0.0",
+                relayerVersion: "1.0.0",
+                minSupportedSdk: { typescript: "0.0.4" },
+            });
+        }
+        if (path === "/api/config") {
+            return Response.json({ packageId: "0x1", network: "testnet" });
+        }
+        if (path === "/api/stats") {
+            return Response.json({ owner: "0x" + "11".repeat(32) });
+        }
+        if (path === "/api/recall") {
+            return Response.json({ results: [], total: 0 });
+        }
+        if (path === "/api/restore") {
+            return Response.json({
+                restored: 0,
+                skipped: 0,
+                failed: 0,
+                total: 0,
+                namespace: "default",
+                owner: "0x" + "11".repeat(32),
+                truncated: false,
+            });
+        }
+        if (path.startsWith("/v1/owners/")) {
+            return Response.json({ namespaces: [], memories: [], cursor: null, has_more: false });
+        }
+        return Response.json({
+            job_id: "job_accept",
+            job_ids: ["job_accept"],
+            status: "completed",
+        });
+    };
+
+    const real = MemWal.create({
+        key: "01".repeat(32),
+        accountId: "0x" + "11".repeat(32),
+    });
+    real.buildSealSession = async () => "test-session";
+    const mock = MemWalMock.create();
+    return {
+        real,
+        mock,
+        getCalls: () => networkCalls,
+    };
+}
+
+async function assertSameAcceptance(label, runOnClient) {
+    const { real, mock, getCalls } = createAcceptanceClients();
+    const callsBefore = getCalls();
+    await runOnClient(real);
+    const callsAfter = getCalls();
+    assert.ok(callsAfter > callsBefore, `${label}: MemWal must reach network on valid input`);
+
+    // Mock client must resolve without throwing
+    await runOnClient(mock);
+}
+
 test("MemWal and MemWalMock enforce identical text validation on remember*, analyze*, and embed", async () => {
     const blankTexts = ["", "   ", "\t\n", "\u200B", "\uFEFF", " \u200B "];
     const nonStringTexts = [null, undefined, 123, {}];
@@ -227,9 +293,6 @@ test("MemWal and MemWalMock enforce identical empty/whitespace namespace validat
         await assertSameRejection(`rememberAndWait("ok", ${desc})`, (c) =>
             c.rememberAndWait("ok", badNs),
         );
-        await assertSameRejection(`recall({ query: "ok", namespace: ${desc} })`, (c) =>
-            c.recall({ query: "ok", namespace: badNs }),
-        );
         await assertSameRejection(`analyze("ok", ${desc})`, (c) =>
             c.analyze("ok", badNs),
         );
@@ -239,8 +302,54 @@ test("MemWal and MemWalMock enforce identical empty/whitespace namespace validat
         await assertSameRejection(`analyzeAndWait("ok", ${desc})`, (c) =>
             c.analyzeAndWait("ok", badNs),
         );
-        await assertSameRejection(`restore(${desc})`, (c) =>
-            c.restore(badNs),
+    }
+
+    // Read paths reject empty string "", but accept whitespace-only namespaces
+    // so data written before client-side blank checks remains readable (#978).
+    await assertSameRejection('recall({ query: "ok", namespace: "" })', (c) =>
+        c.recall({ query: "ok", namespace: "" }),
+    );
+    await assertSameRejection('restore("")', (c) =>
+        c.restore(""),
+    );
+
+    for (const wsNs of ["   ", "\t", "\u200B"]) {
+        const desc = JSON.stringify(wsNs);
+        await assertSameAcceptance(`recall({ query: "ok", namespace: ${desc} })`, (c) =>
+            c.recall({ query: "ok", namespace: wsNs }),
+        );
+        await assertSameAcceptance(`restore(${desc})`, (c) =>
+            c.restore(wsNs),
         );
     }
+});
+
+test("MemWal and MemWalMock accept edge-valid inputs and reach network", async () => {
+    await assertSameAcceptance("recall({ limit: 1 })", (c) =>
+        c.recall({ query: "valid", limit: 1 }),
+    );
+    await assertSameAcceptance("restore('ns', 1)", (c) =>
+        c.restore("ns", 1),
+    );
+    await assertSameAcceptance("listNamespaces({ limit: 1 })", (c) =>
+        c.listNamespaces({ limit: 1 }),
+    );
+    await assertSameAcceptance("recall maxDistance=0", (c) =>
+        c.recall({ query: "valid", maxDistance: 0 }),
+    );
+    await assertSameAcceptance("remember namespace with inner whitespace", (c) =>
+        c.remember("valid fact", "team test"),
+    );
+    await assertSameAcceptance("recall namespace with inner whitespace", (c) =>
+        c.recall({ query: "valid", namespace: "team test" }),
+    );
+    await assertSameAcceptance("restore namespace with inner whitespace", (c) =>
+        c.restore("team test"),
+    );
+    await assertSameAcceptance("remember 255-byte idempotencyKey", (c) =>
+        c.remember("valid fact", "ns", { idempotencyKey: "k".repeat(255) }),
+    );
+    await assertSameAcceptance("rememberBulk 255-byte idempotencyKey", (c) =>
+        c.rememberBulk([{ text: "valid fact" }], { idempotencyKey: "k".repeat(255) }),
+    );
 });

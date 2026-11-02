@@ -373,6 +373,27 @@ export function assertNonBlankText(text: string, message = "Text cannot be empty
     }
 }
 
+/**
+ * Read paths mirror the relayer's `validate_namespace`: only "" is rejected,
+ * so namespaces written before client-side blank checks stay readable.
+ */
+export function assertReadableNamespace(namespace: unknown): void {
+    if (typeof namespace !== "string" || namespace.length === 0) {
+        throw new Error("namespace cannot be empty");
+    }
+}
+
+/**
+ * A list `limit` goes into the signed query string, so check it first.
+ * `String(NaN)`, `-1` or `2.5` were signed and sent verbatim (#1213). The
+ * message matches the recall/recallManual limit guards.
+ */
+export function assertPositiveIntegerLimit(limit: unknown): void {
+    if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
+        throw new TypeError(`limit must be a positive integer, got ${limit}`);
+    }
+}
+
 const MAX_IDEMPOTENCY_KEY_BYTES = 255;
 
 export function validateIdempotencyKey(key: string | undefined): void {

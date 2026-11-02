@@ -70,6 +70,8 @@ import {
     normalizePrivateKey,
     normalizeServerUrl,
     assertNonBlankText,
+    assertReadableNamespace,
+    assertPositiveIntegerLimit,
     validateIdempotencyKey,
     sanitizeServerError,
     redactInternalUrls,
@@ -342,17 +344,6 @@ function rememberJobTimeoutError(
 
 function isTransientPollingStatus(status: number): boolean {
     return status === 0 || status === 429 || status >= 500;
-}
-
-/**
- * A list `limit` goes into the signed query string, so check it first.
- * `String(NaN)`, `-1` or `2.5` were signed and sent verbatim (#1213). The
- * message matches the recall/recallManual limit guards.
- */
-function assertPositiveIntegerLimit(limit: unknown): void {
-    if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-        throw new TypeError(`limit must be a positive integer, got ${limit}`);
-    }
 }
 
 function jsonBodyError(status: number, message: string): Error {
@@ -1249,11 +1240,7 @@ export class MemWal {
         assertNonBlankText(query, "query cannot be empty");
         const rawLimit = options.topK !== undefined ? options.topK : options.limit;
         const limit = rawLimit !== undefined ? rawLimit : 10;
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(options.scoringWeights);
         if (
             options.maxDistance !== undefined
@@ -1264,7 +1251,7 @@ export class MemWal {
             throw new Error("maxDistance must be a non-negative finite number");
         }
         const resolvedNamespace = options.namespace ?? this.namespace;
-        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        assertReadableNamespace(resolvedNamespace);
 
 
         {
@@ -1408,14 +1395,10 @@ export class MemWal {
     async recallManual(opts: RecallManualOptions): Promise<RecallManualHitResult> {
         assertFiniteVector(opts.vector);
         const limit = opts.limit !== undefined ? opts.limit : 10;
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(opts.scoringWeights);
         const resolvedNamespace = opts.namespace ?? this.namespace;
-        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        assertReadableNamespace(resolvedNamespace);
         return this.signedRequest<RecallManualHitResult>(
             "POST",
             "/api/recall/manual",
@@ -1547,12 +1530,8 @@ export class MemWal {
      * ```
      */
     async restore(namespace: string, limit: number = 10): Promise<RestoreResult> {
-        assertNonBlankText(namespace, "namespace cannot be empty");
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertReadableNamespace(namespace);
+        assertPositiveIntegerLimit(limit);
         const result = await this.signedRequest<RestoreResult>(
             "POST",
             "/api/restore",
@@ -1640,7 +1619,7 @@ export class MemWal {
      */
     async listMemories(options: ListMemoriesOptions = {}): Promise<MemoriesResult> {
         if (options.namespace !== undefined) {
-            assertNonBlankText(options.namespace, "namespace cannot be empty");
+            assertReadableNamespace(options.namespace);
         }
         const params = new URLSearchParams();
         if (options.cursor !== undefined) params.set("updated_after", options.cursor);

@@ -29,6 +29,8 @@ import { resolveRecallCall } from "./recall-args.js";
 import {
     assertFiniteScoringWeights,
     assertNonBlankText,
+    assertReadableNamespace,
+    assertPositiveIntegerLimit,
     derivedBulkIdempotencyKey,
     validateIdempotencyKey,
 } from "./utils.js";
@@ -36,12 +38,6 @@ import { MemWalRememberJobNotFoundError } from "./errors.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
 const MAX_BULK_ITEMS = 20;
-
-function assertPositiveIntegerLimit(limit: unknown): void {
-    if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-        throw new TypeError(`limit must be a positive integer, got ${limit}`);
-    }
-}
 
 interface RememberCallOptions extends RememberWaitOptions {}
 
@@ -422,7 +418,7 @@ export class MemWalMock {
         validateText(query, "query");
         validateMaxTokens(options.maxTokens);
         const resolvedNamespace = options.namespace ?? this.namespace;
-        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        assertReadableNamespace(resolvedNamespace);
         const rawLimit = options.topK !== undefined ? options.topK : options.limit;
         const resolvedLimit = rawLimit !== undefined ? rawLimit : 10;
         assertPositiveIntegerLimit(resolvedLimit);
@@ -555,7 +551,7 @@ export class MemWalMock {
     }
 
     async restore(namespace: string, limit = 10): Promise<RestoreResult> {
-        assertNonBlankText(namespace, "namespace cannot be empty");
+        assertReadableNamespace(namespace);
         assertPositiveIntegerLimit(limit);
         return {
             restored: 0,
