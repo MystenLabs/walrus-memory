@@ -1023,3 +1023,264 @@ async fn memwal_mock_supports_full_offline_lifecycle() -> memwal::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires live MEMWAL_PRIVATE_KEY and MEMWAL_ACCOUNT_ID provisioned via memwal-dev-wallet"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end 12-stage live relayer walkthrough"
+)]
+async fn live_dev_wallet_all_endpoints_e2e() -> memwal::Result<()> {
+    let key = std::env::var("MEMWAL_PRIVATE_KEY")
+        .map_err(|_| Error::InvalidKey("MEMWAL_PRIVATE_KEY not set".to_owned()))?;
+    let account_id = std::env::var("MEMWAL_ACCOUNT_ID")
+        .map_err(|_| Error::InvalidArgument("MEMWAL_ACCOUNT_ID not set".to_owned()))?;
+    let expected_owner = std::env::var("MEMWAL_EXPECTED_OWNER").ok();
+    let expected_delegate_sui = std::env::var("MEMWAL_EXPECTED_DELEGATE_SUI").ok();
+    let base_ns =
+        std::env::var("MEMWAL_NAMESPACE").unwrap_or_else(|_| "e2e-rust-full-suite".to_owned());
+    let manual_ns = format!("{base_ns}-manual");
+
+    // 1. Key format & identity parity (64-hex, 0x-hex, suiprivkey1..., raw 32-byte seed)
+    let raw_hex = key.strip_prefix("0x").unwrap_or(&key);
+    let seed_vec =
+        hex::decode(raw_hex).map_err(|e| Error::InvalidKey(format!("test key hex decode: {e}")))?;
+    let seed: [u8; 32] = seed_vec
+        .try_into()
+        .map_err(|_| Error::InvalidKey("expected 32-byte seed".to_owned()))?;
+    let bech32 = encode_sui_private_key(&seed)?;
+    let decoded = decode_sui_private_key(&bech32)?;
+    assert_eq!(&*decoded, &seed);
+
+    let client = MemWal::builder(&bech32, &account_id)
+        .env(Env::Dev)
+        .namespace(&base_ns)
+        .build()?;
+    let client_seed = MemWal::builder_from_seed_bytes(&seed, &account_id)
+        .env(Env::Dev)
+        .namespace(&base_ns)
+        .build()?;
+    assert_eq!(client.public_key_hex()?, client_seed.public_key_hex()?);
+    assert_eq!(client.sui_address()?, client_seed.sui_address()?);
+    if let Some(exp_sui) = expected_delegate_sui {
+        assert_eq!(client.sui_address()?, exp_sui);
+    }
+    println!(
+        "[live-e2e 1/12] Key formats verified: sui_address={}",
+        client.sui_address()?
+    );
+
+    // 2. health() & compatibility()
+    let health = client.health().await?;
+    assert_eq!(health.status, "ok");
+    let compat = client.compatibility().await?;
+    assert_eq!(compat.api_version, "1.0.0");
+    println!(
+        "[live-e2e 2/12] Health={} (v{}), API={}",
+        health.status, health.version, compat.api_version
+    );
+
+    // 3. whoami()
+    let who = client.whoami().await?;
+    assert_eq!(who.account_id, account_id);
+    if let Some(exp_owner) = expected_owner {
+        assert_eq!(who.owner, exp_owner);
+    }
+    println!(
+        "[live-e2e 3/12] Whoami verified: owner={} package={}",
+        who.owner, who.package_id
+    );
+
+    // 4. remember() + remember_status() + wait_for_remember_job()
+    let accepted = client
+        .remember("User works as a distributed systems architect in Singapore")
+        .await?;
+    let status_snap = client.remember_status(&accepted.job_id).await?;
+    assert_eq!(status_snap.job_id, accepted.job_id);
+    let settled_single = client
+        .wait_for_remember_job(&accepted.job_id, &WaitOptions::default())
+        .await?;
+    assert_ne!(settled_single.blob_id.len(), 0);
+    println!(
+        "[live-e2e 4/12] Async remember + wait_for_remember_job settled: job_id={} blob_id={}",
+        settled_single.job_id, settled_single.blob_id
+    );
+
+    // 5. remember_and_wait_with() + DedupeMode::ContentHash
+    let dedupe_opts = RememberWaitOptions::new().dedupe_by_content();
+    let dedup1 = client
+        .remember_and_wait_with(
+            "User prefers dark mode and Tokyo Night color theme",
+            &dedupe_opts,
+        )
+        .await?;
+    let dedup2 = client
+        .remember_and_wait_with(
+            "User prefers dark mode and Tokyo Night color theme",
+            &dedupe_opts,
+        )
+        .await?;
+    assert_ne!(dedup1.blob_id.len(), 0);
+    assert_ne!(dedup2.blob_id.len(), 0);
+    println!(
+        "[live-e2e 5/12] Content-hash dedupe remember_and_wait_with succeeded: blob_id={}",
+        dedup1.blob_id
+    );
+
+    // 6. remember_bulk_and_wait()
+    let bulk_res = client
+        .remember_bulk_and_wait(
+            &[
+                RememberBulkItem::from("User is allergic to shellfish and peanuts"),
+                RememberBulkItem::from("User drinks flat white coffee every morning"),
+            ],
+            &RememberBulkOptions::new(),
+        )
+        .await?;
+    assert_eq!(bulk_res.total, 2);
+    assert_eq!(bulk_res.succeeded, 2);
+    assert_eq!(bulk_res.failed, 0);
+    assert_eq!(bulk_res.timed_out, 0);
+    println!(
+        "[live-e2e 6/12] Bulk remember_bulk_and_wait settled: succeeded={}/{}",
+        bulk_res.succeeded, bulk_res.total
+    );
+
+    // 7. recall() with SEAL session, ScoringWeights, RecallSort, and token budget
+    let recalled = client
+        .recall(
+            RecallParams::new("food allergies and coffee")
+                .with_limit(5)
+                .with_sort(RecallSort::Relevance)
+                .with_scoring_weights(ScoringWeights {
+                    semantic: 0.7,
+                    recency: 0.2,
+                    importance: 0.1,
+                    ..ScoringWeights::default()
+                })
+                .with_max_tokens(120)
+                .with_truncation_strategy(TruncationStrategy::DropTail),
+        )
+        .await?;
+    assert_ne!(recalled.results.len(), 0);
+    assert!(recalled.meta.is_some());
+    println!(
+        "[live-e2e 7/12] Recall with SEAL + ScoringWeights + max_tokens returned {} hit(s); top={:?}",
+        recalled.results.len(),
+        recalled.results[0].text
+    );
+
+    // 8. embed() + remember_manual() + recall_manual()
+    // `/api/remember/manual` enforces the on-chain `account::seal_encrypt_fence`
+    // against a BCS-encoded `@mysten/seal` EncryptedObject matching the account's
+    // packageId, owner, and current access_counter_version. Fetch the genuine SEAL
+    // ciphertext produced in Stage 4 from the Walrus testnet aggregator and index it
+    // under `manual_ns` with a fresh embedding vector from `/api/embed`.
+    let manual_text = "Manual vector memory: user deploys Rust microservices on Sui";
+    let embedded = client.embed(manual_text).await?;
+    assert_ne!(embedded.vector.len(), 0);
+    let agg_url = format!(
+        "https://aggregator.walrus-testnet.walrus.space/v1/blobs/{}",
+        settled_single.blob_id
+    );
+    let seal_cipher_bytes = reqwest::get(&agg_url)
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("walrus aggregator fetch failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| Error::InvalidArgument(format!("walrus aggregator status error: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("walrus aggregator body error: {e}")))?;
+    let cipher_b64 = BASE64_STANDARD.encode(&seal_cipher_bytes);
+    let manual_stored = client
+        .remember_manual(
+            &RememberManualOptions::new(cipher_b64, embedded.vector.clone())
+                .with_namespace(&manual_ns),
+        )
+        .await?;
+    assert_ne!(manual_stored.blob_id.len(), 0);
+    let manual_recalled = client
+        .recall_manual(
+            &RecallManualOptions::new(embedded.vector.clone())
+                .with_limit(3)
+                .with_namespace(&manual_ns),
+        )
+        .await?;
+    assert_ne!(manual_recalled.results.len(), 0);
+    assert_eq!(manual_recalled.results[0].blob_id, manual_stored.blob_id);
+    println!(
+        "[live-e2e 8/12] embed(dim={}) + remember_manual + recall_manual round-trip verified: blob_id={}",
+        embedded.vector.len(),
+        manual_stored.blob_id
+    );
+
+    // 9. analyze_and_wait()
+    let analyzed = client
+        .analyze_and_wait(
+            "I live in Zurich and commute by train. My favorite programming language is Rust.",
+            &AnalyzeOptions::new(),
+            &WaitOptions::default(),
+        )
+        .await?;
+    assert_ne!(analyzed.facts.len(), 0);
+    assert_eq!(analyzed.failed, 0);
+    println!(
+        "[live-e2e 9/12] analyze_and_wait extracted {} fact(s), succeeded={}",
+        analyzed.facts.len(),
+        analyzed.succeeded
+    );
+
+    // 10. ask()
+    let asked = client
+        .ask(
+            "What allergies does the user have and what coffee do they drink?",
+            &AskOptions::new().with_limit(5),
+        )
+        .await?;
+    assert_ne!(asked.answer.len(), 0);
+    assert_ne!(asked.memories_used, 0);
+    println!(
+        "[live-e2e 10/12] ask() grounded Q&A used {} memories: answer={:?}",
+        asked.memories_used, asked.answer
+    );
+
+    // 11. list_namespaces(), list_memories(), and restore()
+    let ns_page = client
+        .list_namespaces(&ListNamespacesOptions::new().with_limit(20))
+        .await?;
+    assert!(ns_page.namespaces.iter().any(|n| n.name == base_ns));
+    let mem_page = client
+        .list_memories(
+            &ListMemoriesOptions::new()
+                .with_namespace(&base_ns)
+                .with_limit(20),
+        )
+        .await?;
+    assert_ne!(mem_page.memories.len(), 0);
+    let restored = client.restore(&base_ns, 20).await?;
+    assert_eq!(restored.namespace, base_ns);
+    assert_eq!(restored.failed, 0);
+    println!(
+        "[live-e2e 11/12] list_namespaces={}, list_memories={}, restore(total={}, skipped={}, restored={})",
+        ns_page.namespaces.len(),
+        mem_page.memories.len(),
+        restored.total,
+        restored.skipped,
+        restored.restored
+    );
+
+    // 12. forget() cleanup + destroy()
+    let f_base = client.forget(Some(&base_ns)).await?;
+    let f_manual = client.forget(Some(&manual_ns)).await?;
+    assert_ne!(f_base.deleted, 0);
+    assert_ne!(f_manual.deleted, 0);
+    client.destroy();
+    assert!(client.is_destroyed());
+    assert!(matches!(client.whoami().await, Err(Error::Destroyed)));
+    println!(
+        "[live-e2e 12/12] forget(base={}, manual={}) + destroy() verified",
+        f_base.deleted, f_manual.deleted
+    );
+
+    Ok(())
+}
