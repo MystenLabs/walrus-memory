@@ -6006,9 +6006,14 @@ mod tests {
     ///    `blob_id = aiHmWsnNbHVna18yk3qVelrruge_smqd1kJtpect2jI`,
     ///    Parallel `remember_bulk` (`14.03s` and `15.88s` end-to-end across wallets `4` and `5`):
     ///    `blob_id = IyH_RfSOqkQDyle6v5S2ZXw1EX93pdMj367XgvwPKvM` (`job_id = 2f7451bb-70a7-4f65-ba1f-9276aaf49ebf`)
-    ///    and `blob_id = nHioLgEs3fU1HluBwNClr8jYVBdxoehhBffQCHPIGEQ` (`job_id = 924bff81-dc60-4ab9-9fb0-0029e7821c1f`),
-    ///    plus `POST /api/recall` (`3` blobs decrypted in-process), `POST /api/restore` (`525 ms`, `3` blobs verified),
-    ///    and `POST /api/mcp` (`memwal_recall` returning all `3` Mainnet memories).
+    ///    and `blob_id = nHioLgEs3fU1HluBwNClr8jYVBdxoehhBffQCHPIGEQ` (`job_id = 924bff81-dc60-4ab9-9fb0-0029e7821c1f`).
+    /// 5. Mainnet Self-Hosted `walrus-upload-relay` (`main` env `tip_config: !no_tip`, `0 MIST` tip, `127.0.0.1:8080`):
+    ///    Single `remember` (`job_id = aed1f29f-878c-4c3d-bdfa-09b65e0b3499`, `8.37s` shard distribution):
+    ///    `blob_id = KeUkBrMBmPsFOuhkoFTnj6LE0Lddtz6aL9ZShiAtqUY` (`blob_object_id = 0x10edf6d072d5d5ceea1f61acf23f912f95f8f0611276caa1f71e2b85ad52d55a`),
+    ///    Parallel `remember_bulk` (`6.23s` and `7.07s` shard distribution, `11.17s` and `12.87s` upload step across wallets `5` and `4`):
+    ///    `blob_id = SN4bYxYu093oNCgUwM2wQm0neKPHWrct4blCfC-ojOQ` (`job_id = 2e45d44e-aaa1-49e4-bb40-76579fedfa74`, `blob_object_id = 0xcb9cfe953f5bb949a60e26870cd18ca83ca40762c316178519f75c7279e28a26`)
+    ///    and `blob_id = DCKYDHt5oA-e65bgP2Qtq7ayH7Ga03mrNobW74cmOSM` (`job_id = c4562e08-b3cb-4e06-998a-b079fa194ecb`, `blob_object_id = 0x3b5100512d819fd9bf2a18ab892a0993e26ea9fa761169cb117762e483218284`),
+    ///    plus `POST /api/recall` (`6` blobs decrypted in-process) and `POST /api/restore` (`2,055 ms`, `6` blobs verified).
     #[tokio::test]
     #[ignore = "hits live Sui Mainnet gRPC and Walrus Mainnet Upload Relay"]
     async fn live_mainnet_walrus_upload_relay_and_seal_pipeline_verification() {
