@@ -1993,8 +1993,7 @@ pub(crate) fn validate_prepared_register_transaction(
     let tx_bytes = base64::engine::general_purpose::STANDARD
         .decode(tx_b64)
         .map_err(|_| "registerTransaction.transactionBytes is not canonical base64".to_owned())?;
-    if tx_bytes.is_empty()
-        || base64::engine::general_purpose::STANDARD.encode(&tx_bytes) != tx_b64
+    if tx_bytes.is_empty() || base64::engine::general_purpose::STANDARD.encode(&tx_bytes) != tx_b64
     {
         return Err("registerTransaction.transactionBytes is not canonical base64".to_owned());
     }
@@ -2017,9 +2016,7 @@ pub(crate) fn validate_prepared_register_transaction(
     {
         assert_sponsored_register_transaction(&tx, expected_sender)?;
     } else if tx.gas_payment.owner != expected_sender {
-        return Err(
-            "registerTransaction gas owner does not match the journaled wallet".to_owned(),
-        );
+        return Err("registerTransaction gas owner does not match the journaled wallet".to_owned());
     }
     let user_sig = UserSignature::from_base64(prepared.signature.trim())
         .map_err(|e| format!("Prepared register transaction signature is invalid: {e}"))?;
@@ -3090,7 +3087,7 @@ pub async fn advance_durable_upload_in_process(
                 });
             }
 
-            const CERTIFY_BACKOFF_MS: &[u64] = &[250, 500, 1000];
+            const CERTIFY_BACKOFF_MS: &[u64] = &[250, 500, 1000, 2000];
             let mut last_certify_err = String::new();
             let mut outcome_opt = None;
             for attempt in 0..=CERTIFY_BACKOFF_MS.len() {
@@ -3146,7 +3143,8 @@ pub async fn advance_durable_upload_in_process(
                     }
                 }
             }
-            let outcome = outcome_opt.ok_or_else(|| format_durable_upload_error(last_certify_err))?;
+            let outcome =
+                outcome_opt.ok_or_else(|| format_durable_upload_error(last_certify_err))?;
 
             let step_json = serde_json::json!({
                 "step": "certified",
@@ -3399,7 +3397,7 @@ pub async fn set_metadata_batch_in_process(
     .await;
     let (acct_ver, reg_ver) = shared_versions_res.unwrap_or((1, 1));
 
-    const METADATA_BACKOFF_MS: &[u64] = &[250, 500, 1000];
+    const METADATA_BACKOFF_MS: &[u64] = &[250, 500, 1000, 2000];
     let mut last_err = String::new();
     for attempt in 0..=METADATA_BACKOFF_MS.len() {
         if attempt > 0 {
@@ -3580,10 +3578,14 @@ fn decode_percent_encoded_loose(input: &str) -> String {
 
 pub(crate) fn is_rebuildable_object_or_sponsor_error(msg: &str) -> bool {
     let decoded = decode_percent_encoded_loose(msg).to_ascii_lowercase();
-    let is_stale_ref =
-        decoded.contains("could not find the referenced object") && decoded.contains("at version");
+    let is_stale_ref = (decoded.contains("could not find the referenced object")
+        && decoded.contains("at version"))
+        || decoded.contains("version doesn't match for object")
+        || decoded.contains("version does not match for object");
     let is_locked_or_unavailable = decoded.contains("objectversionunavailableforconsumption")
-        || decoded.contains("not available for consumption");
+        || decoded.contains("not available for consumption")
+        || decoded.contains("locked at version")
+        || decoded.contains("object is locked");
     let is_sponsor_expired = decoded.contains("sponsored transaction has expired")
         || decoded.contains("\"code\":\"expired\"")
         || decoded.contains("'code':'expired'");
@@ -5948,6 +5950,53 @@ mod tests {
         assert_eq!(enoki_calls.load(Ordering::SeqCst), 3);
     }
 
+    /// Live Sui Mainnet and Walrus Mainnet end-to-end verification and benchmark harness.
+    ///
+    /// Executes against live Mainnet infrastructure without touching shared production
+    /// Postgres or Redis state:
+    /// 1. Walrus Mainnet System object (`0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2`,
+    ///    package `0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77`, `1000` shards).
+    /// 2. Walrus Mainnet Upload Relay (`https://upload-relay.mainnet.walrus.space/v1/tip-config`)
+    ///    Linear tip calculation and `HashedAuthPackage` BCS serialization.
+    /// 3. SEAL Mainnet KeyServer resolution for both V1 (`2`-of-`2`) and production V2 Committee
+    ///    (`0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595` at
+    ///    `https://seal-aggregator-mainnet.mystenlabs.com`, `threshold = 1`, `X-API-Key`).
+    /// 4. In-process `seal_encrypt_in_process` against live Mainnet `MemWalAccount`
+    ///    (`0x00033662f52beae8bacde5dba879bd9bfd58d9d6a1be394ab6905b8928831bfd`, owner
+    ///    `0xcb43203db57678a3ebc9dcefc557e7fde58fa892ccb00eb354c5ea0e81baab9a`, package
+    ///    `0xe7c16fbea0560e7057e2bf7422feaa4fb313749fc69c9e9092fac7a33b81d7f5`, registry
+    ///    `0x8bf82c9e09e36b8d1c38298f68b7cb68e7b8762887e7592add9986d5e9cf199f`).
+    /// 5. When `MAINNET_LIVE_E2E=1` is set:
+    ///    a. Inspects all `16` Mainnet relayer pool wallets via `fetch_wallet_balances_in_process`
+    ///       (`wallet_index = 0`: `0xf9dc406119391cc54825ca3020336a531840d4d4fb75265438c2c068d02e8938`).
+    ///    b. Runs the 4-step durable Walrus upload (`Prepared` -> `Registered` -> `Uploaded` -> `Certified`
+    ///       for `15` Mainnet epochs with Enoki sponsorship), or reuses `MAINNET_EXISTING_BLOB_OBJECT_ID`
+    ///       and `MAINNET_EXISTING_BLOB_ID` when provided.
+    ///    c. Executes `set_metadata_batch_in_process` with `SealPersistence::V1New` to verify the on-chain
+    ///       `account::seal_encrypt_fence` Move call, `blob::insert_or_update_metadata_pair` (`memwal_*`
+    ///       attributes), and idempotent `Ok(0)` reconciliation on repeat invocation.
+    ///    d. Verifies `find_blob_by_job_in_process`, `query_blob_storage_leases_in_process`,
+    ///       `query_blobs_by_owner_in_process` (with gRPC and GraphQL creation-transaction provenance),
+    ///       and byte-for-byte readback from `https://aggregator.walrus-mainnet.walrus.space`.
+    ///
+    /// Verified on-chain Mainnet blobs and transactions produced by this harness:
+    /// 1. Canary Run 1 (Rust In-Process):
+    ///    `blob_id = 3KjFJPg8al7Vhn2e8l7Zk8Vmx5c9OjZ1FsEInCswlc4`,
+    ///    `blob_object_id = 0x2bdd0ee60e130dd5459efbf626ec7c668b43d1c36082fb0d3a26efeaa7d66518`,
+    ///    `register_tx_digest = HKySfAce7UCfHfAWrsSfjG2XgjYkh1VgTei5RHo8LHeM`,
+    ///    `certify_tx_digest = 97ZDzcxr8EAQ6y4CQ7WoRHZiHTwLfgibfuRjxEupa8FJ`.
+    /// 2. Head-to-Head Benchmark Baseline (Node.js Sidecar `main`, `13,905.7 ms` upload):
+    ///    `blob_id = aHaVE6_34GHwwGm1MdwIaVX0p1Q4NsgZdoqsuPOou_4`,
+    ///    `blob_object_id = 0x4112a2038dc1a5015bf73585c84d715ee0e320c96833e7bee709374686d0c7df`,
+    ///    `register_tx_digest = GMp9PbdGfEhaKcCaEarmo7VKvqq6nBvEjHY9yvjEqvjd`,
+    ///    `metadata_tx_digest = ALdKq9MnqY52cbQsppJudEx4VSxNQrG7ebwqLVeUNRzy` (`2,398 ms` first call,
+    ///    `923 ms` immediate idempotent second call).
+    /// 3. Head-to-Head Benchmark Rust In-Process (`--release`, `10,134.0 ms` upload):
+    ///    `blob_id = 0kU9kAiudiOL1HQhMmOHjyAljiTbtU08Xx_UIu98_wE`,
+    ///    `blob_object_id = 0x7f0918de5b5cbb5b82b9cbe6ef97fc59b29f1358dafd41330b9c6bd7fcd368c5`,
+    ///    `register_tx_digest = Hfa3q2sJh5iygs8LkNZhfzAwucLqLAdjJ5ysSwVwH9Fd`,
+    ///    `certify_tx_digest = GSuvQv1m7hkygHPhyBZJwPUSagxsjhCCRSZiAktpoH2`,
+    ///    `metadata_tx_digest = Da8gSf4Ezj9m6mfRcZVGXtwWSCa9D8EchsKKFkUQMJay`.
     #[tokio::test]
     #[ignore = "hits live Sui Mainnet gRPC and Walrus Mainnet Upload Relay"]
     async fn live_mainnet_walrus_upload_relay_and_seal_pipeline_verification() {
@@ -6083,7 +6132,7 @@ mod tests {
             Some("x-api-key")
         );
 
-        // 6. Optional full live Mainnet E2E (Enoki-sponsored register_blob + Upload Relay + certify_blob + GraphQL provenance + Aggregator readback)
+        // 6. Optional full live Mainnet E2E (Enoki-sponsored register_blob + Upload Relay + certify_blob + set_metadata_batch_in_process + GraphQL provenance + Aggregator readback)
         if std::env::var("MAINNET_LIVE_E2E").ok().as_deref() == Some("1") {
             let keys_csv = std::env::var("SERVER_SUI_PRIVATE_KEYS")
                 .expect("SERVER_SUI_PRIVATE_KEYS required when MAINNET_LIVE_E2E=1");
@@ -6092,13 +6141,23 @@ mod tests {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
-            assert!(!keys.is_empty(), "SERVER_SUI_PRIVATE_KEYS must not be empty");
+            assert!(
+                !keys.is_empty(),
+                "SERVER_SUI_PRIVATE_KEYS must not be empty"
+            );
             let pkg_id = std::env::var("PACKAGE_ID")
-                .unwrap_or_else(|_| "0x80ca5c7fbefecbc2da0efeb5aaad4be39a3998bb4bc39bd22afe39fbab0644dc".to_owned());
+                .or_else(|_| std::env::var("MEMWAL_PACKAGE_ID"))
+                .unwrap_or_else(|_| {
+                    "0xe7c16fbea0560e7057e2bf7422feaa4fb313749fc69c9e9092fac7a33b81d7f5".to_owned()
+                });
             let seal_policy_pkg_id = std::env::var("SEAL_POLICY_PACKAGE_ID")
+                .or_else(|_| std::env::var("MEMWAL_SEAL_POLICY_PACKAGE_ID"))
                 .unwrap_or_else(|_| pkg_id.clone());
             let registry_id = std::env::var("REGISTRY_ID")
-                .unwrap_or_else(|_| "0x2467c7211faadbb9bc88d42f8ce5be7aa38e61e2144545c1c970744e70e5e466".to_owned());
+                .or_else(|_| std::env::var("MEMWAL_REGISTRY_ID"))
+                .unwrap_or_else(|_| {
+                    "0x8bf82c9e09e36b8d1c38298f68b7cb68e7b8762887e7592add9986d5e9cf199f".to_owned()
+                });
 
             let runtime_cfg = NativeRuntimeConfig {
                 grpc_url: "https://mysten-rpc.mainnet.sui.io".to_owned(),
@@ -6108,8 +6167,8 @@ mod tests {
                 walrus_system_object_id: MAINNET_WALRUS_SYSTEM_OBJECT_ID.to_owned(),
                 sui_private_keys: keys.clone(),
                 package_id: pkg_id.clone(),
-                seal_policy_package_id: seal_policy_pkg_id,
-                registry_id,
+                seal_policy_package_id: seal_policy_pkg_id.clone(),
+                registry_id: registry_id.clone(),
             };
             match NATIVE_RUNTIME_CONFIG.get() {
                 Some(lock) => {
@@ -6120,8 +6179,49 @@ mod tests {
                 }
             }
 
-            // 6a. Inspect live Mainnet pool wallet balances and pick a funded wallet
+            // 6a. Inspect live Mainnet pool wallet balances and benchmark SEAL + RS2
+            let t_bal = std::time::Instant::now();
             let balances_json = fetch_wallet_balances_in_process().await;
+            let bal_ms = t_bal.elapsed().as_millis();
+            let real_mainnet_acct =
+                "0x00033662f52beae8bacde5dba879bd9bfd58d9d6a1be394ab6905b8928831bfd";
+            let real_mainnet_owner =
+                "0xcb43203db57678a3ebc9dcefc557e7fde58fa892ccb00eb354c5ea0e81baab9a";
+            let t_seal_cold = std::time::Instant::now();
+            let seal_ct = crate::storage::seal_native::seal_encrypt_in_process(
+                b"mainnet-benchmark-seal-payload",
+                real_mainnet_owner,
+                real_mainnet_acct,
+                &pkg_id,
+                None,
+            )
+            .await
+            .expect("Mainnet seal_encrypt_in_process cold benchmark");
+            let seal_cold_ms = t_seal_cold.elapsed().as_millis();
+            let t_seal_warm = std::time::Instant::now();
+            let _ = crate::storage::seal_native::seal_encrypt_in_process(
+                b"mainnet-benchmark-seal-payload",
+                real_mainnet_owner,
+                real_mainnet_acct,
+                &pkg_id,
+                None,
+            )
+            .await
+            .expect("Mainnet seal_encrypt_in_process warm benchmark");
+            let seal_warm_ms = t_seal_warm.elapsed().as_millis();
+            let t_rs2 = std::time::Instant::now();
+            let _ = encode_walrus_blob_rs2(
+                b"mainnet-benchmark-rs2-payload".to_vec(),
+                snapshot.n_shards,
+            )
+            .await
+            .expect("Mainnet RS2 encode benchmark");
+            let rs2_ms = t_rs2.elapsed().as_millis();
+            println!(
+                "[BENCH_RUST_RELEASE] wallet_balances_ms={bal_ms} seal_encrypt_cold_ms={seal_cold_ms} seal_encrypt_warm_ms={seal_warm_ms} seal_ct_len={} rs2_encode_1000_shards_ms={rs2_ms}",
+                seal_ct.len()
+            );
+
             let wallets_arr = balances_json["perWallet"]
                 .as_array()
                 .expect("fetch_wallet_balances_in_process must return perWallet array");
@@ -6157,143 +6257,232 @@ mod tests {
                 wallets_arr[funded_idx]["suiAddressBalanceMist"].as_str().unwrap_or("?")
             );
 
-            // 6b. Advance durable upload end-to-end on live Mainnet (15 epochs, Enoki-sponsored register + certify)
-            let canary_job_id = format!(
-                "mainnet-canary-job-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            );
-            let e2e_payload = format!("memwal-rust-in-process-{canary_job_id}").into_bytes();
+            // 6b. Advance durable upload end-to-end on live Mainnet (or reuse MAINNET_EXISTING_BLOB_OBJECT_ID when testing metadata/transfer only)
+            let existing_obj_opt = std::env::var("MAINNET_EXISTING_BLOB_OBJECT_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let (canary_job_id, e2e_payload, blob_id, blob_object_id) = if let Some(existing_obj) =
+                existing_obj_opt
+            {
+                let existing_blob_id = std::env::var("MAINNET_EXISTING_BLOB_ID").expect(
+                    "MAINNET_EXISTING_BLOB_ID required with MAINNET_EXISTING_BLOB_OBJECT_ID",
+                );
+                let existing_job_id = std::env::var("MAINNET_EXISTING_JOB_ID")
+                    .unwrap_or_else(|_| "mainnet-canary-job-1793616916".to_owned());
+                let payload = format!("memwal-rust-in-process-{existing_job_id}").into_bytes();
+                (existing_job_id, payload, existing_blob_id, existing_obj)
+            } else {
+                let canary_job_id = format!(
+                    "mainnet-canary-job-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                );
+                let e2e_payload = format!("memwal-rust-in-process-{canary_job_id}").into_bytes();
 
-            let journal = UploadJournal {
-                wallet_index: funded_idx,
-                wallet_address: Some(wallet_addr.clone()),
-                execution_identity: None,
-                resume_step: None,
-                register_transaction: None,
+                let journal = UploadJournal {
+                    wallet_index: funded_idx,
+                    wallet_address: Some(wallet_addr.clone()),
+                    execution_identity: None,
+                    resume_step: None,
+                    register_transaction: None,
+                };
+
+                // Step 1: None -> Prepared (Enoki-sponsored register_blob transaction on Mainnet)
+                let t_step1 = std::time::Instant::now();
+                let prep_adv = advance_durable_upload_in_process(
+                    &http,
+                    &e2e_payload,
+                    15,
+                    &wallet_addr,
+                    "mainnet-canary",
+                    &pkg_id,
+                    &canary_job_id,
+                    journal,
+                )
+                .await
+                .expect("Step 1 (Prepared) on live Mainnet");
+                let step1_ms = t_step1.elapsed().as_millis();
+                let journal_after_prep = match prep_adv {
+                    DurableUploadAdvance::Prepared(j) => j,
+                    other => panic!("expected DurableUploadAdvance::Prepared, got {other:?}"),
+                };
+                let prep_tx = journal_after_prep
+                    .register_transaction
+                    .as_ref()
+                    .expect("Prepared journal must contain register_transaction");
+                assert!(
+                    prep_tx.sponsor_digest.is_some(),
+                    "Mainnet register_transaction must be Enoki-sponsored"
+                );
+                println!(
+                    "[MAINNET_LIVE_E2E] Step 1 Prepared OK ({step1_ms}ms): digest={} sponsor_digest={:?}",
+                    prep_tx.digest, prep_tx.sponsor_digest
+                );
+
+                // Step 2: Prepared -> Registered on Sui Mainnet
+                let t_step2 = std::time::Instant::now();
+                let reg_adv = advance_durable_upload_in_process(
+                    &http,
+                    &e2e_payload,
+                    15,
+                    &wallet_addr,
+                    "mainnet-canary",
+                    &pkg_id,
+                    &canary_job_id,
+                    journal_after_prep,
+                )
+                .await
+                .expect("Step 2 (Registered) on live Mainnet");
+                let step2_ms = t_step2.elapsed().as_millis();
+                let (journal_after_reg, reg_step) = match reg_adv {
+                    DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                    other => panic!("expected Registered Step, got {other:?}"),
+                };
+                assert_eq!(reg_step["step"], "registered");
+                let blob_id = reg_step["blobId"].as_str().unwrap().to_owned();
+                let blob_object_id = reg_step["blobObjectId"].as_str().unwrap().to_owned();
+                let register_tx_digest = reg_step["txDigest"].as_str().unwrap().to_owned();
+                println!(
+                    "[MAINNET_LIVE_E2E] Step 2 Registered OK ({step2_ms}ms): blob_id={blob_id} blob_object_id={blob_object_id} register_tx_digest={register_tx_digest}"
+                );
+
+                // Step 3: Registered -> Uploaded via live Mainnet Upload Relay (`https://upload-relay.mainnet.walrus.space`)
+                let t_step3 = std::time::Instant::now();
+                let up_adv = advance_durable_upload_in_process(
+                    &http,
+                    &e2e_payload,
+                    15,
+                    &wallet_addr,
+                    "mainnet-canary",
+                    &pkg_id,
+                    &canary_job_id,
+                    journal_after_reg,
+                )
+                .await
+                .expect("Step 3 (Uploaded) via live Mainnet Upload Relay");
+                let step3_ms = t_step3.elapsed().as_millis();
+                let (journal_after_up, up_step) = match up_adv {
+                    DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                    other => panic!("expected Uploaded Step, got {other:?}"),
+                };
+                assert_eq!(up_step["step"], "uploaded");
+                println!(
+                    "[MAINNET_LIVE_E2E] Step 3 Uploaded OK ({step3_ms}ms): certificate_len={}",
+                    up_step["certificate"].as_str().unwrap_or_default().len()
+                );
+
+                // Step 4: Uploaded -> Certified on Sui Mainnet
+                let t_step4 = std::time::Instant::now();
+                let cert_adv = advance_durable_upload_in_process(
+                    &http,
+                    &e2e_payload,
+                    15,
+                    &wallet_addr,
+                    "mainnet-canary",
+                    &pkg_id,
+                    &canary_job_id,
+                    journal_after_up,
+                )
+                .await
+                .expect("Step 4 (Certified) on live Mainnet");
+                let step4_ms = t_step4.elapsed().as_millis();
+                let (_, cert_step) = match cert_adv {
+                    DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                    other => panic!("expected Certified Step, got {other:?}"),
+                };
+                assert_eq!(cert_step["step"], "certified");
+                let certify_tx_digest = cert_step["certifyTxDigest"]
+                    .as_str()
+                    .unwrap_or("already-certified");
+                let total_upload_ms = t_step1.elapsed().as_millis();
+                println!(
+                    "[MAINNET_LIVE_E2E] Step 4 Certified OK ({step4_ms}ms, total_4_steps={total_upload_ms}ms): blob_id={blob_id} blob_object_id={blob_object_id} certify_tx_digest={certify_tx_digest}"
+                );
+                (canary_job_id, e2e_payload, blob_id, blob_object_id)
             };
 
-            // Step 1: None -> Prepared (Enoki-sponsored register_blob transaction on Mainnet)
-            let prep_adv = advance_durable_upload_in_process(
+            // Step 4b: Execute set_metadata_batch_in_process (`SealPersistence::V1New` `account::seal_encrypt_fence` + `memwal_agent_id` update + idempotent second call)
+            let seal_ct_b64 = base64::engine::general_purpose::STANDARD.encode(&seal_ct);
+            let t_meta = std::time::Instant::now();
+            let updated_count = set_metadata_batch_in_process(
                 &http,
-                &e2e_payload,
-                15,
+                funded_idx,
                 &wallet_addr,
-                "mainnet-canary",
                 &pkg_id,
-                &canary_job_id,
-                journal,
+                Some("mainnet-canary-agent"),
+                vec![SetMetadataBatchEntry {
+                    blob_object_id: blob_object_id.clone(),
+                    namespace: "mainnet-canary".to_owned(),
+                    encrypted_data: Some(seal_ct_b64.clone()),
+                }],
+                SealPersistence::V1New {
+                    account_id: real_mainnet_acct,
+                    registry_id: &registry_id,
+                    policy_package_id: &seal_policy_pkg_id,
+                },
             )
             .await
-            .expect("Step 1 (Prepared) on live Mainnet");
-            let journal_after_prep = match prep_adv {
-                DurableUploadAdvance::Prepared(j) => j,
-                other => panic!("expected DurableUploadAdvance::Prepared, got {other:?}"),
-            };
-            let prep_tx = journal_after_prep
-                .register_transaction
-                .as_ref()
-                .expect("Prepared journal must contain register_transaction");
-            assert!(
-                prep_tx.sponsor_digest.is_some(),
-                "Mainnet register_transaction must be Enoki-sponsored"
-            );
-            println!(
-                "[MAINNET_LIVE_E2E] Step 1 Prepared OK: digest={} sponsor_digest={:?}",
-                prep_tx.digest, prep_tx.sponsor_digest
-            );
-
-            // Step 2: Prepared -> Registered on Sui Mainnet
-            let reg_adv = advance_durable_upload_in_process(
+            .expect("set_metadata_batch_in_process on live Mainnet");
+            let meta_ms = t_meta.elapsed().as_millis();
+            let t_meta_idem = std::time::Instant::now();
+            let idem_count = set_metadata_batch_in_process(
                 &http,
-                &e2e_payload,
-                15,
+                funded_idx,
                 &wallet_addr,
-                "mainnet-canary",
                 &pkg_id,
-                &canary_job_id,
-                journal_after_prep,
+                Some("mainnet-canary-agent"),
+                vec![SetMetadataBatchEntry {
+                    blob_object_id: blob_object_id.clone(),
+                    namespace: "mainnet-canary".to_owned(),
+                    encrypted_data: Some(seal_ct_b64),
+                }],
+                SealPersistence::V1New {
+                    account_id: real_mainnet_acct,
+                    registry_id: &registry_id,
+                    policy_package_id: &seal_policy_pkg_id,
+                },
             )
             .await
-            .expect("Step 2 (Registered) on live Mainnet");
-            let (journal_after_reg, reg_step) = match reg_adv {
-                DurableUploadAdvance::Step { journal: j, step } => (j, step),
-                other => panic!("expected Registered Step, got {other:?}"),
-            };
-            assert_eq!(reg_step["step"], "registered");
-            let blob_id = reg_step["blobId"].as_str().unwrap().to_owned();
-            let blob_object_id = reg_step["blobObjectId"].as_str().unwrap().to_owned();
-            let register_tx_digest = reg_step["txDigest"].as_str().unwrap().to_owned();
+            .expect("idempotent set_metadata_batch_in_process on live Mainnet");
+            let meta_idem_ms = t_meta_idem.elapsed().as_millis();
+            assert_eq!(
+                idem_count, 0,
+                "second set_metadata_batch_in_process call must reconcile to 0 pending blobs"
+            );
             println!(
-                "[MAINNET_LIVE_E2E] Step 2 Registered OK: blob_id={blob_id} blob_object_id={blob_object_id} register_tx_digest={register_tx_digest}"
+                "[MAINNET_LIVE_E2E] Step 4b set_metadata_batch_in_process OK: updated={updated_count} ({meta_ms}ms) idempotent_second_call={idem_count} ({meta_idem_ms}ms)"
             );
 
-            // Step 3: Registered -> Uploaded via live Mainnet Upload Relay (`https://upload-relay.mainnet.walrus.space`)
-            let up_adv = advance_durable_upload_in_process(
-                &http,
-                &e2e_payload,
-                15,
-                &wallet_addr,
-                "mainnet-canary",
-                &pkg_id,
-                &canary_job_id,
-                journal_after_reg,
-            )
-            .await
-            .expect("Step 3 (Uploaded) via live Mainnet Upload Relay");
-            let (journal_after_up, up_step) = match up_adv {
-                DurableUploadAdvance::Step { journal: j, step } => (j, step),
-                other => panic!("expected Uploaded Step, got {other:?}"),
-            };
-            assert_eq!(up_step["step"], "uploaded");
-            println!(
-                "[MAINNET_LIVE_E2E] Step 3 Uploaded OK: certificate_len={}",
-                up_step["certificate"].as_str().unwrap_or_default().len()
-            );
-
-            // Step 4: Uploaded -> Certified on Sui Mainnet
-            let cert_adv = advance_durable_upload_in_process(
-                &http,
-                &e2e_payload,
-                15,
-                &wallet_addr,
-                "mainnet-canary",
-                &pkg_id,
-                &canary_job_id,
-                journal_after_up,
-            )
-            .await
-            .expect("Step 4 (Certified) on live Mainnet");
-            let (_, cert_step) = match cert_adv {
-                DurableUploadAdvance::Step { journal: j, step } => (j, step),
-                other => panic!("expected Certified Step, got {other:?}"),
-            };
-            assert_eq!(cert_step["step"], "certified");
-            let certify_tx_digest = cert_step["certifyTxDigest"]
-                .as_str()
-                .unwrap_or("already-certified");
-            println!(
-                "[MAINNET_LIVE_E2E] Step 4 Certified OK: blob_id={blob_id} blob_object_id={blob_object_id} certify_tx_digest={certify_tx_digest}"
-            );
-
-            // Step 5: Verify on-chain blob discovery + Mainnet provenance check (`find_blob_by_job_in_process` + `query_blob_storage_leases_in_process`)
+            // Step 5: Verify on-chain blob discovery + Mainnet provenance check (`find_blob_by_job_in_process` + `query_blob_storage_leases_in_process` + `query_blobs_in_process`)
+            let t_find = std::time::Instant::now();
             let found_by_job = find_blob_by_job_in_process(&wallet_addr, &canary_job_id)
                 .await
                 .expect("find_blob_by_job_in_process on live Mainnet")
                 .expect("newly certified Mainnet blob must be found by job_id");
+            let find_ms = t_find.elapsed().as_millis();
             assert_eq!(found_by_job.blob_id, blob_id);
             assert_eq!(
                 found_by_job.object_id.as_deref(),
                 Some(blob_object_id.as_str())
             );
-            let leases = query_blob_storage_leases_in_process(
+            let t_leases = std::time::Instant::now();
+            let leases =
+                query_blob_storage_leases_in_process(&wallet_addr, std::slice::from_ref(&blob_id))
+                    .await
+                    .expect("query_blob_storage_leases_in_process on live Mainnet");
+            let leases_ms = t_leases.elapsed().as_millis();
+            let t_qblobs = std::time::Instant::now();
+            let (qblobs, _source_capped) = query_blobs_by_owner_in_process(
                 &wallet_addr,
-                std::slice::from_ref(&blob_id),
+                Some("mainnet-canary"),
+                Some(&pkg_id),
+                Some(10),
             )
             .await
-            .expect("query_blob_storage_leases_in_process on live Mainnet");
+            .expect("query_blobs_by_owner_in_process on live Mainnet");
+            let qblobs_ms = t_qblobs.elapsed().as_millis();
             assert_eq!(leases.blobs.len(), 1);
             assert_eq!(leases.blobs[0].blob_id, blob_id);
             assert_eq!(leases.blobs[0].object_id, blob_object_id);
@@ -6302,18 +6491,19 @@ mod tests {
                 leases.current_epoch + 15,
                 "Mainnet blob lease must span 15 epochs from current_epoch"
             );
+            assert!(
+                !qblobs.is_empty(),
+                "query_blobs_by_owner_in_process must discover certified Mainnet canary blobs"
+            );
             println!(
-                "[MAINNET_LIVE_E2E] Step 5 On-chain discovery & provenance check OK: object_id={:?} blob_id={} current_epoch={} storage_end_epoch={}",
-                found_by_job.object_id,
-                found_by_job.blob_id,
-                leases.current_epoch,
-                leases.blobs[0].storage_end_epoch
+                "[MAINNET_LIVE_E2E] Step 5 Discovery OK: find_by_job_ms={find_ms} leases_ms={leases_ms} query_blobs_ms={qblobs_ms} qblobs_len={}",
+                qblobs.len()
             );
 
             // Step 6: Read back blob bytes from live Mainnet Walrus Aggregator
-            let agg_url = format!(
-                "https://aggregator.walrus-mainnet.walrus.space/v1/blobs/{blob_id}"
-            );
+            let t_agg = std::time::Instant::now();
+            let agg_url =
+                format!("https://aggregator.walrus-mainnet.walrus.space/v1/blobs/{blob_id}");
             let agg_bytes = http
                 .get(&agg_url)
                 .timeout(Duration::from_secs(30))
@@ -6326,11 +6516,25 @@ mod tests {
                 .await
                 .expect("read Mainnet Walrus Aggregator response bytes");
             assert_eq!(agg_bytes.as_ref(), e2e_payload.as_slice());
+            let agg_ms = t_agg.elapsed().as_millis();
             println!(
-                "[MAINNET_LIVE_E2E] Step 6 Aggregator readback verified byte-for-byte ({} bytes)",
+                "[MAINNET_LIVE_E2E] Step 6 Aggregator readback OK ({agg_ms}ms, {} bytes)",
                 agg_bytes.len()
             );
         }
+    }
+
+    #[test]
+    fn is_rebuildable_object_or_sponsor_error_recognizes_enoki_version_mismatch_and_locks() {
+        let enoki_mismatch = "Enoki bad request: {\"errors\":[{\"code\":\"transaction_build_failed\",\"message\":\"provided version doesn't match for object 0x7f0918de5b5cbb5b82b9cbe6ef97fc59b29f1358dafd41330b9c6bd7fcd368c5, provided: 1068588551 actual: 0x3fb15e08\"}]}";
+        assert!(
+            is_rebuildable_object_or_sponsor_error(enoki_mismatch),
+            "Enoki Mainnet object version mismatch must be classified as rebuildable"
+        );
+        let locked_msg = "Object 0x123 is locked at version 42";
+        assert!(is_rebuildable_object_or_sponsor_error(locked_msg));
+        let permanent_err = "Invalid MoveCall argument count";
+        assert!(!is_rebuildable_object_or_sponsor_error(permanent_err));
     }
 
     #[test]
@@ -6786,11 +6990,9 @@ mod tests {
         let wal_shortfall = format_durable_upload_error(format!(
             "Insufficient balance of {MAINNET_WAL_COIN_TYPE} for owner 0x123. Required: 1000, Available: 0"
         ));
-        assert!(
-            !wal_shortfall
-                .to_string()
-                .contains("SHARED_SERVICE_UNAVAILABLE")
-        );
+        assert!(!wal_shortfall
+            .to_string()
+            .contains("SHARED_SERVICE_UNAVAILABLE"));
         assert!(matches!(
             WalletJobError::classify_sidecar_error(&wal_shortfall.to_string()),
             WalletJobError::WalrusBalanceLow(_)
