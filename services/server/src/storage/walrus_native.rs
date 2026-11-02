@@ -943,37 +943,65 @@ struct HashedAuthPackage {
 static TIP_CONFIG_CACHE: OnceLock<RwLock<HashMap<String, TimedValue<RelayTipConfig>>>> =
     OnceLock::new();
 
+fn parse_bounded_u64_env(name: &str, default_val: u64, min_val: u64, max_val: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(min_val, max_val))
+        .unwrap_or(default_val)
+}
+
 pub async fn fetch_relay_tip_config(
     http: &reqwest::Client,
     relay_url: &str,
 ) -> Result<RelayTipConfig, String> {
+    let direct_upload = std::env::var("WALRUS_DIRECT_UPLOAD")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     let base = relay_url.trim().trim_end_matches('/').to_owned();
+    if direct_upload || base.is_empty() || base.eq_ignore_ascii_case("none") {
+        return Ok(RelayTipConfig::NoTip);
+    }
+
+    let ttl_ms = parse_bounded_u64_env("UPLOAD_RELAY_TIP_CACHE_TTL_MS", 300_000, 0, 86_400_000);
+    let timeout_ms = parse_bounded_u64_env("UPLOAD_RELAY_TIP_TIMEOUT_MS", 10_000, 1, 60_000);
+
     let cache = TIP_CONFIG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(cached) = cache.read().await.get(&base) {
-        if cached.fetched_at.elapsed() < Duration::from_secs(60) {
-            return Ok(cached.value.clone());
+    if ttl_ms > 0 {
+        if let Some(cached) = cache.read().await.get(&base) {
+            if cached.fetched_at.elapsed() < Duration::from_millis(ttl_ms) {
+                return Ok(cached.value.clone());
+            }
         }
     }
 
     let url = format!("{base}/v1/tip-config");
     let resp = http
         .get(&url)
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await
         .map_err(|e| format!("failed to query Walrus upload relay tip-config at {url}: {e}"))?;
     if !resp.status().is_success() {
-        return Ok(RelayTipConfig::NoTip);
+        return Err(format!(
+            "tip-config request failed ({})",
+            resp.status().as_u16()
+        ));
     }
-    let tip_config: RelayTipConfig = resp.json().await.unwrap_or(RelayTipConfig::NoTip);
+    let tip_config: RelayTipConfig = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid tip-config JSON from {url}: {e}"))?;
 
-    cache.write().await.insert(
-        base,
-        TimedValue {
-            value: tip_config.clone(),
-            fetched_at: Instant::now(),
-        },
-    );
+    if ttl_ms > 0 {
+        cache.write().await.insert(
+            base,
+            TimedValue {
+                value: tip_config.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
     Ok(tip_config)
 }
 
@@ -1053,30 +1081,18 @@ pub async fn encode_walrus_blob_rs2_with_nonce(
 // 5. Registration, Relay Upload, Certification & Metadata PTBs
 // ---------------------------------------------------------------------------
 
-async fn select_owned_wal_coins(
+async fn query_wal_address_balance(
     grpc_url: &str,
     owner: &str,
     wal_coin_type: &str,
-) -> Result<(Option<u64>, Vec<(Address, u64, Digest)>), String> {
+) -> Result<Option<u64>, String> {
     let mut bal_client = shared_sui_grpc_client(grpc_url)?;
-    let mut obj_client = bal_client.clone();
     let mut bal_state = bal_client.state_client();
-    let mut obj_state = obj_client.state_client();
 
     let mut bal_req = ListBalancesRequest::default();
     bal_req.owner = Some(owner.to_owned());
 
-    let mut req = ListOwnedObjectsRequest::default();
-    req.owner = Some(owner.to_owned());
-    req.page_size = Some(100);
-    req.object_type = Some(format!("0x2::coin::Coin<{wal_coin_type}>"));
-    req.read_mask = Some(FieldMask::from_paths(["object_id", "version", "digest"]));
-
-    let (bal_res, obj_res) = tokio::join!(
-        bal_state.list_balances(bal_req),
-        obj_state.list_owned_objects(req),
-    );
-
+    let bal_res = bal_state.list_balances(bal_req).await;
     let address_wal = match bal_res {
         Ok(resp) => {
             let mut found = 0u64;
@@ -1092,22 +1108,7 @@ async fn select_owned_wal_coins(
         Err(_) => None,
     };
 
-    let mut coins = Vec::new();
-    if let Ok(resp) = obj_res {
-        for obj in resp.into_inner().objects {
-            if let (Some(id_str), Some(version), Some(digest_str)) =
-                (obj.object_id, obj.version, obj.digest)
-            {
-                if let (Ok(id), Ok(digest)) =
-                    (id_str.parse::<Address>(), digest_str.parse::<Digest>())
-                {
-                    coins.push((id, version, digest));
-                }
-            }
-        }
-    }
-
-    Ok((address_wal, coins))
+    Ok(address_wal)
 }
 
 fn finalize_offline_ptb(
@@ -1171,37 +1172,18 @@ pub async fn build_register_blob_ptb(
         .map_err(|e| format!("invalid WAL StructTag '{wal_coin_type_str}': {e}"))?;
     let wal_type_tag = TypeTag::Struct(Box::new(wal_struct_tag));
 
-    let (address_wal_opt, owned_wal_coins) =
-        select_owned_wal_coins(grpc_url, &sender.to_string(), &wal_coin_type_str).await?;
+    let address_wal_opt =
+        query_wal_address_balance(grpc_url, &sender.to_string(), &wal_coin_type_str).await?;
 
     if let Some(available_wal) = address_wal_opt {
-        if available_wal < total_wal_cost && owned_wal_coins.is_empty() {
+        if available_wal < total_wal_cost {
             return Err(format!(
                 "Insufficient balance of {wal_coin_type_str} for owner {sender}. Required: {total_wal_cost}, Available: {available_wal}"
             ));
         }
     }
 
-    let (wal_coin_arg, destroy_zero_after) = if address_wal_opt.unwrap_or(total_wal_cost)
-        >= total_wal_cost
-        || owned_wal_coins.is_empty()
-    {
-        (
-            builder.funds_withdrawal_coin(wal_type_tag.clone(), total_wal_cost),
-            true,
-        )
-    } else {
-        let (first_id, first_ver, first_dig) = owned_wal_coins[0];
-        let primary = builder.object(ObjectInput::owned(first_id, first_ver, first_dig));
-        if owned_wal_coins.len() > 1 {
-            let extras: Vec<_> = owned_wal_coins[1..]
-                .iter()
-                .map(|&(id, ver, dig)| builder.object(ObjectInput::owned(id, ver, dig)))
-                .collect();
-            builder.merge_coins(primary, extras);
-        }
-        (primary, false)
-    };
+    let wal_coin_arg = builder.funds_withdrawal_coin(wal_type_tag.clone(), total_wal_cost);
 
     let system_arg = builder.object(ObjectInput::shared(
         system.system_object_id,
@@ -1257,17 +1239,15 @@ pub async fn build_register_blob_ptb(
         );
     }
 
-    if destroy_zero_after {
-        builder.move_call(
-            Function::new(
-                Address::TWO,
-                Identifier::from_static("coin"),
-                Identifier::from_static("destroy_zero"),
-            )
-            .with_type_args(vec![wal_type_tag]),
-            vec![wal_coin_arg],
-        );
-    }
+    builder.move_call(
+        Function::new(
+            Address::TWO,
+            Identifier::from_static("coin"),
+            Identifier::from_static("destroy_zero"),
+        )
+        .with_type_args(vec![wal_type_tag]),
+        vec![wal_coin_arg],
+    );
 
     let sender_arg = builder.pure(&sender);
     builder.transfer_objects(vec![blob_obj], sender_arg);
@@ -1289,11 +1269,18 @@ pub async fn post_blob_to_upload_relay(
     nonce: &[u8; 32],
     data: Vec<u8>,
 ) -> Result<ConfirmationCertificate, String> {
+    let tip_config = fetch_relay_tip_config(http, relay_url).await?;
     let base = relay_url.trim().trim_end_matches('/');
-    let nonce_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce);
-    let url = format!(
-        "{base}/v1/blob-upload-relay?blob_id={blob_id_str}&deletable_blob_object={blob_object_id}&tx_id={register_tx_digest}&nonce={nonce_b64}&encoding_type=RS2"
-    );
+    let url = if matches!(tip_config, RelayTipConfig::NoTip) {
+        format!(
+            "{base}/v1/blob-upload-relay?blob_id={blob_id_str}&deletable_blob_object={blob_object_id}&encoding_type=RS2"
+        )
+    } else {
+        let nonce_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce);
+        format!(
+            "{base}/v1/blob-upload-relay?blob_id={blob_id_str}&deletable_blob_object={blob_object_id}&tx_id={register_tx_digest}&nonce={nonce_b64}&encoding_type=RS2"
+        )
+    };
 
     const BACKOFF_MS: &[u64] = &[250, 500, 1000, 2000];
     let mut last_err = String::new();
@@ -1904,6 +1891,92 @@ pub(crate) fn compute_deterministic_register_nonce(
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
+fn command_uses_gas_coin(cmd: &sui_sdk_types::Command) -> bool {
+    use sui_sdk_types::{Argument, Command};
+    let is_gas = |arg: &Argument| matches!(arg, Argument::Gas);
+    match cmd {
+        Command::MoveCall(mc) => mc.arguments.iter().any(is_gas),
+        Command::TransferObjects(to) => is_gas(&to.address) || to.objects.iter().any(is_gas),
+        Command::SplitCoins(sc) => is_gas(&sc.coin) || sc.amounts.iter().any(is_gas),
+        Command::MergeCoins(mc) => is_gas(&mc.coin) || mc.coins_to_merge.iter().any(is_gas),
+        Command::MakeMoveVector(mv) => mv.elements.iter().any(is_gas),
+        Command::Upgrade(ug) => is_gas(&ug.ticket),
+        Command::Publish(_) => false,
+        _ => false,
+    }
+}
+
+pub(crate) fn assert_register_transaction_uses_address_balance_wal(
+    ptb: &ProgrammableTransaction,
+) -> Result<(), String> {
+    if ptb.commands.iter().any(command_uses_gas_coin) {
+        return Err("registerTransaction resolved the relay tip from an owned SUI coin".to_owned());
+    }
+    if ptb
+        .inputs
+        .iter()
+        .any(|input| matches!(input, sui_sdk_types::Input::ImmutableOrOwned(_)))
+    {
+        return Err("registerTransaction resolved WAL from an owned coin".to_owned());
+    }
+    let sui_tag = TypeTag::Struct(Box::new(StructTag::sui()));
+    let has_wal_withdrawal = ptb.inputs.iter().any(|input| match input {
+        sui_sdk_types::Input::FundsWithdrawal(fw) => fw.coin_type() != &sui_tag,
+        _ => false,
+    });
+    if !has_wal_withdrawal {
+        return Err("registerTransaction has no WAL address-balance withdrawal".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn assert_sponsored_register_transaction(
+    tx: &Transaction,
+    expected_sender: Address,
+) -> Result<(), String> {
+    if tx.sender != expected_sender {
+        return Err("sponsored registerTransaction sender does not match the wallet".to_owned());
+    }
+    if tx.gas_payment.owner == expected_sender {
+        return Err("sponsored registerTransaction must use a distinct gas owner".to_owned());
+    }
+    match &tx.kind {
+        TransactionKind::ProgrammableTransaction(ptb) => {
+            assert_register_transaction_uses_address_balance_wal(ptb)
+        }
+        _ => Err("registerTransaction contains invalid TransactionData: non-PTB kind".to_owned()),
+    }
+}
+
+pub(crate) fn assert_address_balance_register_transaction(tx: &Transaction) -> Result<u64, String> {
+    if !tx.gas_payment.objects.is_empty() {
+        return Err(format!(
+            "registerTransaction must pay gas from the address balance (gasData.payment.length={})",
+            tx.gas_payment.objects.len()
+        ));
+    }
+    let max_epoch = match &tx.expiration {
+        TransactionExpiration::ValidDuring {
+            max_epoch: Some(max_epoch),
+            min_timestamp: None,
+            max_timestamp: None,
+            ..
+        } => *max_epoch,
+        other => {
+            return Err(format!(
+                "registerTransaction must use a ValidDuring address-balance expiration (expiration={other:?})"
+            ));
+        }
+    };
+    match &tx.kind {
+        TransactionKind::ProgrammableTransaction(ptb) => {
+            assert_register_transaction_uses_address_balance_wal(ptb)?;
+            Ok(max_epoch)
+        }
+        _ => Err("registerTransaction contains invalid TransactionData: non-PTB kind".to_owned()),
+    }
+}
+
 /// Validates a persisted `PreparedRegisterTransaction` against `expected_sender` and its own
 /// signature before reconciling or submitting it on-chain.
 ///
@@ -1915,28 +1988,38 @@ pub(crate) fn validate_prepared_register_transaction(
 ) -> Result<(Transaction, UserSignature), String> {
     let tx_b64 = prepared.transaction_bytes.trim();
     if tx_b64.is_empty() {
-        return Err("Prepared register transaction bytes are empty".to_owned());
+        return Err("registerTransaction.transactionBytes is not canonical base64".to_owned());
     }
     let tx_bytes = base64::engine::general_purpose::STANDARD
         .decode(tx_b64)
-        .map_err(|e| format!("Prepared register transaction bytes are not valid base64: {e}"))?;
-    if base64::engine::general_purpose::STANDARD.encode(&tx_bytes) != tx_b64 {
-        return Err("Prepared register transaction bytes are not canonical base64".to_owned());
+        .map_err(|_| "registerTransaction.transactionBytes is not canonical base64".to_owned())?;
+    if tx_bytes.is_empty()
+        || base64::engine::general_purpose::STANDARD.encode(&tx_bytes) != tx_b64
+    {
+        return Err("registerTransaction.transactionBytes is not canonical base64".to_owned());
     }
     let tx: Transaction = bcs::from_bytes(&tx_bytes)
-        .map_err(|e| format!("Prepared register transaction BCS is invalid: {e}"))?;
-    if tx.sender != expected_sender {
-        return Err(format!(
-            "Prepared register transaction sender mismatch: expected {expected_sender}, got {}",
-            tx.sender
-        ));
-    }
+        .map_err(|e| format!("registerTransaction contains invalid TransactionData: {e}"))?;
     let computed_digest = tx.digest().to_string();
     if computed_digest != prepared.digest.trim() {
         return Err(format!(
-            "Prepared register transaction digest mismatch: expected {}, got {computed_digest}",
+            "registerTransaction digest mismatch: expected {}, got {computed_digest}",
             prepared.digest
         ));
+    }
+    if tx.sender != expected_sender {
+        return Err("registerTransaction sender does not match the journaled wallet".to_owned());
+    }
+    if prepared
+        .sponsor_digest
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        assert_sponsored_register_transaction(&tx, expected_sender)?;
+    } else if tx.gas_payment.owner != expected_sender {
+        return Err(
+            "registerTransaction gas owner does not match the journaled wallet".to_owned(),
+        );
     }
     let user_sig = UserSignature::from_base64(prepared.signature.trim())
         .map_err(|e| format!("Prepared register transaction signature is invalid: {e}"))?;
@@ -1982,14 +2065,20 @@ pub(crate) async fn prepare_register_transaction_in_process(
             Ok(sponsored) => {
                 let sponsored_bytes = base64::engine::general_purpose::STANDARD
                     .decode(sponsored.bytes.trim())
-                    .map_err(|e| format!("invalid base64 from Enoki sponsor: {e}"))?;
+                    .map_err(|_| {
+                        "registerTransaction.transactionBytes is not canonical base64".to_owned()
+                    })?;
                 verify_sponsored_transaction_matches_ptb(&sponsored_bytes, sender_addr, &ptb)?;
+                let sponsored_tx: Transaction = bcs::from_bytes(&sponsored_bytes).map_err(|e| {
+                    format!("registerTransaction contains invalid TransactionData: {e}")
+                })?;
+                assert_sponsored_register_transaction(&sponsored_tx, sender_addr)?;
                 let (sig_b64, computed_digest) =
                     sign_transaction_bytes(raw_private_key, &sponsored_bytes)?;
                 if !sponsored.digest.trim().is_empty() && sponsored.digest.trim() != computed_digest
                 {
                     return Err(format!(
-                        "Enoki sponsor digest mismatch: Enoki reported {}, Transaction bytes hashed to {computed_digest}",
+                        "registerTransaction digest mismatch: expected {}, got {computed_digest}",
                         sponsored.digest
                     ));
                 }
@@ -2062,6 +2151,7 @@ pub(crate) async fn prepare_register_transaction_in_process(
             nonce,
         },
     };
+    assert_address_balance_register_transaction(&transaction)?;
 
     let tx_bytes = bcs::to_bytes(&transaction)
         .map_err(|e| format!("failed to BCS-encode Transaction: {e}"))?;
@@ -2703,6 +2793,8 @@ pub async fn advance_durable_upload_in_process(
         journal.wallet_address = Some(sender_str.clone());
     }
 
+    let epochs_u32 = parse_durable_walrus_epochs(epochs, &runtime.sui_network)?;
+
     let system = resolve_walrus_system_snapshot(
         &runtime.grpc_url,
         &runtime.sui_network,
@@ -2710,9 +2802,8 @@ pub async fn advance_durable_upload_in_process(
         &runtime.walrus_system_object_id,
     )
     .await
-    .map_err(AppError::Internal)?;
+    .map_err(format_durable_upload_error)?;
 
-    let epochs_u32 = (epochs as u32).clamp(1, 53);
     let end_epoch = (system.epoch + epochs_u32) as i32;
 
     if journal.execution_identity.is_none() {
@@ -2784,7 +2875,7 @@ pub async fn advance_durable_upload_in_process(
             let Some(prepared) = journal.register_transaction.clone() else {
                 let tip_config = fetch_relay_tip_config(http, &runtime.walrus_publisher_url)
                     .await
-                    .map_err(AppError::Internal)?;
+                    .map_err(format_durable_upload_error)?;
 
                 let mut attrs = vec![
                     ("memwal_namespace", namespace.to_owned()),
@@ -2808,7 +2899,7 @@ pub async fn advance_durable_upload_in_process(
                     &attrs,
                 )
                 .await
-                .map_err(AppError::Internal)?;
+                .map_err(format_durable_upload_error)?;
 
                 let mut allowed_addrs = vec![sender_str];
                 if let Some((tip_recipient, _)) =
@@ -2834,7 +2925,7 @@ pub async fn advance_durable_upload_in_process(
                     Ok(tx) => tx,
                     Err(err) => {
                         invalidate_walrus_system_snapshot_cache().await;
-                        return Err(AppError::Internal(err));
+                        return Err(format_durable_upload_error(err));
                     }
                 };
 
@@ -2861,7 +2952,7 @@ pub async fn advance_durable_upload_in_process(
                 Ok(PreparedStepAdvance::Executed(out)) => out,
                 Err(err) => {
                     invalidate_walrus_system_snapshot_cache().await;
-                    return Err(AppError::Internal(format!(
+                    return Err(format_durable_upload_error(format!(
                         "The registration transaction was not successful: {err}"
                     )));
                 }
@@ -2949,7 +3040,7 @@ pub async fn advance_durable_upload_in_process(
                 data.to_vec(),
             )
             .await
-            .map_err(AppError::Internal)?;
+            .map_err(format_durable_upload_error)?;
 
             let cert_b64 = bcs::to_bytes(&cert)
                 .or_else(|_| serde_json::to_vec(&cert))
@@ -3024,7 +3115,7 @@ pub async fn advance_durable_upload_in_process(
                         {
                             continue;
                         }
-                        return Err(AppError::Internal(last_certify_err));
+                        return Err(format_durable_upload_error(last_certify_err));
                     }
                 };
 
@@ -3051,11 +3142,11 @@ pub async fn advance_durable_upload_in_process(
                             continue;
                         }
                         invalidate_walrus_system_snapshot_cache().await;
-                        return Err(AppError::Internal(last_certify_err));
+                        return Err(format_durable_upload_error(last_certify_err));
                     }
                 }
             }
-            let outcome = outcome_opt.ok_or(AppError::Internal(last_certify_err))?;
+            let outcome = outcome_opt.ok_or_else(|| format_durable_upload_error(last_certify_err))?;
 
             let step_json = serde_json::json!({
                 "step": "certified",
@@ -3082,9 +3173,83 @@ pub async fn advance_durable_upload_in_process(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 6. Batch Metadata & Ownership Transfer (`set_metadata_batch_in_process`)
-// ---------------------------------------------------------------------------
+const MAX_WALRUS_EPOCHS: u64 = 15;
+
+pub(crate) fn parse_durable_walrus_epochs(epochs: u64, sui_network: &str) -> Result<u32, AppError> {
+    if sui_network.trim().eq_ignore_ascii_case("mainnet") {
+        if epochs != MAX_WALRUS_EPOCHS {
+            return Err(AppError::BadRequest(format!(
+                "Invalid epochs: mainnet requires exactly {MAX_WALRUS_EPOCHS}, got {epochs}"
+            )));
+        }
+        return Ok(epochs as u32);
+    }
+    if !(1..=MAX_WALRUS_EPOCHS).contains(&epochs) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid epochs: expected an integer from 1 to {MAX_WALRUS_EPOCHS}, got {epochs}"
+        )));
+    }
+    Ok(epochs as u32)
+}
+
+pub(crate) fn is_shared_service_upload_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("moveabort")
+        || lower.contains("insufficient balance")
+        || lower.contains("insufficient gas")
+        || lower.contains("gasbalance")
+        || lower.contains("balance of gas object")
+    {
+        return false;
+    }
+    if lower.contains("enoki transient/rate-limit error")
+        || lower.contains("failed to query walrus upload relay tip-config")
+        || lower.contains("walrus upload relay post failed")
+        || lower.contains("walrus upload relay returned 408")
+        || lower.contains("walrus upload relay returned 429")
+        || lower.contains("walrus upload relay returned 5")
+    {
+        return true;
+    }
+    if let Some(rest) = lower.split("tip-config request failed (").nth(1) {
+        if let Some(code_str) = rest.split(')').next() {
+            if let Ok(code) = code_str.trim().parse::<u16>() {
+                if code == 408 || code == 429 || (500..=599).contains(&code) {
+                    return true;
+                }
+            }
+        }
+    }
+    lower.contains("status: unavailable")
+        || lower.contains("status: resourceexhausted")
+        || lower.contains("status: deadlineexceeded")
+        || lower.contains("status: internal")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("econnreset")
+        || lower.contains("econnrefused")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("transport error")
+        || lower.contains("error trying to connect")
+        || lower.contains("dns error")
+}
+
+pub(crate) fn format_durable_upload_error(err: String) -> AppError {
+    if is_shared_service_upload_error(&err) {
+        let payload = serde_json::json!({
+            "code": "SHARED_SERVICE_UNAVAILABLE",
+            "error": err,
+        });
+        AppError::Internal(format!(
+            "durable Walrus upload failed (503 Service Unavailable): {payload}"
+        ))
+    } else {
+        AppError::Internal(err)
+    }
+}
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reconcile_metadata_batch_entries<'a>(
@@ -4838,7 +5003,7 @@ mod tests {
         assert!(
             validate_prepared_register_transaction(&prepared, other_sender, raw_key)
                 .unwrap_err()
-                .contains("sender mismatch")
+                .contains("registerTransaction sender does not match")
         );
 
         // Wrong signing key fails signature verification.
@@ -5486,16 +5651,24 @@ mod tests {
             .derive_address();
         let sender_str = sender.to_string();
 
+        let wal_tag = TypeTag::Struct(Box::new(TESTNET_WAL_COIN_TYPE.parse().unwrap()));
         let ptb = ProgrammableTransaction {
-            inputs: Vec::new(),
+            inputs: vec![sui_sdk_types::Input::FundsWithdrawal(
+                sui_sdk_types::FundsWithdrawal::new(
+                    1_000,
+                    wal_tag,
+                    sui_sdk_types::WithdrawFrom::Sender,
+                ),
+            )],
             commands: Vec::new(),
         };
+        let sponsor_owner = Address::from([0x99; 32]);
         let tx = Transaction {
             kind: TransactionKind::ProgrammableTransaction(ptb),
             sender,
             gas_payment: GasPayment {
                 objects: Vec::new(),
-                owner: sender,
+                owner: sponsor_owner,
                 price: 1_000,
                 budget: 50_000_000,
             },
@@ -5823,11 +5996,21 @@ mod tests {
             "Mainnet Upload Relay uses Linear tip config, got: {tip_cfg:?}"
         );
 
-        // 3. Live Mainnet SEAL KeyServer resolution + BLS12-381 IBE Encryption
+        // 3. Live Mainnet SEAL KeyServer resolution + BLS12-381 IBE Encryption (default 2-of-2 Mainnet servers)
+        let saved_seal_configs = std::env::var("SEAL_SERVER_CONFIGS").ok();
+        let saved_seal_threshold = std::env::var("SEAL_THRESHOLD").ok();
+        std::env::remove_var("SEAL_SERVER_CONFIGS");
+        std::env::remove_var("SEAL_THRESHOLD");
         let (servers, threshold) =
             crate::storage::seal_native::resolve_seal_key_servers(mainnet_grpc_url, None)
                 .await
                 .expect("resolve live Mainnet SEAL KeyServers on Sui Mainnet");
+        if let Some(v) = &saved_seal_configs {
+            std::env::set_var("SEAL_SERVER_CONFIGS", v);
+        }
+        if let Some(v) = &saved_seal_threshold {
+            std::env::set_var("SEAL_THRESHOLD", v);
+        }
         assert_eq!(threshold, 2);
         assert_eq!(servers.len(), 2);
 
@@ -5855,11 +6038,17 @@ mod tests {
         assert_eq!(auth_pkg_bcs.len(), 72);
 
         // 5. Production (`main`) V2 Committee SEAL KeyServer + expected committee identity on live Mainnet
-        std::env::set_var(
-            "SEAL_SERVER_CONFIGS",
-            r#"[{"objectId":"0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595","weight":1,"aggregatorUrl":"https://seal-aggregator-mainnet.mystenlabs.com","apiKeyName":"x-api-key","apiKey":"probe-only"}]"#,
-        );
-        std::env::set_var("SEAL_THRESHOLD", "1");
+        let orig_seal_configs = std::env::var("SEAL_SERVER_CONFIGS").ok();
+        let orig_seal_threshold = std::env::var("SEAL_THRESHOLD").ok();
+        if orig_seal_configs.is_none() {
+            std::env::set_var(
+                "SEAL_SERVER_CONFIGS",
+                r#"[{"objectId":"0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595","weight":1,"aggregatorUrl":"https://seal-aggregator-mainnet.mystenlabs.com","apiKeyName":"x-api-key","apiKey":"probe-only"}]"#,
+            );
+        }
+        if orig_seal_threshold.is_none() {
+            std::env::set_var("SEAL_THRESHOLD", "1");
+        }
         let expected_prod_committee = serde_json::json!({
             "servers": [{
                 "objectId": "0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595",
@@ -5873,15 +6062,275 @@ mod tests {
         )
         .await
         .expect("resolve live production Mainnet V2 Committee SEAL KeyServer");
-        std::env::remove_var("SEAL_SERVER_CONFIGS");
-        std::env::remove_var("SEAL_THRESHOLD");
+        if orig_seal_configs.is_none() {
+            std::env::remove_var("SEAL_SERVER_CONFIGS");
+        }
+        if orig_seal_threshold.is_none() {
+            std::env::remove_var("SEAL_THRESHOLD");
+        }
         assert_eq!(prod_threshold, 1);
         assert_eq!(prod_servers.len(), 1);
         assert_eq!(
             prod_servers[0].url,
             "https://seal-aggregator-mainnet.mystenlabs.com"
         );
-        assert_eq!(prod_servers[0].api_key_name.as_deref(), Some("x-api-key"));
+        assert_eq!(
+            prod_servers[0]
+                .api_key_name
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref(),
+            Some("x-api-key")
+        );
+
+        // 6. Optional full live Mainnet E2E (Enoki-sponsored register_blob + Upload Relay + certify_blob + GraphQL provenance + Aggregator readback)
+        if std::env::var("MAINNET_LIVE_E2E").ok().as_deref() == Some("1") {
+            let keys_csv = std::env::var("SERVER_SUI_PRIVATE_KEYS")
+                .expect("SERVER_SUI_PRIVATE_KEYS required when MAINNET_LIVE_E2E=1");
+            let keys: Vec<String> = keys_csv
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert!(!keys.is_empty(), "SERVER_SUI_PRIVATE_KEYS must not be empty");
+            let pkg_id = std::env::var("PACKAGE_ID")
+                .unwrap_or_else(|_| "0x80ca5c7fbefecbc2da0efeb5aaad4be39a3998bb4bc39bd22afe39fbab0644dc".to_owned());
+            let seal_policy_pkg_id = std::env::var("SEAL_POLICY_PACKAGE_ID")
+                .unwrap_or_else(|_| pkg_id.clone());
+            let registry_id = std::env::var("REGISTRY_ID")
+                .unwrap_or_else(|_| "0x2467c7211faadbb9bc88d42f8ce5be7aa38e61e2144545c1c970744e70e5e466".to_owned());
+
+            let runtime_cfg = NativeRuntimeConfig {
+                grpc_url: "https://mysten-rpc.mainnet.sui.io".to_owned(),
+                sui_network: "mainnet".to_owned(),
+                walrus_publisher_url: mainnet_relay_url.clone(),
+                walrus_package_id: MAINNET_WALRUS_PACKAGE_ID.to_owned(),
+                walrus_system_object_id: MAINNET_WALRUS_SYSTEM_OBJECT_ID.to_owned(),
+                sui_private_keys: keys.clone(),
+                package_id: pkg_id.clone(),
+                seal_policy_package_id: seal_policy_pkg_id,
+                registry_id,
+            };
+            match NATIVE_RUNTIME_CONFIG.get() {
+                Some(lock) => {
+                    *lock.write().unwrap() = runtime_cfg;
+                }
+                None => {
+                    let _ = NATIVE_RUNTIME_CONFIG.set(StdRwLock::new(runtime_cfg));
+                }
+            }
+
+            // 6a. Inspect live Mainnet pool wallet balances and pick a funded wallet
+            let balances_json = fetch_wallet_balances_in_process().await;
+            let wallets_arr = balances_json["perWallet"]
+                .as_array()
+                .expect("fetch_wallet_balances_in_process must return perWallet array");
+            let required_wal = snapshot
+                .storage_cost(encoded.encoded_size, 15)
+                .saturating_add(snapshot.write_cost(encoded.encoded_size));
+            println!(
+                "[MAINNET_LIVE_E2E] inspected {} Mainnet pool wallets; required_wal={} FROST for 15 epochs",
+                wallets_arr.len(),
+                required_wal
+            );
+            let funded_idx = wallets_arr
+                .iter()
+                .position(|w| {
+                    let wal_addr = w["walAddressBalanceFrost"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let sui_addr = w["suiAddressBalanceMist"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    wal_addr >= required_wal && sui_addr >= tip_mist
+                })
+                .expect("at least one Mainnet pool wallet must have sufficient WAL and SUI address balance");
+            let wallet_addr = wallets_arr[funded_idx]["address"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            println!(
+                "[MAINNET_LIVE_E2E] selected wallet_index={funded_idx} address={wallet_addr} walAddressBalanceFrost={} suiAddressBalanceMist={}",
+                wallets_arr[funded_idx]["walAddressBalanceFrost"].as_str().unwrap_or("?"),
+                wallets_arr[funded_idx]["suiAddressBalanceMist"].as_str().unwrap_or("?")
+            );
+
+            // 6b. Advance durable upload end-to-end on live Mainnet (15 epochs, Enoki-sponsored register + certify)
+            let canary_job_id = format!(
+                "mainnet-canary-job-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            );
+            let e2e_payload = format!("memwal-rust-in-process-{canary_job_id}").into_bytes();
+
+            let journal = UploadJournal {
+                wallet_index: funded_idx,
+                wallet_address: Some(wallet_addr.clone()),
+                execution_identity: None,
+                resume_step: None,
+                register_transaction: None,
+            };
+
+            // Step 1: None -> Prepared (Enoki-sponsored register_blob transaction on Mainnet)
+            let prep_adv = advance_durable_upload_in_process(
+                &http,
+                &e2e_payload,
+                15,
+                &wallet_addr,
+                "mainnet-canary",
+                &pkg_id,
+                &canary_job_id,
+                journal,
+            )
+            .await
+            .expect("Step 1 (Prepared) on live Mainnet");
+            let journal_after_prep = match prep_adv {
+                DurableUploadAdvance::Prepared(j) => j,
+                other => panic!("expected DurableUploadAdvance::Prepared, got {other:?}"),
+            };
+            let prep_tx = journal_after_prep
+                .register_transaction
+                .as_ref()
+                .expect("Prepared journal must contain register_transaction");
+            assert!(
+                prep_tx.sponsor_digest.is_some(),
+                "Mainnet register_transaction must be Enoki-sponsored"
+            );
+            println!(
+                "[MAINNET_LIVE_E2E] Step 1 Prepared OK: digest={} sponsor_digest={:?}",
+                prep_tx.digest, prep_tx.sponsor_digest
+            );
+
+            // Step 2: Prepared -> Registered on Sui Mainnet
+            let reg_adv = advance_durable_upload_in_process(
+                &http,
+                &e2e_payload,
+                15,
+                &wallet_addr,
+                "mainnet-canary",
+                &pkg_id,
+                &canary_job_id,
+                journal_after_prep,
+            )
+            .await
+            .expect("Step 2 (Registered) on live Mainnet");
+            let (journal_after_reg, reg_step) = match reg_adv {
+                DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                other => panic!("expected Registered Step, got {other:?}"),
+            };
+            assert_eq!(reg_step["step"], "registered");
+            let blob_id = reg_step["blobId"].as_str().unwrap().to_owned();
+            let blob_object_id = reg_step["blobObjectId"].as_str().unwrap().to_owned();
+            let register_tx_digest = reg_step["txDigest"].as_str().unwrap().to_owned();
+            println!(
+                "[MAINNET_LIVE_E2E] Step 2 Registered OK: blob_id={blob_id} blob_object_id={blob_object_id} register_tx_digest={register_tx_digest}"
+            );
+
+            // Step 3: Registered -> Uploaded via live Mainnet Upload Relay (`https://upload-relay.mainnet.walrus.space`)
+            let up_adv = advance_durable_upload_in_process(
+                &http,
+                &e2e_payload,
+                15,
+                &wallet_addr,
+                "mainnet-canary",
+                &pkg_id,
+                &canary_job_id,
+                journal_after_reg,
+            )
+            .await
+            .expect("Step 3 (Uploaded) via live Mainnet Upload Relay");
+            let (journal_after_up, up_step) = match up_adv {
+                DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                other => panic!("expected Uploaded Step, got {other:?}"),
+            };
+            assert_eq!(up_step["step"], "uploaded");
+            println!(
+                "[MAINNET_LIVE_E2E] Step 3 Uploaded OK: certificate_len={}",
+                up_step["certificate"].as_str().unwrap_or_default().len()
+            );
+
+            // Step 4: Uploaded -> Certified on Sui Mainnet
+            let cert_adv = advance_durable_upload_in_process(
+                &http,
+                &e2e_payload,
+                15,
+                &wallet_addr,
+                "mainnet-canary",
+                &pkg_id,
+                &canary_job_id,
+                journal_after_up,
+            )
+            .await
+            .expect("Step 4 (Certified) on live Mainnet");
+            let (_, cert_step) = match cert_adv {
+                DurableUploadAdvance::Step { journal: j, step } => (j, step),
+                other => panic!("expected Certified Step, got {other:?}"),
+            };
+            assert_eq!(cert_step["step"], "certified");
+            let certify_tx_digest = cert_step["certifyTxDigest"]
+                .as_str()
+                .unwrap_or("already-certified");
+            println!(
+                "[MAINNET_LIVE_E2E] Step 4 Certified OK: blob_id={blob_id} blob_object_id={blob_object_id} certify_tx_digest={certify_tx_digest}"
+            );
+
+            // Step 5: Verify on-chain blob discovery + Mainnet provenance check (`find_blob_by_job_in_process` + `query_blob_storage_leases_in_process`)
+            let found_by_job = find_blob_by_job_in_process(&wallet_addr, &canary_job_id)
+                .await
+                .expect("find_blob_by_job_in_process on live Mainnet")
+                .expect("newly certified Mainnet blob must be found by job_id");
+            assert_eq!(found_by_job.blob_id, blob_id);
+            assert_eq!(
+                found_by_job.object_id.as_deref(),
+                Some(blob_object_id.as_str())
+            );
+            let leases = query_blob_storage_leases_in_process(
+                &wallet_addr,
+                std::slice::from_ref(&blob_id),
+            )
+            .await
+            .expect("query_blob_storage_leases_in_process on live Mainnet");
+            assert_eq!(leases.blobs.len(), 1);
+            assert_eq!(leases.blobs[0].blob_id, blob_id);
+            assert_eq!(leases.blobs[0].object_id, blob_object_id);
+            assert_eq!(
+                leases.blobs[0].storage_end_epoch,
+                leases.current_epoch + 15,
+                "Mainnet blob lease must span 15 epochs from current_epoch"
+            );
+            println!(
+                "[MAINNET_LIVE_E2E] Step 5 On-chain discovery & provenance check OK: object_id={:?} blob_id={} current_epoch={} storage_end_epoch={}",
+                found_by_job.object_id,
+                found_by_job.blob_id,
+                leases.current_epoch,
+                leases.blobs[0].storage_end_epoch
+            );
+
+            // Step 6: Read back blob bytes from live Mainnet Walrus Aggregator
+            let agg_url = format!(
+                "https://aggregator.walrus-mainnet.walrus.space/v1/blobs/{blob_id}"
+            );
+            let agg_bytes = http
+                .get(&agg_url)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .expect("GET blob from Mainnet Walrus Aggregator")
+                .error_for_status()
+                .expect("Mainnet Walrus Aggregator HTTP 200")
+                .bytes()
+                .await
+                .expect("read Mainnet Walrus Aggregator response bytes");
+            assert_eq!(agg_bytes.as_ref(), e2e_payload.as_slice());
+            println!(
+                "[MAINNET_LIVE_E2E] Step 6 Aggregator readback verified byte-for-byte ({} bytes)",
+                agg_bytes.len()
+            );
+        }
     }
 
     #[test]
@@ -6027,5 +6476,415 @@ mod tests {
         assert!(!is_rebuildable_object_or_sponsor_error(
             "BLOB_OWNER_MISMATCH: Blob 0x123 is owned by 0x456"
         ));
+    }
+
+    #[test]
+    fn parse_durable_walrus_epochs_enforces_mainnet_15_and_testnet_bounds() {
+        assert_eq!(parse_durable_walrus_epochs(15, "mainnet").unwrap(), 15);
+        let err_mainnet = parse_durable_walrus_epochs(1, "mainnet").unwrap_err();
+        assert!(
+            err_mainnet
+                .to_string()
+                .contains("Invalid epochs: mainnet requires exactly 15, got 1"),
+            "unexpected mainnet epochs error: {err_mainnet}"
+        );
+
+        assert_eq!(parse_durable_walrus_epochs(1, "testnet").unwrap(), 1);
+        assert_eq!(parse_durable_walrus_epochs(15, "testnet").unwrap(), 15);
+        let err_testnet_low = parse_durable_walrus_epochs(0, "testnet").unwrap_err();
+        assert!(
+            err_testnet_low
+                .to_string()
+                .contains("Invalid epochs: expected an integer from 1 to 15, got 0"),
+            "unexpected testnet low epochs error: {err_testnet_low}"
+        );
+        let err_testnet_high = parse_durable_walrus_epochs(16, "testnet").unwrap_err();
+        assert!(
+            err_testnet_high
+                .to_string()
+                .contains("Invalid epochs: expected an integer from 1 to 15, got 16"),
+            "unexpected testnet high epochs error: {err_testnet_high}"
+        );
+    }
+
+    #[test]
+    fn register_transaction_shape_assertions_match_permanent_classifier() {
+        use crate::jobs::WalletJobError;
+
+        let raw_key = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let sender = parse_sui_private_key(raw_key)
+            .unwrap()
+            .public_key()
+            .derive_address();
+        let other_addr = Address::from([0x77; 32]);
+        let wal_tag = TypeTag::Struct(Box::new(TESTNET_WAL_COIN_TYPE.parse().unwrap()));
+        let sui_tag = TypeTag::Struct(Box::new(StructTag::sui()));
+
+        let valid_ptb = ProgrammableTransaction {
+            inputs: vec![sui_sdk_types::Input::FundsWithdrawal(
+                sui_sdk_types::FundsWithdrawal::new(
+                    500,
+                    wal_tag.clone(),
+                    sui_sdk_types::WithdrawFrom::Sender,
+                ),
+            )],
+            commands: Vec::new(),
+        };
+
+        // 1. Non-canonical base64
+        let err1 = validate_prepared_register_transaction(
+            &PreparedRegisterTransaction {
+                transaction_bytes: "not-base64!!!".to_owned(),
+                signature: String::new(),
+                digest: String::new(),
+                sponsor_digest: None,
+            },
+            sender,
+            raw_key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err1),
+                WalletJobError::Permanent(_)
+            ),
+            "err1={err1}"
+        );
+
+        // 2. Invalid BCS TransactionData
+        let err2 = validate_prepared_register_transaction(
+            &PreparedRegisterTransaction {
+                transaction_bytes: base64::engine::general_purpose::STANDARD.encode(b"bad-bcs"),
+                signature: String::new(),
+                digest: String::new(),
+                sponsor_digest: None,
+            },
+            sender,
+            raw_key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err2),
+                WalletJobError::Permanent(_)
+            ),
+            "err2={err2}"
+        );
+
+        // 3. Digest mismatch
+        let base_tx = Transaction {
+            kind: TransactionKind::ProgrammableTransaction(valid_ptb.clone()),
+            sender,
+            gas_payment: GasPayment {
+                objects: Vec::new(),
+                owner: sender,
+                price: 1_000,
+                budget: 50_000_000,
+            },
+            expiration: TransactionExpiration::ValidDuring {
+                min_epoch: Some(10),
+                max_epoch: Some(10),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain: Digest::ZERO,
+                nonce: 1,
+            },
+        };
+        let base_bytes = bcs::to_bytes(&base_tx).unwrap();
+        let (base_sig, base_digest) = sign_transaction_bytes(raw_key, &base_bytes).unwrap();
+        let err3 = validate_prepared_register_transaction(
+            &PreparedRegisterTransaction {
+                transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&base_bytes),
+                signature: base_sig.clone(),
+                digest: "WrongDigest".to_owned(),
+                sponsor_digest: None,
+            },
+            sender,
+            raw_key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err3),
+                WalletJobError::Permanent(_)
+            ),
+            "err3={err3}"
+        );
+
+        // 4. Sender mismatch
+        let err4 = validate_prepared_register_transaction(
+            &PreparedRegisterTransaction {
+                transaction_bytes: base64::engine::general_purpose::STANDARD.encode(&base_bytes),
+                signature: base_sig.clone(),
+                digest: base_digest.clone(),
+                sponsor_digest: None,
+            },
+            other_addr,
+            raw_key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err4),
+                WalletJobError::Permanent(_)
+            ),
+            "err4={err4}"
+        );
+
+        // 5. Direct tx gas owner mismatch
+        let mut wrong_gas_owner_tx = base_tx.clone();
+        wrong_gas_owner_tx.gas_payment.owner = other_addr;
+        let wrong_gas_bytes = bcs::to_bytes(&wrong_gas_owner_tx).unwrap();
+        let (wrong_gas_sig, wrong_gas_digest) =
+            sign_transaction_bytes(raw_key, &wrong_gas_bytes).unwrap();
+        let err5 = validate_prepared_register_transaction(
+            &PreparedRegisterTransaction {
+                transaction_bytes: base64::engine::general_purpose::STANDARD
+                    .encode(&wrong_gas_bytes),
+                signature: wrong_gas_sig,
+                digest: wrong_gas_digest,
+                sponsor_digest: None,
+            },
+            sender,
+            raw_key,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err5),
+                WalletJobError::Permanent(_)
+            ),
+            "err5={err5}"
+        );
+
+        // 6. Sponsored tx with gas owner == sender
+        let err6 = assert_sponsored_register_transaction(&base_tx, sender).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err6),
+                WalletJobError::Permanent(_)
+            ),
+            "err6={err6}"
+        );
+
+        // 7. Direct tx with non-empty gas payment objects
+        let mut owned_gas_tx = base_tx.clone();
+        owned_gas_tx
+            .gas_payment
+            .objects
+            .push(sui_sdk_types::ObjectReference::new(
+                Address::TWO,
+                1,
+                Digest::ZERO,
+            ));
+        let err7 = assert_address_balance_register_transaction(&owned_gas_tx).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err7),
+                WalletJobError::Permanent(_)
+            ),
+            "err7={err7}"
+        );
+
+        // 8. Direct tx without ValidDuring expiration
+        let mut no_exp_tx = base_tx.clone();
+        no_exp_tx.expiration = TransactionExpiration::None;
+        let err8 = assert_address_balance_register_transaction(&no_exp_tx).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err8),
+                WalletJobError::Permanent(_)
+            ),
+            "err8={err8}"
+        );
+
+        // 9. PTB using Argument::Gas for tip
+        let gas_tip_ptb = ProgrammableTransaction {
+            inputs: valid_ptb.inputs.clone(),
+            commands: vec![sui_sdk_types::Command::TransferObjects(
+                sui_sdk_types::TransferObjects {
+                    objects: vec![sui_sdk_types::Argument::Gas],
+                    address: sui_sdk_types::Argument::Input(0),
+                },
+            )],
+        };
+        let err9 = assert_register_transaction_uses_address_balance_wal(&gas_tip_ptb).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err9),
+                WalletJobError::Permanent(_)
+            ),
+            "err9={err9}"
+        );
+
+        // 10. PTB using owned WAL coin
+        let owned_wal_ptb = ProgrammableTransaction {
+            inputs: vec![sui_sdk_types::Input::ImmutableOrOwned(
+                sui_sdk_types::ObjectReference::new(Address::TWO, 1, Digest::ZERO),
+            )],
+            commands: Vec::new(),
+        };
+        let err10 =
+            assert_register_transaction_uses_address_balance_wal(&owned_wal_ptb).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err10),
+                WalletJobError::Permanent(_)
+            ),
+            "err10={err10}"
+        );
+
+        // 11. PTB missing WAL FundsWithdrawal (only SUI withdrawal)
+        let sui_only_ptb = ProgrammableTransaction {
+            inputs: vec![sui_sdk_types::Input::FundsWithdrawal(
+                sui_sdk_types::FundsWithdrawal::new(
+                    100,
+                    sui_tag,
+                    sui_sdk_types::WithdrawFrom::Sender,
+                ),
+            )],
+            commands: Vec::new(),
+        };
+        let err11 =
+            assert_register_transaction_uses_address_balance_wal(&sui_only_ptb).unwrap_err();
+        assert!(
+            matches!(
+                WalletJobError::classify_sidecar_error(&err11),
+                WalletJobError::Permanent(_)
+            ),
+            "err11={err11}"
+        );
+    }
+
+    #[test]
+    fn format_durable_upload_error_wraps_shared_service_outages_as_upload_slot_congestion() {
+        use crate::jobs::WalletJobError;
+
+        for shared_err in [
+            "tip-config request failed (503)",
+            "Walrus upload relay returned 502 Bad Gateway: upstream error",
+            "Walrus upload relay POST failed: connection reset by peer",
+            "Enoki transient/rate-limit error (429): Too Many Requests",
+            "GetEpoch gRPC failed: status: Unavailable, message: \"upstream unavailable\"",
+        ] {
+            let app_err = format_durable_upload_error(shared_err.to_owned());
+            let msg = app_err.to_string();
+            assert!(
+                msg.contains("SHARED_SERVICE_UNAVAILABLE"),
+                "expected SHARED_SERVICE_UNAVAILABLE wrapper for '{shared_err}', got: {msg}"
+            );
+            assert!(
+                matches!(
+                    WalletJobError::classify_sidecar_error(&msg),
+                    WalletJobError::UploadSlotCongestion(_)
+                ),
+                "expected UploadSlotCongestion for '{shared_err}', got msg={msg}"
+            );
+        }
+
+        // MoveAbort and wallet WAL shortfalls must NOT be wrapped as SHARED_SERVICE_UNAVAILABLE
+        let wal_shortfall = format_durable_upload_error(format!(
+            "Insufficient balance of {MAINNET_WAL_COIN_TYPE} for owner 0x123. Required: 1000, Available: 0"
+        ));
+        assert!(
+            !wal_shortfall
+                .to_string()
+                .contains("SHARED_SERVICE_UNAVAILABLE")
+        );
+        assert!(matches!(
+            WalletJobError::classify_sidecar_error(&wal_shortfall.to_string()),
+            WalletJobError::WalrusBalanceLow(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_relay_tip_config_rejects_non_2xx_and_no_tip_relay_omits_tx_id_and_nonce() {
+        use axum::{
+            extract::Query,
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::Arc;
+
+        // 1. Server returning 503 on `/v1/tip-config` must return Err, never silently NoTip
+        let app_503 = Router::new().route(
+            "/v1/tip-config",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "relay overloaded") }),
+        );
+        let listener_503 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_503 = listener_503.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener_503, app_503).await;
+        });
+
+        let http = reqwest::Client::new();
+        let err = fetch_relay_tip_config(&http, &format!("http://{addr_503}"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("tip-config request failed (503)"),
+            "expected tip-config 503 error, got: {err}"
+        );
+
+        // 2. Server returning `"no_tip"` on `/v1/tip-config` must receive POST `/v1/blob-upload-relay`
+        //    WITHOUT `tx_id` or `nonce` query parameters.
+        let captured_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured_query);
+        let app_no_tip = Router::new()
+            .route("/v1/tip-config", get(|| async { Json("no_tip") }))
+            .route(
+                "/v1/blob-upload-relay",
+                post(
+                    move |Query(params): Query<HashMap<String, String>>| async move {
+                        *captured_clone.lock().await = Some(params);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "synthetic stop after query capture",
+                        )
+                    },
+                ),
+            );
+        let listener_no_tip = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_no_tip = listener_no_tip.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener_no_tip, app_no_tip).await;
+        });
+
+        let relay_url = format!("http://{addr_no_tip}");
+        let tip_cfg = fetch_relay_tip_config(&http, &relay_url).await.unwrap();
+        assert_eq!(tip_cfg, RelayTipConfig::NoTip);
+
+        let _ = post_blob_to_upload_relay(
+            &http,
+            &relay_url,
+            "blob-123",
+            "0xdeadbeef",
+            "TxDigestShouldBeOmitted",
+            &[9u8; 32],
+            b"hello".to_vec(),
+        )
+        .await;
+
+        let params = captured_query
+            .lock()
+            .await
+            .clone()
+            .expect("upload relay query params captured");
+        assert_eq!(params.get("blob_id").map(String::as_str), Some("blob-123"));
+        assert_eq!(
+            params.get("deletable_blob_object").map(String::as_str),
+            Some("0xdeadbeef")
+        );
+        assert_eq!(params.get("encoding_type").map(String::as_str), Some("RS2"));
+        assert!(
+            !params.contains_key("tx_id"),
+            "no_tip upload relay request must omit tx_id, got: {params:?}"
+        );
+        assert!(
+            !params.contains_key("nonce"),
+            "no_tip upload relay request must omit nonce, got: {params:?}"
+        );
     }
 }

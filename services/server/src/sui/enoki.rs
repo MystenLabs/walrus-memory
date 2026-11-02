@@ -1076,7 +1076,8 @@ pub async fn execute_ptb_with_address_balance(
 }
 
 /// Verifies that the BCS `Transaction` returned by Enoki `sponsor` matches our expected
-/// `sender` and `ProgrammableTransaction` kind (`assertSponsoredRegisterTransaction` /
+/// `sender`, uses a distinct sponsor `gas_payment.owner`, and preserves the exact
+/// `ProgrammableTransaction` kind (`assertSponsoredRegisterTransaction` /
 /// `assertSponsoredRegisterTransactionKind` in `walrus-upload-journal.ts`).
 pub fn verify_sponsored_transaction_matches_ptb(
     sponsored_tx_bytes: &[u8],
@@ -1084,17 +1085,17 @@ pub fn verify_sponsored_transaction_matches_ptb(
     expected_ptb: &ProgrammableTransaction,
 ) -> Result<(), String> {
     let tx: Transaction = bcs::from_bytes(sponsored_tx_bytes)
-        .map_err(|e| format!("invalid sponsored Transaction BCS: {e}"))?;
+        .map_err(|e| format!("registerTransaction contains invalid TransactionData: {e}"))?;
     if tx.sender != expected_sender {
-        return Err(format!(
-            "Enoki sponsored transaction sender mismatch: expected {expected_sender}, got {}",
-            tx.sender
-        ));
+        return Err("sponsored registerTransaction sender does not match the wallet".to_owned());
+    }
+    if tx.gas_payment.owner == expected_sender {
+        return Err("sponsored registerTransaction must use a distinct gas owner".to_owned());
     }
     match &tx.kind {
         TransactionKind::ProgrammableTransaction(ptb) if ptb == expected_ptb => Ok(()),
         _ => Err(
-            "Enoki sponsored transaction kind does not match the requested ProgrammableTransaction"
+            "Enoki returned a sponsored transaction whose kind differs from the requested transaction"
                 .to_owned(),
         ),
     }

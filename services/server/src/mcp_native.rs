@@ -750,7 +750,7 @@ pub fn format_namespaces_result(page: &NamespacesPage) -> String {
         .filter(|ns| !ns.name.is_empty() && ns.memory_count > 0)
         .collect();
     let next_cursor = page.next_cursor.as_deref().filter(|s| !s.is_empty());
-    let has_more_pages = page.has_more || next_cursor.is_some();
+    let has_more_pages = page.has_more;
 
     if non_empty.is_empty() {
         if has_more_pages {
@@ -1282,7 +1282,7 @@ pub(crate) fn format_restore_output_with_namespaces(
             format!(" {suggestion_hint}")
         };
         lines.push(format!(
-            "Namespace \"{resolved_namespace}\" holds 0 on-chain blobs.{hint_suffix}"
+            "This restore query discovered 0 matching blobs in namespace \"{resolved_namespace}\".{hint_suffix}"
         ));
     }
 
@@ -4886,12 +4886,16 @@ mod tests {
 
         let out =
             format_restore_output_with_namespaces(&empty_restore, "study-note", Some(&namespaces));
-        assert!(out.contains("Namespace \"study-note\" holds 0 on-chain blobs."));
+        assert!(out.contains(
+            "This restore query discovered 0 matching blobs in namespace \"study-note\"."
+        ));
         assert!(out.contains("Did you mean namespace \"study-notes\" (12 memories)?"));
         assert!(out.contains("Existing namespaces: \"study-notes\" (12)."));
 
         let out_no_ns = format_restore_output_with_namespaces(&empty_restore, "study-note", None);
-        assert!(out_no_ns.contains("Namespace \"study-note\" holds 0 on-chain blobs."));
+        assert!(out_no_ns.contains(
+            "This restore query discovered 0 matching blobs in namespace \"study-note\"."
+        ));
         assert!(!out_no_ns.contains("Did you mean"));
     }
 
@@ -4923,6 +4927,33 @@ mod tests {
         );
         assert!(rendered.contains("- \"default\": 1 memory, storage_used=256B, updated=2026-08-18"));
         assert!(rendered.contains("More namespaces available (next_cursor=\"cursor-2\")."));
+
+        // Terminal page with a non-null watermark cursor (`has_more: false`) must NOT claim more pages.
+        let terminal_with_watermark = NamespacesPage {
+            namespaces: vec![NamespaceEntry {
+                name: "default".to_owned(),
+                memory_count: 1,
+                storage_used: Some(256),
+                updated_at: Some("2026-08-18T09:30:00Z".to_owned()),
+            }],
+            next_cursor: Some("2026-08-18T09:30:00Z|default".to_owned()),
+            has_more: false,
+        };
+        let terminal_rendered = format_namespaces_result(&terminal_with_watermark);
+        assert!(terminal_rendered.starts_with("Namespaces (1):"));
+        assert!(!terminal_rendered.contains("Namespaces (1+):"));
+        assert!(!terminal_rendered.contains("More namespaces available"));
+
+        // Empty terminal page with a non-null watermark cursor (`has_more: false`) must report empty, not continuation.
+        let empty_terminal_with_watermark = NamespacesPage {
+            namespaces: vec![],
+            next_cursor: Some("2026-08-18T09:30:00Z|default".to_owned()),
+            has_more: false,
+        };
+        assert_eq!(
+            format_namespaces_result(&empty_terminal_with_watermark),
+            "No namespaces with stored memories found for this account."
+        );
 
         // Final empty page
         let empty_page = NamespacesPage {
