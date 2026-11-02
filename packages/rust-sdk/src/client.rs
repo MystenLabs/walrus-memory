@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -346,15 +346,11 @@ impl MemWal {
     pub fn destroy(&self) {
         self.0.destroyed.store(true, Ordering::SeqCst);
         {
-            let mut signer_guard = self
-                .0
-                .signer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut signer_guard = self.write_signer();
             *signer_guard = None;
         }
         {
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.session = None;
             caches.server_config = None;
             caches.package_verified = false;
@@ -395,7 +391,7 @@ impl MemWal {
     /// Returns [`Error::Destroyed`] if [`Self::destroy`] has been called.
     pub fn public_key_hex(&self) -> Result<String> {
         self.check_not_destroyed()?;
-        let guard = self.0.signer.read().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.read_signer();
         let signer = guard.as_ref().ok_or(Error::Destroyed)?;
         Ok(signer.public_key_hex().to_owned())
     }
@@ -407,7 +403,7 @@ impl MemWal {
     /// Returns [`Error::Destroyed`] if [`Self::destroy`] has been called.
     pub fn sui_address(&self) -> Result<String> {
         self.check_not_destroyed()?;
-        let guard = self.0.signer.read().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.read_signer();
         let signer = guard.as_ref().ok_or(Error::Destroyed)?;
         Ok(signer.sui_address().to_owned())
     }
@@ -972,10 +968,12 @@ impl MemWal {
             results,
             &pending,
             &last_seen,
-            timeout_ms,
-            answered,
-            last_refusal,
-            saw_rate_limit,
+            &BulkPollTelemetry {
+                timeout_ms,
+                answered,
+                last_refusal,
+                saw_rate_limit,
+            },
         ))
     }
 
@@ -1089,11 +1087,7 @@ impl MemWal {
         }
         let resolved_ns = self.resolve_namespace(params.namespace.as_deref())?;
         let timeout = params.timeout.unwrap_or(self.0.recall_timeout);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "clamped to u64::MAX milliseconds"
-        )]
-        let raw_deadline_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        let raw_deadline_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         let deadline_ms = if raw_deadline_ms > RECALL_DEADLINE_MARGIN_MS {
             raw_deadline_ms - RECALL_DEADLINE_MARGIN_MS
         } else {
@@ -1561,13 +1555,25 @@ impl MemWal {
         Ok(out)
     }
 
+    fn lock_caches(&self) -> MutexGuard<'_, CachedMetadata> {
+        self.0.caches.lock().expect("runtime cache lock poisoned")
+    }
+
+    fn read_signer(&self) -> RwLockReadGuard<'_, Option<Signer>> {
+        self.0.signer.read().expect("signer lock poisoned")
+    }
+
+    fn write_signer(&self) -> RwLockWriteGuard<'_, Option<Signer>> {
+        self.0.signer.write().expect("signer lock poisoned")
+    }
+
     fn get_or_insert_pending_key(
         &self,
         identity: &str,
         generate: impl FnOnce() -> String,
     ) -> Result<String> {
         self.check_not_destroyed()?;
-        let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut caches = self.lock_caches();
         if let Some(existing) = caches.pending_remember_keys.get(identity) {
             return Ok(existing.clone());
         }
@@ -1579,7 +1585,7 @@ impl MemWal {
     }
 
     fn clear_pending_key(&self, identity: &str) {
-        let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut caches = self.lock_caches();
         caches.pending_remember_keys.remove(identity);
     }
 
@@ -1593,7 +1599,7 @@ impl MemWal {
     async fn ensure_compatible_relayer(&self) -> Result<VersionInfo> {
         self.check_not_destroyed()?;
         {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(cached) = &caches.version_info {
                 return Ok(cached.clone());
             }
@@ -1602,7 +1608,7 @@ impl MemWal {
         let _gate = self.0.compat_gate.lock().await;
         self.check_not_destroyed()?;
         {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(cached) = &caches.version_info {
                 return Ok(cached.clone());
             }
@@ -1658,7 +1664,7 @@ impl MemWal {
         validate_compatibility(&info, &self.0.server_url)?;
         self.check_not_destroyed()?;
         {
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.version_info = Some(info.clone());
         }
         Ok(info)
@@ -1667,7 +1673,7 @@ impl MemWal {
     async fn resolve_owner(&self) -> Result<String> {
         self.check_not_destroyed()?;
         {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(owner) = &caches.owner_address {
                 return Ok(owner.clone());
             }
@@ -1676,7 +1682,7 @@ impl MemWal {
         let _gate = self.0.owner_gate.lock().await;
         self.check_not_destroyed()?;
         {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(owner) = &caches.owner_address {
                 return Ok(owner.clone());
             }
@@ -1706,7 +1712,7 @@ impl MemWal {
 
         self.check_not_destroyed()?;
         {
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.owner_address = Some(stats.owner.clone());
         }
         Ok(stats.owner)
@@ -1716,7 +1722,7 @@ impl MemWal {
         self.check_not_destroyed()?;
         let now_ms = now_epoch_ms();
         {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(entry) = &caches.session
                 && now_ms < entry.expires_at_ms
             {
@@ -1728,7 +1734,7 @@ impl MemWal {
         self.check_not_destroyed()?;
         let now_ms = now_epoch_ms();
         let (cached_cfg, already_verified) = {
-            let caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let caches = self.lock_caches();
             if let Some(entry) = &caches.session
                 && now_ms < entry.expires_at_ms
             {
@@ -1742,7 +1748,7 @@ impl MemWal {
         } else {
             let fetched = self.fetch_server_config().await?;
             self.check_not_destroyed()?;
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.server_config = Some(fetched.clone());
             fetched
         };
@@ -1750,7 +1756,7 @@ impl MemWal {
         if !already_verified {
             self.verify_package_version_one(&cfg).await?;
             self.check_not_destroyed()?;
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.package_verified = true;
         }
 
@@ -1759,11 +1765,7 @@ impl MemWal {
         let ephemeral_seed = Zeroizing::new(ephemeral_signing.to_bytes());
         let session_key_bech32 = encode_sui_private_key(&ephemeral_seed)?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "Unix epoch milliseconds fit in u64 for millions of years"
-        )]
-        let creation_time_ms = now_epoch_ms() as u64;
+        let creation_time_ms = u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX);
         let personal_msg = build_seal_session_personal_message(
             &cfg.package_id,
             SEAL_SESSION_TTL_MIN,
@@ -1772,7 +1774,7 @@ impl MemWal {
         )?;
 
         let (delegate_sui_address, personal_sig) = {
-            let guard = self.0.signer.read().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.read_signer();
             let signer = guard.as_ref().ok_or(Error::Destroyed)?;
             (
                 signer.sui_address().to_owned(),
@@ -1801,7 +1803,7 @@ impl MemWal {
 
         self.check_not_destroyed()?;
         {
-            let mut caches = self.0.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut caches = self.lock_caches();
             caches.session = Some(SessionCacheEntry {
                 header_value: header_value.clone(),
                 expires_at_ms,
@@ -2049,7 +2051,7 @@ impl MemWal {
         );
 
         let (public_key_hex, signature_hex) = {
-            let guard = self.0.signer.read().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.read_signer();
             let signer = guard.as_ref().ok_or(Error::Destroyed)?;
             (
                 signer.public_key_hex().to_owned(),
@@ -2528,20 +2530,21 @@ fn init_bulk_timeout_placeholders(
         .collect()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "private bulk-wait finalizer consolidating settled and timed-out outcomes"
-)]
+struct BulkPollTelemetry {
+    timeout_ms: u128,
+    answered: bool,
+    last_refusal: Option<u16>,
+    saw_rate_limit: bool,
+}
+
 fn finalize_bulk_wait_result(
     job_ids: &[String],
     mut results: Vec<RememberBulkItemResult>,
     pending: &HashSet<String>,
     last_seen: &HashMap<String, RememberBulkStatusItem>,
-    timeout_ms: u128,
-    answered: bool,
-    last_refusal: Option<u16>,
-    saw_rate_limit: bool,
+    telemetry: &BulkPollTelemetry,
 ) -> RememberBulkResult {
+    let timeout_ms = telemetry.timeout_ms;
     for (idx, job_id) in job_ids.iter().enumerate() {
         if !pending.contains(job_id) {
             continue;
@@ -2556,16 +2559,18 @@ fn finalize_bulk_wait_result(
             } else {
                 format!("still {} after {timeout_ms}ms", seen.status)
             }
-        } else if answered {
+        } else if telemetry.answered {
             "not in relayer status answer; item may not be stored".to_owned()
-        } else if let Some(code) = last_refusal {
+        } else if let Some(code) = telemetry.last_refusal {
             format!("no status read succeeded (last HTTP {code}); item may not be stored")
         } else {
             format!("polling timed out after {timeout_ms}ms")
         };
 
-        let names_429 = !answered && !last_seen.contains_key(job_id) && last_refusal == Some(429);
-        let final_msg = if saw_rate_limit && !names_429 {
+        let names_429 = !telemetry.answered
+            && !last_seen.contains_key(job_id)
+            && telemetry.last_refusal == Some(429);
+        let final_msg = if telemetry.saw_rate_limit && !names_429 {
             format!("{base_msg}; wait hit rate limit (429)")
         } else {
             base_msg

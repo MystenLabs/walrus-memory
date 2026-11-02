@@ -1,4 +1,8 @@
 //! Comprehensive Wiremock and unit integration suite for the `memwal` Rust SDK.
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "integration tests use ? for concise setup alongside assert! macros"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,10 +98,16 @@ fn verify_ed25519_request_headers(req: &Request, expected_path_and_query: &str) 
         .and_then(|v| v.to_str().ok())
         .expect("missing x-account-id");
 
-    assert_eq!(account_id, TEST_ACCOUNT_ID);
+    assert_eq!(
+        account_id, TEST_ACCOUNT_ID,
+        "x-account-id header must match test account ID"
+    );
     let expected_pubkey =
         delegate_key_to_public_key_hex(TEST_KEY_HEX).expect("valid test delegate key");
-    assert_eq!(pubkey_hex, expected_pubkey);
+    assert_eq!(
+        pubkey_hex, expected_pubkey,
+        "x-public-key header must match derived Ed25519 public key"
+    );
 
     let server_expected = format!(
         "{timestamp}.{}.{expected_path_and_query}.{}.{nonce}.{account_id}",
@@ -112,7 +122,10 @@ fn verify_ed25519_request_headers(req: &Request, expected_path_and_query: &str) 
         nonce,
         account_id,
     );
-    assert_eq!(helper_msg, server_expected);
+    assert_eq!(
+        helper_msg, server_expected,
+        "canonical_message output must match relayer auth format"
+    );
 
     let pk_bytes: [u8; 32] = hex::decode(pubkey_hex)
         .expect("valid pubkey hex")

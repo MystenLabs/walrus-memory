@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Utc;
 use sha2::{Digest as _, Sha256};
@@ -107,7 +107,7 @@ impl MemWalMock {
     /// Wipes stored mock memories and marks the mock client destroyed.
     pub fn destroy(&self) {
         self.0.destroyed.store(true, Ordering::SeqCst);
-        let mut guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.lock_state();
         guard.entries.clear();
         guard.deleted.clear();
     }
@@ -152,7 +152,7 @@ impl MemWalMock {
         self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let ns = self.resolve_ns(opts.namespace.as_deref())?;
-        let entry = self.insert_entry(text, &ns, opts.dedupe == DedupeMode::ContentHash);
+        let entry = self.insert_entry(text, &ns, opts.dedupe);
         Ok(RememberAccepted {
             job_id: entry.id,
             status: "done".to_owned(),
@@ -182,7 +182,7 @@ impl MemWalMock {
         self.check_alive().await?;
         validate_non_blank(text, "text")?;
         let ns = self.resolve_ns(opts.remember.namespace.as_deref())?;
-        let entry = self.insert_entry(text, &ns, opts.remember.dedupe == DedupeMode::ContentHash);
+        let entry = self.insert_entry(text, &ns, opts.remember.dedupe);
         Ok(RememberResult {
             id: entry.id.clone(),
             job_id: entry.id,
@@ -209,7 +209,7 @@ impl MemWalMock {
                 error: Some(format!("job {job_id} not found")),
             });
         }
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         if let Some(found) = guard.entries.iter().find(|e| e.id == job_id) {
             Ok(RememberJobStatus {
                 job_id: found.id.clone(),
@@ -242,7 +242,7 @@ impl MemWalMock {
         _opts: &WaitOptions,
     ) -> Result<RememberResult> {
         self.check_alive().await?;
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         let found = guard
             .entries
             .iter()
@@ -279,7 +279,7 @@ impl MemWalMock {
                 )));
             }
             let ns = self.resolve_ns(item.namespace.as_deref())?;
-            let stored = self.insert_entry(&item.text, &ns, false);
+            let stored = self.insert_entry(&item.text, &ns, DedupeMode::RetryWindow);
             ids.push(stored.id);
         }
         Ok(RememberBulkAccepted {
@@ -322,7 +322,7 @@ impl MemWalMock {
         job_ids: &[String],
     ) -> Result<RememberBulkStatusResult> {
         self.check_alive().await?;
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         let results = job_ids
             .iter()
             .map(|jid| {
@@ -417,7 +417,7 @@ impl MemWalMock {
         let ns = self.resolve_ns(params.namespace.as_deref())?;
 
         let scored = {
-            let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.lock_state();
             let mut candidates: Vec<(u64, RecallMemory)> = guard
                 .entries
                 .iter()
@@ -489,7 +489,7 @@ impl MemWalMock {
         self.check_alive().await?;
         let ns = self.resolve_ns(namespace)?;
         let now = Utc::now().to_rfc3339();
-        let mut guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.lock_state();
         let before = guard.entries.len();
         let mut tombstones = Vec::new();
         guard.entries.retain(|e| {
@@ -505,7 +505,7 @@ impl MemWalMock {
             }
         });
         guard.deleted.extend(tombstones);
-        let deleted = (before - guard.entries.len()) as u64;
+        let deleted = u64::try_from(before - guard.entries.len()).unwrap_or(0);
         Ok(ForgetResult {
             deleted,
             namespace: ns,
@@ -542,16 +542,14 @@ impl MemWalMock {
             let _ = normalize_occurred_at(ts)?;
         }
 
-        let segments: Vec<&str> = text
+        let mut job_ids = Vec::new();
+        let mut facts = Vec::new();
+        for seg in text
             .split(['.', '\n'])
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect();
-
-        let mut job_ids = Vec::with_capacity(segments.len());
-        let mut facts = Vec::with_capacity(segments.len());
-        for seg in segments {
-            let entry = self.insert_entry(seg, &ns, false);
+        {
+            let entry = self.insert_entry(seg, &ns, DedupeMode::RetryWindow);
             job_ids.push(entry.id.clone());
             facts.push(AnalyzedFact {
                 text: seg.to_owned(),
@@ -640,7 +638,7 @@ impl MemWalMock {
         self.check_alive().await?;
         validate_namespace(namespace)?;
         validate_positive_limit(limit, "limit")?;
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         let count = guard
             .entries
             .iter()
@@ -667,22 +665,24 @@ impl MemWalMock {
         if let Some(limit) = opts.limit {
             validate_positive_limit(limit, "limit")?;
         }
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         let mut grouped: BTreeMap<String, (u64, u64, String)> = BTreeMap::new();
         for entry in &guard.entries {
             let slot = grouped
                 .entry(entry.namespace.clone())
                 .or_insert_with(|| (0, 0, entry.created_at.clone()));
             slot.0 += 1;
-            slot.1 += entry.text.len() as u64;
+            slot.1 += u64::try_from(entry.text.len()).unwrap_or(u64::MAX);
             if entry.created_at > slot.2 {
                 slot.2.clone_from(&entry.created_at);
             }
         }
 
         let limit = opts.limit.unwrap_or(100);
-        let all: Vec<NamespaceSummary> = grouped
+        let has_more = grouped.len() > limit;
+        let namespaces: Vec<NamespaceSummary> = grouped
             .into_iter()
+            .take(limit)
             .map(|(name, (count, bytes, updated_at))| NamespaceSummary {
                 id: name.clone(),
                 name,
@@ -691,9 +691,6 @@ impl MemWalMock {
                 updated_at,
             })
             .collect();
-
-        let has_more = all.len() > limit;
-        let namespaces: Vec<NamespaceSummary> = all.into_iter().take(limit).collect();
         let next_cursor = namespaces.last().map(|n| n.updated_at.clone());
         Ok(NamespacesPage {
             namespaces,
@@ -716,7 +713,7 @@ impl MemWalMock {
         if let Some(ns) = &opts.namespace {
             validate_namespace(ns)?;
         }
-        let guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.lock_state();
         let limit = opts.limit.unwrap_or(100);
         let has_more = guard.entries.len() > limit;
         let mut memories: Vec<MemorySummary> = guard
@@ -729,7 +726,7 @@ impl MemWalMock {
                 blob_id: e.blob_id.clone(),
                 created_at: e.created_at.clone(),
                 updated_at: e.created_at.clone(),
-                size: e.text.len() as u64,
+                size: u64::try_from(e.text.len()).unwrap_or(u64::MAX),
                 agent_id: None,
                 package_id: None,
                 status: "indexed".to_owned(),
@@ -810,6 +807,10 @@ impl MemWalMock {
         })
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, MockState> {
+        self.0.state.lock().expect("mock state lock poisoned")
+    }
+
     async fn check_alive(&self) -> Result<()> {
         tokio::task::yield_now().await;
         if self.is_destroyed() {
@@ -825,9 +826,9 @@ impl MemWalMock {
         Ok(ns.to_owned())
     }
 
-    fn insert_entry(&self, text: &str, namespace: &str, dedupe: bool) -> StoredEntry {
-        let mut guard = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if dedupe
+    fn insert_entry(&self, text: &str, namespace: &str, dedupe: DedupeMode) -> StoredEntry {
+        let mut guard = self.lock_state();
+        if dedupe == DedupeMode::ContentHash
             && let Some(existing) = guard
                 .entries
                 .iter()
@@ -859,11 +860,9 @@ fn lexical_distance(query: &str, candidate: &str) -> f64 {
         return 1.0;
     }
     let overlap = q_tokens.intersection(&c_tokens).count();
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "token set sizes in unit tests fit well inside f64 mantissa"
-    )]
-    let ratio = (overlap as f64) / (q_tokens.len() as f64);
+    let overlap_f = u32::try_from(overlap).map_or(f64::MAX, f64::from);
+    let total_f = u32::try_from(q_tokens.len()).map_or(f64::MAX, f64::from);
+    let ratio = overlap_f / total_f;
     (1.0 - ratio).clamp(0.0, 1.0)
 }
 

@@ -241,11 +241,7 @@ pub(crate) fn blake2b_256(data: &[u8]) -> [u8; 32] {
 pub(crate) fn encode_uleb128(mut value: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(4);
     loop {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "masked to low 7 bits before cast"
-        )]
-        let mut byte = (value & 0x7f) as u8;
+        let mut byte = u8::try_from(value & 0x7f).unwrap_or(0);
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
@@ -311,7 +307,7 @@ pub fn encode_sui_private_key(seed: &[u8; 32]) -> Result<String> {
     let mut raw = Zeroizing::new([0_u8; 33]);
     raw[0] = SUI_ED25519_FLAG;
     raw[1..].copy_from_slice(seed);
-    let words = convert_bits(&raw[..], 8, 5, true)?;
+    let words = convert_bits(&raw[..], 8, 5, BitPadding::Pad)?;
     Ok(bech32_encode(SUI_PRIVKEY_HRP, &words))
 }
 
@@ -328,7 +324,7 @@ pub fn decode_sui_private_key(encoded: &str) -> Result<Zeroizing<[u8; 32]>> {
             "unexpected Bech32 prefix {hrp:?}; expected {SUI_PRIVKEY_HRP:?}"
         )));
     }
-    let decoded = Zeroizing::new(convert_bits(&data, 5, 8, false)?);
+    let decoded = Zeroizing::new(convert_bits(&data, 5, 8, BitPadding::NoPad)?);
     if decoded.len() != 33 {
         return Err(Error::InvalidKey(format!(
             "invalid suiprivkey payload length: expected 33 bytes, got {}",
@@ -412,7 +408,7 @@ fn bech32_create_checksum(hrp: &str, data: &[u8]) -> [u8; 6] {
     let polymod = bech32_polymod(&values) ^ 1;
     let mut checksum = [0_u8; 6];
     for (i, slot) in checksum.iter_mut().enumerate() {
-        *slot = ((polymod >> (5 * (5 - i))) & 0x1f) as u8;
+        *slot = u8::try_from((polymod >> (5 * (5 - i))) & 0x1f).unwrap_or(0);
     }
     checksum
 }
@@ -480,11 +476,7 @@ fn bech32_decode(encoded: &str) -> Result<(String, Vec<u8>)> {
             .ok_or_else(|| {
                 Error::InvalidKey(format!("invalid Bech32 character '{}'", char::from(ch)))
             })?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "BECH32_CHARSET has length 32"
-        )]
-        words.push(pos as u8);
+        words.push(u8::try_from(pos).unwrap_or(0));
     }
 
     if !bech32_verify_checksum(&hrp, &words) {
@@ -497,34 +489,40 @@ fn bech32_decode(encoded: &str) -> Result<(String, Vec<u8>)> {
     Ok((hrp, words))
 }
 
-fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BitPadding {
+    Pad,
+    NoPad,
+}
+
+fn convert_bits(data: &[u8], from_bits: u8, to_bits: u8, padding: BitPadding) -> Result<Vec<u8>> {
+    let from = u32::from(from_bits);
+    let to = u32::from(to_bits);
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
-    let maxv: u32 = (1 << to_bits) - 1;
-    let max_acc: u32 = (1 << (from_bits + to_bits - 1)) - 1;
+    let maxv: u32 = (1 << to) - 1;
+    let max_acc: u32 = (1 << (from + to - 1)) - 1;
     let mut out =
-        Vec::with_capacity((data.len() * (from_bits as usize)).div_ceil(to_bits as usize));
+        Vec::with_capacity((data.len() * usize::from(from_bits)).div_ceil(usize::from(to_bits)));
 
     for &value in data {
         let v = u32::from(value);
-        if (v >> from_bits) != 0 {
+        if (v >> from) != 0 {
             return Err(Error::InvalidKey("Bech32 word out of range".to_owned()));
         }
-        acc = ((acc << from_bits) | v) & max_acc;
-        bits += from_bits;
-        while bits >= to_bits {
-            bits -= to_bits;
-            #[expect(clippy::cast_possible_truncation, reason = "to_bits is at most 8")]
-            out.push(((acc >> bits) & maxv) as u8);
+        acc = ((acc << from) | v) & max_acc;
+        bits += from;
+        while bits >= to {
+            bits -= to;
+            out.push(u8::try_from((acc >> bits) & maxv).unwrap_or(0));
         }
     }
 
-    if pad {
+    if padding == BitPadding::Pad {
         if bits > 0 {
-            #[expect(clippy::cast_possible_truncation, reason = "to_bits is at most 8")]
-            out.push(((acc << (to_bits - bits)) & maxv) as u8);
+            out.push(u8::try_from((acc << (to - bits)) & maxv).unwrap_or(0));
         }
-    } else if bits >= from_bits || ((acc << (to_bits - bits)) & maxv) != 0 {
+    } else if bits >= from || ((acc << (to - bits)) & maxv) != 0 {
         return Err(Error::InvalidKey(
             "non-zero padding bits in Bech32 payload".to_owned(),
         ));
@@ -538,17 +536,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn suiprivkey_round_trip_and_redacted_debug() -> Result<()> {
+    fn suiprivkey_round_trip_and_redacted_debug() {
         let seed = [0x42_u8; 32];
-        let encoded = encode_sui_private_key(&seed)?;
+        let encoded = encode_sui_private_key(&seed).expect("encode suiprivkey");
         assert!(encoded.starts_with("suiprivkey1"));
 
-        let decoded = decode_sui_private_key(&encoded)?;
+        let decoded = decode_sui_private_key(&encoded).expect("decode suiprivkey");
         assert_eq!(&*decoded, &seed);
 
-        let signer_from_bech32 = Signer::from_key_str(&encoded)?;
+        let signer_from_bech32 = Signer::from_key_str(&encoded).expect("parse bech32");
         let hex_key = hex::encode(seed);
-        let signer_from_hex = Signer::from_key_str(&hex_key)?;
+        let signer_from_hex = Signer::from_key_str(&hex_key).expect("parse hex");
         assert_eq!(
             signer_from_bech32.public_key_hex(),
             signer_from_hex.public_key_hex()
@@ -561,30 +559,27 @@ mod tests {
         let dbg = format!("{signer_from_hex:?}");
         assert!(!dbg.contains(&hex_key));
         assert!(dbg.contains("<redacted>"));
-        Ok(())
     }
 
     #[test]
-    fn non_ed25519_suiprivkey_is_rejected() -> Result<()> {
+    fn non_ed25519_suiprivkey_is_rejected() {
         let mut secp_payload = [0_u8; 33];
         secp_payload[0] = 0x01; // Secp256k1 scheme flag
         secp_payload[1..].copy_from_slice(&[0x11_u8; 32]);
-        let words = convert_bits(&secp_payload, 8, 5, true)?;
+        let words = convert_bits(&secp_payload, 8, 5, BitPadding::Pad).expect("convert bits");
         let encoded = bech32_encode(SUI_PRIVKEY_HRP, &words);
 
         let err = decode_sui_private_key(&encoded).expect_err("secp256k1 flag must fail");
         assert!(matches!(err, Error::InvalidKey(_)));
         assert!(err.to_string().contains("0x01"));
-        Ok(())
     }
 
     #[test]
-    fn seed_bytes_are_copied_without_mutating_caller() -> Result<()> {
+    fn seed_bytes_are_copied_without_mutating_caller() {
         let caller = [0x7a_u8; 32];
-        let signer = Signer::from_seed_bytes(&caller)?;
+        let signer = Signer::from_seed_bytes(&caller).expect("from seed bytes");
         assert_eq!(caller, [0x7a_u8; 32]);
         assert_eq!(signer.public_key_hex().len(), 64);
-        Ok(())
     }
 
     #[test]
