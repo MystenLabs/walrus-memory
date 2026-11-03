@@ -240,3 +240,30 @@ export function wrapTool<Args>(
         }
     };
 }
+
+/**
+ * Normalize and validate an MCP tool namespace parameter.
+ *
+ * Returns undefined when namespace is undefined or not a string.
+ * Trims leading and trailing whitespace.
+ * Returns undefined when trimmed length is 0.
+ * Rejects control characters ([\r\n\0]).
+ * Rejects UTF-8 byte length exceeding 255 bytes.
+ * Preserves mixed-case casing.
+ */
+export function normalizeMcpNamespace(namespace?: string): string | undefined {
+    if (typeof namespace !== "string") {
+        return undefined;
+    }
+    if (/[\r\n\0]/.test(namespace)) {
+        throw new Error("Namespace cannot contain control characters");
+    }
+    const trimmed = namespace.trim();
+    if (trimmed.length === 0) {
+        return undefined;
+    }
+    if (Buffer.byteLength(trimmed, "utf8") > 255) {
+        throw new Error("Namespace cannot exceed 255 bytes");
+    }
+    return trimmed;
+}

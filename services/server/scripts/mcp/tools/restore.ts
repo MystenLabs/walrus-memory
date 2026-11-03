@@ -7,7 +7,7 @@ import {
     tryListNamespaces,
     type NamespaceEntry,
 } from "./namespaces.js";
-import { wrapTool } from "./util.js";
+import { wrapTool, normalizeMcpNamespace } from "./util.js";
 
 const RESTORE_INPUT = {
     namespace: z
@@ -95,7 +95,11 @@ export function registerRestoreTool(
             inputSchema: RESTORE_INPUT,
         },
         wrapTool<{ namespace: string; limit: number }>(session, "memwal_restore", async ({ namespace, limit }) => {
-            const result = await session.memwal.restore(namespace, limit);
+            const cleanNamespace = normalizeMcpNamespace(namespace);
+            if (!cleanNamespace) {
+                throw new Error("Namespace cannot be empty");
+            }
+            const result = await session.memwal.restore(cleanNamespace, limit);
             const isEmpty =
                 result.truncated !== true &&
                 result.total === 0 &&
@@ -103,7 +107,7 @@ export function registerRestoreTool(
                 result.skipped === 0 &&
                 (result.failed ?? 0) === 0;
             const discovery = isEmpty
-                ? await tryListNamespaces(session, namespace, 50)
+                ? await tryListNamespaces(session, cleanNamespace, 50)
                 : null;
             return {
                 content: [
