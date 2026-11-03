@@ -19,6 +19,9 @@ test("shouldCapture rejects explicit conversational opt-out directives before TR
     "Please don't remember where I live: 123 Example Street.",
     "For privacy, don't remember my home address: 123 Example Street.",
     "For privacy, do not remember where I live: 123 Example Street.",
+    "My temporary medical appointment is at 3 PM and do not remember this.",
+    "My home address is 123 Example Street but do not save this in memory.",
+    "We are discussing executive compensation and do not log this conversation.",
     "Do not save or remember this: my temporary medical appointment is at 3 PM.",
     "Please don't remember my temporary medical appointment at 3 PM.",
     "Never store this in memory: our internal codename is Project Aurora.",
@@ -327,5 +330,54 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     analyzedPayloads.length,
     2,
     "opt-out phrases after a comma like 'For privacy, don't remember...' must suppress assistant echoes from reaching analyze()",
+  );
+
+  // 8. Hook-level regression: explicit opt-outs after coordinating conjunctions ("and do not remember this", "but do not save this in memory") suppress echoes.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u10",
+          role: "user",
+          content: "My temporary medical appointment is at 3 PM and do not remember this.",
+        },
+        {
+          id: "a10",
+          role: "assistant",
+          content: "Understood, I will not store your 3 PM medical appointment.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-conjunction-remember-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    2,
+    "opt-out phrases after 'and' like 'and do not remember this' must suppress assistant echoes from reaching analyze()",
+  );
+
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u11",
+          role: "user",
+          content: "My home address is 123 Example Street but do not save this in memory.",
+        },
+        {
+          id: "a11",
+          role: "assistant",
+          content: "Got it, 123 Example Street will not be saved in memory.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-conjunction-save-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    2,
+    "opt-out phrases after 'but' like 'but do not save this in memory' must suppress assistant echoes from reaching analyze()",
   );
 });
