@@ -2645,11 +2645,6 @@ pub async fn upload_blob_in_process(
     )
     .map_err(|e| UploadBlobError::App(AppError::BadRequest(e)))?;
 
-    let _permit = global_upload_limiter()
-        .acquire(1)
-        .await
-        .map_err(|e| UploadBlobError::App(AppError::Internal(e)))?;
-
     let mut journal = UploadJournal {
         wallet_index: key_index,
         wallet_address: None,
