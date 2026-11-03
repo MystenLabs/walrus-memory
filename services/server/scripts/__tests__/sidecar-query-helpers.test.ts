@@ -34,6 +34,7 @@ import {
     createdBlobObjectIdFromTransaction,
     durableRegisterDirectSigningAllowed,
     executePreparedRegisterTransaction,
+    PreparedRegisterNotOnChainError,
     readUploadBlobObject,
     waitForCertifiedStep,
     certifiedStep,
@@ -685,6 +686,25 @@ test("an expired prepared registration absent from chain is safe to rebuild", as
     assert.deepEqual(classifyDurableSideEffectError(ambiguous, true, true), {
         code: "SHARED_SERVICE_UNAVAILABLE",
     });
+    assert.equal(executeCalls, 0);
+
+    await assert.rejects(
+        executePreparedRegisterTransaction(
+            validated,
+            client,
+            () => {},
+            async () => 1n,
+            true,
+            async () => {
+                throw new Error("reconcile-only lookup must not submit sponsored transactions");
+            },
+            1,
+            false,
+        ),
+        (error: unknown) =>
+            error instanceof PreparedRegisterNotOnChainError
+            && error.code === "PREPARED_REGISTER_NOT_ON_CHAIN",
+    );
     assert.equal(executeCalls, 0);
 });
 

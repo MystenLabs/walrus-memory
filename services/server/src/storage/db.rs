@@ -5393,13 +5393,15 @@ mod quota_admission_tests {
         .await
         .expect("live reservation must extend cleanly");
 
-        // 6. Restart after the prepared checkpoint: a job holding a prepared register_transaction
-        // whose reservation expired must still re-admit entitlement and be rejected if quota is full.
+        // 6. Restart after the prepared checkpoint: reconcile the prepared digest first.
+        // If the registration already landed on-chain before the crash, it advances to
+        // `registered` even when the reservation expired and quota filled; if the digest
+        // is not on-chain (`PREPARED_REGISTER_NOT_ON_CHAIN`), expired-quota re-admission rejects it.
         let prepared_journal = crate::storage::walrus::UploadJournal {
             wallet_index: 0,
             wallet_address: Some("0xabc".into()),
             execution_identity: None,
-            resume_step: Some(serde_json::json!({ "step": "encoded" })),
+            resume_step: Some(serde_json::json!({ "step": "encoded", "blobId": "blob-1" })),
             register_transaction: Some(crate::storage::walrus::PreparedRegisterTransaction {
                 transaction_bytes: "aa".into(),
                 signature: "bb".into(),
@@ -5411,16 +5413,110 @@ mod quota_admission_tests {
             !crate::jobs::upload_journal_signer_committed(&prepared_journal),
             "prepared journal is not signer committed before on-chain execution"
         );
-        let prepared_err = crate::jobs::ensure_upload_storage_reservation_with_db(
+
+        let landed_on_chain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen_reconcile = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/walrus/upload-step-v3",
+            axum::routing::post({
+                let landed_on_chain = std::sync::Arc::clone(&landed_on_chain);
+                let seen_reconcile = std::sync::Arc::clone(&seen_reconcile);
+                move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let landed_on_chain = std::sync::Arc::clone(&landed_on_chain);
+                    let seen_reconcile = std::sync::Arc::clone(&seen_reconcile);
+                    async move {
+                        seen_reconcile.lock().unwrap().push(req);
+                        if landed_on_chain.load(std::sync::atomic::Ordering::SeqCst) {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "step": {
+                                        "step": "registered",
+                                        "blobId": "blob-1",
+                                        "blobObjectId": "0xblob1",
+                                        "txDigest": "cc"
+                                    }
+                                })),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({
+                                    "code": "PREPARED_REGISTER_NOT_ON_CHAIN",
+                                    "error": "prepared register transaction cc is not on chain"
+                                })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sidecar_url = format!("http://{}", listener.local_addr().unwrap());
+        let sidecar_server =
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // 6a. Prepared digest already finalized on-chain: reconciles to `registered` without failing quota.
+        let reconciled = crate::jobs::reconcile_or_ensure_upload_storage_reservation(
             &db,
+            &reqwest::Client::new(),
+            &sidecar_url,
+            None,
             max_bytes,
-            "mw10-job-prepared",
+            &[0u8; 60],
+            1,
             &owner,
-            60,
+            "default",
+            "0xpkg",
+            "mw10-job-prepared-landed",
+            &prepared_journal,
+            true,
         )
         .await
-        .expect_err("delayed job restarting after prepared checkpoint must be rejected when owner quota is full");
+        .expect("already-registered prepared digest must reconcile even when expired reservation cannot re-admit");
+        match reconciled {
+            Some(crate::storage::walrus::DurableUploadAdvance::Step { step, .. }) => {
+                assert_eq!(step["step"], "registered");
+                assert_eq!(step["blobObjectId"], "0xblob1");
+            }
+            _ => panic!("expected reconciled registered step"),
+        }
+
+        // 6b. Prepared digest is NOT on-chain: falls through to quota re-admission and rejects permanently.
+        landed_on_chain.store(false, std::sync::atomic::Ordering::SeqCst);
+        let prepared_err = match crate::jobs::reconcile_or_ensure_upload_storage_reservation(
+            &db,
+            &reqwest::Client::new(),
+            &sidecar_url,
+            None,
+            max_bytes,
+            &[0u8; 60],
+            1,
+            &owner,
+            "default",
+            "0xpkg",
+            "mw10-job-prepared-unpaid",
+            &prepared_journal,
+            true,
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("unpaid prepared digest with expired reservation must be rejected when owner quota is full"),
+        };
         assert!(prepared_err.aborts_retries(), "{prepared_err}");
+        assert!(
+            prepared_err
+                .message()
+                .contains("storage quota exceeded after reservation expired"),
+            "{prepared_err}"
+        );
+
+        sidecar_server.abort();
+        let reqs = seen_reconcile.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["reconcileOnly"], true);
+        assert_eq!(reqs[1]["reconcileOnly"], true);
 
         cleanup(&db, &owner).await;
     }

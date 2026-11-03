@@ -848,6 +848,98 @@ pub(crate) async fn ensure_upload_storage_reservation_with_db(
     }
 }
 
+/// Before enforcing expired-quota re-admission on a resumed `encoded` journal
+/// that already holds a saved `register_transaction`, reconcile that digest
+/// against the sidecar without permitting a new submission. If the prepared
+/// registration already landed on-chain before the crash, advance directly to
+/// `registered` so the paid blob is not stranded when quota has filled in the
+/// meantime; if the sidecar proves the digest is not on-chain (`Unpaid`),
+/// enforce `ensure_upload_storage_reservation_with_db` before execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_or_ensure_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    http_client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    max_storage_bytes: i64,
+    encrypted: &[u8],
+    epochs: u64,
+    owner: &str,
+    namespace: &str,
+    package_id: &str,
+    remember_job_id: &str,
+    journal: &UploadJournal,
+    needs_prepared_reconcile: bool,
+) -> Result<Option<DurableUploadAdvance>, WalletJobError> {
+    if upload_journal_signer_committed(journal) {
+        return Ok(None);
+    }
+
+    if needs_prepared_reconcile && journal.register_transaction.is_some() {
+        let mut attaches = 0u32;
+        let reconciled = loop {
+            let _ = sqlx::query(
+                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+            )
+            .bind(remember_job_id)
+            .execute(db.pool())
+            .await;
+            match crate::storage::walrus::reconcile_durable_upload(
+                http_client,
+                sidecar_url,
+                sidecar_secret,
+                encrypted,
+                epochs,
+                owner,
+                namespace,
+                package_id,
+                remember_job_id,
+                journal.clone(),
+            )
+            .await
+            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
+            {
+                Ok(reconciled) => break reconciled,
+                Err(err)
+                    if attaches < SAME_JOURNAL_ATTACHES
+                        && matches!(
+                            &err,
+                            WalletJobError::UploadSlotCongestion(msg)
+                                if WalletJobError::is_sidecar_upload_transport_error(msg)
+                        ) =>
+                {
+                    attaches += 1;
+                    tracing::info!(
+                        "[wallet-job:upload] job_id={} dropped reconcile connection; reattaching same journal ({}/{})",
+                        remember_job_id,
+                        attaches,
+                        SAME_JOURNAL_ATTACHES,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        match reconciled {
+            crate::storage::walrus::PreparedRegisterReconciliation::Advanced(advanced) => {
+                return Ok(Some(advanced));
+            }
+            crate::storage::walrus::PreparedRegisterReconciliation::Unpaid => {}
+        }
+    }
+
+    ensure_upload_storage_reservation_with_db(
+        db,
+        max_storage_bytes,
+        remember_job_id,
+        owner,
+        encrypted.len() as i64,
+    )
+    .await?;
+    Ok(None)
+}
+
 /// Backoff before re-running a congestion-requeued upload: 30s, 60s, 120s,
 /// 240s, 480s, then capped at 600s. Deliberately minutes-scale — the 2-16s
 /// `backoff_duration` style is useless against a backlog that takes minutes
@@ -2104,59 +2196,73 @@ async fn execute_durable_upload(
     // Each sidecar call advances one checkpointable step. Persist the returned
     // checkpoint before asking the sidecar to perform the next side effect.
     let mut budget = DurableUploadBudget::new();
+    let mut needs_prepared_reconcile =
+        !upload_journal_signer_committed(&journal) && journal.register_transaction.is_some();
     while budget.take_step() {
-        if !upload_journal_signer_committed(&journal) {
-            ensure_upload_storage_reservation_with_db(
-                &state.db,
-                state.config.rate_limit.max_storage_bytes,
-                remember_job_id,
-                owner,
-                encrypted.len() as i64,
-            )
-            .await?;
-        }
-        let mut attaches = 0u32;
-        let advanced = loop {
-            let _ = sqlx::query(
-                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
-            )
-            .bind(remember_job_id)
-            .execute(state.db.pool())
-            .await;
-            match crate::storage::walrus::advance_durable_upload(
-                &state.http_client,
-                &state.config.sidecar_url,
-                state.config.sidecar_secret.as_deref(),
-                encrypted,
-                epochs as u64,
-                owner,
-                namespace,
-                package_id,
-                remember_job_id,
-                journal.clone(),
-            )
-            .await
-            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
-            {
-                Ok(advanced) => break advanced,
-                Err(err)
-                    if attaches < SAME_JOURNAL_ATTACHES
-                        && matches!(
-                            &err,
-                            WalletJobError::UploadSlotCongestion(msg)
-                                if WalletJobError::is_sidecar_upload_transport_error(msg)
-                        ) =>
+        let reconciled_advance = reconcile_or_ensure_upload_storage_reservation(
+            &state.db,
+            &state.http_client,
+            &state.config.sidecar_url,
+            state.config.sidecar_secret.as_deref(),
+            state.config.rate_limit.max_storage_bytes,
+            encrypted,
+            epochs as u64,
+            owner,
+            namespace,
+            package_id,
+            remember_job_id,
+            &journal,
+            needs_prepared_reconcile,
+        )
+        .await?;
+        needs_prepared_reconcile = false;
+
+        let advanced = if let Some(advanced) = reconciled_advance {
+            advanced
+        } else {
+            let mut attaches = 0u32;
+            loop {
+                let _ = sqlx::query(
+                    "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+                )
+                .bind(remember_job_id)
+                .execute(state.db.pool())
+                .await;
+                match crate::storage::walrus::advance_durable_upload(
+                    &state.http_client,
+                    &state.config.sidecar_url,
+                    state.config.sidecar_secret.as_deref(),
+                    encrypted,
+                    epochs as u64,
+                    owner,
+                    namespace,
+                    package_id,
+                    remember_job_id,
+                    journal.clone(),
+                )
+                .await
+                .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
                 {
-                    attaches += 1;
-                    tracing::info!(
-                        "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
-                        remember_job_id,
-                        attaches,
-                        SAME_JOURNAL_ATTACHES,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    Ok(advanced) => break advanced,
+                    Err(err)
+                        if attaches < SAME_JOURNAL_ATTACHES
+                            && matches!(
+                                &err,
+                                WalletJobError::UploadSlotCongestion(msg)
+                                    if WalletJobError::is_sidecar_upload_transport_error(msg)
+                            ) =>
+                    {
+                        attaches += 1;
+                        tracing::info!(
+                            "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
+                            remember_job_id,
+                            attaches,
+                            SAME_JOURNAL_ATTACHES,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
         };
 

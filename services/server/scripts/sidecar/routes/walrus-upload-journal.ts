@@ -578,6 +578,15 @@ async function lookupPreparedRegisterTransaction(
     return undefined;
 }
 
+export class PreparedRegisterNotOnChainError extends Error {
+    readonly code = "PREPARED_REGISTER_NOT_ON_CHAIN";
+
+    constructor(message: string) {
+        super(message);
+        this.name = "PreparedRegisterNotOnChainError";
+    }
+}
+
 export async function executePreparedRegisterTransaction(
     prepared: ValidatedPreparedRegisterTransaction,
     client: PreparedRegisterClient = suiClient,
@@ -586,6 +595,7 @@ export async function executePreparedRegisterTransaction(
     mayHaveBeenSubmitted = false,
     executeSponsored: PreparedRegisterSponsorExecutor = executePreparedRegisterWithEnoki,
     indexAttempts = 8,
+    allowSubmission = true,
 ): Promise<unknown> {
     const include = { effects: true, objectTypes: true } as const;
     const assertExpectedDigest = (result: any): unknown => {
@@ -604,6 +614,11 @@ export async function executePreparedRegisterTransaction(
     if (existing !== undefined) {
         onTransactionObservedOrSubmitted();
         return assertExpectedDigest(existing);
+    }
+    if (!allowSubmission) {
+        throw new PreparedRegisterNotOnChainError(
+            `prepared register transaction ${prepared.digest} is not on chain`,
+        );
     }
     const maxEpoch = prepared.maxEpoch;
     if (maxEpoch !== undefined && await getCurrentEpoch() > maxEpoch) {
@@ -930,13 +945,16 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     encodeMs = Date.now() - started;
                     return encoded;
                 };
-                flightKey = uploadStepFlightKey(
+                const baseFlightKey = uploadStepFlightKey(
                     jobId,
                     resume?.step,
                     resume && "blobId" in resume ? resume.blobId : undefined,
                     preparedRegisterTransaction?.digest,
                     preparedRegisterTransaction?.sponsorDigest,
                 );
+                flightKey = reconcileOnly && !uploadStepFlights.has(baseFlightKey)
+                    ? `${baseFlightKey}|reconcile`
+                    : baseFlightKey;
                 if (preparedRegisterTransaction && resume?.step === "encoded") {
                     rejectedPreparation = {
                         key: uploadStepFlightKey(jobId, "encoded", resume.blobId, undefined),
@@ -986,17 +1004,34 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                         // digest lookup proves absence, lookup failures must
                         // preserve the prepared transaction for reconciliation.
                         if (reconcileOnly) submissionStarted = true;
-                        const result = await executePreparedRegisterTransaction(
-                            validated,
-                            suiClient,
-                            () => {
-                                // A successful digest lookup proves the effect
-                                // already exists; an execute call may create it.
-                                submissionStarted = true;
-                            },
-                            currentSuiEpoch,
-                            reconcileOnly,
-                        );
+                        let result: unknown;
+                        try {
+                            result = await executePreparedRegisterTransaction(
+                                validated,
+                                suiClient,
+                                () => {
+                                    // A successful digest lookup proves the effect
+                                    // already exists; an execute call may create it.
+                                    submissionStarted = true;
+                                },
+                                currentSuiEpoch,
+                                reconcileOnly,
+                                executePreparedRegisterWithEnoki,
+                                8,
+                                !reconcileOnly,
+                            );
+                        } catch (execError: unknown) {
+                            if (execError instanceof PreparedRegisterNotOnChainError) {
+                                reply(409, {
+                                    error: execError.message,
+                                    code: execError.code,
+                                    jobId,
+                                    digest: validated.digest,
+                                });
+                                return;
+                            }
+                            throw execError;
+                        }
                         const blobObjectId = createdBlobObjectIdFromTransaction(result);
                         await validateRegisteredBlob(blobObjectId, encoded);
                         step = registeredStep(encoded, blobObjectId, validated.digest);
