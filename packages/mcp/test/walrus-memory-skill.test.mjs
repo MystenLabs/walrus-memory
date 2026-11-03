@@ -40,9 +40,6 @@ test("public walrus-memory SKILL.md documents all core MCP tools", () => {
         "memwal_remember",
         "memwal_remember_bulk",
         "memwal_analyze",
-        "memwal_ask",
-        "memwal_stats",
-        "memwal_forget",
         "memwal_restore",
     ];
 

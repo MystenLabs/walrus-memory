@@ -33,9 +33,17 @@ npx -y @mysten-incubation/memwal-mcp login --dev
 
 ### Agent Configuration
 
-Add Walrus Memory to your agent configuration file. Supported clients include Claude Code, Cursor, Codex, Windsurf, OpenCode, and Antigravity.
+Add Walrus Memory to your agent configuration file. Supported clients include Claude Code, Cursor, Codex, OpenCode, and Antigravity.
 
-1. Configuration for Claude Code (`~/.claude/settings.json` or project `.claude/settings.json`):
+1. Configuration for Claude Code:
+
+Run the CLI add command:
+
+```bash
+claude mcp add --scope user memwal -- npx -y @mysten-incubation/memwal-mcp
+```
+
+Or add the server to your project `.mcp.json`:
 
 ```json
 {
@@ -61,20 +69,29 @@ Add Walrus Memory to your agent configuration file. Supported clients include Cl
 }
 ```
 
-3. Configuration for Codex, OpenCode, or Antigravity (`~/.codex/config.json` or `.codex-mcp.json`):
+3. Configuration for Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.memwal]
+command = "npx"
+args = ["-y", "@mysten-incubation/memwal-mcp"]
+```
+
+4. Configuration for OpenCode (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "memwal": {
-      "command": "npx",
-      "args": ["-y", "@mysten-incubation/memwal-mcp"]
+      "type": "local",
+      "command": ["npx", "-y", "@mysten-incubation/memwal-mcp"],
+      "enabled": true
     }
   }
 }
 ```
 
-4. Configuration with a default project namespace:
+5. Configuration with a default project namespace:
 
 ```json
 {
@@ -119,9 +136,6 @@ The `@mysten-incubation/memwal-mcp` server exposes the following tools to connec
 | `memwal_remember` | `text` (string, required), `namespace` (string, optional) | Persist a single durable fact, user preference, architectural guideline, or project rule permanently to Walrus. Returns an accepted job identifier. |
 | `memwal_remember_bulk` | `facts` (array of strings, 1 to 20 items, required), `namespace` (string, optional) | Persist multiple distinct facts in a single request. Recommended after onboarding interviews, comprehensive architecture reviews, or multi-topic discussions. |
 | `memwal_analyze` | `text` (string, required), `namespace` (string, optional) | Extract memorable facts from a larger passage of text such as meeting transcripts or rough notes, saving each extracted fact as an independent memory. |
-| `memwal_ask` | `question` (string, required), `limit` (integer, optional, default 5, max 100), `namespace` (string, optional) | Query memories and generate an LLM synthesized answer directly, citing relevant memory context and distance scores. |
-| `memwal_stats` | `namespace` (string, optional, default "default") | Retrieve memory metrics for an authenticated owner and namespace, including total memory count and aggregate storage bytes. |
-| `memwal_forget` | `namespace` (string, optional, default "default") | Remove vector index rows for a given namespace from active recall. Underlying Walrus storage blobs remain preserved on the decentralized network. |
 | `memwal_restore` | `namespace` (string, required), `limit` (integer, optional, default 10, max 100) | Recovery operation. Re-indexes a namespace from decentralized Walrus blobs back into the relayer search index when switching machines or relayers. |
 
 Auxiliary operational tools include:
@@ -143,10 +157,11 @@ Coding agents must follow a consistent lifecycle when interacting with Walrus Me
 
 ### 2. Saving Durable Context (`memwal_remember` and `memwal_remember_bulk`)
 
-1. Save durable, high-signal information: developer preferences, non-obvious bug root causes, deployment configurations, architectural boundaries, and coding standards.
-2. Do not save ephemeral information: current scratchpad status, temporary test commands, conversational greetings, or transient compile errors.
-3. Use `memwal_remember_bulk` whenever capturing multiple distinct facts simultaneously to minimize network round trips and avoid queuing duplicate operations.
-4. Understand write semantics: `memwal_remember` and `memwal_remember_bulk` return almost immediately once the relayer queues the write job. Final storage on Walrus finishes asynchronously in the background.
+1. Gate proactive saves on user consent: Follow the opt-in rule. When automatic memory capture is off or status is unknown, save memories only when the user explicitly asks to remember or save information in that turn. Never run `auto-save on` or enable automatic capture on the user's behalf.
+2. When automatic capture is enabled or an explicit save is requested, save durable, high-signal information: developer preferences, non-obvious bug root causes, deployment configurations, architectural boundaries, and coding standards.
+3. Do not save ephemeral information: current scratchpad status, temporary test commands, conversational greetings, or transient compile errors.
+4. Use `memwal_remember_bulk` whenever capturing multiple distinct facts simultaneously to minimize network round trips and avoid queuing duplicate operations.
+5. Understand write semantics: `memwal_remember` and `memwal_remember_bulk` return almost immediately once the relayer queues the write job. Final storage on Walrus finishes asynchronously in the background.
 
 ### 3. Namespace Isolation
 
