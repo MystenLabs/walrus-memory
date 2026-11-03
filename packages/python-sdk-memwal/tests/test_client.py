@@ -844,13 +844,13 @@ class TestRecall:
         omitted = await memwal_client.recall("coffee")
         assert omitted.results == []
         assert omitted.dropped_count == 3
-        assert omitted.total == 3
+        assert omitted.total == 0
         assert omitted.degraded is True
 
         omitted_params = await memwal_client.recall(RecallParams(query="coffee"))
         assert omitted_params.results == []
         assert omitted_params.dropped_count == 3
-        assert omitted_params.total == 3
+        assert omitted_params.total == 0
         assert omitted_params.degraded is True
 
         explicit_ignore = await memwal_client.recall(
@@ -858,7 +858,7 @@ class TestRecall:
         )
         assert explicit_ignore.results == []
         assert explicit_ignore.dropped_count == 3
-        assert explicit_ignore.total == 3
+        assert explicit_ignore.total == 0
         assert explicit_ignore.degraded is True
 
         with pytest.raises(MemWalRecallAllDropped) as exc_info:
@@ -881,7 +881,7 @@ class TestRecall:
         sync_default = sync_client.recall("coffee")
         assert sync_default.results == []
         assert sync_default.dropped_count == 3
-        assert sync_default.total == 3
+        assert sync_default.total == 0
         assert sync_default.degraded is True
 
         with pytest.raises(MemWalRecallAllDropped):

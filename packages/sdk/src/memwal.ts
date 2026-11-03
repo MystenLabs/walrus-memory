@@ -1302,22 +1302,23 @@ export class MemWal {
                     ? result.total
                     : result.results.length;
 
-            let processed: RecallResult =
-                result.results.length === 0 && degraded
-                    ? {
-                        ...result,
-                        total: Math.max(rawTotal, droppedCount > 0 ? droppedCount : 1),
-                        dropped_count: droppedCount > 0 ? droppedCount : Math.max(1, rawTotal),
-                        degraded: true,
-                    }
-                    : degraded
-                        ? { ...result, degraded: true }
-                        : result;
+            let processed: RecallResult = degraded
+                ? {
+                    ...result,
+                    total: rawTotal,
+                    dropped_count: droppedCount > 0 ? droppedCount : (result.results.length === 0 ? Math.max(1, rawTotal) : undefined),
+                    degraded: true,
+                }
+                : result;
 
             if (result.results.length === 0 && degraded && onDropped === "throw") {
+                const effectiveDropped =
+                    typeof processed.dropped_count === "number" && processed.dropped_count > 0
+                        ? processed.dropped_count
+                        : Math.max(1, rawTotal);
                 throw new MemWalRecallAllDroppedError(
-                    processed.dropped_count!,
-                    processed.total,
+                    effectiveDropped,
+                    effectiveDropped,
                     resolvedNamespace,
                 );
             }

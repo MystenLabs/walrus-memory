@@ -130,7 +130,7 @@ RememberBulkResult(
 
 Search memories matching a natural-language query, scoped to `owner + namespace`.
 When `max_distance` is set, the client drops weak matches where `distance >= max_distance`.
-By default (`on_dropped="ignore"`), an all-dropped response where matched blobs failed download or decryption returns the degraded `RecallResult` (`results=[]`, `degraded=True`, `dropped_count`, and pre-drop `total`). Pass `on_dropped="throw"` (on `RecallParams` or `recall()`) to raise `MemWalRecallAllDropped` instead.
+By default (`on_dropped="ignore"`), an all-dropped response where matched blobs failed download or decryption returns the degraded `RecallResult` (`results=[]`, `degraded=True`, `dropped_count`). Pass `on_dropped="throw"` (on `RecallParams` or `recall()`) to raise `MemWalRecallAllDropped` instead.
 
 Preferred form:
 

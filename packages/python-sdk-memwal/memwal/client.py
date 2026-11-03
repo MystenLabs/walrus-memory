@@ -1279,7 +1279,6 @@ class MemWal:
                     namespace=resolved_namespace,
                 )
             dropped = effective_dropped
-            total_count = effective_total
 
         if max_distance is not None:
             memories = [m for m in memories if m.distance < max_distance]

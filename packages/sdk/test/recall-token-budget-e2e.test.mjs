@@ -60,20 +60,20 @@ test("recall returns degraded result by default when all matches are dropped and
             return Response.json({ packageId: "0x1", network: "testnet" });
         }
         if (path === "/api/recall" && init.method === "POST") {
-            return Response.json({ results: [], total: 3, dropped_count: 3, degraded: true });
+            return Response.json({ results: [], total: 0, dropped_count: 3, degraded: true });
         }
         throw new Error(`unexpected request ${path}`);
     };
 
     const byDefault = await client().recall({ query: "x", namespace: "default" });
     assert.equal(byDefault.dropped_count, 3);
-    assert.equal(byDefault.total, 3);
+    assert.equal(byDefault.total, 0);
     assert.equal(byDefault.degraded, true);
     assert.equal(byDefault.results.length, 0);
 
     const positionalDefault = await client().recall("x", 10, "default");
     assert.equal(positionalDefault.dropped_count, 3);
-    assert.equal(positionalDefault.total, 3);
+    assert.equal(positionalDefault.total, 0);
     assert.equal(positionalDefault.degraded, true);
     assert.equal(positionalDefault.results.length, 0);
 
@@ -83,7 +83,7 @@ test("recall returns degraded result by default when all matches are dropped and
         onDropped: "ignore",
     });
     assert.equal(ignored.dropped_count, 3);
-    assert.equal(ignored.total, 3);
+    assert.equal(ignored.total, 0);
     assert.equal(ignored.degraded, true);
     assert.equal(ignored.results.length, 0);
 
@@ -100,7 +100,7 @@ test("recall returns degraded result by default when all matches are dropped and
     );
 });
 
-test("recall normalizes legacy all-dropped total=0 response by default, throws on explicit throw, and validates onDropped", async () => {
+test("recall preserves total=0 on legacy all-dropped response by default, throws on explicit throw, and validates onDropped", async () => {
     globalThis.fetch = async (url, init = {}) => {
         const path = new URL(url).pathname;
         if (path === "/version") {
@@ -129,7 +129,7 @@ test("recall normalizes legacy all-dropped total=0 response by default, throws o
         namespace: "profile",
     });
     assert.equal(omitted.results.length, 0);
-    assert.equal(omitted.total, 2);
+    assert.equal(omitted.total, 0);
     assert.equal(omitted.dropped_count, 2);
     assert.equal(omitted.degraded, true);
 

@@ -286,7 +286,7 @@ async fn recall_pipeline(
             "recall complete: 0 results (no vector hits) for owner={}",
             owner
         );
-        return Ok(build_recall_response(vec![], 0, 0));
+        return Ok(build_recall_response(vec![], 0));
     }
 
     // Hydrate the hits through the storage engine: blob cache -> Walrus
@@ -369,15 +369,14 @@ async fn recall_pipeline(
         t0.elapsed().as_millis()
     );
 
-    Ok(build_recall_response(results, hit_count, dropped_count))
+    Ok(build_recall_response(results, dropped_count))
 }
 
 fn build_recall_response(
     results: Vec<RecallResult>,
-    hit_count: usize,
     dropped_count: usize,
 ) -> RecallResponse {
-    let total = hit_count.max(results.len().saturating_add(dropped_count));
+    let total = results.len();
     let degraded = dropped_count > 0;
     RecallResponse {
         results,
@@ -525,16 +524,16 @@ Available: 10708877";
 
     #[test]
     fn recall_response_includes_dropped_count_and_degraded_when_nonzero() {
-        let resp = super::build_recall_response(vec![], 3, 3);
+        let resp = super::build_recall_response(vec![], 3);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["results"], serde_json::json!([]));
-        assert_eq!(json["total"], 3);
+        assert_eq!(json["total"], 0);
         assert_eq!(json["dropped_count"], 3);
         assert_eq!(json["degraded"], true);
     }
 
     #[test]
-    fn recall_response_partial_drop_preserves_pre_drop_total() {
+    fn recall_response_partial_drop_preserves_usable_total() {
         let resp = super::build_recall_response(
             vec![crate::types::RecallResult {
                 blob_id: "blob-1".to_string(),
@@ -543,19 +542,18 @@ Available: 10708877";
                 score: None,
                 created_at: None,
             }],
-            3,
             2,
         );
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["results"].as_array().unwrap().len(), 1);
-        assert_eq!(json["total"], 3);
+        assert_eq!(json["total"], 1);
         assert_eq!(json["dropped_count"], 2);
         assert_eq!(json["degraded"], true);
     }
 
     #[test]
     fn recall_response_omits_dropped_count_and_degraded_when_zero() {
-        let resp = super::build_recall_response(vec![], 0, 0);
+        let resp = super::build_recall_response(vec![], 0);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["total"], 0);
         assert!(json.get("dropped_count").is_none());

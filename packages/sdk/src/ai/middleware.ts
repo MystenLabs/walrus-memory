@@ -267,7 +267,7 @@ export function withMemWal(
                                 : Math.max(1, recallResult.total ?? 1);
                         throw new MemWalRecallAllDroppedError(
                             droppedCount,
-                            Math.max(recallResult.total ?? 0, droppedCount),
+                            droppedCount,
                             options.namespace ?? "default",
                         );
                     }
