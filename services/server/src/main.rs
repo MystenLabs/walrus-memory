@@ -836,6 +836,40 @@ mod mcp_rate_limit_tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn mcp_server_card_discovery_routes_accessible_without_auth() {
+        let app = Router::new()
+            .route(
+                "/.well-known/mcp/server-card.json",
+                get(mcp_proxy::mcp_server_card),
+            )
+            .route("/mcp/server-card", get(mcp_proxy::mcp_server_card))
+            .route("/api/mcp/server-card", get(mcp_proxy::mcp_server_card));
+
+        for path in [
+            "/.well-known/mcp/server-card.json",
+            "/mcp/server-card",
+            "/api/mcp/server-card",
+        ] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "application/mcp-server-card+json; charset=utf-8"
+            );
+            assert_eq!(
+                response.headers().get("cache-control").unwrap(),
+                "public, max-age=300"
+            );
+            assert!(response.headers().contains_key("etag"));
+        }
+    }
     #[tokio::test]
     async fn owner_policy_admin_requires_operator_key_on_every_method() {
         let state = test_state(denying_redis().await).await;
@@ -3581,6 +3615,12 @@ async fn main() {
             "/metrics",
             get(observability::metrics).layer(DefaultBodyLimit::max(16 * 1024)),
         )
+        .route(
+            "/.well-known/mcp/server-card.json",
+            get(mcp_proxy::mcp_server_card),
+        )
+        .route("/mcp/server-card", get(mcp_proxy::mcp_server_card))
+        .route("/api/mcp/server-card", get(mcp_proxy::mcp_server_card))
         .merge(sponsor_routes)
         .merge(mcp_routes);
 

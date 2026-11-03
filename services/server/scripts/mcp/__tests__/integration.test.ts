@@ -528,3 +528,55 @@ test("official stdio bridge authenticates SSE message POSTs", async (t) => {
 
     child.stdin.end();
 });
+
+test("GET /server-card and /mcp/server-card return 200 with server card and 304 on matching etag", async () => {
+    for (const path of ["/server-card", "/mcp/server-card", "/.well-known/mcp/server-card.json"]) {
+        const res = await fetch(`${baseUrl}${path}`);
+        assert.equal(res.status, 200);
+        assert.equal(
+            res.headers.get("content-type"),
+            "application/mcp-server-card+json; charset=utf-8"
+        );
+        assert.equal(res.headers.get("cache-control"), "public, max-age=300");
+        const etag = res.headers.get("etag");
+        assert(etag, "etag must be present");
+
+        const data = await res.json() as Record<string, unknown>;
+        assert.equal(data.name, "memwal");
+        assert.equal(data.schemaVersion, "1.0");
+        assert.equal(data.title, "Walrus Memory MCP Server");
+        assert.equal(
+            data.description,
+            "Decentralized, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
+        );
+        assert.equal((data.endpoints as Record<string, string>).streamableHttp, "/api/mcp");
+        assert.equal((data.endpoints as Record<string, string>).sse, "/api/mcp/sse");
+        assert.equal((data.authentication as Record<string, unknown>).required, true);
+
+        const tools = data.tools as Array<{ name: string; description: string }>;
+        assert.equal(tools.length, 8);
+        const expectedTools = [
+            "memwal_remember",
+            "memwal_remember_bulk",
+            "memwal_recall",
+            "memwal_analyze",
+            "memwal_ask",
+            "memwal_forget",
+            "memwal_stats",
+            "memwal_restore",
+        ];
+        for (let i = 0; i < expectedTools.length; i++) {
+            assert.equal(tools[i].name, expectedTools[i]);
+            assert(tools[i].description.length > 0);
+        }
+
+        const cachedRes = await fetch(`${baseUrl}${path}`, {
+            headers: { "if-none-match": etag },
+        });
+        assert.equal(cachedRes.status, 304);
+        assert.equal(cachedRes.headers.get("etag"), etag);
+        assert.equal(cachedRes.headers.get("cache-control"), "public, max-age=300");
+        const bodyText = await cachedRes.text();
+        assert.equal(bodyText, "");
+    }
+});

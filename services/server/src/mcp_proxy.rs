@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     body::Body,
@@ -556,6 +556,129 @@ fn oauth_unauthorized_response(
             .insert(axum::http::header::WWW_AUTHENTICATE, v);
     }
     resp
+}
+
+pub static MCP_SERVER_CARD_ETAG: LazyLock<String> = LazyLock::new(|| {
+    format!("\"memwal-mcp-server-card-v{}\"", env!("CARGO_PKG_VERSION"))
+});
+
+pub static MCP_SERVER_CARD_RAW_ETAG: LazyLock<String> = LazyLock::new(|| {
+    format!("memwal-mcp-server-card-v{}", env!("CARGO_PKG_VERSION"))
+});
+
+pub static MCP_SERVER_CARD_JSON: LazyLock<String> = LazyLock::new(|| {
+    serde_json::to_string(&serde_json::json!({
+        "schemaVersion": "1.0",
+        "name": "memwal",
+        "title": "Walrus Memory MCP Server",
+        "description": "Decentralized, SEAL-encrypted long-term memory for AI agents on Walrus and Sui.",
+        "version": env!("CARGO_PKG_VERSION"),
+        "vendor": {
+            "name": "Mysten Labs",
+            "url": "https://walrus.xyz"
+        },
+        "documentationUrl": "https://docs.memwal.ai/mcp",
+        "endpoints": {
+            "streamableHttp": "/api/mcp",
+            "sse": "/api/mcp/sse"
+        },
+        "authentication": {
+            "required": true,
+            "schemes": [
+                {
+                    "type": "ed25519-delegate-headers",
+                    "headers": ["x-delegate-key", "x-account-id"],
+                    "description": "Delegate key and Walrus Memory account ID headers"
+                },
+                {
+                    "type": "ed25519-signed-request",
+                    "headers": ["x-public-key", "x-account-id", "x-timestamp", "x-nonce", "x-signature"],
+                    "description": "Ed25519 request signature headers"
+                }
+            ]
+        },
+        "capabilities": {
+            "tools": {
+                "listChanged": false
+            }
+        },
+        "tools": [
+            {
+                "name": "memwal_remember",
+                "description": "Save a durable fact, preference, or constraint to Walrus Memory."
+            },
+            {
+                "name": "memwal_remember_bulk",
+                "description": "Save multiple durable facts to Walrus Memory in a single batched call."
+            },
+            {
+                "name": "memwal_recall",
+                "description": "Recall relevant context, prior decisions, and user preferences from Walrus Memory."
+            },
+            {
+                "name": "memwal_analyze",
+                "description": "Analyze text to extract durable facts and persist them to Walrus Memory."
+            },
+            {
+                "name": "memwal_ask",
+                "description": "Ask a natural language question grounded in stored memories."
+            },
+            {
+                "name": "memwal_forget",
+                "description": "Remove or revoke specific facts from Walrus Memory."
+            },
+            {
+                "name": "memwal_stats",
+                "description": "Inspect memory statistics, usage quotas, and account status."
+            },
+            {
+                "name": "memwal_restore",
+                "description": "Rebuild or recover the memory index from Walrus storage."
+            }
+        ]
+    }))
+    .expect("mcp server card json must serialize")
+});
+
+fn matches_if_none_match(header_val: &str, quoted_etag: &str, raw_etag: &str) -> bool {
+    header_val.split(',').any(|item| {
+        let trimmed = item.trim();
+        if trimmed == "*" || trimmed == quoted_etag || trimmed == raw_etag {
+            return true;
+        }
+        let stripped = trimmed.strip_prefix("W/").unwrap_or(trimmed).trim();
+        stripped == quoted_etag || stripped.trim_matches('"') == raw_etag
+    })
+}
+
+/// MCP Server Card discovery endpoint following SEP-2127 conventions.
+///
+/// Returns metadata describing this MCP server, transport endpoints,
+/// authentication schemes, capabilities, and supported tools.
+pub async fn mcp_server_card(headers: HeaderMap) -> Response {
+    if let Some(inm) = headers.get(axum::http::header::IF_NONE_MATCH) {
+        if let Ok(val) = inm.to_str() {
+            if matches_if_none_match(val, &MCP_SERVER_CARD_ETAG, &MCP_SERVER_CARD_RAW_ETAG) {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(axum::http::header::CACHE_CONTROL, "public, max-age=300")
+                    .header(axum::http::header::ETAG, MCP_SERVER_CARD_ETAG.as_str())
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| StatusCode::NOT_MODIFIED.into_response());
+            }
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/mcp-server-card+json; charset=utf-8",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=300")
+        .header(axum::http::header::ETAG, MCP_SERVER_CARD_ETAG.as_str())
+        .body(Body::from(MCP_SERVER_CARD_JSON.as_bytes()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `GET /api/mcp/sse` — open the SSE stream to the sidecar and stream the
@@ -1360,5 +1483,163 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("0xrealaccount")
         );
+    }
+
+    // MCP Server Card (SEP-2127) discovery tests
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_200_with_expected_headers_and_body() {
+        let response = mcp_server_card(HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/mcp-server-card+json; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=300")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some(MCP_SERVER_CARD_ETAG.as_str())
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["schemaVersion"], "1.0");
+        assert_eq!(json["name"], "memwal");
+        assert_eq!(json["title"], "Walrus Memory MCP Server");
+        assert_eq!(
+            json["description"],
+            "Decentralized, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
+        );
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["vendor"]["name"], "Mysten Labs");
+        assert_eq!(json["vendor"]["url"], "https://walrus.xyz");
+        assert_eq!(json["documentationUrl"], "https://docs.memwal.ai/mcp");
+        assert_eq!(json["endpoints"]["streamableHttp"], "/api/mcp");
+        assert_eq!(json["endpoints"]["sse"], "/api/mcp/sse");
+        assert_eq!(json["authentication"]["required"], true);
+        assert_eq!(json["capabilities"]["tools"]["listChanged"], false);
+
+        let tools = json["tools"].as_array().expect("tools array must exist");
+        assert_eq!(tools.len(), 8);
+        let expected_names = [
+            "memwal_remember",
+            "memwal_remember_bulk",
+            "memwal_recall",
+            "memwal_analyze",
+            "memwal_ask",
+            "memwal_forget",
+            "memwal_stats",
+            "memwal_restore",
+        ];
+        for (i, name) in expected_names.iter().enumerate() {
+            assert_eq!(tools[i]["name"], *name);
+            assert!(
+                !tools[i]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty(),
+                "tool {name} must have a non-empty description"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_304_when_if_none_match_matches() {
+        let etag = MCP_SERVER_CARD_ETAG.as_str();
+        let raw_etag = MCP_SERVER_CARD_RAW_ETAG.as_str();
+
+        for header_val in [
+            etag,
+            raw_etag,
+            "*",
+            &format!("W/{etag}"),
+            &format!("\"random-etag\", {etag}"),
+        ] {
+            let headers = axum_headers(&[("if-none-match", header_val)]);
+            let response = mcp_server_card(headers).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "failed for If-None-Match: {header_val}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ETAG)
+                    .and_then(|v| v.to_str().ok()),
+                Some(etag)
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("public, max-age=300")
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(bytes.is_empty(), "304 body must be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_200_when_if_none_match_differs() {
+        let headers = axum_headers(&[("if-none-match", "\"outdated-version\"")]);
+        let response = mcp_server_card(headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_router_endpoints_respond_without_auth() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/mcp/server-card.json",
+                get(mcp_server_card),
+            )
+            .route("/mcp/server-card", get(mcp_server_card))
+            .route("/api/mcp/server-card", get(mcp_server_card));
+
+        for path in [
+            "/.well-known/mcp/server-card.json",
+            "/mcp/server-card",
+            "/api/mcp/server-card",
+        ] {
+            let req = axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "path {path} must return 200 without auth"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/mcp-server-card+json; charset=utf-8")
+            );
+        }
     }
 }
