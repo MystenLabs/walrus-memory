@@ -23,9 +23,17 @@ export function registerSearchTool(api: any, client: MemWal, config: PluginConfi
       description:
         "Search long-term memory for relevant past information, facts, " +
         "preferences, and decisions. Returns memories ranked by relevance. " +
-        "The search is pinned to the calling agent's namespace.",
+        "The search is pinned to the calling agent's namespace. " +
+        "When <memwal-memories> is already injected in the prompt context by auto-recall, " +
+        "use those recalled memories directly and avoid calling memory_search with the same query. " +
+        "Call memory_search at most once per turn with a specific, focused query only when " +
+        "the conversation shifts to a topic not covered by <memwal-memories> or when auto-recall is disabled.",
       parameters: Type.Object({
-        query: Type.String({ description: "Search query" }),
+        query: Type.String({
+          description:
+            "Specific, focused search query. When <memwal-memories> is already injected in the prompt context, " +
+            "use recalled memories directly and query only for topics not covered by them.",
+        }),
         limit: Type.Optional(
           Type.Number({ description: "Max results (default: 5)" }),
         ),
