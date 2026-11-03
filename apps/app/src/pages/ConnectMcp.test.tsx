@@ -219,7 +219,7 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.queryByText(/Sign in again and open the new link straight away/i)).not.toBeInTheDocument()
     })
 
-    it('explains an expired link when preflight cannot reach the listener', async () => {
+    it('explains an expired link, remote host, and credential transfer when preflight cannot reach the listener', async () => {
         vi.stubGlobal(
             'fetch',
             vi.fn(async (input: RequestInfo | URL) => {
@@ -236,6 +236,15 @@ describe('MCP sign-in hand-off', () => {
         )
 
         expect(await screen.findByText(/opened too late/i)).toBeInTheDocument()
+        expect(screen.getByText(/remote host or bot/i)).toBeInTheDocument()
+        expect(screen.getByText(/blocks localhost requests/i)).toBeInTheDocument()
+        expect(screen.getByText(/~\/\.memwal\/credentials\.json/i)).toBeInTheDocument()
+        expect(
+            screen.getByRole('link', { name: /remote setup and troubleshooting/i }),
+        ).toHaveAttribute(
+            'href',
+            'https://docs.test/troubleshooting/overview#sign-in-page-says-nothing-answered-on-your-computer',
+        )
         expect(screen.getByText(/Something went wrong/i)).toBeInTheDocument()
         expect(screen.queryByText(/Almost there/i)).not.toBeInTheDocument()
     })

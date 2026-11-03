@@ -141,6 +141,7 @@ flowchart TD
 
 - **First run (no credentials):** the server still starts and exposes `memwal_login`, so the agent signs you in inline instead of failing with a vague startup error. The login tool returns a clickable URL (valid 5 minutes); after you approve in the browser, the next tool call picks up the credentials automatically.
 - **Credential file:** login writes `~/.memwal/credentials.json` (mode `0600`) containing your delegate key and account metadata. The delegate private key is a sensitive, long-lived credential; treat it like an API key.
+- **Remote hosts and bots:** `memwal_login` verifies the sign-in and delivers credentials over a loopback listener (`http://127.0.0.1:<port>`) on the machine running `memwal-mcp`, so the browser must run on that same host. When `memwal-mcp` runs on a remote server, container, or hosted bot without a local browser, run `npx -y @mysten-incubation/memwal-mcp login` on the machine that has your browser and wallet, then copy `~/.memwal/credentials.json` (`chmod 600`) to `~/.memwal/credentials.json` on the remote host (or use [Streamable HTTP](/mcp/reference#streamable-http) where your client supports custom headers).
 - **Local vs remote tools:** the package handles `memwal_login` / `memwal_logout` locally (they never reach the relayer) and forwards all memory tools (`memwal_remember`, `memwal_recall`, …) to the relayer over an authenticated session.
 - **Logout** deletes only the local credential file. To fully revoke access, also remove the delegate key from the dashboard.
 

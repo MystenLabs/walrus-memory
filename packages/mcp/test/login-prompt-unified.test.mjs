@@ -91,3 +91,11 @@ test("the two prompts differ ONLY in that warning", () => {
             .replace(/\n{3,}/g, "\n\n");
     assert.equal(strip(signedOut), strip(signedIn));
 });
+
+test("both modes state the same-machine browser requirement and remote host credential transfer", () => {
+    for (const [name, text] of [["signed out", signedOut], ["signed in", signedIn]]) {
+        assert.match(text, /same machine running this MCP server/i, `${name}: same-machine browser requirement`);
+        assert.match(text, /remote host or bot/i, `${name}: remote host guidance`);
+        assert.ok(text.includes(CREDS), `${name}: remote credential target path`);
+    }
+});
