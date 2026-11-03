@@ -501,7 +501,11 @@ fn redact_credential_assignments(input: &str, count: &mut usize) -> String {
                 if end_q < val_bytes.len() && val_bytes[end_q] == open_q {
                     end_q + 1
                 } else {
-                    0
+                    input[p..]
+                        .chars()
+                        .take_while(|&ch| !is_screening_whitespace(ch) && ch != ',' && ch != ';')
+                        .map(char::len_utf8)
+                        .sum()
                 }
             } else {
                 input[p..]
@@ -2681,6 +2685,24 @@ mod tests {
             (
                 "credential assignment",
                 "Local env has POSTGRES_PASSWORD=hunter2 for local tests".to_string(),
+                "[redacted:credential-assignment]",
+                "hunter2",
+            ),
+            (
+                "unterminated double-quoted credential assignment",
+                "Local test database uses POSTGRES_PASSWORD=\"hunter2".to_string(),
+                "[redacted:credential-assignment]",
+                "hunter2",
+            ),
+            (
+                "unterminated single-quoted credential assignment before newline",
+                "Local test database uses POSTGRES_PASSWORD='hunter2\non localnet".to_string(),
+                "[redacted:credential-assignment]",
+                "hunter2",
+            ),
+            (
+                "unterminated backtick-quoted credential assignment",
+                "Local test database uses api_secret: `hunter2; on localnet".to_string(),
                 "[redacted:credential-assignment]",
                 "hunter2",
             ),
