@@ -2090,7 +2090,7 @@ pub(crate) enum SignedPreauthDenial {
 pub(crate) async fn check_signed_preauth_windows<C>(
     redis: &mut C,
     config: &McpRateLimitConfig,
-    ip: std::net::IpAddr,
+    ip: Option<std::net::IpAddr>,
     global_keys: (&str, &str),
 ) -> Result<Option<SignedPreauthDenial>, redis::RedisError>
 where
@@ -2099,25 +2099,38 @@ where
     let now = chrono::Utc::now().timestamp_millis() as f64;
     let min_start = now - 60_000.0;
     let hr_start = now - 3_600_000.0;
-    let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
 
-    let windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 4] = [
-        (
-            &ip_min,
-            min_start,
-            now,
-            config.per_minute,
-            120,
-            SignedPreauthDenial::IpBurst,
-        ),
-        (
-            &ip_hr,
-            hr_start,
-            now + 0.1,
-            config.per_hour,
-            3700,
-            SignedPreauthDenial::IpSustained,
-        ),
+    if let Some(ip) = ip {
+        let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
+        let ip_windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 2] = [
+            (
+                &ip_min,
+                min_start,
+                now,
+                config.per_minute,
+                120,
+                SignedPreauthDenial::IpBurst,
+            ),
+            (
+                &ip_hr,
+                hr_start,
+                now + 0.1,
+                config.per_hour,
+                3700,
+                SignedPreauthDenial::IpSustained,
+            ),
+        ];
+
+        for (key, start, at, limit, ttl, denial) in ip_windows {
+            if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
+                == WindowCheckResult::Denied
+            {
+                return Ok(Some(denial));
+            }
+        }
+    }
+
+    let global_windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 2] = [
         (
             global_keys.0,
             min_start,
@@ -2136,7 +2149,7 @@ where
         ),
     ];
 
-    for (key, start, at, limit, ttl, denial) in windows {
+    for (key, start, at, limit, ttl, denial) in global_windows {
         if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
             == WindowCheckResult::Denied
         {
@@ -2190,17 +2203,23 @@ pub async fn signed_preauth_rate_limit_middleware(
         return next.run(request).await;
     }
 
+    let direct_peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
     let ip = McpRateLimitConfig::normalize_ip(rate_limit_peer_addr(
         &request,
         state.config.trusted_proxy_hops,
     ));
+    let is_internal_loopback = direct_peer.map_or(false, |p| p.is_loopback()) && ip.is_loopback();
+    let ip_window = if is_internal_loopback { None } else { Some(ip) };
     let config = &state.config.mcp_rate_limit;
     let mut redis = state.redis.clone();
 
     match check_signed_preauth_windows(
         &mut redis,
         config,
-        ip,
+        ip_window,
         (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
     )
     .await
@@ -3592,7 +3611,7 @@ mod tests {
             match check_signed_preauth_windows(
                 &mut redis_signed,
                 &signed_cfg,
-                attacker_ip,
+                Some(attacker_ip),
                 (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
             )
             .await
@@ -3612,7 +3631,7 @@ mod tests {
                 check_signed_preauth_windows(
                     &mut redis_signed,
                     &signed_cfg,
-                    legit_ip,
+                    Some(legit_ip),
                     (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
                 )
                 .await
@@ -3621,6 +3640,34 @@ mod tests {
                 "legitimate caller on separate IP must retain pre-auth admission capacity"
             );
         }
+
+        // 4. Internal loopback MCP callers (`ip: None`):
+        // Bypass external source IP burst windows so distinct accounts served by a local sidecar
+        // are not capped at `per_minute` (4 requests).
+        // They remain subject to deployment-wide global ceiling windows (`global_per_minute` = 10).
+        let mut loopback_redis = SlidingWindowMockRedis::default();
+        let mut loopback_admitted = 0;
+        let mut loopback_denied = 0;
+        for _ in 0..15 {
+            match check_signed_preauth_windows(
+                &mut loopback_redis,
+                &signed_cfg,
+                None,
+                (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
+            )
+            .await
+            .unwrap()
+            {
+                None => loopback_admitted += 1,
+                Some(SignedPreauthDenial::GlobalBurst) => loopback_denied += 1,
+                Some(other) => panic!("unexpected denial for loopback sidecar caller: {other:?}"),
+            }
+        }
+        assert_eq!(
+            loopback_admitted, 10,
+            "loopback sidecar caller reaches global ceiling without hitting source IP burst"
+        );
+        assert_eq!(loopback_denied, 5);
     }
 
     #[tokio::test]
