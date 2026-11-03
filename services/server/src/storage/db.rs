@@ -5393,6 +5393,35 @@ mod quota_admission_tests {
         .await
         .expect("live reservation must extend cleanly");
 
+        // 6. Restart after the prepared checkpoint: a job holding a prepared register_transaction
+        // whose reservation expired must still re-admit entitlement and be rejected if quota is full.
+        let prepared_journal = crate::storage::walrus::UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some("0xabc".into()),
+            execution_identity: None,
+            resume_step: Some(serde_json::json!({ "step": "encoded" })),
+            register_transaction: Some(crate::storage::walrus::PreparedRegisterTransaction {
+                transaction_bytes: "aa".into(),
+                signature: "bb".into(),
+                digest: "cc".into(),
+                sponsor_digest: None,
+            }),
+        };
+        assert!(
+            !crate::jobs::upload_journal_signer_committed(&prepared_journal),
+            "prepared journal is not signer committed before on-chain execution"
+        );
+        let prepared_err = crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-prepared",
+            &owner,
+            60,
+        )
+        .await
+        .expect_err("delayed job restarting after prepared checkpoint must be rejected when owner quota is full");
+        assert!(prepared_err.aborts_retries(), "{prepared_err}");
+
         cleanup(&db, &owner).await;
     }
 

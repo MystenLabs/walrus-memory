@@ -1020,7 +1020,7 @@ fn wallet_index_for_upload_attempt(
 ///
 /// `encoded` is a local checkpoint, and a prepared register has not been
 /// submitted. `registered` and later refer to a blob object that signer owns.
-fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
+pub(crate) fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
     matches!(
         journal
             .resume_step
@@ -2105,7 +2105,7 @@ async fn execute_durable_upload(
     // checkpoint before asking the sidecar to perform the next side effect.
     let mut budget = DurableUploadBudget::new();
     while budget.take_step() {
-        if !upload_journal_signer_committed(&journal) && journal.register_transaction.is_none() {
+        if !upload_journal_signer_committed(&journal) {
             ensure_upload_storage_reservation_with_db(
                 &state.db,
                 state.config.rate_limit.max_storage_bytes,
