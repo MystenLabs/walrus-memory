@@ -26,6 +26,7 @@ import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
 import { useCopyFeedback } from '../hooks/useCopyFeedback'
 import { apiGet } from '../utils/api'
 import { assertDelegateKeyRegistered, deriveDelegatePublicKeyHex, normalizeDelegatePrivateKey } from '../utils/delegateKeyImport'
+import { MAX_DELEGATE_KEYS } from '../utils/delegateKeys'
 import { fetchAccountIdForOwner, fetchObjectJson, publicKeyToHex } from '../utils/suiClientCompat'
 import ConnectWalrusMemory, { type ConnectPath } from './ConnectWalrusMemory'
 
@@ -40,7 +41,6 @@ interface OnChainDelegateKey {
     createdAt: number
 }
 
-const MAX_DELEGATE_KEYS = 20
 const MAX_DELEGATE_KEYS_MESSAGE = 'This wallet already has 20 delegate keys. Remove an old key before creating a new delegate key.'
 const DELEGATE_KEYS_SECTION_ID = 'delegate-keys'
 // Relayer clamps `limit` (default 100, max 500); these stay well inside that.
