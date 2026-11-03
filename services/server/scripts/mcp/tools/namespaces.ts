@@ -213,7 +213,10 @@ export async function tryListNamespaces(
 /**
  * Format the output of `memwal_namespaces`.
  */
-export function formatNamespacesResult(page: NamespacesPage): string {
+export function formatNamespacesResult(
+    page: NamespacesPage,
+    incomingCursor?: string | null,
+): string {
     const nonEmpty = (page.namespaces ?? []).filter(
         (ns) => typeof ns?.name === "string" && (ns.memory_count ?? 0) > 0,
     );
@@ -224,6 +227,8 @@ export function formatNamespacesResult(page: NamespacesPage): string {
     // `/api/namespaces` always returns `next_cursor` as the last row's watermark
     // when `rows.length > 0`, even on the final page (`has_more: false`).
     const hasMorePages = page.has_more === true;
+    const isContinuation =
+        typeof incomingCursor === "string" && incomingCursor.trim().length > 0;
 
     if (nonEmpty.length === 0) {
         if (hasMorePages) {
@@ -235,6 +240,9 @@ export function formatNamespacesResult(page: NamespacesPage): string {
                 );
             }
             return "No non-empty namespaces found on this page. More namespaces exist on later pages.";
+        }
+        if (isContinuation) {
+            return "No non-empty namespaces found on this page.";
         }
         return "No namespaces with stored memories found for this account.";
     }
@@ -282,7 +290,7 @@ export function registerNamespacesTool(
                     content: [
                         {
                             type: "text",
-                            text: formatNamespacesResult(page),
+                            text: formatNamespacesResult(page, cursor),
                         },
                     ],
                 };

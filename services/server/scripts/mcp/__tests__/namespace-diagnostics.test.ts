@@ -395,3 +395,64 @@ test("formatNamespacesResult preserves next_cursor on tombstone-only non-final p
     assert.match(secondPage, /^Namespaces \(1\):/);
     assert.match(secondPage, /- "active-ns": 9 memories/);
 });
+
+test("formatNamespacesResult keeps empty continuation pages scoped without false account-wide empty claims", async (t) => {
+    // When incoming cursor is provided on an empty final page,
+    // it must say "No non-empty namespaces found on this page.",
+    // NOT "No namespaces with stored memories found for this account."
+    const continuationText = formatNamespacesResult(
+        {
+            namespaces: [{ name: "tombstone-ns", memory_count: 0 }],
+            has_more: false,
+            next_cursor: "terminal_watermark",
+        },
+        "cursor_page_2",
+    );
+    assert.equal(continuationText, "No non-empty namespaces found on this page.");
+    assert.doesNotMatch(
+        continuationText,
+        /No namespaces with stored memories found for this account/,
+    );
+
+    // End-to-end client callTool verification:
+    // Page 1: populated active namespace (9 memories), has_more: true, next_cursor: "cursor_page_2"
+    // Page 2: tombstone-only namespace (0 memories), has_more: false, next_cursor: "terminal_watermark"
+    const client = await openTestClient(t, {
+        listNamespaces: async ({ cursor }: { cursor?: string }) => {
+            if (!cursor) {
+                return {
+                    namespaces: [{ id: "ns-live", name: "active-ns", memory_count: 9 }],
+                    has_more: true,
+                    next_cursor: "cursor_page_2",
+                    snapshot_version: 1,
+                };
+            }
+            assert.equal(cursor, "cursor_page_2");
+            return {
+                namespaces: [{ id: "ns-dead", name: "tombstone-ns", memory_count: 0 }],
+                has_more: false,
+                next_cursor: "terminal_watermark",
+                snapshot_version: 1,
+            };
+        },
+    });
+
+    const firstPage = textFromResult(
+        await client.callTool({ name: "memwal_namespaces", arguments: { limit: 1 } }),
+    );
+    assert.match(firstPage, /^Namespaces \(1\+\):/);
+    assert.match(firstPage, /- "active-ns": 9 memories/);
+    assert.match(firstPage, /next_cursor="cursor_page_2"/);
+
+    const secondPage = textFromResult(
+        await client.callTool({
+            name: "memwal_namespaces",
+            arguments: { limit: 1, cursor: "cursor_page_2" },
+        }),
+    );
+    assert.equal(secondPage, "No non-empty namespaces found on this page.");
+    assert.doesNotMatch(
+        secondPage,
+        /No namespaces with stored memories found for this account/,
+    );
+});
