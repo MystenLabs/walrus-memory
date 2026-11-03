@@ -74,11 +74,11 @@ export function collapseDuplicates<T extends { text: string; blob_id?: unknown }
         { survivor: T; index: number; total: number; blobIds: Set<string> }
     >();
     for (const item of results) {
-        const key = dedupeKey(item.text);
         const blobId =
             typeof item.blob_id === "string" && item.blob_id.trim().length > 0
                 ? item.blob_id.trim()
                 : null;
+        const key = blobId ? `blob:${blobId}` : `text:${dedupeKey(item.text)}`;
         const existing = seen.get(key);
         if (!existing) {
             const blobIds = new Set<string>();
@@ -129,8 +129,10 @@ export function formatCollapsedDuplicatesNote(
         const backing =
             d.blobIds.length > 1
                 ? `#${d.index} is stored across ${d.blobIds.length} blobs`
-                : `${d.total} copies total`;
-        return `\n(${d.collapsed} duplicate ${copyWord} of #${d.index} collapsed — ${backing}; the same fact is stored more than once.)`;
+                : d.blobIds.length === 1
+                  ? `#${d.index} shares 1 blob across ${d.total} copies`
+                  : `${d.total} copies total`;
+        return `\n(${d.collapsed} duplicate ${copyWord} of #${d.index} collapsed: ${backing}; the same fact is stored more than once.)`;
     }
     const totalCollapsed = duplicates.reduce((sum, d) => sum + d.collapsed, 0);
     const copyWord = totalCollapsed === 1 ? "copy" : "copies";
@@ -138,7 +140,11 @@ export function formatCollapsedDuplicatesNote(
         .map((d) => {
             const dupWord = d.collapsed === 1 ? "duplicate" : "duplicates";
             const backing =
-                d.blobIds.length > 1 ? `${d.blobIds.length} blobs` : `${d.total} copies`;
+                d.blobIds.length > 1
+                    ? `${d.blobIds.length} blobs`
+                    : d.blobIds.length === 1
+                      ? `1 blob, ${d.total} copies`
+                      : `${d.total} copies`;
             return `#${d.index} (${d.collapsed} ${dupWord}, ${backing})`;
         })
         .join(", ");

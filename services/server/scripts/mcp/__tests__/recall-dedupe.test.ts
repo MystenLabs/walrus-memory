@@ -101,12 +101,28 @@ test("handles an empty result set", () => {
     assert.equal(formatCollapsedDuplicatesNote(duplicates), null);
 });
 
-test("names the duplicated 1-based result index and distinct blob count when a middle row is duplicated (#722)", () => {
-    const { unique, collapsed, duplicates } = collapseDuplicates([
+test("two blobs with identical text both appear in memwal_recall output and match SDK count (#722)", () => {
+    const fixture = [
         row("Staging database runs on port 6543", 0.341, "blob-1"),
         row("User prefers dark roast coffee", 0.489, "blob-2"),
         row("Team deploys from the main branch on Fridays", 0.567, "a-L8o2vB1jQ_eX7yU3cN0zK5wF9tD6mS4pR2gH8jL0k"),
         row("Team deploys from the main branch on Fridays", 0.567, "Z9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF9eD8cB7aA6z"),
+        row("Primary editor is Neovim with lazy.nvim", 0.619, "blob-4"),
+        row("API gateway timeout is set to 30 seconds", 0.651, "blob-5"),
+    ];
+    const { unique, collapsed, duplicates } = collapseDuplicates(fixture);
+    assert.equal(unique.length, 6, "both blobs carrying identical text must appear");
+    assert.equal(collapsed, 0);
+    assert.deepEqual(duplicates, []);
+    assert.equal(formatCollapsedDuplicatesNote(duplicates), null);
+});
+
+test("names the duplicated 1-based result index when multiple rows share the same blob_id", () => {
+    const { unique, collapsed, duplicates } = collapseDuplicates([
+        row("Staging database runs on port 6543", 0.341, "blob-1"),
+        row("User prefers dark roast coffee", 0.489, "blob-2"),
+        row("Team deploys from the main branch on Fridays", 0.567, "blob-shared"),
+        row("Team deploys from the main branch on Fridays", 0.567, "blob-shared"),
         row("Primary editor is Neovim with lazy.nvim", 0.619, "blob-4"),
         row("API gateway timeout is set to 30 seconds", 0.651, "blob-5"),
     ]);
@@ -117,19 +133,31 @@ test("names the duplicated 1-based result index and distinct blob count when a m
             index: 3,
             collapsed: 1,
             total: 2,
-            blobIds: [
-                "a-L8o2vB1jQ_eX7yU3cN0zK5wF9tD6mS4pR2gH8jL0k",
-                "Z9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF9eD8cB7aA6z",
-            ],
+            blobIds: ["blob-shared"],
         },
     ]);
     assert.equal(
         formatCollapsedDuplicatesNote(duplicates),
-        "\n(1 duplicate copy of #3 collapsed — #3 is stored across 2 blobs; the same fact is stored more than once.)",
+        "\n(1 duplicate copy of #3 collapsed: #3 shares 1 blob across 2 copies; the same fact is stored more than once.)",
     );
 });
 
-test("formats single-row duplicate note without blob count when blob_id is absent or identical", () => {
+test("formats duplicate note with 3 copies sharing the same blob_id", () => {
+    const { unique, collapsed, duplicates } = collapseDuplicates([
+        row("first", 0.1, "blob-1"),
+        row("duplicated fact", 0.2, "blob-shared"),
+        row("duplicated fact", 0.2, "blob-shared"),
+        row("duplicated fact", 0.2, "blob-shared"),
+    ]);
+    assert.equal(unique.length, 2);
+    assert.equal(collapsed, 2);
+    assert.equal(
+        formatCollapsedDuplicatesNote(duplicates),
+        "\n(2 duplicate copies of #2 collapsed: #2 shares 1 blob across 3 copies; the same fact is stored more than once.)",
+    );
+});
+
+test("formats single-row duplicate note without blob count when blob_id is absent", () => {
     const { duplicates } = collapseDuplicates([
         row("first", 0.1),
         row("duplicated fact", 0.2),
@@ -138,22 +166,22 @@ test("formats single-row duplicate note without blob count when blob_id is absen
     ]);
     assert.equal(
         formatCollapsedDuplicatesNote(duplicates),
-        "\n(2 duplicate copies of #2 collapsed — 3 copies total; the same fact is stored more than once.)",
+        "\n(2 duplicate copies of #2 collapsed: 3 copies total; the same fact is stored more than once.)",
     );
 });
 
 test("formats multi-row duplicate summary when more than one survivor had duplicates", () => {
     const { collapsed, duplicates } = collapseDuplicates([
         row("fact one", 0.1, "b1"),
-        row("fact one", 0.1, "b2"),
+        row("fact one", 0.1, "b1"),
         row("fact two", 0.2, "b3"),
         row("fact three", 0.3, "b4"),
-        row("fact three", 0.3, "b5"),
-        row("fact three", 0.3, "b6"),
+        row("fact three", 0.3, "b4"),
+        row("fact three", 0.3, "b4"),
     ]);
     assert.equal(collapsed, 3);
     assert.equal(
         formatCollapsedDuplicatesNote(duplicates),
-        "\n(3 duplicate copies collapsed: #1 (1 duplicate, 2 blobs), #3 (2 duplicates, 3 blobs); the same fact is stored more than once.)",
+        "\n(3 duplicate copies collapsed: #1 (1 duplicate, 1 blob, 2 copies), #3 (2 duplicates, 1 blob, 3 copies); the same fact is stored more than once.)",
     );
 });
