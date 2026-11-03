@@ -316,6 +316,17 @@ export function extractCandidateChunks(
     const skipped: SkippedSection[] = [];
 
     for (const section of rawSections) {
+        const headingSafety = screenContentForSafety(section.heading);
+        if (!headingSafety.safe) {
+            skipped.push({
+                file: relPath,
+                section: section.heading,
+                reason: headingSafety.reason!,
+                snippet: makeSnippet(section.heading),
+            });
+            continue;
+        }
+
         const safety = screenContentForSafety(section.content);
         if (!safety.safe) {
             skipped.push({
@@ -345,6 +356,17 @@ export function extractCandidateChunks(
             }
 
             const provenanceText = `[source: ${relPath} | section: ${section.heading}]\n${trimmed}`;
+            const provenanceSafety = screenContentForSafety(provenanceText);
+            if (!provenanceSafety.safe) {
+                skipped.push({
+                    file: relPath,
+                    section: section.heading,
+                    reason: provenanceSafety.reason!,
+                    snippet: makeSnippet(provenanceText),
+                });
+                continue;
+            }
+
             candidates.push({
                 file: relPath,
                 section: section.heading,
@@ -377,7 +399,7 @@ function loadConfigJson(): { key?: string; accountId?: string; serverUrl?: strin
     return null;
 }
 
-function createSignedRelayerClient(params: {
+export function createSignedRelayerClient(params: {
     key: string;
     accountId: string;
     serverUrl: string;
@@ -442,10 +464,12 @@ function createSignedRelayerClient(params: {
                 if (pendingIds.length === 0) break;
 
                 const statusResp = await signedPost<{
+                    results?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
                     jobs?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
                 }>("/api/remember/bulk/status", { job_ids: pendingIds });
 
-                for (const job of statusResp.jobs ?? []) {
+                const rawList = statusResp.results ?? statusResp.jobs ?? [];
+                for (const job of rawList) {
                     const id = job.job_id ?? job.id;
                     if (id && latest.has(id)) {
                         const prev = latest.get(id)!;

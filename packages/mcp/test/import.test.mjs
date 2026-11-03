@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
-    ALLOWED_IMPORT_FILES,
     clampMaxItems,
+    createSignedRelayerClient,
     discoverImportFiles,
     extractCandidateChunks,
     helpText,
@@ -388,5 +388,62 @@ test("importProjectMemories confirmed upload throws when credentials are missing
             }),
         /Credentials required for upload/,
     );
+});
+
+test("extractCandidateChunks screens headings for secrets and opt-out markers", () => {
+    const content = [
+        "# API_KEY=synthetic-heading-only-secret",
+        "Substantive paragraph content that should be skipped because its heading is a secret.",
+        "",
+        "# [no-memory]",
+        "Another substantive paragraph that should be skipped because of the opt-out heading.",
+        "",
+        "# Safe Heading",
+        "This paragraph is safe and should be kept as a candidate memory chunk.",
+    ].join("\n");
+
+    const { candidates, skipped } = extractCandidateChunks(content, "AGENTS.md");
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].section, "Safe Heading");
+    assert.equal(skipped.length, 2);
+    assert.equal(skipped[0].reason, "secret_detected");
+    assert.equal(skipped[1].reason, "opt_out_marker");
+});
+
+test("createSignedRelayerClient reads bulk-status results envelope", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+        let called = false;
+        globalThis.fetch = async (url, _init) => {
+            called = true;
+            assert.ok(String(url).endsWith("/api/remember/bulk/status"));
+            return {
+                ok: true,
+                status: 200,
+                text: async () =>
+                    JSON.stringify({
+                        results: [{ job_id: "test-job-1", status: "done" }],
+                    }),
+            };
+        };
+
+        const client = createSignedRelayerClient({
+            key: "11".repeat(32),
+            accountId: "0x" + "22".repeat(32),
+            serverUrl: "http://127.0.0.1:9999",
+        });
+
+        const outcome = await client.waitForRememberJobs(["test-job-1"], ["default"], {
+            timeoutMs: 2000,
+            pollIntervalMs: 50,
+        });
+
+        assert.equal(called, true);
+        assert.equal(outcome.results.length, 1);
+        assert.equal(outcome.results[0].id, "test-job-1");
+        assert.equal(outcome.results[0].status, "done");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
 });
 

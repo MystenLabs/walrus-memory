@@ -917,6 +917,7 @@ export { runBridge } from "./bridge.js";
 export {
     ALLOWED_IMPORT_FILES,
     clampMaxItems,
+    createSignedRelayerClient,
     discoverImportFiles,
     extractCandidateChunks,
     importProjectMemories,
