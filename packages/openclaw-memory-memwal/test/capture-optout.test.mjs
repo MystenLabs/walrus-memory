@@ -17,6 +17,8 @@ test("shouldCapture rejects explicit conversational opt-out directives before TR
     "Please don’t save any of this: I prefer working from Tokyo next month",
     "Do not remember the following: I prefer working from Tokyo next month.",
     "Please don't remember where I live: 123 Example Street.",
+    "For privacy, don't remember my home address: 123 Example Street.",
+    "For privacy, do not remember where I live: 123 Example Street.",
     "Do not save or remember this: my temporary medical appointment is at 3 PM.",
     "Please don't remember my temporary medical appointment at 3 PM.",
     "Never store this in memory: our internal codename is Project Aurora.",
@@ -301,4 +303,29 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     "coordinated first-person 'but don't remember' prose must be captured by the hook",
   );
   assert.ok(analyzedPayloads[1].includes("I prefer Rust but don't remember when we adopted it."));
+
+  // 7. Hook-level regression: explicit privacy-directed remember opt-out after a comma ("For privacy, don't remember my home address: ...") suppresses echoes.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u9",
+          role: "user",
+          content: "For privacy, don't remember my home address: 123 Example Street.",
+        },
+        {
+          id: "a9",
+          role: "assistant",
+          content: "Understood, your address 123 Example Street will not be stored in Walrus Memory.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-privacy-comma-optout" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    2,
+    "opt-out phrases after a comma like 'For privacy, don't remember...' must suppress assistant echoes from reaching analyze()",
+  );
 });
