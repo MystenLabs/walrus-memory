@@ -761,27 +761,25 @@ pub(crate) async fn query_owner_memories(
                 _ => None,
             };
             let live_after = (c.updated_at, c.id);
-            if c.snapshot_at.is_none() {
-                if let Some(ref pg_snap) = c.pg_snapshot {
-                    if has_unavoidable_cursor_gap(
-                        pool,
-                        owner,
-                        &live_after,
-                        deleted_after.as_ref(),
-                        retention_cut,
-                        pg_snap,
-                    )
-                    .await?
-                    {
-                        return Ok(MemoriesResponse {
-                            memories: Vec::new(),
-                            next_cursor: None,
-                            has_more: false,
-                            snapshot_version: SNAPSHOT_VERSION,
-                            deleted: Vec::new(),
-                            must_resync: true,
-                        });
-                    }
+            if let Some(ref pg_snap) = c.pg_snapshot {
+                if has_unavoidable_cursor_gap(
+                    pool,
+                    owner,
+                    &live_after,
+                    deleted_after.as_ref(),
+                    retention_cut,
+                    pg_snap,
+                )
+                .await?
+                {
+                    return Ok(MemoriesResponse {
+                        memories: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                        snapshot_version: SNAPSHOT_VERSION,
+                        deleted: Vec::new(),
+                        must_resync: true,
+                    });
                 }
             }
             let snapshot_at = c.snapshot_at.unwrap_or(horizon_at);
@@ -891,7 +889,9 @@ pub(crate) async fn query_owner_memories(
         .map(|(id, _, t)| (*t, id.clone()))
         .or(deleted_after.clone());
 
-    let next_pg_snapshot = if rows.is_empty() && deleted_rows.is_empty() {
+    let next_pg_snapshot = if has_more {
+        prior_pg_snapshot.or(Some(current_pg_snapshot))
+    } else if rows.is_empty() && deleted_rows.is_empty() {
         prior_pg_snapshot.or(Some(current_pg_snapshot))
     } else {
         Some(current_pg_snapshot)
@@ -2843,6 +2843,45 @@ mod tests {
         );
         assert!(poll2.memories.is_empty());
         assert!(poll2.next_cursor.is_none());
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for multi-page walks: when page 1 advances past an
+    /// uncommitted row and returns `has_more: true`, and that row subsequently
+    /// commits behind page 1's watermark before page 2, page 2 must not skip
+    /// gap detection nor advance the snapshot to hide the gap. It must detect
+    /// the post-snapshot commit behind page 1's watermark and signal `must_resync: true`.
+    #[tokio::test]
+    async fn incremental_sync_signals_must_resync_when_late_commit_lands_between_pages() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        seed_entry(&pool, &owner, "m1", "default", 10, ts(100)).await;
+        seed_entry(&pool, &owner, "m2", "default", 10, ts(200)).await;
+
+        let page1 = query_owner_memories(&pool, &owner, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page1.memories.len(), 1);
+        assert_eq!(page1.memories[0].memory_id, format!("{owner}-m1"));
+        assert!(page1.has_more);
+        assert!(!page1.must_resync);
+        let cursor1 = page1.next_cursor.expect("continuation cursor after page 1");
+
+        // Now a row commits behind page 1's watermark (ts(50) < ts(100))
+        // before page 2 is fetched.
+        seed_entry(&pool, &owner, "m0-late", "default", 10, ts(50)).await;
+
+        let page2 = query_owner_memories(&pool, &owner, Some(cursor1), 1)
+            .await
+            .unwrap();
+        assert!(
+            page2.must_resync,
+            "late commit behind page 1 watermark before page 2 must trigger must_resync on continuation"
+        );
+        assert!(page2.memories.is_empty());
+        assert!(page2.next_cursor.is_none());
 
         cleanup(&pool, &owner).await;
     }
