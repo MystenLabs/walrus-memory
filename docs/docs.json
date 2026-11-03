@@ -43,6 +43,7 @@
             "pages": [
               "getting-started/what-is-memwal",
               "getting-started/quick-start",
+              "getting-started/find-your-agent-id",
               "getting-started/choose-your-path",
               "examples/example-apps",
               "examples/chatbot",
