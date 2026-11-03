@@ -156,7 +156,7 @@ fn format_remember_preparation_error(err: &AppError) -> String {
 /// current `status`. Infrastructure failures collapse to fixed copy, chosen by
 /// whether the job has stopped retrying. Everything else keeps its text with
 /// addresses redacted. The DB row is untouched.
-pub(crate) fn sanitize_job_error_for_client(
+pub fn sanitize_job_error_for_client(
     status: &str,
     error_msg: Option<String>,
 ) -> Option<String> {
@@ -190,7 +190,7 @@ async fn mark_remember_job_failed(
     prepare_claim_token: Option<&str>,
     msg: &str,
 ) {
-    let _ = sqlx::query(
+    let row = sqlx::query_as::<_, (String, String)>(
         "UPDATE remember_jobs
          SET status = 'failed',
              error_msg = $1,
@@ -201,21 +201,31 @@ async fn mark_remember_job_failed(
            AND COALESCE(error_msg, '') <> $4
            AND NOT EXISTS (
                SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
-           )",
+           )
+         RETURNING owner, namespace",
     )
     .bind(msg)
     .bind(job_id)
     .bind(prepare_claim_token)
     .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
-    .execute(state.db.pool())
+    .fetch_optional(state.db.pool())
     .await;
+
+    if let Ok(Some((owner, namespace))) = row {
+        state.events.publish_remember_failed(
+            owner,
+            namespace,
+            Some(job_id.to_string()),
+            Some(msg.to_string()),
+        );
+    }
 }
 
 async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &str) {
     if job_ids.is_empty() {
         return;
     }
-    let _ = sqlx::query(
+    let rows = sqlx::query_as::<_, (String, String, String)>(
         "UPDATE remember_jobs
          SET status = 'failed',
              error_msg = $1,
@@ -224,13 +234,25 @@ async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &s
            AND COALESCE(error_msg, '') <> $3
            AND NOT EXISTS (
                SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
-           )",
+           )
+         RETURNING id, owner, namespace",
     )
     .bind(msg)
     .bind(job_ids)
     .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
-    .execute(state.db.pool())
+    .fetch_all(state.db.pool())
     .await;
+
+    if let Ok(rows) = rows {
+        for (job_id, owner, namespace) in rows {
+            state.events.publish_remember_failed(
+                owner,
+                namespace,
+                Some(job_id),
+                Some(msg.to_string()),
+            );
+        }
+    }
 }
 
 // ============================================================
@@ -1021,6 +1043,13 @@ pub async fn remember(
         auth.account_id.clone(),
         namespace_owned,
         auth.public_key.clone(),
+    );
+
+    state.events.publish_remember_accepted(
+        owner,
+        namespace,
+        Some(job_id.clone()),
+        Some(1),
     );
 
     tracing::info!(
@@ -1859,6 +1888,15 @@ pub async fn remember_bulk(
     }
 
     let total = job_ids.len();
+    let batch_id = body
+        .idempotency_key
+        .clone()
+        .or_else(|| job_ids.first().cloned())
+        .unwrap_or_default();
+    let primary_ns = pending_items
+        .first()
+        .map(|p| p.namespace.clone())
+        .unwrap_or_else(|| "default".to_string());
 
     if !pending_items.is_empty() {
         spawn_prepare_bulk_remember_job(
@@ -1869,6 +1907,13 @@ pub async fn remember_bulk(
             pending_items,
         );
     }
+
+    state.events.publish_remember_accepted(
+        owner,
+        &primary_ns,
+        Some(batch_id),
+        Some(total),
+    );
 
     tracing::info!("remember_bulk accepted: {} items owner={}", total, owner,);
 
@@ -2050,6 +2095,14 @@ pub async fn remember_manual(
     let mref = stored?;
     let id = mref.id;
     let blob_id = mref.blob_id;
+
+    state.events.publish_remember_completed(
+        owner,
+        namespace,
+        Some(id.clone()),
+        Some(blob_id.clone()),
+        Some(1),
+    );
 
     tracing::info!(
         "remember_manual complete: id={}, blob_id={}, ns={}",

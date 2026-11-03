@@ -6410,6 +6410,7 @@ mod stale_sweep_tests {
         let retryable_err = crate::jobs::WalletJobError::Transient("sidecar timeout".into());
         crate::jobs::update_remember_job_after_wallet_error(
             &db.pool,
+            None,
             Some(&unpaid_running_id),
             &retryable_err,
             "sidecar timeout on attempt 1",
@@ -6418,6 +6419,7 @@ mod stale_sweep_tests {
         .await;
         crate::jobs::update_remember_job_after_wallet_error(
             &db.pool,
+            None,
             Some(&tombstone_only_id),
             &retryable_err,
             "sidecar timeout on tombstoned job",
@@ -6428,6 +6430,7 @@ mod stale_sweep_tests {
         let terminal_err = crate::jobs::WalletJobError::Permanent("permanent sidecar error".into());
         crate::jobs::update_remember_job_after_wallet_error(
             &db.pool,
+            None,
             Some(&unpaid_running_id),
             &terminal_err,
             "permanent sidecar error",
