@@ -3,6 +3,7 @@ mod auth;
 mod client_ip;
 mod compatibility;
 mod engine;
+mod events;
 mod jobs;
 mod jobs_security_delete;
 mod mcp_proxy;
@@ -768,6 +769,7 @@ mod mcp_rate_limit_tests {
             blob_cache_ttl: std::time::Duration::from_secs(DEFAULT_BLOB_CACHE_TTL_SECS),
             blob_cache_max_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
             embedding_cache_ttl: std::time::Duration::from_secs(DEFAULT_EMBEDDING_CACHE_TTL_SECS),
+            events: Arc::new(events::EventHub::new()),
         })
     }
 
@@ -1288,6 +1290,7 @@ mod owner_token_active_check_tests {
             blob_cache_ttl: std::time::Duration::from_secs(DEFAULT_BLOB_CACHE_TTL_SECS),
             blob_cache_max_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
             embedding_cache_ttl: std::time::Duration::from_secs(DEFAULT_EMBEDDING_CACHE_TTL_SECS),
+            events: Arc::new(events::EventHub::new()),
         });
 
         let read_api_routes = Router::new()
@@ -1300,6 +1303,7 @@ mod owner_token_active_check_tests {
                 get(routes::list_owner_memories),
             )
             .route("/v1/owners/{owner}/agents", get(routes::list_owner_agents))
+            .route("/api/events", get(events::events_stream))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 rate_limit::read_api_rate_limit_middleware,
@@ -2711,6 +2715,7 @@ async fn main() {
         blob_cache_ttl,
         blob_cache_max_bytes,
         embedding_cache_ttl,
+        events: Arc::new(events::EventHub::new()),
     });
 
     jobs_security_delete::spawn_reconciler(Arc::clone(&state));
@@ -3371,6 +3376,7 @@ async fn main() {
             get(routes::list_owner_memories),
         )
         .route("/v1/owners/{owner}/agents", get(routes::list_owner_agents))
+        .route("/api/events", get(events::events_stream))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit::read_api_rate_limit_middleware,

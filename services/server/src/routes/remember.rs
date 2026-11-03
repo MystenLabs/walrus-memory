@@ -156,7 +156,7 @@ fn format_remember_preparation_error(err: &AppError) -> String {
 /// current `status`. Infrastructure failures collapse to fixed copy, chosen by
 /// whether the job has stopped retrying. Everything else keeps its text with
 /// addresses redacted. The DB row is untouched.
-pub(crate) fn sanitize_job_error_for_client(
+pub fn sanitize_job_error_for_client(
     status: &str,
     error_msg: Option<String>,
 ) -> Option<String> {
@@ -190,27 +190,47 @@ async fn mark_remember_job_failed(
     prepare_claim_token: Option<&str>,
     msg: &str,
 ) {
-    let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status NOT IN ('done', 'uploaded') AND ($3::TEXT IS NULL OR prepare_claim_token = $3)",
+    let row = sqlx::query_as::<_, (String, String)>(
+        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status NOT IN ('done', 'uploaded') AND ($3::TEXT IS NULL OR prepare_claim_token = $3) RETURNING owner, namespace",
     )
     .bind(msg)
     .bind(job_id)
     .bind(prepare_claim_token)
-    .execute(state.db.pool())
+    .fetch_optional(state.db.pool())
     .await;
+
+    if let Ok(Some((owner, namespace))) = row {
+        state.events.publish_remember_failed(
+            owner,
+            namespace,
+            Some(job_id.to_string()),
+            Some(msg.to_string()),
+        );
+    }
 }
 
 async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &str) {
     if job_ids.is_empty() {
         return;
     }
-    let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = ANY($2)",
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = ANY($2) RETURNING id, owner, namespace",
     )
     .bind(msg)
     .bind(job_ids)
-    .execute(state.db.pool())
+    .fetch_all(state.db.pool())
     .await;
+
+    if let Ok(rows) = rows {
+        for (job_id, owner, namespace) in rows {
+            state.events.publish_remember_failed(
+                owner,
+                namespace,
+                Some(job_id),
+                Some(msg.to_string()),
+            );
+        }
+    }
 }
 
 // ============================================================
@@ -986,6 +1006,13 @@ pub async fn remember(
         auth.account_id.clone(),
         namespace_owned,
         auth.public_key.clone(),
+    );
+
+    state.events.publish_remember_accepted(
+        owner,
+        namespace,
+        Some(job_id.clone()),
+        Some(1),
     );
 
     tracing::info!(
@@ -1767,6 +1794,15 @@ pub async fn remember_bulk(
     }
 
     let total = job_ids.len();
+    let batch_id = body
+        .idempotency_key
+        .clone()
+        .or_else(|| job_ids.first().cloned())
+        .unwrap_or_default();
+    let primary_ns = pending_items
+        .first()
+        .map(|p| p.namespace.clone())
+        .unwrap_or_else(|| "default".to_string());
 
     if !pending_items.is_empty() {
         spawn_prepare_bulk_remember_job(
@@ -1777,6 +1813,13 @@ pub async fn remember_bulk(
             pending_items,
         );
     }
+
+    state.events.publish_remember_accepted(
+        owner,
+        &primary_ns,
+        Some(batch_id),
+        Some(total),
+    );
 
     tracing::info!("remember_bulk accepted: {} items owner={}", total, owner,);
 
@@ -1958,6 +2001,14 @@ pub async fn remember_manual(
     let mref = stored?;
     let id = mref.id;
     let blob_id = mref.blob_id;
+
+    state.events.publish_remember_completed(
+        owner,
+        namespace,
+        Some(id.clone()),
+        Some(blob_id.clone()),
+        Some(1),
+    );
 
     tracing::info!(
         "remember_manual complete: id={}, blob_id={}, ns={}",

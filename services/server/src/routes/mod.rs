@@ -49,6 +49,7 @@ pub use owner_token::{issue_token, token_probe};
 pub use recall::{recall, recall_manual};
 pub use remember::{
     remember, remember_bulk, remember_bulk_status, remember_manual, remember_status,
+    sanitize_job_error_for_client,
 };
 pub use sponsor::{sponsor_execute_proxy, sponsor_proxy};
 

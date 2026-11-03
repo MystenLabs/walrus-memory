@@ -73,6 +73,12 @@ pub async fn forget(
 
     let deleted = state.db.delete_by_namespace(owner, namespace).await?;
 
+    state.events.publish_forget(
+        owner,
+        namespace,
+        Some(deleted as usize),
+    );
+
     tracing::info!(
         "forget complete: deleted {} entries for owner={} ns={}",
         deleted,
@@ -1415,6 +1421,12 @@ async fn restore_unbounded(
         .collect();
 
     state.db.insert_vectors_atomic(&batch).await?;
+
+    state.events.publish_restore_completed(
+        owner,
+        namespace,
+        Some(restored),
+    );
 
     tracing::info!(
         "restore complete: restored={} skipped={} failed={} total={} owner={} ns={}",
