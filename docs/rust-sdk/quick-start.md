@@ -113,13 +113,12 @@ Calling `client.destroy()` synchronously zeroes the Ed25519 signing seed, clears
 Use `MemWalMock` in unit tests to verify prompt assembly, namespace isolation, deduplication, and token budgeting without network sockets or testnet credentials:
 
 ```rust
-use memwal::{DedupeMode, MemWalMock, RememberOptions, RememberWaitOptions};
+use memwal::{MemWalMock, RememberWaitOptions};
 
 #[tokio::test]
 async fn deduplicates_repeated_agent_facts() -> memwal::Result<()> {
-    let mock = MemWalMock::with_namespace("session-42")?;
-    let opts = RememberWaitOptions::new()
-        .with_remember(RememberOptions::new().with_dedupe(DedupeMode::ContentHash));
+    let mock = MemWalMock::with_namespace("session-42");
+    let opts = RememberWaitOptions::new().dedupe_by_content();
 
     let first = mock.remember_and_wait_with("Primary DB is PostgreSQL 17", &opts).await?;
     let second = mock.remember_and_wait_with("Primary DB is PostgreSQL 17", &opts).await?;

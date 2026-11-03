@@ -1025,6 +1025,199 @@ async fn memwal_mock_supports_full_offline_lifecycle() -> memwal::Result<()> {
 }
 
 #[tokio::test]
+async fn memwal_mock_pagination_terminates_with_limit_one() -> memwal::Result<()> {
+    let mock = MemWalMock::with_namespace("ns-alpha");
+    mock.remember_and_wait("memory in alpha").await?;
+    mock.remember_and_wait_with(
+        "memory in beta",
+        &RememberWaitOptions::new().with_namespace("ns-beta"),
+    )
+    .await?;
+
+    let mut cursor = None;
+    let mut seen_namespaces = Vec::new();
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 10, "list_namespaces loop must terminate");
+        let opts = ListNamespacesOptions {
+            cursor: cursor.clone(),
+            limit: Some(1),
+        };
+        let page = mock.list_namespaces(&opts).await?;
+        for ns in page.namespaces {
+            seen_namespaces.push(ns.name);
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen_namespaces.len(), 2);
+    assert_eq!(pages, 2);
+    assert!(seen_namespaces.contains(&"ns-alpha".to_owned()));
+    assert!(seen_namespaces.contains(&"ns-beta".to_owned()));
+
+    cursor = None;
+    let mut seen_memories = Vec::new();
+    pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 10, "list_memories loop must terminate");
+        let opts = ListMemoriesOptions {
+            cursor: cursor.clone(),
+            limit: Some(1),
+            namespace: None,
+        };
+        let page = mock.list_memories(&opts).await?;
+        for m in page.memories {
+            seen_memories.push(m.memory_id);
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen_memories.len(), 2);
+    assert_eq!(pages, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_retry_after_does_not_panic_and_returns_rate_limited() -> memwal::Result<()> {
+    let server = MockServer::start().await;
+    mount_standard_preflights(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/recall"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "99999999999999999999")
+                .set_body_json(json!({
+                    "error": "rate limited",
+                    "retry_after_seconds": 1e30
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let client = MemWal::builder(TEST_KEY_HEX, TEST_ACCOUNT_ID)
+        .server_url(server.uri())
+        .build()?;
+
+    let err = client
+        .recall(RecallParams::new("test query"))
+        .await
+        .expect_err("429 must return Error::RateLimited");
+
+    match err {
+        Error::RateLimited { retry_after, .. } => {
+            assert!(
+                retry_after.is_none(),
+                "oversized retry_after delay must be safely rejected instead of panicking"
+            );
+        }
+        other => panic!("expected Error::RateLimited, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn quick_start_example_compiles_and_runs() -> memwal::Result<()> {
+    let mock = MemWalMock::with_namespace("session-42");
+    let opts = RememberWaitOptions::new().dedupe_by_content();
+
+    let first = mock
+        .remember_and_wait_with("Primary DB is PostgreSQL 17", &opts)
+        .await?;
+    let second = mock
+        .remember_and_wait_with("Primary DB is PostgreSQL 17", &opts)
+        .await?;
+    assert_eq!(first.blob_id, second.blob_id);
+
+    let recalled = mock.recall("Which database version is primary?").await?;
+    assert_eq!(recalled.results.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_for_remember_jobs_preserves_completed_chunks_when_later_chunk_fails()
+-> memwal::Result<()> {
+    let server = MockServer::start().await;
+    mount_standard_preflights(&server).await;
+
+    let job_ids: Vec<String> = (0..21).map(|i| format!("batch_job_{i}")).collect();
+    let namespaces: Vec<String> = vec!["conv".to_owned(); 21];
+
+    let poll_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = Arc::clone(&poll_attempts);
+
+    Mock::given(method("POST"))
+        .and(path("/api/remember/bulk/status"))
+        .respond_with(move |req: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json");
+            let ids = body["job_ids"].as_array().expect("job_ids array");
+            if ids.len() == 20 {
+                let items: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|id| {
+                        let s = id.as_str().expect("id");
+                        json!({
+                            "job_id": s,
+                            "status": "done",
+                            "blob_id": format!("blob_for_{s}"),
+                            "namespace": "conv"
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "results": items }))
+            } else if ids.len() == 1 {
+                let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(429)
+                        .insert_header("retry-after", "0.001")
+                        .set_body_json(json!({ "error": "rate limited" }))
+                } else {
+                    let s = ids[0].as_str().expect("id");
+                    let items = vec![json!({
+                        "job_id": s,
+                        "status": "done",
+                        "blob_id": format!("blob_for_{s}"),
+                        "namespace": "conv"
+                    })];
+                    ResponseTemplate::new(200).set_body_json(json!({ "results": items }))
+                }
+            } else {
+                panic!("unexpected chunk size: {}", ids.len());
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client = MemWal::builder(TEST_KEY_HEX, TEST_ACCOUNT_ID)
+        .server_url(server.uri())
+        .build()?;
+
+    let wait_opts = WaitOptions::default()
+        .with_timeout(Duration::from_millis(1500))
+        .with_poll_interval(Duration::from_millis(5));
+
+    let res = client
+        .wait_for_remember_jobs(&job_ids, &namespaces, &wait_opts)
+        .await?;
+
+    assert_eq!(res.total, 21);
+    assert_eq!(res.succeeded, 21);
+    assert_eq!(res.failed, 0);
+    assert_eq!(res.timed_out, 0);
+    assert_eq!(poll_attempts.load(Ordering::SeqCst), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires live MEMWAL_PRIVATE_KEY and MEMWAL_ACCOUNT_ID provisioned via memwal-dev-wallet"]
 #[expect(
     clippy::too_many_lines,

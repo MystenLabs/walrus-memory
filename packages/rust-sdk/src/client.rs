@@ -820,21 +820,30 @@ impl MemWal {
             .await
     }
 
-    async fn remember_bulk_status_with_timeout(
+    async fn query_bulk_status_chunks_with_deadline(
         &self,
         job_ids: &[String],
-        timeout: Duration,
-    ) -> Result<RememberBulkStatusResult> {
-        self.check_not_destroyed()?;
+        deadline: Instant,
+    ) -> (Vec<RememberBulkStatusItem>, Option<Error>) {
         if job_ids.is_empty() {
-            return Ok(RememberBulkStatusResult {
-                results: Vec::new(),
-            });
+            return (Vec::new(), None);
         }
 
         let mut all_results = Vec::with_capacity(job_ids.len());
         for chunk in job_ids.chunks(MAX_BULK_ITEMS) {
-            let chunk_res: RememberBulkStatusResult = self
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (
+                    all_results,
+                    Some(Error::RequestTimeout {
+                        method: "POST".to_owned(),
+                        path: "/api/remember/bulk/status".to_owned(),
+                        elapsed: self.0.request_timeout,
+                    }),
+                );
+            }
+            let chunk_timeout = remaining.min(self.0.request_timeout);
+            let chunk_res: Result<RememberBulkStatusResult> = self
                 .signed_request(
                     "POST",
                     "/api/remember/bulk/status",
@@ -842,16 +851,38 @@ impl MemWal {
                     &[200],
                     SignedCallOpts {
                         include_seal_session: false,
-                        timeout,
+                        timeout: chunk_timeout,
                     },
                 )
-                .await?;
-            all_results.extend(chunk_res.results);
+                .await;
+
+            match chunk_res {
+                Ok(chunk) => {
+                    all_results.extend(chunk.results);
+                }
+                Err(err) => {
+                    return (all_results, Some(err));
+                }
+            }
         }
 
-        Ok(RememberBulkStatusResult {
-            results: all_results,
-        })
+        (all_results, None)
+    }
+
+    async fn remember_bulk_status_with_timeout(
+        &self,
+        job_ids: &[String],
+        timeout: Duration,
+    ) -> Result<RememberBulkStatusResult> {
+        self.check_not_destroyed()?;
+        let deadline = Instant::now() + timeout;
+        let (results, opt_err) = self
+            .query_bulk_status_chunks_with_deadline(job_ids, deadline)
+            .await;
+        if let Some(err) = opt_err {
+            return Err(err);
+        }
+        Ok(RememberBulkStatusResult { results })
     }
 
     /// Polls multiple background `remember` jobs until every job settles or `opts.timeout` expires.
@@ -912,14 +943,27 @@ impl MemWal {
                 break;
             }
 
-            let poll_timeout = self.poll_deadline(deadline);
-            let batch_res = self
-                .remember_bulk_status_with_timeout(&pending_ids, poll_timeout)
+            let (batch_results, batch_err) = self
+                .query_bulk_status_chunks_with_deadline(&pending_ids, deadline)
                 .await;
 
-            let batch = match batch_res {
-                Ok(b) => b,
-                Err(err) if err.is_transient() => {
+            if !batch_results.is_empty() {
+                answered = true;
+                for item in batch_results {
+                    settle_bulk_item(
+                        &item,
+                        job_ids,
+                        namespaces,
+                        &self.0.namespace,
+                        &mut results,
+                        &mut pending,
+                        &mut last_seen,
+                    );
+                }
+            }
+
+            if let Some(err) = batch_err {
+                if err.is_transient() {
                     last_refusal = err.status_code();
                     if matches!(err, Error::RateLimited { .. }) {
                         saw_rate_limit = true;
@@ -930,20 +974,7 @@ impl MemWal {
                     }
                     continue;
                 }
-                Err(err) => return Err(err),
-            };
-            answered = true;
-
-            for item in batch.results {
-                settle_bulk_item(
-                    &item,
-                    job_ids,
-                    namespaces,
-                    &self.0.namespace,
-                    &mut results,
-                    &mut pending,
-                    &mut last_seen,
-                );
+                return Err(err);
             }
 
             if pending.is_empty() || Instant::now() >= deadline {
@@ -986,27 +1017,32 @@ impl MemWal {
         last_seen: &mut HashMap<String, RememberBulkStatusItem>,
     ) -> Result<bool> {
         let probe_timeout = self.0.request_timeout.min(CONFIRM_READ_TIMEOUT);
-        match self
-            .remember_bulk_status_with_timeout(job_ids, probe_timeout)
-            .await
-        {
-            Ok(probed) => {
-                for item in probed.results {
-                    if pending.contains(&item.job_id) {
-                        settle_bulk_item(
-                            &item,
-                            job_ids,
-                            namespaces,
-                            &self.0.namespace,
-                            results,
-                            pending,
-                            last_seen,
-                        );
-                    }
-                }
-                Ok(true)
+        let deadline = Instant::now() + probe_timeout;
+        let (probed_results, probed_err) = self
+            .query_bulk_status_chunks_with_deadline(job_ids, deadline)
+            .await;
+
+        let answered = !probed_results.is_empty();
+        for item in probed_results {
+            if pending.contains(&item.job_id) {
+                settle_bulk_item(
+                    &item,
+                    job_ids,
+                    namespaces,
+                    &self.0.namespace,
+                    results,
+                    pending,
+                    last_seen,
+                );
             }
-            Err(Error::RateLimited { retry_after, .. }) => Err(Error::RateLimited {
+        }
+
+        if answered {
+            return Ok(true);
+        }
+
+        match probed_err {
+            Some(Error::RateLimited { retry_after, .. }) => Err(Error::RateLimited {
                 retry_after,
                 job_ids: job_ids.to_vec(),
                 message: format!(
@@ -1014,7 +1050,7 @@ impl MemWal {
                     job_ids.len()
                 ),
             }),
-            Err(_) => Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -2263,8 +2299,7 @@ fn classify_http_error(status: u16, headers: &HeaderMap, raw_body: &str) -> Erro
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(Duration::from_secs_f64);
+            .and_then(safe_duration_from_secs_f64);
         let retry_after = header_retry.or(body_retry_after);
         return Error::RateLimited {
             retry_after,
@@ -2278,6 +2313,13 @@ fn classify_http_error(status: u16, headers: &HeaderMap, raw_body: &str) -> Erro
         code: parsed_code,
         message: sanitized_msg,
     }
+}
+
+fn safe_duration_from_secs_f64(secs: f64) -> Option<Duration> {
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(secs).ok()
 }
 
 fn extract_error_fields(raw_body: &str) -> (String, Option<String>, Option<Duration>) {
@@ -2301,8 +2343,7 @@ fn extract_error_fields(raw_body: &str) -> (String, Option<String>, Option<Durat
         let retry = map
             .get("retry_after_seconds")
             .and_then(serde_json::Value::as_f64)
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(Duration::from_secs_f64);
+            .and_then(safe_duration_from_secs_f64);
 
         return (msg, code, retry);
     }

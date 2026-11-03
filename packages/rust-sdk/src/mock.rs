@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::Engine as _;
 use chrono::Utc;
 use sha2::{Digest as _, Sha256};
 
@@ -678,11 +679,8 @@ impl MemWalMock {
             }
         }
 
-        let limit = opts.limit.unwrap_or(100);
-        let has_more = grouped.len() > limit;
-        let namespaces: Vec<NamespaceSummary> = grouped
+        let all_namespaces: Vec<NamespaceSummary> = grouped
             .into_iter()
-            .take(limit)
             .map(|(name, (count, bytes, updated_at))| NamespaceSummary {
                 id: name.clone(),
                 name,
@@ -691,7 +689,17 @@ impl MemWalMock {
                 updated_at,
             })
             .collect();
-        let next_cursor = namespaces.last().map(|n| n.updated_at.clone());
+
+        let remaining = if let Some(cursor) = &opts.cursor {
+            filter_namespaces_by_cursor(&all_namespaces, cursor)
+        } else {
+            all_namespaces
+        };
+
+        let limit = opts.limit.unwrap_or(100);
+        let has_more = remaining.len() > limit;
+        let namespaces: Vec<NamespaceSummary> = remaining.into_iter().take(limit).collect();
+        let next_cursor = namespaces.last().map(encode_mock_namespace_cursor);
         Ok(NamespacesPage {
             namespaces,
             next_cursor,
@@ -714,12 +722,9 @@ impl MemWalMock {
             validate_namespace(ns)?;
         }
         let guard = self.lock_state();
-        let limit = opts.limit.unwrap_or(100);
-        let has_more = guard.entries.len() > limit;
-        let mut memories: Vec<MemorySummary> = guard
+        let all_memories: Vec<MemorySummary> = guard
             .entries
             .iter()
-            .take(limit)
             .map(|e| MemorySummary {
                 memory_id: e.id.clone(),
                 namespace_id: e.namespace.clone(),
@@ -736,13 +741,23 @@ impl MemWalMock {
             })
             .collect();
 
+        let remaining = if let Some(cursor) = &opts.cursor {
+            filter_memories_by_cursor(&all_memories, cursor)
+        } else {
+            all_memories
+        };
+
+        let limit = opts.limit.unwrap_or(100);
+        let has_more = remaining.len() > limit;
+        let mut memories: Vec<MemorySummary> = remaining.into_iter().take(limit).collect();
+        let next_cursor = memories.last().map(encode_mock_memory_cursor);
+
         let mut deleted = guard.deleted.clone();
         if let Some(ns) = &opts.namespace {
             memories.retain(|m| &m.namespace_id == ns);
             deleted.retain(|d| &d.namespace_id == ns);
         }
 
-        let next_cursor = memories.last().map(|m| m.updated_at.clone());
         Ok(MemoriesPage {
             memories,
             next_cursor,
@@ -871,4 +886,94 @@ fn tokenize(s: &str) -> HashSet<String> {
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NamespaceCursorPayload {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+fn decode_namespace_cursor(cursor: &str) -> Option<(Option<String>, Option<String>)> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(cursor))
+        .ok()?;
+    let payload: NamespaceCursorPayload = serde_json::from_slice(&bytes).ok()?;
+    Some((payload.namespace, payload.updated_at))
+}
+
+fn encode_mock_namespace_cursor(summary: &NamespaceSummary) -> String {
+    let payload = serde_json::json!({
+        "namespace": summary.name,
+        "updated_at": summary.updated_at,
+    });
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+}
+
+fn filter_namespaces_by_cursor(all: &[NamespaceSummary], cursor: &str) -> Vec<NamespaceSummary> {
+    let cursor_target = decode_namespace_cursor(cursor);
+    let pos = all.iter().position(|ns| {
+        if let Some((ref target_ns, ref target_up)) = cursor_target {
+            match (target_ns, target_up) {
+                (Some(name), Some(up)) if &ns.name == name && &ns.updated_at == up => return true,
+                (Some(name), None) if &ns.name == name => return true,
+                (None, Some(up)) if &ns.updated_at == up => return true,
+                _ => {}
+            }
+        }
+        ns.name == cursor || ns.updated_at == cursor || ns.id == cursor
+    });
+
+    match pos {
+        Some(idx) => all.get(idx + 1..).unwrap_or(&[]).to_vec(),
+        None => all.to_vec(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryCursorPayload {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+fn decode_memory_cursor(cursor: &str) -> Option<(Option<String>, Option<String>)> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(cursor))
+        .ok()?;
+    let payload: MemoryCursorPayload = serde_json::from_slice(&bytes).ok()?;
+    Some((payload.id, payload.updated_at))
+}
+
+fn encode_mock_memory_cursor(summary: &MemorySummary) -> String {
+    let payload = serde_json::json!({
+        "id": summary.memory_id,
+        "updated_at": summary.updated_at,
+    });
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+}
+
+fn filter_memories_by_cursor(all: &[MemorySummary], cursor: &str) -> Vec<MemorySummary> {
+    let cursor_target = decode_memory_cursor(cursor);
+    let pos = all.iter().position(|m| {
+        if let Some((ref target_id, ref target_up)) = cursor_target {
+            match (target_id, target_up) {
+                (Some(id), Some(up)) if &m.memory_id == id && &m.updated_at == up => return true,
+                (Some(id), None) if &m.memory_id == id => return true,
+                (None, Some(up)) if &m.updated_at == up => return true,
+                _ => {}
+            }
+        }
+        m.memory_id == cursor || m.updated_at == cursor
+    });
+
+    match pos {
+        Some(idx) => all.get(idx + 1..).unwrap_or(&[]).to_vec(),
+        None => all.to_vec(),
+    }
 }
