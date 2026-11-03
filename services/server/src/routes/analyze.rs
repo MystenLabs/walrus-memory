@@ -340,6 +340,25 @@ fn redact_token_secrets(input: &str, count: &mut usize) -> String {
     out
 }
 
+#[inline]
+fn is_screening_whitespace(ch: char) -> bool {
+    ch.is_whitespace() || ch == '\u{FEFF}'
+}
+
+#[inline]
+fn skip_screening_whitespace(input: &str, mut p: usize) -> usize {
+    while p < input.len() {
+        if let Some(ch) = input[p..].chars().next() {
+            if is_screening_whitespace(ch) {
+                p += ch.len_utf8();
+                continue;
+            }
+        }
+        break;
+    }
+    p
+}
+
 fn redact_credential_assignments(input: &str, count: &mut usize) -> String {
     const KEYWORDS: &[&str] = &[
         "db_passwords",
@@ -459,16 +478,12 @@ fn redact_credential_assignments(input: &str, count: &mut usize) -> String {
             if p < bytes.len() && matches!(bytes[p], b'"' | b'\'' | b'`') {
                 p += 1;
             }
-            while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                p += 1;
-            }
+            p = skip_screening_whitespace(input, p);
             if p >= bytes.len() || (bytes[p] != b':' && bytes[p] != b'=') {
                 continue;
             }
             p += 1;
-            while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                p += 1;
-            }
+            p = skip_screening_whitespace(input, p);
             if p >= bytes.len() {
                 continue;
             }
@@ -491,7 +506,7 @@ fn redact_credential_assignments(input: &str, count: &mut usize) -> String {
             } else {
                 input[p..]
                     .chars()
-                    .take_while(|&ch| !ch.is_whitespace() && ch != ',' && ch != ';')
+                    .take_while(|&ch| !is_screening_whitespace(ch) && ch != ',' && ch != ';')
                     .map(char::len_utf8)
                     .sum()
             };
@@ -545,14 +560,10 @@ fn redact_auth_and_cookie_headers(input: &str, count: &mut usize) -> String {
 
             if let Some(h_len) = header_match {
                 let mut p = i + h_len;
-                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                    p += 1;
-                }
+                p = skip_screening_whitespace(input, p);
                 if p < bytes.len() && (bytes[p] == b':' || bytes[p] == b'=') {
                     p += 1;
-                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                        p += 1;
-                    }
+                    p = skip_screening_whitespace(input, p);
                     let p_sep = p;
                     let after_sep = &bytes[p..];
                     let prefix_len = if after_sep
@@ -584,14 +595,13 @@ fn redact_auth_and_cookie_headers(input: &str, count: &mut usize) -> String {
                     };
                     if let Some(plen) = prefix_len {
                         p += plen;
-                        while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                            p += 1;
-                        }
+                        p = skip_screening_whitespace(input, p);
                     }
-                    let val_len = bytes[p..]
-                        .iter()
-                        .take_while(|&&b| !b.is_ascii_whitespace())
-                        .count();
+                    let val_len = input[p..]
+                        .chars()
+                        .take_while(|&ch| !is_screening_whitespace(ch))
+                        .map(char::len_utf8)
+                        .sum::<usize>();
                     if val_len > 0 || prefix_len.is_some() {
                         out.push_str(&input[i..p_sep]);
                         out.push_str("[redacted:auth-header]");
@@ -619,39 +629,28 @@ fn redact_auth_and_cookie_headers(input: &str, count: &mut usize) -> String {
             };
             if let Some(c_len) = cookie_match {
                 let mut p = i + c_len;
-                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                    p += 1;
-                }
+                p = skip_screening_whitespace(input, p);
                 if p < bytes.len() && (bytes[p] == b':' || bytes[p] == b'=') {
                     p += 1;
-                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                        p += 1;
-                    }
+                    p = skip_screening_whitespace(input, p);
                     let mut cp = p;
-                    let first_pair = bytes[cp..]
-                        .iter()
-                        .take_while(|&&b| !b.is_ascii_whitespace() && b != b';')
-                        .count();
+                    let first_pair = input[cp..]
+                        .chars()
+                        .take_while(|&ch| !is_screening_whitespace(ch) && ch != ';')
+                        .map(char::len_utf8)
+                        .sum::<usize>();
                     if first_pair > 0 {
                         cp += first_pair;
                         loop {
-                            let mut look = cp;
-                            while look < bytes.len()
-                                && (bytes[look] == b' ' || bytes[look] == b'\t')
-                            {
-                                look += 1;
-                            }
+                            let mut look = skip_screening_whitespace(input, cp);
                             if look < bytes.len() && bytes[look] == b';' {
                                 look += 1;
-                                while look < bytes.len()
-                                    && (bytes[look] == b' ' || bytes[look] == b'\t')
-                                {
-                                    look += 1;
-                                }
-                                let next_pair = bytes[look..]
-                                    .iter()
-                                    .take_while(|&&b| !b.is_ascii_whitespace() && b != b';')
-                                    .count();
+                                look = skip_screening_whitespace(input, look);
+                                let next_pair = input[look..]
+                                    .chars()
+                                    .take_while(|&ch| !is_screening_whitespace(ch) && ch != ';')
+                                    .map(char::len_utf8)
+                                    .sum::<usize>();
                                 if next_pair > 0 {
                                     cp = look + next_pair;
                                     continue;
@@ -768,9 +767,9 @@ fn redact_seed_phrase(input: &str, count: &mut usize) -> String {
                         if word_count == 24 {
                             break;
                         }
-                        let sep_spaces = take_while_len(&bytes[wp..], |b| b == b' ' || b == b'\t');
-                        if sep_spaces > 0 {
-                            wp += sep_spaces;
+                        let skipped = skip_screening_whitespace(input, wp);
+                        if skipped > wp {
+                            wp = skipped;
                         } else {
                             break;
                         }
@@ -2428,8 +2427,25 @@ mod tests {
         assert!(screened_assign.contains("POSTGRES_PASSWORD=[redacted:credential-assignment]"));
         assert!(screened_assign.contains("User staging DB password is"));
 
+        // Multiline and Unicode whitespace around separators (#435 review finding from @ducnmm).
+        let multiline_assign =
+            "User staging DB password is POSTGRES_PASSWORD=\nhunter2 for local testing";
+        let screened_multiline =
+            screen_fact_text(multiline_assign).expect("multiline assignment fact should survive");
+        assert!(!screened_multiline.contains("hunter2"));
+        assert!(screened_multiline.contains("POSTGRES_PASSWORD=\n[redacted:credential-assignment]"));
+
+        let nbsp_assign =
+            "User staging DB password is POSTGRES_PASSWORD=\u{00A0}hunter2 for local testing";
+        let screened_nbsp =
+            screen_fact_text(nbsp_assign).expect("nbsp assignment fact should survive");
+        assert!(!screened_nbsp.contains("hunter2"));
+        assert!(screened_nbsp.contains("POSTGRES_PASSWORD=\u{00A0}[redacted:credential-assignment]"));
+
         // Bare credential assignment with no surrounding fact is dropped.
         assert_eq!(screen_fact_text("POSTGRES_PASSWORD=hunter2"), None);
+        assert_eq!(screen_fact_text("POSTGRES_PASSWORD=\nhunter2"), None);
+        assert_eq!(screen_fact_text("POSTGRES_PASSWORD=\u{00A0}hunter2"), None);
         assert_eq!(screen_fact_text("api_key = secret1234567890"), None);
 
         // Auth header is redacted.
@@ -2438,6 +2454,18 @@ mod tests {
         let screened_auth = screen_fact_text(auth_fact).expect("auth header fact should survive");
         assert!(!screened_auth.contains("token1234567890"));
         assert!(screened_auth.contains("Authorization: [redacted:auth-header]"));
+
+        let multiline_auth = "User tests endpoint using Authorization:\nBearer hunter2 on dev host";
+        let screened_ml_auth =
+            screen_fact_text(multiline_auth).expect("multiline auth header should survive");
+        assert!(!screened_ml_auth.contains("hunter2"));
+        assert!(screened_ml_auth.contains("Authorization:\n[redacted:auth-header]"));
+
+        let nbsp_auth = "User tests endpoint using Authorization:\u{00A0}Bearer hunter2 on dev host";
+        let screened_nbsp_auth =
+            screen_fact_text(nbsp_auth).expect("nbsp auth header should survive");
+        assert!(!screened_nbsp_auth.contains("hunter2"));
+        assert!(screened_nbsp_auth.contains("Authorization:\u{00A0}[redacted:auth-header]"));
 
         // Seed phrase is redacted.
         let seed_fact = "User wallet seed phrase is apple banana cherry date dog elephant fish goat horse island jungle kite on ledger";
