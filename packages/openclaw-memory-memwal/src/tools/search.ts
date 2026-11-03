@@ -26,13 +26,15 @@ export function registerSearchTool(api: any, client: MemWal, config: PluginConfi
         "The search is pinned to the calling agent's namespace. " +
         "When <memwal-memories> is already injected in the prompt context by auto-recall, " +
         "use those recalled memories directly and avoid calling memory_search with the same query. " +
-        "Call memory_search at most once per turn with a specific, focused query only when " +
-        "the conversation shifts to a topic not covered by <memwal-memories> or when auto-recall is disabled.",
+        "Call memory_search at most once per turn with a specific, focused query when " +
+        "auto-recall is disabled, when no <memwal-memories> block was injected, " +
+        "when the conversation shifts to a topic not covered by <memwal-memories>, " +
+        "or when specific details are missing from the recalled entries.",
       parameters: Type.Object({
         query: Type.String({
           description:
             "Specific, focused search query. When <memwal-memories> is already injected in the prompt context, " +
-            "use recalled memories directly and query only for topics not covered by them.",
+            "use recalled memories directly and query only when specific details are missing or for topics not covered by them.",
         }),
         limit: Type.Optional(
           Type.Number({ description: "Max results (default: 5)" }),

@@ -280,6 +280,14 @@ test("registerSearchTool guides the agent against redundant search when memwal m
     searchTool.parameters.properties.query.description.includes("<memwal-memories>"),
     "query parameter description should guide against redundant search"
   );
+  assert.ok(
+    searchTool.description.includes("specific details are missing"),
+    "description should allow searching when specific details are missing"
+  );
+  assert.ok(
+    searchTool.parameters.properties.query.description.includes("specific details are missing"),
+    "query description should allow searching when specific details are missing"
+  );
 });
 
 test("escapeForPrompt escapes every injection-relevant character", () => {
