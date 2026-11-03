@@ -186,9 +186,8 @@ function isValidIdentity(candidate: unknown): candidate is string {
 }
 
 /**
- * Sanitize a namespace segment by trimming and replacing characters outside
- * [A-Za-z0-9._-] with underscore, collapsing consecutive underscores,
- * stripping leading and trailing underscores, and bounding to 64 characters.
+ * Sanitize a raw sender or session identifier for safe inclusion in a namespace segment.
+ * Preserves uniqueness by appending a collision-resistant hash of the original raw identity.
  */
 export function sanitizeNamespaceSegment(raw: string): string {
   if (typeof raw !== "string") return "";
@@ -197,7 +196,11 @@ export function sanitizeNamespaceSegment(raw: string): string {
   const replaced = trimmed.replace(/[^A-Za-z0-9._-]+/g, "_");
   const collapsed = replaced.replace(/_+/g, "_");
   const stripped = collapsed.replace(/^_+|_+$/g, "");
-  return stripped.slice(0, 64).replace(/^_+|_+$/g, "");
+  if (!stripped) return "";
+
+  const hash = createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 12);
+  const prefix = stripped.slice(0, 48).replace(/^_+|_+$/g, "");
+  return prefix ? `${prefix}_${hash}` : hash;
 }
 
 /**
@@ -253,14 +256,14 @@ export function extractSessionId(
   if (ctx?.sessionKey && typeof ctx.sessionKey === "string") {
     const parts = ctx.sessionKey.split(":");
     if (parts.length >= 3) {
-      const segment = parts[2]?.trim();
+      const remaining = parts.slice(2).join(":").trim();
       if (
-        segment &&
-        isValidIdentity(segment) &&
-        segment.toLowerCase() !== "main" &&
-        segment.toLowerCase() !== "default"
+        remaining &&
+        isValidIdentity(remaining) &&
+        remaining.toLowerCase() !== "main" &&
+        remaining.toLowerCase() !== "default"
       ) {
-        return segment;
+        return remaining;
       }
     }
   }

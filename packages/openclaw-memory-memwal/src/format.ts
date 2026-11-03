@@ -119,6 +119,9 @@ export interface ExtractedMessage {
   text: string;
   key: string;
   occurredAt?: Date;
+  senderId?: string;
+  userId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -163,7 +166,25 @@ export function extractMessages(
         parseMessageTimestamp(msg.created_at) ??
         parseMessageTimestamp(msg.timestamp) ??
         parseMessageTimestamp(msg.date);
-      extracted.push({ role: msg.role, text, key, occurredAt });
+      const senderId =
+        typeof msg.senderId === "string" && msg.senderId.trim().length > 0
+          ? msg.senderId.trim()
+          : typeof msg.authorId === "string" && msg.authorId.trim().length > 0
+            ? msg.authorId.trim()
+            : typeof msg.author === "string" && msg.author.trim().length > 0
+              ? msg.author.trim()
+              : typeof msg.from === "string" && msg.from.trim().length > 0
+                ? msg.from.trim()
+                : undefined;
+      const userId =
+        typeof msg.userId === "string" && msg.userId.trim().length > 0
+          ? msg.userId.trim()
+          : undefined;
+      const metadata =
+        msg.metadata && typeof msg.metadata === "object"
+          ? (msg.metadata as Record<string, unknown>)
+          : undefined;
+      extracted.push({ role: msg.role, text, key, occurredAt, senderId, userId, metadata });
     }
   }
   return extracted;

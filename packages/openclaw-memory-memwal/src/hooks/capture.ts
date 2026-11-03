@@ -7,7 +7,7 @@
  */
 
 import type { MemWal } from "@mysten-incubation/memwal";
-import { resolveScopedAgent } from "../config.js";
+import { resolveScopedAgent, extractSenderId } from "../config.js";
 import { shouldCapture } from "../capture.js";
 import {
   extractMessages,
@@ -130,6 +130,62 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
 
       if (!extracted.length) return;
 
+      let attributed = extracted;
+      if (scoped.isolationMode === "sender") {
+        const currentSender = extractSenderId(ctx, event);
+        if (!currentSender) {
+          api.logger.debug?.("memory-memwal: auto-capture skipped: missing current sender in sender isolation mode");
+          return;
+        }
+
+        const hasForeignSender = extracted.some((m) => {
+          if (m.role !== "user") return false;
+          const s = extractSenderId(undefined, {
+            senderId: m.senderId,
+            userId: m.userId,
+            metadata: m.metadata,
+          });
+          return Boolean(s && s !== currentSender);
+        });
+
+        const isGroup =
+          Boolean(ctx?.sessionKey && /:(group|channel|room):/i.test(ctx.sessionKey)) ||
+          hasForeignSender;
+
+        const filtered: ExtractedMessage[] = [];
+        let prevUserBelongsToSender = false;
+
+        for (const msg of extracted) {
+          if (msg.role === "user") {
+            const msgSender = extractSenderId(undefined, {
+              senderId: msg.senderId,
+              userId: msg.userId,
+              metadata: msg.metadata,
+            });
+            if (msgSender) {
+              if (msgSender === currentSender) {
+                prevUserBelongsToSender = true;
+                filtered.push(msg);
+              } else {
+                prevUserBelongsToSender = false;
+              }
+            } else if (!isGroup) {
+              prevUserBelongsToSender = true;
+              filtered.push(msg);
+            } else {
+              prevUserBelongsToSender = false;
+            }
+          } else if (msg.role === "assistant") {
+            if (prevUserBelongsToSender) {
+              filtered.push(msg);
+            }
+          }
+        }
+        attributed = filtered;
+      }
+
+      if (!attributed.length) return;
+
       const eventTimestamp =
         parseMessageTimestamp(event.occurredAt) ??
         parseMessageTimestamp(event.createdAt) ??
@@ -140,7 +196,7 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       // before filtering or network calls, so any later retry after midnight
       // still anchors to when the message was created rather than hook retry time.
       const now = new Date();
-      for (const msg of extracted) {
+      for (const msg of attributed) {
         if (!state.firstSeenAt.has(msg.key)) {
           rememberBoundedKey(
             state.firstSeenAt,
@@ -152,11 +208,11 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
 
       // Filter individual messages for capturable content and skip messages
       // already captured on an earlier turn (GH #1106).
-      const capturable = extracted.filter((m) => shouldCapture(m.text));
+      const capturable = attributed.filter((m) => shouldCapture(m.text));
       if (!capturable.length) {
         api.logger.debug?.(
           `memory-memwal: auto-capture skipped: no capturable content ` +
-          `(agent: ${agentId}, ${extracted.length} messages checked)`,
+          `(agent: ${agentId}, ${attributed.length} messages checked)`,
         );
         return;
       }

@@ -5,19 +5,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  parseConfig,
   sanitizeNamespaceSegment,
   extractSenderId,
   extractSessionId,
   resolveScopedAgent,
   resolveScopedToolNamespace,
 } from "../dist/config.js";
-import { registerHooks } from "../dist/hooks/index.js";
 import { registerRecallHook } from "../dist/hooks/recall.js";
 import { registerCaptureHook } from "../dist/hooks/capture.js";
 import { registerTools } from "../dist/tools/index.js";
-import { registerSearchTool } from "../dist/tools/search.js";
-import { registerStoreTool } from "../dist/tools/store.js";
 
 function makeApi(ctx) {
   const hooks = {};
@@ -58,18 +54,25 @@ const BASE_CONFIG = {
   requestTimeoutMs: 5000,
 };
 
-test("sanitizeNamespaceSegment sanitizes, collapses underscores, and bounds length", () => {
-  assert.equal(sanitizeNamespaceSegment("alice"), "alice");
-  assert.equal(sanitizeNamespaceSegment("  alice.smith  "), "alice.smith");
-  assert.equal(sanitizeNamespaceSegment("user@domain.com"), "user_domain.com");
-  assert.equal(sanitizeNamespaceSegment("___test___user___"), "test_user");
+test("sanitizeNamespaceSegment sanitizes, preserves collision resistance with hash, and fails closed", () => {
+  assert.ok(sanitizeNamespaceSegment("alice").startsWith("alice_"));
+  assert.ok(sanitizeNamespaceSegment("  alice.smith  ").startsWith("alice.smith_"));
   assert.equal(sanitizeNamespaceSegment("!@#$%^&*()"), "");
   assert.equal(sanitizeNamespaceSegment(""), "");
 
-  const longRaw = "a".repeat(100);
-  const sanitizedLong = sanitizeNamespaceSegment(longRaw);
-  assert.equal(sanitizedLong.length, 64);
-  assert.equal(sanitizedLong, "a".repeat(64));
+  // Collision resistance: distinct emails/names must not collide
+  assert.notEqual(
+    sanitizeNamespaceSegment("alice@example.com"),
+    sanitizeNamespaceSegment("alice_example.com"),
+  );
+
+  // Strings sharing the first 64 characters must not collide
+  const longRawA = "a".repeat(100);
+  const longRawB = "a".repeat(64) + "b".repeat(36);
+  assert.notEqual(
+    sanitizeNamespaceSegment(longRawA),
+    sanitizeNamespaceSegment(longRawB),
+  );
 });
 
 test("extractSenderId checks priority order and rejects placeholder identities", () => {
@@ -109,6 +112,10 @@ test("extractSessionId checks event, context, and sessionKey third segment", () 
   assert.equal(
     extractSessionId({ sessionKey: "agent:support:session-999" }),
     "session-999",
+  );
+  assert.equal(
+    extractSessionId({ sessionKey: "agent:main:discord:channel:111" }),
+    "discord:channel:111",
   );
   assert.equal(
     extractSessionId({ sessionKey: "agent:main:main" }),
@@ -180,11 +187,11 @@ test("isolateBySender: true isolates two senders under the same agent", () => {
   );
 
   assert.equal(scopedAlice.isolationMode, "sender");
-  assert.equal(scopedAlice.namespace, "bot:sender:sender_alice");
+  assert.equal(scopedAlice.namespace, `bot:sender:${sanitizeNamespaceSegment("sender_alice")}`);
   assert.equal(scopedAlice.sharedNamespace, undefined);
 
   assert.equal(scopedBob.isolationMode, "sender");
-  assert.equal(scopedBob.namespace, "bot:sender:sender_bob");
+  assert.equal(scopedBob.namespace, `bot:sender:${sanitizeNamespaceSegment("sender_bob")}`);
   assert.equal(scopedBob.sharedNamespace, undefined);
 });
 
@@ -201,7 +208,7 @@ test("isolateBySender: true falls back to session ID when sender ID is missing",
     { sessionId: "sess-42" },
   );
   assert.equal(scopedSession.isolationMode, "session");
-  assert.equal(scopedSession.namespace, "default:session:sess-42");
+  assert.equal(scopedSession.namespace, `default:session:${sanitizeNamespaceSegment("sess-42")}`);
   assert.equal(scopedSession.sessionId, "sess-42");
 
   // Anonymous sender, valid sessionKey 3rd segment
@@ -210,7 +217,7 @@ test("isolateBySender: true falls back to session ID when sender ID is missing",
     { sessionKey: "agent:main:sess-fallback", senderId: "anonymous" },
   );
   assert.equal(scopedFallback.isolationMode, "session");
-  assert.equal(scopedFallback.namespace, "default:session:sess-fallback");
+  assert.equal(scopedFallback.namespace, `default:session:${sanitizeNamespaceSegment("sess-fallback")}`);
   assert.equal(scopedFallback.sessionId, "sess-fallback");
 });
 
@@ -245,7 +252,7 @@ test("includeSharedNamespaceOnRecall: true sets sharedNamespace for recall", () 
   );
 
   assert.equal(scoped.isolationMode, "sender");
-  assert.equal(scoped.namespace, "assistant:sender:alice");
+  assert.equal(scoped.namespace, `assistant:sender:${sanitizeNamespaceSegment("alice")}`);
   assert.equal(scoped.sharedNamespace, "assistant");
 });
 
@@ -307,10 +314,11 @@ test("auto-recall merges shared namespace memories keeping sender memories first
     },
   };
 
+  const aliceMainNs = `main:sender:${sanitizeNamespaceSegment("alice")}`;
   const mockClient = {
     recall: async (_prompt, _limit, namespace) => {
       queriedNamespaces.push(namespace);
-      if (namespace === "main:sender:alice") {
+      if (namespace === aliceMainNs) {
         return {
           results: [
             { id: "mem-sender-1", text: "Alice personal preference", distance: 0.1 },
@@ -344,7 +352,7 @@ test("auto-recall merges shared namespace memories keeping sender memories first
     { sessionKey: "agent:main:session-10", senderId: "alice" },
   );
 
-  assert.ok(queriedNamespaces.includes("main:sender:alice"));
+  assert.ok(queriedNamespaces.includes(aliceMainNs));
   assert.ok(queriedNamespaces.includes("main"));
 
   // Sender preference is placed before shared memories
@@ -437,9 +445,58 @@ test("auto-capture includes session_id provenance prefix in conversation text", 
     { sessionKey: "agent:main:sess-1234", senderId: "alice" },
   );
 
-  assert.equal(capturedNamespace, "default:sender:alice");
+  assert.equal(capturedNamespace, `default:sender:${sanitizeNamespaceSegment("alice")}`);
   assert.ok(capturedText.startsWith("[session_id: sess-1234]\n\n"));
   assert.ok(capturedText.includes("We chose Redis for caching layer"));
+});
+
+test("auto-capture attributes historical messages by trusted sender in multi-sender session", async () => {
+  let capturedText = "";
+  let capturedNamespace = "";
+  const mockApi = {
+    on: (event, handler) => {
+      if (event === "agent_end") mockApi.handler = handler;
+    },
+    logger: {
+      warn: () => {},
+      info: () => {},
+      debug: () => {},
+    },
+  };
+  const mockClient = {
+    analyze: async (text, opts) => {
+      capturedText = text;
+      capturedNamespace = opts.namespace;
+      return { facts: [{ id: "f1", text: "captured fact" }] };
+    },
+  };
+
+  const config = {
+    ...BASE_CONFIG,
+    isolateBySender: true,
+  };
+
+  registerCaptureHook(mockApi, mockClient, config);
+
+  await mockApi.handler(
+    {
+      success: true,
+      messages: [
+        { role: "user", content: "Alice says: my secret project is Project Alpha", senderId: "alice" },
+        { role: "assistant", content: "Understood, Alice. Project Alpha noted." },
+        { role: "user", content: "Bob says: my favorite language is Rust", senderId: "bob" },
+        { role: "assistant", content: "Great to know, Bob! Rust is fast." },
+      ],
+    },
+    { sessionKey: "agent:main:group:room-1", senderId: "bob" },
+  );
+
+  const bobNs = `default:sender:${sanitizeNamespaceSegment("bob")}`;
+  assert.equal(capturedNamespace, bobNs);
+  assert.ok(capturedText.includes("Bob says: my favorite language is Rust"));
+  assert.ok(capturedText.includes("Great to know, Bob! Rust is fast."));
+  assert.ok(!capturedText.includes("Alice says: my secret project is Project Alpha"));
+  assert.ok(!capturedText.includes("Understood, Alice. Project Alpha noted."));
 });
 
 test("memory_search blocks cross-sender namespace access", async () => {
@@ -457,13 +514,16 @@ test("memory_search blocks cross-sender namespace access", async () => {
     includeSharedNamespaceOnRecall: true,
   };
 
+  const aliceNs = `default:sender:${sanitizeNamespaceSegment("alice")}`;
+  const bobNs = `default:sender:${sanitizeNamespaceSegment("bob")}`;
+
   const h = makeApi({ sessionKey: "agent:main:sess-1", senderId: "alice" });
   registerTools(h.api, client, config);
 
   // 1. Omitting namespace defaults to caller's sender sub-namespace
   const ownSearch = await h.tools.memory_search.execute("s1", { query: "pref" });
-  assert.equal(ownSearch.details.namespace, "default:sender:alice");
-  assert.deepEqual(calls, [["recall", "default:sender:alice"]]);
+  assert.equal(ownSearch.details.namespace, aliceNs);
+  assert.deepEqual(calls, [["recall", aliceNs]]);
 
   // 2. Querying shared namespace is allowed when includeSharedNamespaceOnRecall: true
   calls.length = 0;
@@ -478,7 +538,7 @@ test("memory_search blocks cross-sender namespace access", async () => {
   calls.length = 0;
   const crossSearch = await h.tools.memory_search.execute("s3", {
     query: "secret",
-    namespace: "default:sender:bob",
+    namespace: bobNs,
   });
   assert.equal(crossSearch.details.error, "cross_sender_namespace_forbidden");
   assert.equal(crossSearch.error, "cross_sender_namespace_forbidden");
@@ -508,6 +568,9 @@ test("memory_store blocks cross-sender namespace writes and maps default to send
     includeSharedNamespaceOnRecall: true,
   };
 
+  const aliceNs = `default:sender:${sanitizeNamespaceSegment("alice")}`;
+  const bobNs = `default:sender:${sanitizeNamespaceSegment("bob")}`;
+
   const h = makeApi({ sessionKey: "agent:main:sess-alpha", senderId: "alice" });
   registerTools(h.api, client, config);
 
@@ -515,9 +578,9 @@ test("memory_store blocks cross-sender namespace writes and maps default to send
   const ownStore = await h.tools.memory_store.execute("st1", {
     text: "Alice prefers daily standups at 9am UTC",
   });
-  assert.equal(ownStore.details.namespace, "default:sender:alice");
+  assert.equal(ownStore.details.namespace, aliceNs);
   assert.equal(ownStore.details.sessionId, "sess-alpha");
-  assert.equal(calls[0][1], "default:sender:alice");
+  assert.equal(calls[0][1], aliceNs);
 
   // 2. Passing the base namespace by habit maps to caller's sender namespace (never writes to shared)
   calls.length = 0;
@@ -525,14 +588,14 @@ test("memory_store blocks cross-sender namespace writes and maps default to send
     text: "Alice notes our team launch deadline is Friday",
     namespace: "default",
   });
-  assert.equal(habitStore.details.namespace, "default:sender:alice");
-  assert.equal(calls[0][1], "default:sender:alice");
+  assert.equal(habitStore.details.namespace, aliceNs);
+  assert.equal(calls[0][1], aliceNs);
 
   // 3. Storing into another sender's namespace is blocked
   calls.length = 0;
   const crossStore = await h.tools.memory_store.execute("st3", {
     text: "Malicious injection into Bob's namespace",
-    namespace: "default:sender:bob",
+    namespace: bobNs,
   });
   assert.equal(crossStore.details.error, "cross_sender_namespace_forbidden");
   assert.equal(crossStore.error, "cross_sender_namespace_forbidden");
