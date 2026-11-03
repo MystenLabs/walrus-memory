@@ -23,4 +23,41 @@ export interface PluginConfig {
   captureMaxMessages: number;
   /** Per-request deadline in ms for every relayer call. */
   requestTimeoutMs: number;
+  /** Isolate memories by sender or user sub-namespace (default: false). */
+  isolateBySender: boolean;
+  /** Include base shared namespace memories when recalling in isolated mode (default: false). */
+  includeSharedNamespaceOnRecall: boolean;
+}
+
+export interface PluginHookContext {
+  sessionKey?: string;
+  senderId?: string;
+  userId?: string;
+  from?: string;
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface AgentStartEvent {
+  prompt?: string;
+  senderId?: string;
+  userId?: string;
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface AgentEndEvent {
+  success?: boolean;
+  messages?: unknown[];
+  senderId?: string;
+  userId?: string;
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+  occurredAt?: unknown;
+  createdAt?: unknown;
+  created_at?: unknown;
+  timestamp?: unknown;
+  [key: string]: unknown;
 }

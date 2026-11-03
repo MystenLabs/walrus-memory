@@ -1,5 +1,5 @@
 /**
- * Auto-capture hook — agent_end.
+ * Auto-capture hook: agent_end.
  *
  * After the LLM finishes a turn, extracts conversation text, filters
  * for capturable content, and sends to Walrus Memory's analyze() endpoint
@@ -7,7 +7,7 @@
  */
 
 import type { MemWal } from "@mysten-incubation/memwal";
-import { resolveAgent } from "../config.js";
+import { resolveScopedAgent } from "../config.js";
 import { shouldCapture } from "../capture.js";
 import {
   extractMessages,
@@ -23,11 +23,11 @@ const MAX_TRACKED_SCOPES = 1_000;
 const SCOPE_IDLE_TTL_MS = 30 * 60_000;
 
 interface ScopeCaptureState {
-  /** Message keys already sent to a successful `analyze()` call. */
+  /** Message keys already sent to a successful analyze() call. */
   capturedKeys: Set<string>;
-  /** Creation / first-seen timestamp per message key so retries across midnight keep their original date. */
+  /** Creation or first-seen timestamp per message key so retries across midnight keep their original date. */
   firstSeenAt: Map<string, Date>;
-  /** Currently running `analyze()` promise for this scope, if any. */
+  /** Currently running analyze() promise for this scope, if any. */
   inFlight: Promise<unknown> | null;
   /** Protect the whole hook, including retry delays between analyze calls. */
   activeHook: boolean;
@@ -101,19 +101,27 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
   api.on("agent_end", async (event: any, ctx: any) => {
     if (!event.success || !event.messages?.length) return;
 
-    const { namespace, agentName } = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
+    const scoped = resolveScopedAgent(config, ctx, event);
+    if (scoped.isolationMode === "missing_identity" || !scoped.namespace) {
+      api.logger.warn(
+        "memwal: skipping auto-capture because isolateBySender is enabled and no sender or session identity was provided",
+      );
+      return;
+    }
+
+    const { namespace, agentId, sessionId } = scoped;
     const scopeKey = `${namespace}\0${ctx?.sessionKey ?? ""}`;
     const state = getScopeState(scopeKey);
     if (!state) {
-      api.logger.debug?.("memory-memwal: auto-capture skipped — capture scopes are busy");
+      api.logger.debug?.("memory-memwal: auto-capture skipped: capture scopes are busy");
       return;
     }
     if (state.activeHook) return;
     state.activeHook = true;
 
     try {
-      // Extract both user and assistant messages — the server LLM on analyze()
-      // decides what's worth keeping. Assistant messages can contain user
+      // Extract both user and assistant messages: the server LLM on analyze()
+      // decides what is worth keeping. Assistant messages can contain user
       // commitments, decisions, and summaries that are valuable as memories.
       const extracted = extractMessages(
         event.messages,
@@ -128,7 +136,7 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
         parseMessageTimestamp(event.created_at) ??
         parseMessageTimestamp(event.timestamp);
 
-      // Record creation / first-seen timestamp for every message in the window
+      // Record creation or first-seen timestamp for every message in the window
       // before filtering or network calls, so any later retry after midnight
       // still anchors to when the message was created rather than hook retry time.
       const now = new Date();
@@ -147,8 +155,8 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       const capturable = extracted.filter((m) => shouldCapture(m.text));
       if (!capturable.length) {
         api.logger.debug?.(
-          `memory-memwal: auto-capture skipped — no capturable content ` +
-          `(agent: ${agentName}, ${extracted.length} messages checked)`,
+          `memory-memwal: auto-capture skipped: no capturable content ` +
+          `(agent: ${agentId}, ${extracted.length} messages checked)`,
         );
         return;
       }
@@ -156,8 +164,8 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       const uncaptured = capturable.filter((m) => !state.capturedKeys.has(m.key));
       if (!uncaptured.length) {
         api.logger.debug?.(
-          `memory-memwal: auto-capture skipped — all ${capturable.length} capturable messages already captured ` +
-          `(agent: ${agentName}, namespace: ${namespace})`,
+          `memory-memwal: auto-capture skipped: all ${capturable.length} capturable messages already captured ` +
+          `(agent: ${agentId}, namespace: ${namespace})`,
         );
         return;
       }
@@ -166,8 +174,8 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       // extraction is still running on the server after a timeout (GH #1095).
       if (state.inFlight) {
         api.logger.debug?.(
-          `memory-memwal: auto-capture skipped — previous analyze() still in flight ` +
-          `(agent: ${agentName}, namespace: ${namespace})`,
+          `memory-memwal: auto-capture skipped: previous analyze() still in flight ` +
+          `(agent: ${agentId}, namespace: ${namespace})`,
         );
         return;
       }
@@ -190,9 +198,13 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       for (const batch of batches.values()) {
         // Numbered list helps the server LLM distinguish separate messages
         // during fact extraction (vs one big wall of text)
-        const conversation = batch.items
+        const conversationBody = batch.items
           .map((m, i) => `${i + 1}. ${m.text}`)
           .join("\n\n");
+
+        const conversation = sessionId
+          ? `[session_id: ${sessionId}]\n\n${conversationBody}`
+          : conversationBody;
 
         const result = await withRetry(() =>
           withTimeout(
@@ -227,7 +239,7 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       if (totalFacts > 0) {
         api.logger.info(
           `memory-memwal: auto-captured ${totalFacts} facts ` +
-          `(agent: ${agentName}, namespace: ${namespace})`,
+          `(agent: ${agentId}, namespace: ${namespace})`,
         );
       }
     } catch (err) {

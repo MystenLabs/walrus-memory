@@ -60,6 +60,14 @@
         "minimum": 1000,
         "maximum": 60000,
         "description": "Per-request deadline for relayer calls (default: 10000)"
+      },
+      "isolateBySender": {
+        "type": "boolean",
+        "description": "Isolate memories by sender or user sub-namespace (default: false)"
+      },
+      "includeSharedNamespaceOnRecall": {
+        "type": "boolean",
+        "description": "Include shared agent namespace memories when recalling in isolated mode (default: false)"
       }
     }
   },
@@ -106,6 +114,16 @@
     "captureMaxMessages": {
       "label": "Capture Window",
       "placeholder": "10",
+      "advanced": true
+    },
+    "isolateBySender": {
+      "label": "Isolate By Sender",
+      "help": "Partition memories by sender or user ID into sub-namespaces",
+      "advanced": true
+    },
+    "includeSharedNamespaceOnRecall": {
+      "label": "Include Shared Namespace On Recall",
+      "help": "Recall from both sender sub-namespace and base agent namespace",
       "advanced": true
     }
   }

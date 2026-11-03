@@ -4,7 +4,7 @@
 
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { PluginConfig } from "./types.js";
+import type { PluginConfig, PluginHookContext } from "./types.js";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "./constants.js";
 
 // ============================================================================
@@ -33,6 +33,8 @@ const ConfigSchema = z.object({
   minRelevance: z.number().min(0).max(1).default(0.3),
   captureMaxMessages: z.number().min(1).max(50).default(10),
   requestTimeoutMs: z.number().min(1000).max(60000).default(DEFAULT_REQUEST_TIMEOUT_MS),
+  isolateBySender: z.boolean().default(false),
+  includeSharedNamespaceOnRecall: z.boolean().default(false),
 });
 
 // ============================================================================
@@ -77,7 +79,7 @@ export function parseConfig(raw: unknown): PluginConfig {
 }
 
 // ============================================================================
-// Agent + Namespace Resolution
+// Agent and Namespace Resolution
 // ============================================================================
 
 export interface ResolvedAgent {
@@ -161,4 +163,233 @@ export function resolveToolNamespace(
 
 export function keyPreview(key: string): string {
   return key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : "****";
+}
+
+// ============================================================================
+// Multi-user and Sender Sub-Namespace Isolation
+// ============================================================================
+
+const INVALID_IDENTITY_STRINGS = new Set([
+  "anonymous",
+  "unknown",
+  "undefined",
+  "null",
+  "none",
+]);
+
+function isValidIdentity(candidate: unknown): candidate is string {
+  if (typeof candidate !== "string") return false;
+  const trimmed = candidate.trim();
+  if (!trimmed) return false;
+  if (INVALID_IDENTITY_STRINGS.has(trimmed.toLowerCase())) return false;
+  return true;
+}
+
+/**
+ * Sanitize a namespace segment by trimming and replacing characters outside
+ * [A-Za-z0-9._-] with underscore, collapsing consecutive underscores,
+ * stripping leading and trailing underscores, and bounding to 64 characters.
+ */
+export function sanitizeNamespaceSegment(raw: string): string {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const replaced = trimmed.replace(/[^A-Za-z0-9._-]+/g, "_");
+  const collapsed = replaced.replace(/_+/g, "_");
+  const stripped = collapsed.replace(/^_+|_+$/g, "");
+  return stripped.slice(0, 64).replace(/^_+|_+$/g, "");
+}
+
+/**
+ * Extract sender identifier from hook context or event.
+ * Checks event.senderId, ctx.senderId, event.userId, ctx.userId, ctx.from,
+ * and metadata fields in order, ignoring placeholder and whitespace values.
+ */
+export function extractSenderId(
+  ctx?: PluginHookContext,
+  event?: { senderId?: string; userId?: string; metadata?: Record<string, unknown> },
+): string | undefined {
+  const candidates: unknown[] = [
+    event?.senderId,
+    ctx?.senderId,
+    event?.userId,
+    ctx?.userId,
+    ctx?.from,
+    event?.metadata?.senderId,
+    ctx?.metadata?.senderId,
+    event?.metadata?.userId,
+    ctx?.metadata?.userId,
+  ];
+
+  for (const candidate of candidates) {
+    if (isValidIdentity(candidate)) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extract session identifier from hook context, event, or the third segment
+ * of ctx.sessionKey (agent:<agentId>:<sessionSegment>).
+ */
+export function extractSessionId(
+  ctx?: PluginHookContext,
+  event?: { sessionId?: string; metadata?: Record<string, unknown> },
+): string | undefined {
+  const candidates: unknown[] = [
+    event?.sessionId,
+    ctx?.sessionId,
+    event?.metadata?.sessionId,
+    ctx?.metadata?.sessionId,
+  ];
+
+  for (const candidate of candidates) {
+    if (isValidIdentity(candidate)) {
+      return candidate.trim();
+    }
+  }
+
+  if (ctx?.sessionKey && typeof ctx.sessionKey === "string") {
+    const parts = ctx.sessionKey.split(":");
+    if (parts.length >= 3) {
+      const segment = parts[2]?.trim();
+      if (
+        segment &&
+        isValidIdentity(segment) &&
+        segment.toLowerCase() !== "main" &&
+        segment.toLowerCase() !== "default"
+      ) {
+        return segment;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export interface ScopedAgentResult {
+  agentId: string;
+  namespace?: string;
+  sharedNamespace?: string;
+  sessionId?: string;
+  isolationMode: "disabled" | "sender" | "session" | "missing_identity";
+}
+
+/**
+ * Resolve scoped agent identity, namespace, and isolation mode.
+ */
+export function resolveScopedAgent(
+  config: Pick<PluginConfig, "defaultNamespace" | "isolateBySender" | "includeSharedNamespaceOnRecall">,
+  ctx?: PluginHookContext,
+  event?: { senderId?: string; userId?: string; sessionId?: string; metadata?: Record<string, unknown> },
+): ScopedAgentResult {
+  const base = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
+  const sessionId = extractSessionId(ctx, event);
+
+  if (!config.isolateBySender) {
+    return {
+      agentId: base.agentName,
+      namespace: base.namespace,
+      sharedNamespace: undefined,
+      sessionId,
+      isolationMode: "disabled",
+    };
+  }
+
+  const senderId = extractSenderId(ctx, event);
+  const cleanSender = senderId ? sanitizeNamespaceSegment(senderId) : "";
+  if (cleanSender) {
+    return {
+      agentId: base.agentName,
+      namespace: `${base.namespace}:sender:${cleanSender}`,
+      sharedNamespace: config.includeSharedNamespaceOnRecall ? base.namespace : undefined,
+      sessionId,
+      isolationMode: "sender",
+    };
+  }
+
+  const cleanSession = sessionId ? sanitizeNamespaceSegment(sessionId) : "";
+  if (cleanSession) {
+    return {
+      agentId: base.agentName,
+      namespace: `${base.namespace}:session:${cleanSession}`,
+      sharedNamespace: config.includeSharedNamespaceOnRecall ? base.namespace : undefined,
+      sessionId,
+      isolationMode: "session",
+    };
+  }
+
+  return {
+    agentId: base.agentName,
+    namespace: undefined,
+    sharedNamespace: undefined,
+    sessionId: undefined,
+    isolationMode: "missing_identity",
+  };
+}
+
+export interface ScopedToolNamespaceResult {
+  namespace?: string;
+  error?: string;
+}
+
+/**
+ * Resolve tool namespace with support for sender isolation and access control.
+ */
+export function resolveScopedToolNamespace(
+  config: Pick<PluginConfig, "defaultNamespace" | "isolateBySender" | "includeSharedNamespaceOnRecall">,
+  ctx?: PluginHookContext,
+  requestedNamespace?: unknown,
+  options?: { allowSharedRecall?: boolean },
+): ScopedToolNamespaceResult {
+  if (!config.isolateBySender) {
+    const ns = resolveToolNamespace(
+      config.defaultNamespace,
+      ctx?.sessionKey,
+      requestedNamespace,
+    );
+    if (!ns) {
+      return { namespace: undefined, error: "namespace_rejected" };
+    }
+    return { namespace: ns };
+  }
+
+  const scoped = resolveScopedAgent(config, ctx);
+  if (!scoped.namespace) {
+    return { namespace: undefined, error: "sender_identity_required" };
+  }
+
+  if (requestedNamespace == null || requestedNamespace === "") {
+    return { namespace: scoped.namespace };
+  }
+
+  if (typeof requestedNamespace !== "string") {
+    return { namespace: undefined, error: "cross_sender_namespace_forbidden" };
+  }
+
+  const trimmed = requestedNamespace.trim();
+  if (!trimmed) {
+    return { namespace: scoped.namespace };
+  }
+
+  if (
+    options?.allowSharedRecall &&
+    config.includeSharedNamespaceOnRecall &&
+    scoped.sharedNamespace &&
+    trimmed === scoped.sharedNamespace
+  ) {
+    return { namespace: scoped.sharedNamespace };
+  }
+
+  const base = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
+  const isBaseNamespace =
+    trimmed === base.namespace ||
+    (base.legacyNamespace !== undefined && trimmed === base.legacyNamespace);
+
+  if (trimmed === scoped.namespace || isBaseNamespace) {
+    return { namespace: scoped.namespace };
+  }
+
+  return { namespace: undefined, error: "cross_sender_namespace_forbidden" };
 }
