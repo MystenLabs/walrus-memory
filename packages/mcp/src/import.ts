@@ -1,0 +1,635 @@
+/**
+ * Local project memory importer for Walrus Memory MCP.
+ *
+ * Scans allowlisted instruction and rule files in a project,
+ * chunks them into provenance-tagged memory candidates,
+ * screens for secrets and opt-out markers,
+ * and previews or uploads them in batches to Walrus Memory.
+ */
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { join, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { getPublicKeyAsync } from "@noble/ed25519";
+import { loadCreds } from "./auth.js";
+import { bytesToHex, hexToBytes, signMessage } from "./crypto.js";
+import { log, note } from "./logger.js";
+
+export interface ImportClient {
+    rememberBulk(items: Array<{ text: string; namespace: string }>): Promise<{
+        job_ids?: string[];
+    }>;
+    waitForRememberJobs?(
+        jobIds: string[],
+        namespaces: string[],
+        options?: { timeoutMs?: number; pollIntervalMs?: number },
+    ): Promise<{
+        results: Array<{ id: string; status: string; namespace?: string; error?: string }>;
+        total?: number;
+        succeeded?: number;
+        failed?: number;
+    }>;
+}
+
+/** Allowlisted project instruction and rule files. */
+export const ALLOWED_IMPORT_FILES = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "MEMORY.md",
+    ".cursorrules",
+    ".clinerules",
+    ".windsurfrules",
+    ".github/copilot-instructions.md",
+] as const;
+
+export type AllowedImportFile = (typeof ALLOWED_IMPORT_FILES)[number];
+
+export interface CandidateChunk {
+    file: string;
+    section: string;
+    charCount: number;
+    snippet: string;
+    text: string;
+}
+
+export interface SkippedSection {
+    file: string;
+    section: string;
+    reason: "secret_detected" | "opt_out_marker";
+    snippet: string;
+}
+
+export interface ImportOptions {
+    targetDir?: string;
+    dryRun?: boolean;
+    yes?: boolean;
+    namespace?: string;
+    maxItems?: number;
+    relayerUrl?: string;
+    key?: string;
+    accountId?: string;
+    client?: ImportClient;
+    print?: (msg: string) => void;
+}
+
+export interface ImportPreviewResult {
+    mode: "preview";
+    discoveredFiles: string[];
+    candidates: CandidateChunk[];
+    skipped: SkippedSection[];
+    targetDir: string;
+    namespace: string;
+}
+
+export interface ImportUploadResult {
+    mode: "uploaded";
+    discoveredFiles: string[];
+    candidates: CandidateChunk[];
+    skipped: SkippedSection[];
+    targetDir: string;
+    namespace: string;
+    accepted: number;
+    completed: number;
+    pending: number;
+    failed: number;
+    jobIds: string[];
+}
+
+export type ImportResult = ImportPreviewResult | ImportUploadResult;
+
+/** Clamp max items to valid range 1..100, defaulting to 20. */
+export function clampMaxItems(n: number | undefined): number {
+    if (n === undefined || Number.isNaN(n)) return 20;
+    if (n < 1) return 1;
+    if (n > 100) return 100;
+    return Math.floor(n);
+}
+
+/** Flatten whitespace and produce a single-line snippet up to maxLen chars. */
+export function makeSnippet(text: string, maxLen = 80): string {
+    const flattened = text.replace(/\s+/g, " ").trim();
+    if (flattened.length <= maxLen) return flattened;
+    return flattened.slice(0, maxLen);
+}
+
+const OPT_OUT_PATTERNS: RegExp[] = [
+    /<\s*private[\s>][\s\S]*?<\s*\/\s*private\s*>/i,
+    /<\s*\/?\s*private\s*>/i,
+    /\[no-memory\]/i,
+    /\bMEMWAL_IGNORE\b/,
+];
+
+const SECRET_PATTERNS: RegExp[] = [
+    // Sui private key (suiprivkey1...)
+    /suiprivkey1[0-9a-zA-Z]+/,
+    // PEM private key block
+    /-----BEGIN [A-Z0-9_\s-]+PRIVATE KEY-----/,
+    // Standard API keys: sk-..., ghp_..., github_pat_...
+    /\bsk-[0-9a-zA-Z_-]{20,}/,
+    /\bghp_[0-9a-zA-Z]{36,}/,
+    /\bgithub_pat_[0-9a-zA-Z_]{22,}/,
+    // Slack tokens
+    /\bxox[baprs]-[0-9a-zA-Z-]{10,}/,
+    // AWS access key ID
+    /\bAKIA[0-9A-Z]{16}\b/,
+    // JSON Web Token
+    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+    // .env style secret assignments
+    /(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*\S+/i,
+];
+
+/** Screen text for secrets or opt-out markers. */
+export function screenContentForSafety(text: string): {
+    safe: boolean;
+    reason?: "secret_detected" | "opt_out_marker";
+} {
+    for (const pattern of OPT_OUT_PATTERNS) {
+        if (pattern.test(text)) {
+            return { safe: false, reason: "opt_out_marker" };
+        }
+    }
+    for (const pattern of SECRET_PATTERNS) {
+        if (pattern.test(text)) {
+            return { safe: false, reason: "secret_detected" };
+        }
+    }
+    return { safe: true };
+}
+
+/** Discover allowlisted files in targetDir with path containment verification. */
+export function discoverImportFiles(targetDir: string): { realRoot: string; files: string[] } {
+    const resolvedTarget = resolve(targetDir);
+    if (!existsSync(resolvedTarget)) {
+        throw new Error(`Target directory does not exist: ${resolvedTarget}`);
+    }
+    const realRoot = realpathSync(resolvedTarget);
+    const rootStat = statSync(realRoot);
+    if (!rootStat.isDirectory()) {
+        throw new Error(`Target path is not a directory: ${realRoot}`);
+    }
+
+    const discovered: string[] = [];
+    const rootPrefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
+
+    for (const relPath of ALLOWED_IMPORT_FILES) {
+        const fullCandidatePath = join(realRoot, relPath);
+        if (!existsSync(fullCandidatePath)) {
+            continue;
+        }
+
+        try {
+            const lstat = lstatSync(fullCandidatePath);
+            if (lstat.isDirectory()) {
+                continue;
+            }
+
+            const realFile = realpathSync(fullCandidatePath);
+            if (!realFile.startsWith(rootPrefix)) {
+                log.warn("import.symlink_escape_refused", {
+                    file: relPath,
+                    target: realFile,
+                    root: realRoot,
+                });
+                continue;
+            }
+
+            const realStat = statSync(realFile);
+            if (!realStat.isFile()) {
+                continue;
+            }
+
+            discovered.push(relPath);
+        } catch {
+            continue;
+        }
+    }
+
+    return { realRoot, files: discovered };
+}
+
+interface RawSection {
+    heading: string;
+    content: string;
+}
+
+function parseSections(content: string, relPath: string): RawSection[] {
+    const lines = content.split(/\r?\n/);
+    const sections: RawSection[] = [];
+    let currentHeading = "";
+    let currentLines: string[] = [];
+
+    const headingRegex = /^#{1,3}\s+(.+)$/;
+
+    for (const line of lines) {
+        const match = line.match(headingRegex);
+        if (match) {
+            if (currentLines.length > 0 || currentHeading) {
+                const text = currentLines.join("\n").trim();
+                if (text) {
+                    sections.push({
+                        heading: currentHeading || "Overview",
+                        content: text,
+                    });
+                }
+            }
+            currentHeading = match[1].trim();
+            currentLines = [];
+        } else {
+            currentLines.push(line);
+        }
+    }
+
+    if (currentLines.length > 0 || currentHeading) {
+        const text = currentLines.join("\n").trim();
+        if (text) {
+            sections.push({
+                heading: currentHeading || "Overview",
+                content: text,
+            });
+        }
+    }
+
+    if (sections.length === 0 && content.trim()) {
+        const defaultHeading = relPath.startsWith(".") ? "Rules" : "General";
+        sections.push({
+            heading: defaultHeading,
+            content: content.trim(),
+        });
+    }
+
+    return sections;
+}
+
+function splitIntoParagraphs(text: string, maxChars = 1500): string[] {
+    const paragraphs = text
+        .split(/\n\s*\n+/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+    const chunks: string[] = [];
+    let currentChunk = "";
+
+    for (const para of paragraphs) {
+        if (!currentChunk) {
+            if (para.length > maxChars) {
+                const lines = para
+                    .split(/\n+/)
+                    .map((l) => l.trim())
+                    .filter(Boolean);
+                let lineChunk = "";
+                for (const line of lines) {
+                    if (!lineChunk) {
+                        lineChunk = line;
+                    } else if (lineChunk.length + 1 + line.length <= maxChars) {
+                        lineChunk += "\n" + line;
+                    } else {
+                        chunks.push(lineChunk);
+                        lineChunk = line;
+                    }
+                }
+                if (lineChunk) {
+                    currentChunk = lineChunk;
+                }
+            } else {
+                currentChunk = para;
+            }
+        } else if (currentChunk.length + 2 + para.length <= maxChars) {
+            currentChunk += "\n\n" + para;
+        } else {
+            chunks.push(currentChunk);
+            currentChunk = para;
+        }
+    }
+    if (currentChunk) {
+        chunks.push(currentChunk);
+    }
+    return chunks;
+}
+
+/** Extract chunks and screen for safety from file content. */
+export function extractCandidateChunks(
+    content: string,
+    relPath: string,
+): { candidates: CandidateChunk[]; skipped: SkippedSection[] } {
+    const rawSections = parseSections(content, relPath);
+    const candidates: CandidateChunk[] = [];
+    const skipped: SkippedSection[] = [];
+
+    for (const section of rawSections) {
+        const safety = screenContentForSafety(section.content);
+        if (!safety.safe) {
+            skipped.push({
+                file: relPath,
+                section: section.heading,
+                reason: safety.reason!,
+                snippet: makeSnippet(section.content),
+            });
+            continue;
+        }
+
+        const subChunks = splitIntoParagraphs(section.content, 1500);
+        for (const sub of subChunks) {
+            const trimmed = sub.trim();
+            if (trimmed.length < 20) {
+                continue;
+            }
+            const subSafety = screenContentForSafety(trimmed);
+            if (!subSafety.safe) {
+                skipped.push({
+                    file: relPath,
+                    section: section.heading,
+                    reason: subSafety.reason!,
+                    snippet: makeSnippet(trimmed),
+                });
+                continue;
+            }
+
+            const provenanceText = `[source: ${relPath} | section: ${section.heading}]\n${trimmed}`;
+            candidates.push({
+                file: relPath,
+                section: section.heading,
+                charCount: provenanceText.length,
+                snippet: makeSnippet(trimmed),
+                text: provenanceText,
+            });
+        }
+    }
+
+    return { candidates, skipped };
+}
+
+function loadConfigJson(): { key?: string; accountId?: string; serverUrl?: string } | null {
+    try {
+        const configPath = join(homedir(), ".memwal", "config.json");
+        if (existsSync(configPath)) {
+            const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+            if (typeof parsed === "object" && parsed !== null) {
+                return {
+                    key: parsed.key ?? parsed.delegatePrivateKey ?? parsed.privateKey,
+                    accountId: parsed.accountId ?? parsed.account_id,
+                    serverUrl: parsed.serverUrl ?? parsed.relayerUrl ?? parsed.server_url,
+                };
+            }
+        }
+    } catch {
+        // Ignore unreadable config
+    }
+    return null;
+}
+
+function createSignedRelayerClient(params: {
+    key: string;
+    accountId: string;
+    serverUrl: string;
+}): ImportClient {
+    const baseUrl = params.serverUrl.replace(/\/+$/, "");
+    let pubKeyHexPromise: Promise<string> | null = null;
+
+    async function getPublicKeyHex(): Promise<string> {
+        if (!pubKeyHexPromise) {
+            pubKeyHexPromise = getPublicKeyAsync(hexToBytes(params.key)).then(bytesToHex);
+        }
+        return pubKeyHexPromise;
+    }
+
+    async function signedPost<T>(path: string, payload: unknown): Promise<T> {
+        const bodyStr = JSON.stringify(payload);
+        const bodyHash = createHash("sha256").update(bodyStr, "utf8").digest("hex");
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const nonce = randomUUID();
+        const canonical = `${timestamp}.POST.${path}.${bodyHash}.${nonce}.${params.accountId}`;
+        const signature = await signMessage(params.key, canonical);
+        const publicKeyHex = await getPublicKeyHex();
+
+        const resp = await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-public-key": publicKeyHex,
+                "x-signature": signature,
+                "x-timestamp": timestamp,
+                "x-nonce": nonce,
+                "x-account-id": params.accountId,
+            },
+            body: bodyStr,
+        });
+
+        const text = await resp.text();
+        if (!resp.ok) {
+            throw new Error(`Relayer ${path} failed (${resp.status}): ${text}`);
+        }
+        return JSON.parse(text) as T;
+    }
+
+    return {
+        async rememberBulk(items) {
+            return signedPost<{ job_ids?: string[] }>("/api/remember/bulk", { items });
+        },
+        async waitForRememberJobs(jobIds, namespaces, options = {}) {
+            const timeoutMs = options.timeoutMs ?? 60_000;
+            const pollIntervalMs = options.pollIntervalMs ?? 1000;
+            const deadline = Date.now() + timeoutMs;
+            const latest = new Map<string, { id: string; status: string; namespace?: string; error?: string }>();
+            for (let i = 0; i < jobIds.length; i++) {
+                latest.set(jobIds[i], { id: jobIds[i], status: "pending", namespace: namespaces[i] });
+            }
+
+            while (Date.now() < deadline) {
+                const pendingIds = jobIds.filter((id) => {
+                    const st = latest.get(id)?.status;
+                    return st !== "done" && st !== "failed";
+                });
+                if (pendingIds.length === 0) break;
+
+                const statusResp = await signedPost<{
+                    jobs?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
+                }>("/api/remember/bulk/status", { job_ids: pendingIds });
+
+                for (const job of statusResp.jobs ?? []) {
+                    const id = job.job_id ?? job.id;
+                    if (id && latest.has(id)) {
+                        const prev = latest.get(id)!;
+                        latest.set(id, { ...prev, status: job.status, error: job.error });
+                    }
+                }
+
+                const stillPending = jobIds.some((id) => {
+                    const st = latest.get(id)?.status;
+                    return st !== "done" && st !== "failed";
+                });
+                if (!stillPending) break;
+                await new Promise((r) => setTimeout(r, pollIntervalMs));
+            }
+
+            return {
+                results: jobIds.map((id) => latest.get(id)!),
+            };
+        },
+    };
+}
+
+/** Execute import in preview mode or confirmed upload mode. */
+export async function importProjectMemories(options: ImportOptions = {}): Promise<ImportResult> {
+    const targetDir = options.targetDir ?? process.cwd();
+    const { realRoot, files: discoveredFiles } = discoverImportFiles(targetDir);
+    const namespace = options.namespace ?? process.env.MEMWAL_NAMESPACE ?? "default";
+    const maxItems = clampMaxItems(options.maxItems);
+    const dryRun = options.dryRun ?? false;
+    const isYes = options.yes ?? false;
+    const print = options.print ?? note;
+
+    const allCandidates: CandidateChunk[] = [];
+    const allSkipped: SkippedSection[] = [];
+
+    for (const relPath of discoveredFiles) {
+        const fullPath = join(realRoot, relPath);
+        const content = readFileSync(fullPath, "utf8");
+        const { candidates, skipped } = extractCandidateChunks(content, relPath);
+        allCandidates.push(...candidates);
+        allSkipped.push(...skipped);
+    }
+
+    const candidates = allCandidates.slice(0, maxItems);
+
+    if (!isYes || dryRun) {
+        print("Local project memory import preview:");
+        print(`  Project root: ${realRoot}`);
+        print(`  Namespace:    ${namespace}`);
+        print(`  Discovered:   ${discoveredFiles.length} file(s) (${discoveredFiles.join(", ")})`);
+        print(`  Candidates:   ${candidates.length} chunk(s)`);
+        print("");
+
+        candidates.forEach((c, idx) => {
+            print(`[${idx + 1}] ${c.file} | section: ${c.section} (${c.charCount} chars)`);
+            print(`    "${c.snippet}"`);
+        });
+
+        if (allSkipped.length > 0) {
+            print("");
+            const secretCount = allSkipped.filter((s) => s.reason === "secret_detected").length;
+            const optOutCount = allSkipped.filter((s) => s.reason === "opt_out_marker").length;
+            print(
+                `Skipped ${allSkipped.length} section(s) for safety: ` +
+                    `${secretCount} secret(s), ${optOutCount} opt-out marker(s).`,
+            );
+        }
+
+        print("");
+        print(`Run with --yes to upload these ${candidates.length} memory chunks to Walrus Memory.`);
+
+        return {
+            mode: "preview",
+            discoveredFiles,
+            candidates,
+            skipped: allSkipped,
+            targetDir: realRoot,
+            namespace,
+        };
+    }
+
+    let client = options.client;
+    if (!client) {
+        const savedCreds = loadCreds();
+        const savedConfig = loadConfigJson();
+
+        const key =
+            options.key ??
+            process.env.MEMWAL_PRIVATE_KEY ??
+            savedCreds?.delegatePrivateKey ??
+            savedConfig?.key;
+        const accountId =
+            options.accountId ??
+            process.env.MEMWAL_ACCOUNT_ID ??
+            savedCreds?.accountId ??
+            savedConfig?.accountId;
+        const serverUrl =
+            options.relayerUrl ??
+            process.env.MEMWAL_SERVER_URL ??
+            savedCreds?.relayerUrl ??
+            savedConfig?.serverUrl ??
+            "https://relayer.memory.walrus.xyz";
+
+        if (!key || !accountId) {
+            const missingMsg =
+                "Credentials required for upload. Please run memwal-mcp login first, " +
+                "or set MEMWAL_PRIVATE_KEY and MEMWAL_ACCOUNT_ID.";
+            print(`Error: ${missingMsg}`);
+            throw new Error(missingMsg);
+        }
+
+        client = createSignedRelayerClient({
+            key,
+            accountId,
+            serverUrl,
+        });
+    }
+
+    print(`Uploading ${candidates.length} memory chunk(s) to Walrus Memory (namespace: ${namespace})...`);
+
+    const batchSize = 20;
+    let accepted = 0;
+    let completed = 0;
+    let pending = 0;
+    let failed = 0;
+    const allJobIds: string[] = [];
+
+    for (let i = 0; i < candidates.length; i += batchSize) {
+        const batch = candidates.slice(i, i + batchSize);
+        const items = batch.map((c) => ({
+            text: c.text,
+            namespace,
+        }));
+
+        const acceptedResult = await client.rememberBulk(items);
+        const jobIds = acceptedResult?.job_ids ?? [];
+        accepted += jobIds.length;
+        allJobIds.push(...jobIds);
+
+        if (typeof (client as any).waitForRememberJobs === "function" && jobIds.length > 0) {
+            try {
+                const waitResult = await (client as any).waitForRememberJobs(
+                    jobIds,
+                    items.map((it) => it.namespace),
+                    { timeoutMs: 60_000, pollIntervalMs: 1000 },
+                );
+                if (waitResult && Array.isArray(waitResult.results)) {
+                    for (const res of waitResult.results) {
+                        if (res.status === "done") {
+                            completed++;
+                        } else if (res.status === "failed") {
+                            failed++;
+                        } else {
+                            pending++;
+                        }
+                    }
+                } else {
+                    pending += jobIds.length;
+                }
+            } catch {
+                pending += jobIds.length;
+            }
+        } else {
+            pending += jobIds.length;
+        }
+    }
+
+    print("Upload outcome:");
+    print(`  Accepted:  ${accepted}`);
+    print(`  Completed: ${completed}`);
+    print(`  Pending:   ${pending}`);
+    print(`  Failed:    ${failed}`);
+
+    return {
+        mode: "uploaded",
+        discoveredFiles,
+        candidates,
+        skipped: allSkipped,
+        targetDir: realRoot,
+        namespace,
+        accepted,
+        completed,
+        pending,
+        failed,
+        jobIds: allJobIds,
+    };
+}

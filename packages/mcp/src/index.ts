@@ -34,6 +34,7 @@ import {
     AUTO_SAVE_ENV,
 } from "./auto-save.js";
 import { askAutoSaveConsent, consentOutcomeNotice } from "./consent.js";
+import { importProjectMemories } from "./import.js";
 import { log, note } from "./logger.js";
 
 /**
@@ -58,6 +59,16 @@ interface ParsedArgs {
     autoSave?: "on" | "off" | "status";
     /** `status` / `whoami` — print current credential info and exit. */
     status: boolean;
+    /** Import local project memories into Walrus Memory. */
+    importCmd?: boolean;
+    /** Target directory path for project import. */
+    importPath?: string;
+    /** Preview candidate chunks without uploading. */
+    dryRun?: boolean;
+    /** Confirm upload to Walrus Memory. */
+    yes?: boolean;
+    /** Maximum number of memory chunks to import. */
+    maxItems?: number;
     /** Args parseArgs did not recognise, in the order seen. For a flag
      *  written `--key=value`, only `--key` is recorded — see parseArgs. */
     unknown: string[];
@@ -74,7 +85,7 @@ const ENV_PRESETS: Record<string, { relayer: string; web: string }> = {
 
 /** Bare words that are commands rather than values. An unknown flag must not
  *  swallow one as its argument. */
-const POSITIONALS = new Set(["login", "approve-project", "revoke-project", "auto-save", "on", "off", "status", "whoami"]);
+const POSITIONALS = new Set(["login", "approve-project", "revoke-project", "auto-save", "on", "off", "status", "whoami", "import"]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
     const out: ParsedArgs = {
@@ -115,6 +126,33 @@ export function parseArgs(argv: string[]): ParsedArgs {
             case "whoami":
                 out.status = true;
                 break;
+            case "import":
+            case "--import": {
+                out.importCmd = true;
+                const nextArg = argv[i + 1];
+                if (nextArg !== undefined && !nextArg.startsWith("-") && !POSITIONALS.has(nextArg)) {
+                    out.importPath = nextArg;
+                    i++;
+                }
+                break;
+            }
+            case "--dry-run":
+                out.dryRun = true;
+                break;
+            case "--yes":
+            case "-y":
+                out.yes = true;
+                break;
+            case "--max-items": {
+                const val = next();
+                if (val !== undefined) {
+                    const num = parseInt(val, 10);
+                    if (!Number.isNaN(num)) {
+                        out.maxItems = num;
+                    }
+                }
+                break;
+            }
             case "auto-save":
             case "--auto-save": {
                 // `auto-save` on its own reports the state rather than
@@ -162,6 +200,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
                 else if (a?.startsWith("--label=")) out.label = a.split("=", 2)[1];
                 else if (a?.startsWith("--namespace=")) out.namespace = a.split("=", 2)[1];
                 else if (a?.startsWith("--ns=")) out.namespace = a.split("=", 2)[1];
+                else if (a?.startsWith("--max-items=")) {
+                    const val = a.split("=", 2)[1];
+                    const num = parseInt(val, 10);
+                    if (!Number.isNaN(num)) {
+                        out.maxItems = num;
+                    }
+                }
                 // Anything still unmatched is a typo, or a flag from a newer
                 // build. Values of KNOWN value-taking flags never reach this
                 // branch — `next()` already consumed them.
@@ -444,6 +489,24 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // applyDefaultNamespace in bridge.ts).
     const namespace = args.namespace ?? process.env.MEMWAL_NAMESPACE;
 
+    if (args.importCmd) {
+        try {
+            await importProjectMemories({
+                targetDir: args.importPath,
+                dryRun: args.dryRun,
+                yes: args.yes,
+                namespace,
+                maxItems: args.maxItems,
+                relayerUrl,
+            });
+        } catch (err) {
+            log.error("import.failed", { error: (err as Error).message });
+            note(`Error: ${(err as Error).message}`);
+            process.exitCode = 1;
+        }
+        return;
+    }
+
     // Explicit `login` is a human command. When stdin is not a TTY the
     // process was spawned by a script or MCP client — booting the
     // auth-required stub here would exit 0 without ever opening a browser.
@@ -714,6 +777,13 @@ export function helpText(): string {
         "                                   required again if the account,",
         "                                   delegate key or relayer changes.",
         "  memwal-mcp revoke-project        Withdraw that approval.",
+        "  memwal-mcp import [path]         Import local project memory files into",
+        "                                   Walrus Memory (preview-first).",
+        "                                   Safe files: AGENTS.md, CLAUDE.md,",
+        "                                   GEMINI.md, MEMORY.md, .cursorrules,",
+        "                                   .clinerules, .windsurfrules,",
+        "                                   .github/copilot-instructions.md.",
+        "                                   Pass --yes to confirm upload.",
         "  memwal-mcp auto-save on|off      Turn automatic memory on or off.",
         "                                   ON once you agree to it: `login` asks",
         "                                   in the terminal the first time, and",
@@ -750,6 +820,11 @@ export function helpText(): string {
         "                                   namespace always wins. Unset →",
         '                                   relayer uses its "default".',
         "                                   Alias: --ns",
+        "  --dry-run                        Preview candidate chunks without",
+        "                                   uploading (default when --yes is omitted).",
+        "  --yes, -y                        Confirm upload to Walrus Memory.",
+        "  --max-items <n>                  Cap total chunks imported (1..100,",
+        "                                   default: 20).",
         "",
         "Network presets (set --relayer and --web-url together):",
         ...presetLines,
@@ -839,4 +914,22 @@ export {
 export { askAutoSaveConsent, interpretConsentAnswer, CONSENT_PROMPT } from "./consent.js";
 export { loginFlow } from "./login.js";
 export { runBridge } from "./bridge.js";
+export {
+    ALLOWED_IMPORT_FILES,
+    clampMaxItems,
+    discoverImportFiles,
+    extractCandidateChunks,
+    importProjectMemories,
+    makeSnippet,
+    screenContentForSafety,
+} from "./import.js";
+export type {
+    AllowedImportFile,
+    CandidateChunk,
+    ImportOptions,
+    ImportPreviewResult,
+    ImportResult,
+    ImportUploadResult,
+    SkippedSection,
+} from "./import.js";
 export type { MemWalCredentials, CredsResolution, ProjectCredsDecision } from "./auth.js";
