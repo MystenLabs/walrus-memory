@@ -5,6 +5,7 @@ use axum::{
     response::Response,
 };
 use percent_encoding::percent_decode_str;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,22 @@ pub enum SponsorRlResult {
     HourLimitExceeded,
     /// Per-day cumulative bucket exhausted.
     DayLimitExceeded,
+}
+
+// ============================================================
+// Write-Path Rate Limit Charge Extension
+// ============================================================
+
+/// Represents an authenticated write path rate limit charge carried from
+/// rate_limit_middleware into write handlers. When an async job fails
+/// terminally due to an upstream infrastructure error, this charge can be
+/// refunded back to the delegate key bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitCharge {
+    pub request_id: String,
+    pub public_key: String,
+    pub owner: String,
+    pub weight: i64,
 }
 
 // ============================================================
@@ -317,8 +334,9 @@ where
 }
 
 /// Remove the `weight` ZSET members (`{request_id}:0 .. {request_id}:{weight-1}`)
-/// previously recorded in `key` when a subsequent rate-limit layer denies or errors.
-async fn rollback_window_entries<C>(
+/// previously recorded in `key` when a subsequent rate-limit layer denies or errors,
+/// or when an infrastructure failure refunds delegate-key rate limit.
+pub(crate) async fn rollback_window_entries<C>(
     redis: &mut C,
     key: &str,
     request_id: &str,
@@ -379,6 +397,15 @@ impl InMemoryFallback {
                 .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
         }
     }
+
+    pub fn refund(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new(capacity));
+        bucket.refund(weight, capacity, refill_rate);
+    }
 }
 
 pub struct TokenBucket {
@@ -406,6 +433,14 @@ impl TokenBucket {
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         let projected = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
         self.tokens = projected - weight;
+        self.last_update = now;
+    }
+
+    pub fn refund(&mut self, weight: f64, capacity: f64, refill_rate_per_sec: f64) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        let projected = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
+        self.tokens = (projected + weight.max(0.0)).min(capacity);
         self.last_update = now;
     }
 }
@@ -508,6 +543,7 @@ pub(crate) enum WriteRateLimitDenial {
 /// (`rate:dk:{public_key}`, `rate:{owner}`, `rate:hr:{owner}`), rolling back
 /// any earlier layer's recorded ZSET members via `ZREM` if a later layer
 /// denies or encounters a Redis error.
+#[allow(dead_code)]
 pub(crate) async fn check_write_rate_limit_windows<C, B>(
     redis: &mut C,
     dk_key: &str,
@@ -521,9 +557,38 @@ where
     C: redis::aio::ConnectionLike,
     B: Into<RequestBudgets>,
 {
+    let request_id = Uuid::new_v4().to_string();
+    check_write_rate_limit_windows_with_id(
+        redis,
+        dk_key,
+        burst_key,
+        hourly_key,
+        now,
+        budgets,
+        weight,
+        &request_id,
+    )
+    .await
+}
+
+/// Check and record across all three write-path sliding windows with a
+/// caller-supplied request ID so entries can be tracked and refunded if needed.
+pub(crate) async fn check_write_rate_limit_windows_with_id<C, B>(
+    redis: &mut C,
+    dk_key: &str,
+    burst_key: &str,
+    hourly_key: &str,
+    now: f64,
+    budgets: B,
+    weight: i64,
+    request_id: &str,
+) -> Result<Option<WriteRateLimitDenial>, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+    B: Into<RequestBudgets>,
+{
     let budgets = budgets.into();
     let (dk_window_start, burst_window_start, hourly_window_start) = sliding_window_starts(now);
-    let request_id = Uuid::new_v4().to_string();
 
     // Layer 1: Per-delegate-key (burst) — atomic check + record
     match check_and_record_window_with_id(
@@ -534,7 +599,7 @@ where
         budgets.max_requests_per_delegate_key,
         weight,
         120, // TTL 2 min
-        &request_id,
+        request_id,
     )
     .await
     {
@@ -555,14 +620,14 @@ where
         budgets.max_requests_per_minute,
         weight,
         120, // TTL 2 min
-        &request_id,
+        request_id,
     )
     .await
     {
         Ok(WindowCheckResult::Denied) => {
             // Roll back the delegate-key window entries recorded by Layer 1 so
             // an account-burst denial never spends per-delegate-key budget.
-            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, dk_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [burst] rollback of delegate-key entry failed: {}",
                     e
@@ -572,7 +637,7 @@ where
         }
         Err(e) => {
             tracing::warn!("rate limit [burst] Redis error: {}", e);
-            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
+            let _ = rollback_window_entries(redis, dk_key, request_id, weight).await;
             return Err(e);
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -587,20 +652,20 @@ where
         budgets.max_requests_per_hour,
         weight,
         3700, // TTL ~1hr + buffer
-        &request_id,
+        request_id,
     )
     .await
     {
         Ok(WindowCheckResult::Denied) => {
             // Roll back both the delegate-key and account-burst entries recorded
             // by Layers 1 and 2 so an hourly denial never spends minute budgets.
-            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, dk_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [sustained] rollback of delegate-key entry failed: {}",
                     e
                 );
             }
-            if let Err(e) = rollback_window_entries(redis, burst_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, burst_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [sustained] rollback of account-burst entry failed: {}",
                     e
@@ -610,8 +675,8 @@ where
         }
         Err(e) => {
             tracing::warn!("rate limit [sustained] Redis error: {}", e);
-            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
-            let _ = rollback_window_entries(redis, burst_key, &request_id, weight).await;
+            let _ = rollback_window_entries(redis, dk_key, request_id, weight).await;
+            let _ = rollback_window_entries(redis, burst_key, request_id, weight).await;
             return Err(e);
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -645,7 +710,7 @@ where
 /// Normalizes trailing slash in path before cost weight lookup.
 pub async fn rate_limit_middleware(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // RATE_LIMIT_DISABLED=1 — see RateLimitConfig::bench_bypass_enabled.
@@ -680,6 +745,7 @@ pub async fn rate_limit_middleware(
 
     // Determine cost weight based on endpoint; path is normalized inside endpoint_weight.
     let weight = endpoint_weight(request.uri().path());
+    let req_id = Uuid::new_v4().to_string();
 
     // --- Key definitions for all three rate-limit buckets ---
     let dk_key = format!("rate:dk:{}", auth.public_key);
@@ -692,7 +758,7 @@ pub async fn rate_limit_middleware(
     // errors. If Redis is unavailable, we fall through to the in-memory
     // token-bucket fallback.
 
-    let redis_down = match check_write_rate_limit_windows(
+    let redis_down = match check_write_rate_limit_windows_with_id(
         &mut redis,
         &dk_key,
         &burst_key,
@@ -700,6 +766,7 @@ pub async fn rate_limit_middleware(
         now,
         config,
         weight,
+        &req_id,
     )
     .await
     {
@@ -801,10 +868,58 @@ pub async fn rate_limit_middleware(
             3600.0,
         );
 
+        if weight > 0 {
+            request.extensions_mut().insert(RateLimitCharge {
+                request_id: req_id,
+                public_key: auth.public_key,
+                owner: auth.owner,
+                weight,
+            });
+        }
+
         return next.run(request).await;
     }
 
+    if weight > 0 {
+        request.extensions_mut().insert(RateLimitCharge {
+            request_id: req_id,
+            public_key: auth.public_key,
+            owner: auth.owner,
+            weight,
+        });
+    }
+
     next.run(request).await
+}
+
+/// Refund delegate key rate limit charge after an infrastructure failure.
+///
+/// Credits the delegate key sliding window entry in Redis (using the recorded
+/// request ID members) and the in-memory fallback token bucket.
+pub async fn refund_delegate_key_rate_limit(state: &AppState, charge: &RateLimitCharge) {
+    if charge.weight <= 0
+        || charge.public_key.is_empty()
+        || state.config.rate_limit.bench_bypass_enabled
+    {
+        return;
+    }
+
+    let dk_key = format!("rate:dk:{}", charge.public_key);
+    let dk_fallback_key = format!("dk:{}", charge.public_key);
+    let mut redis = state.redis.clone();
+    if let Err(e) =
+        rollback_window_entries(&mut redis, &dk_key, &charge.request_id, charge.weight).await
+    {
+        tracing::warn!(
+            "failed to rollback delegate key rate limit in redis: {}",
+            e
+        );
+    }
+
+    let capacity = state.config.rate_limit.max_requests_per_delegate_key as f64;
+    let mut fallback = state.fallback_rate_limit.lock().await;
+    fallback.refund(&dk_key, charge.weight as f64, capacity, 60.0);
+    fallback.refund(&dk_fallback_key, charge.weight as f64, capacity, 60.0);
 }
 
 // ============================================================
@@ -2441,6 +2556,59 @@ mod tests {
         assert_eq!(burst, now - 60_000.0);
         assert_eq!(hourly, now - 3_600_000.0);
         assert!(dk < now && burst < now && hourly < now);
+    }
+
+    #[test]
+    fn token_bucket_refund_restores_tokens_capped_at_capacity() {
+        let mut bucket = TokenBucket::new(10.0);
+        assert!(bucket.peek(6.0, 10.0, 1.0));
+        bucket.consume(6.0, 10.0, 1.0);
+        assert!(bucket.tokens <= 4.05, "tokens after deduction: {}", bucket.tokens);
+
+        bucket.refund(3.0, 10.0, 1.0);
+        assert!(bucket.tokens >= 6.95 && bucket.tokens <= 7.05, "tokens after 3 refund: {}", bucket.tokens);
+
+        // Refunding more than capacity must cap at capacity
+        bucket.refund(10.0, 10.0, 1.0);
+        assert!((bucket.tokens - 10.0).abs() < 1e-4, "tokens capped at capacity: {}", bucket.tokens);
+    }
+
+    #[test]
+    fn in_memory_fallback_refund_refills_and_caps() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:0x999";
+        let capacity = 60.0;
+        let refill_duration_secs = 60.0;
+
+        // Take 20 tokens
+        assert!(fallback.can_consume(key, 20.0, capacity, refill_duration_secs));
+        fallback.consume(key, 20.0, capacity, refill_duration_secs);
+
+        let initial_remaining = fallback.buckets.get(key).unwrap().tokens;
+        assert!(initial_remaining <= 40.05, "initial remaining: {}", initial_remaining);
+
+        // Refund 10 tokens
+        fallback.refund(key, 10.0, capacity, refill_duration_secs);
+        let tokens_after_first = fallback.buckets.get(key).unwrap().tokens;
+        assert!(tokens_after_first >= 49.9 && tokens_after_first <= 50.1, "tokens after refund: {}", tokens_after_first);
+
+        // Refund 100 tokens: must not exceed 60.0
+        fallback.refund(key, 100.0, capacity, refill_duration_secs);
+        let tokens_capped = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_capped - capacity).abs() < 1e-4, "tokens capped at capacity: {}", tokens_capped);
+    }
+
+    #[test]
+    fn rate_limit_charge_serialization_roundtrip() {
+        let charge = RateLimitCharge {
+            request_id: "req-123".to_string(),
+            public_key: "0xpk".to_string(),
+            owner: "0xowner".to_string(),
+            weight: 5,
+        };
+        let json = serde_json::to_string(&charge).expect("serialize charge");
+        let deserialized: RateLimitCharge = serde_json::from_str(&json).expect("deserialize charge");
+        assert_eq!(charge, deserialized);
     }
 
     #[test]

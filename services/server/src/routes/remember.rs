@@ -111,18 +111,7 @@ fn redact_hex_addresses(msg: &str) -> String {
     out
 }
 
-fn is_upstream_inference_job_error(msg: &str) -> bool {
-    msg.starts_with("Embedding Provider Unavailable:")
-        || msg.starts_with("Upstream Unavailable: Embedding API")
-        || msg.starts_with("Internal Error: Embedding API")
-        || msg.starts_with("Upstream Unavailable: Summarization API")
-        || msg.starts_with("Internal Error: Summarization API")
-        || msg.starts_with("Upstream Unavailable: Failed to parse embedding response")
-        || msg.starts_with("Upstream Unavailable: Embedding response contained no vectors")
-        || msg.starts_with("Upstream Unavailable: Failed to parse summarization response")
-        || msg.starts_with("Upstream Unavailable: Summarization returned empty result")
-        || msg.contains(EMBEDDING_PROVIDER_UNAVAILABLE_CODE)
-}
+pub(crate) use crate::jobs::is_upstream_inference_job_error;
 
 fn format_embedding_provider_unavailable_job_error() -> String {
     let trace_id = crate::observability::current_request_id()
@@ -189,14 +178,14 @@ async fn mark_remember_job_failed(
     job_id: &str,
     prepare_claim_token: Option<&str>,
     msg: &str,
-) {
-    let _ = sqlx::query(
+) -> bool {
+    let res = sqlx::query(
         "UPDATE remember_jobs
          SET status = 'failed',
              error_msg = $1,
              updated_at = NOW()
          WHERE id = $2
-           AND status NOT IN ('done', 'uploaded')
+           AND status NOT IN ('done', 'uploaded', 'failed')
            AND ($3::TEXT IS NULL OR prepare_claim_token = $3)
            AND COALESCE(error_msg, '') <> $4
            AND NOT EXISTS (
@@ -209,18 +198,21 @@ async fn mark_remember_job_failed(
     .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(state.db.pool())
     .await;
+
+    matches!(res, Ok(r) if r.rows_affected() == 1)
 }
 
-async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &str) {
+async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &str) -> u64 {
     if job_ids.is_empty() {
-        return;
+        return 0;
     }
-    let _ = sqlx::query(
+    let res = sqlx::query(
         "UPDATE remember_jobs
          SET status = 'failed',
              error_msg = $1,
              updated_at = NOW()
          WHERE id = ANY($2)
+           AND status NOT IN ('done', 'uploaded', 'failed')
            AND COALESCE(error_msg, '') <> $3
            AND NOT EXISTS (
                SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
@@ -231,6 +223,8 @@ async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &s
     .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(state.db.pool())
     .await;
+
+    res.map(|r| r.rows_affected()).unwrap_or(0)
 }
 
 // ============================================================
@@ -246,6 +240,7 @@ fn spawn_prepare_remember_job(
     account_id: String,
     namespace: String,
     agent_public_key: String,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) {
     let request_context = crate::observability::current_context();
     tokio::spawn(async move {
@@ -364,6 +359,7 @@ fn spawn_prepare_remember_job(
                         remember_job_id: Some(job_id.clone()),
                         prepare_claim_token: prepare_claim_token.clone(),
                         epochs: state.config.walrus_storage_epochs,
+                        rate_limit_charge: rate_limit_charge.clone(),
                     },
                 )
                 .await?;
@@ -388,13 +384,23 @@ fn spawn_prepare_remember_job(
                 // release its reservation. No-op when the failure was the
                 // quota rejection itself (nothing was reserved).
                 rate_limit::release_storage_quota_one(&state, &job_id).await;
-                mark_remember_job_failed(
+                let transitioned_failed = mark_remember_job_failed(
                     &state,
                     &job_id,
                     prepare_claim_token.as_deref(),
                     &client_msg,
                 )
                 .await;
+                if transitioned_failed
+                    && (is_upstream_inference_job_error(&client_msg)
+                        || is_upstream_inference_job_error(&raw_msg)
+                        || raw_msg.contains("Memory encryption backend is unavailable")
+                        || raw_msg.contains("seal encrypt failed"))
+                {
+                    if let Some(ref charge) = rate_limit_charge {
+                        crate::rate_limit::refund_delegate_key_rate_limit(&state, charge).await;
+                    }
+                }
             }
         };
 
@@ -412,6 +418,7 @@ fn spawn_prepare_bulk_remember_job(
     account_id: String,
     agent_public_key: String,
     pending_items: Vec<PendingBulkRememberItem>,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) {
     let request_context = crate::observability::current_context();
     tokio::spawn(async move {
@@ -530,6 +537,7 @@ fn spawn_prepare_bulk_remember_job(
                         agent_public_key: Some(agent_public_key.clone()),
                         items: bulk_items,
                         epochs: state.config.walrus_storage_epochs,
+                        rate_limit_charge: rate_limit_charge.clone(),
                     })
                     .await
                     .map_err(|e| {
@@ -553,7 +561,17 @@ fn spawn_prepare_bulk_remember_job(
                 // Same reasoning as the single path: nothing downstream will
                 // release these, because the batch never reached the queue.
                 rate_limit::release_storage_quota(&state, &job_ids).await;
-                mark_remember_jobs_failed(&state, &job_ids, &client_msg).await;
+                let affected = mark_remember_jobs_failed(&state, &job_ids, &client_msg).await;
+                if affected > 0
+                    && (is_upstream_inference_job_error(&client_msg)
+                        || is_upstream_inference_job_error(&raw_msg)
+                        || raw_msg.contains("Memory encryption backend is unavailable")
+                        || raw_msg.contains("seal encrypt failed"))
+                {
+                    if let Some(ref charge) = rate_limit_charge {
+                        crate::rate_limit::refund_delegate_key_rate_limit(&state, charge).await;
+                    }
+                }
             }
         };
 
@@ -862,9 +880,11 @@ async fn summarize_for_embedding(
 pub async fn remember(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
+    rate_limit_charge: Option<Extension<crate::rate_limit::RateLimitCharge>>,
     Json(body): Json<RememberRequest>,
 ) -> Result<(StatusCode, Json<RememberAcceptedResponse>), AppError> {
     reject_if_writes_paused(state.config.writes_paused)?;
+    let charge = rate_limit_charge.map(|Extension(c)| c);
     if text_is_blank(&body.text) {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
@@ -926,6 +946,7 @@ pub async fn remember(
                 text,
                 owner_owned,
                 namespace_owned,
+                charge,
             )
             .await;
         }
@@ -997,6 +1018,7 @@ pub async fn remember(
                     text,
                     owner_owned,
                     namespace_owned,
+                    charge,
                 )
                 .await;
             }
@@ -1021,6 +1043,7 @@ pub async fn remember(
         auth.account_id.clone(),
         namespace_owned,
         auth.public_key.clone(),
+        charge,
     );
 
     tracing::info!(
@@ -1074,6 +1097,7 @@ async fn collapse_onto_existing_job(
     text: String,
     owner: String,
     namespace: String,
+    charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(StatusCode, Json<RememberAcceptedResponse>), AppError> {
     let accepted = |job_id: String, status: String| {
         Ok((
@@ -1101,6 +1125,7 @@ async fn collapse_onto_existing_job(
                     auth.account_id.clone(),
                     namespace,
                     auth.public_key.clone(),
+                    charge,
                 );
                 return accepted(existing_id, "pending".to_string());
             }
@@ -1125,6 +1150,7 @@ async fn collapse_onto_existing_job(
                     auth.account_id.clone(),
                     namespace,
                     auth.public_key.clone(),
+                    charge,
                 );
                 return accepted(existing_id, "pending".to_string());
             }
@@ -1265,6 +1291,7 @@ fn paid_recovery_operation(
         remember_job_id: Some(job_id.to_string()),
         prepare_claim_token: None,
         epochs,
+        rate_limit_charge: None,
     })
 }
 
@@ -1412,6 +1439,7 @@ fn spawn_persisted_remember_preparation(
     account_id: String,
     namespace: String,
     public_key: String,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) {
     spawn_prepare_remember_job(
         state,
@@ -1422,6 +1450,7 @@ fn spawn_persisted_remember_preparation(
         account_id,
         namespace,
         public_key,
+        rate_limit_charge,
     );
 }
 
@@ -1724,9 +1753,11 @@ pub async fn remember_status(
 pub async fn remember_bulk(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
+    rate_limit_charge: Option<Extension<crate::rate_limit::RateLimitCharge>>,
     Json(body): Json<RememberBulkRequest>,
 ) -> Result<(StatusCode, Json<RememberBulkAcceptedResponse>), AppError> {
     reject_if_writes_paused(state.config.writes_paused)?;
+    let charge = rate_limit_charge.map(|Extension(c)| c);
     // ── Validate ──────────────────────────────────────────────────────────
     if body.items.is_empty() {
         return Err(AppError::BadRequest("items cannot be empty".into()));
@@ -1867,6 +1898,7 @@ pub async fn remember_bulk(
             auth.account_id.clone(),
             auth.public_key.clone(),
             pending_items,
+            charge,
         );
     }
 
