@@ -296,10 +296,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
             args.relayerUrl && args.relayerUrl !== creds.relayerUrl
                 ? `${effectiveRelayerUrl} (overrides saved ${creds.relayerUrl} via --relayer)`
                 : !args.relayerUrl && envRelayerUrl && envRelayerUrl !== creds.relayerUrl
-                  ? `${effectiveRelayerUrl} (saved; MEMWAL_SERVER_URL=${envRelayerUrl} is ignored when signed in — pass --relayer to override)`
+                  ? `${effectiveRelayerUrl} (saved; MEMWAL_SERVER_URL=${envRelayerUrl} is ignored when signed in; pass --relayer to override)`
                   : effectiveRelayerUrl;
-        const effectiveLabel =
-            args.label || process.env.MEMWAL_CLIENT_LABEL || creds.label || "MCP Client";
+
+        const savedLabel = creds.label;
+        const envLabel = process.env.MEMWAL_CLIENT_LABEL;
+        const flagLabel = args.label;
+        let labelNote: string;
+        if (savedLabel) {
+            if (flagLabel && flagLabel !== savedLabel) {
+                labelNote = `${savedLabel} (saved; --label=${flagLabel} is ignored when signed in)`;
+            } else if (!flagLabel && envLabel && envLabel !== savedLabel) {
+                labelNote = `${savedLabel} (saved; MEMWAL_CLIENT_LABEL=${envLabel} is ignored when signed in)`;
+            } else {
+                labelNote = savedLabel;
+            }
+        } else {
+            labelNote = flagLabel || envLabel || "MCP Client";
+        }
+
         const effectiveNamespace = args.namespace
             ? `${args.namespace} (via --namespace)`
             : process.env.MEMWAL_NAMESPACE
@@ -308,8 +323,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         note(`Logged in as ${creds.walletAddress}`);
         note(`  Account:   ${creds.accountId}`);
         note(`  Delegate:  ${creds.delegateAddress}`);
-        note(`  Wallet:    ${creds.walletAddress}`);
-        note(`  Label:     ${effectiveLabel}`);
+        note(`  Label:     ${labelNote}`);
         note(`  Relayer:   ${relayerNote}`);
         note(`  Namespace: ${effectiveNamespace}`);
         note(`  Creds:     ${resolution.path} (${resolution.source})`);
@@ -684,6 +698,9 @@ export function helpText(): string {
         "  memwal-mcp login                 Force re-authentication (wipes",
         "                                   existing credentials and opens",
         "                                   browser).",
+        "  memwal-mcp status                Print current account, relayer URL,",
+        "                                   and credential path. Alias: whoami.",
+        "                                   Exits 1 when not logged in.",
         "  memwal-mcp --logout              Delete saved credentials without",
         "                                   re-running login.",
         "  memwal-mcp approve-project       Approve the project-local",
@@ -714,9 +731,6 @@ export function helpText(): string {
         "                                   settings.json next to",
         "                                   credentials.json.",
         "  memwal-mcp auto-save             Report the current setting.",
-        "  memwal-mcp status                Print current account, relayer URL,",
-        "                                   and credential path. Alias: whoami.",
-        "                                   Exits 1 when not logged in.",
         "  memwal-mcp --help                Show this help.",
         "",
         "Options:",

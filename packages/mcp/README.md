@@ -127,7 +127,7 @@ memwal-mcp --logout
 memwal-mcp --help
 ```
 
-`memwal-mcp status` (alias `whoami`) prints the active `Account`, `Delegate` address, `Wallet` address, key `Label`, effective `Relayer` URL (highlighting any `--relayer` override or `MEMWAL_SERVER_URL` mismatch), resolved `Namespace`, and `Creds` path without requiring a TTY, and exits `1` when not logged in.
+`memwal-mcp status` (alias `whoami`) prints the active `Account`, `Delegate` address, key `Label`, effective `Relayer` URL (highlighting any `--relayer` override or `MEMWAL_SERVER_URL` mismatch), resolved `Namespace`, and `Creds` path without requiring a TTY, and exits `1` when not logged in.
 
 ## Options
 
