@@ -230,6 +230,14 @@ impl NativeRuntimeConfig {
     }
 }
 
+pub fn sui_chain_identifier_for_network(network: &str) -> &'static str {
+    match network.trim() {
+        "testnet" => "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD",
+        "mainnet" => "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+        _ => "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD",
+    }
+}
+
 static NATIVE_RUNTIME_CONFIG: OnceLock<StdRwLock<NativeRuntimeConfig>> = OnceLock::new();
 
 pub fn init_native_runtime_config(config: &Config) {
@@ -2753,6 +2761,11 @@ pub async fn advance_durable_upload_in_process(
     mut journal: UploadJournal,
 ) -> Result<DurableUploadAdvance, AppError> {
     // 1. Validate `resume_step` and `register_transaction` invariants BEFORE any RPC calls.
+    let _permit = global_upload_limiter()
+        .acquire(1)
+        .await
+        .map_err(AppError::Internal)?;
+
     let parsed_resume = parse_resume_step_json(journal.resume_step.as_ref())?;
     if journal.register_transaction.is_some()
         && !matches!(parsed_resume, Some(ParsedResumeStep::Encoded { .. }))
@@ -2803,10 +2816,24 @@ pub async fn advance_durable_upload_in_process(
 
     let end_epoch = (system.epoch + epochs_u32) as i32;
 
-    if journal.execution_identity.is_none() {
+    let expected_chain_id = sui_chain_identifier_for_network(&runtime.sui_network);
+    let expected_package_id = system.call_package_id.to_string();
+    if let Some(existing) = &journal.execution_identity {
+        if existing.chain_identifier != expected_chain_id
+            || existing.walrus_package_id != expected_package_id
+        {
+            return Err(AppError::BadRequest(format!(
+                "upload execution identity mismatch: expected ({}, {}), got ({}, {})",
+                expected_chain_id,
+                expected_package_id,
+                existing.chain_identifier,
+                existing.walrus_package_id
+            )));
+        }
+    } else {
         journal.execution_identity = Some(UploadExecutionIdentity {
-            chain_identifier: runtime.sui_network.clone(),
-            walrus_package_id: system.call_package_id.to_string(),
+            chain_identifier: expected_chain_id.to_owned(),
+            walrus_package_id: expected_package_id,
         });
     }
 

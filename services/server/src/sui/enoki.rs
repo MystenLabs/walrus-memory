@@ -1189,19 +1189,14 @@ pub async fn submit_wallet_ptb_with_allowed_addresses(
                 let (sig_b64, _) = sign_transaction_bytes(raw_private_key, &sponsored_bytes)?;
                 match enoki_execute_sponsored_transaction(http, &sponsored.digest, &sig_b64).await {
                     Ok(executed) => {
-                        if effects_mode == EffectsFetchMode::WithCreatedObjects {
-                            return fetch_executed_transaction_outcome(
-                                grpc_url,
-                                &executed.digest,
-                                true,
-                            )
-                            .await;
-                        }
-                        return Ok(WalletTxOutcome {
-                            digest: executed.digest,
-                            created_objects: Vec::new(),
-                            used_enoki: true,
-                        });
+                        let collect_created_objects =
+                            effects_mode == EffectsFetchMode::WithCreatedObjects;
+                        return fetch_executed_transaction_outcome(
+                            grpc_url,
+                            &executed.digest,
+                            collect_created_objects,
+                        )
+                        .await;
                     }
                     // Once sponsorship begins and Enoki receives a signed transaction, never submit
                     // a second direct transaction after an ambiguous execute response
