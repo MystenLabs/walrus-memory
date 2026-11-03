@@ -37,7 +37,19 @@ import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 from urllib.parse import ParseResult, urlencode, urlparse
 
 import httpx
@@ -1685,7 +1697,11 @@ class MemWal:
                 raise ValueError("namespace must be a non-empty string when provided")
             query_parts.append(("namespace", namespace))
         if types is not None:
-            if isinstance(types, str) or not isinstance(types, (list, tuple, set)) or len(types) == 0:
+            if (
+                isinstance(types, str)
+                or not isinstance(types, (list, tuple, set))
+                or len(types) == 0
+            ):
                 raise ValueError("types must be a non-empty sequence of strings when provided")
             for t in types:
                 if not isinstance(t, str) or not t.strip():
@@ -1704,9 +1720,10 @@ class MemWal:
             if response.status_code != 200:
                 err_text = (await response.aread()).decode("utf-8", errors="replace")
                 if response.status_code == 426:
+                    detail = err_text[:300] or "upgrade required"
                     raise MemWalCompatibilityError(
                         "Walrus Memory relayer rejected this SDK as unsupported "
-                        f"(HTTP 426 Upgrade Required). Relayer response: {err_text[:300] or 'upgrade required'}"
+                        f"(HTTP 426 Upgrade Required). Relayer response: {detail}"
                     )
                 if response.headers.get("x-auth-error") == "ERR_TIMESTAMP_OUT_OF_BOUNDS":
                     raise MemWalClockDriftError(
@@ -2747,7 +2764,11 @@ class MemWalSync:
                 raise ValueError("namespace must be a non-empty string when provided")
             query_parts.append(("namespace", namespace))
         if types is not None:
-            if isinstance(types, str) or not isinstance(types, (list, tuple, set)) or len(types) == 0:
+            if (
+                isinstance(types, str)
+                or not isinstance(types, (list, tuple, set))
+                or len(types) == 0
+            ):
                 raise ValueError("types must be a non-empty sequence of strings when provided")
             for t in types:
                 if not isinstance(t, str) or not t.strip():
@@ -2767,9 +2788,10 @@ class MemWalSync:
                 if response.status_code != 200:
                     err_text = response.text
                     if response.status_code == 426:
+                        detail = err_text[:300] or "upgrade required"
                         raise MemWalCompatibilityError(
                             "Walrus Memory relayer rejected this SDK as unsupported "
-                            f"(HTTP 426 Upgrade Required). Relayer response: {err_text[:300] or 'upgrade required'}"
+                            f"(HTTP 426 Upgrade Required). Relayer response: {detail}"
                         )
                     if response.headers.get("x-auth-error") == "ERR_TIMESTAMP_OUT_OF_BOUNDS":
                         raise MemWalClockDriftError(

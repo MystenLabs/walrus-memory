@@ -5,7 +5,6 @@ Tests for subscribe_events SSE stream in Python SDK.
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import httpx
 import nacl.signing
