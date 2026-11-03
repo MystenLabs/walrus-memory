@@ -55,7 +55,7 @@ export function loginPrompt(info: LoginPromptInfo): string {
         `The user CANNOT proceed without seeing the exact URL. Surface it verbatim`,
         `in your reply, then explain the steps:`,
         ``,
-        `1. Open the URL in any browser (it may have already opened automatically)`,
+        `1. Open the URL in a browser on the same machine running this MCP server (it may have already opened automatically)`,
         `2. Click **Connect Sui Wallet** and approve the on-chain \`add_delegate_key\` transaction`,
         `3. Once "Connected" appears in the browser, retry the original request — the other memwal_* tools will then have credentials at \`${info.credentialsPath}\``,
         ...(info.signedIn
@@ -74,7 +74,7 @@ export function loginPrompt(info: LoginPromptInfo): string {
               ]
             : []),
         ``,
-        `_The login link stays valid for 5 minutes. If it expires, call \`memwal_login\` again to get a fresh URL._`,
+        `_The login link stays valid for 5 minutes and talks to localhost on the machine running this MCP server. If it expires, call \`memwal_login\` again to get a fresh URL. If this MCP server runs on a remote host or bot without a local browser, run \`npx -y @mysten-incubation/memwal-mcp login\` on the machine with your browser and copy the resulting credentials file to \`${info.credentialsPath}\` (mode \`0600\`) on the remote host._`,
     ].join("\n");
 }
 

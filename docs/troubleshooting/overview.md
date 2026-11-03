@@ -85,6 +85,31 @@ This section covers problems that appear before the memory tools work.
 
 **Fix:** Quit the MCP client fully, then start it again. If you registered the server with `claude mcp add`, run `claude mcp list` to confirm `memwal` is registered before you restart.
 
+### Sign-in page says nothing answered on your computer
+
+**Symptom:** Opening the `memwal_login` URL shows **Something went wrong** and reports that nothing answered on your computer at `http://127.0.0.1:<port>` before the wallet prompt appears.
+
+**Cause:** Before asking your wallet to sign, the `/connect/mcp` page sends a preflight request to `http://127.0.0.1:<port>/preflight` to confirm that the local `memwal-mcp` listener is running on the same device as your browser. The browser reports the same network error for three distinct situations:
+
+1. **Remote host, container, or bot:** `memwal-mcp` is running on a different machine, SSH server, container, or hosted bot (such as Grok Bot) than the computer where you opened the browser link. Because `127.0.0.1` always points to the device running the browser, the browser checks its own localhost instead of the remote host.
+2. **Expired or stopped listener:** More than 5 minutes passed after `memwal_login` generated the link, or the MCP client process stopped or restarted before you opened the page.
+3. **Browser or firewall block:** A browser shield, extension, or local firewall blocked a public HTTPS page from making requests to `http://127.0.0.1`.
+
+**Fix:**
+
+1. **If `memwal-mcp` runs on the same computer as your browser:** Call `memwal_login` again to start a fresh 5-minute listener and open the new link right away. If it still fails, check whether a browser shield (for example Brave Shields or a privacy extension) is blocking localhost requests from the Walrus Memory web app.
+2. **If `memwal-mcp` runs on a remote host, container, or bot without a local browser:** Do not use the remote `memwal_login` URL on your laptop unless you forward the exact loopback port over SSH. Instead, sign in on the machine that has your browser and wallet, then copy the credentials file to the remote host:
+   ```bash
+   # 1. On your local machine (with browser and Sui wallet):
+   npx -y @mysten-incubation/memwal-mcp login
+
+   # 2. Copy ~/.memwal/credentials.json to the remote host with 0600 permissions:
+   ssh user@remote-host 'mkdir -p ~/.memwal && chmod 700 ~/.memwal'
+   scp ~/.memwal/credentials.json user@remote-host:~/.memwal/credentials.json
+   ssh user@remote-host 'chmod 600 ~/.memwal/credentials.json'
+   ```
+   Then restart the MCP server or bot on the remote host so it picks up `~/.memwal/credentials.json` (or `$MEMWAL_CREDS_DIR/credentials.json`). If your remote client supports [Streamable HTTP](/mcp/reference#streamable-http), you can also configure `https://relayer.memory.walrus.xyz/api/mcp` directly with `Authorization` and `x-memwal-account-id` headers from that file.
+
 ### Sign-in succeeds but credentials are not saved
 
 **Symptom:** The sign-in page confirms that your delegate key was registered, but says it could not hand the credentials back to your computer. The agent stays logged out and `~/.memwal/credentials.json` does not appear.
