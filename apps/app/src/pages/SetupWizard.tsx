@@ -22,7 +22,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { LogOut, Copy, TriangleAlert } from 'lucide-react'
 import { config } from '../config'
 import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
-import { fetchDelegateKeyCount, isMaxDelegateKeysError, MAX_DELEGATE_KEYS } from '../utils/delegateKeys'
+import { isMaxDelegateKeysError, MAX_DELEGATE_KEYS } from '../utils/delegateKeys'
 import { fetchAccountIdForOwner, fetchObjectJson, publicKeyToHex } from '../utils/suiClientCompat'
 
 type Step = 'intro' | 'import-key' | 'generating' | 'show-key' | 'onchain' | 'done' | 'error'
@@ -82,7 +82,8 @@ async function getAccountObjectId(suiClient: ReturnType<typeof useSuiClient>, ow
 type AccountJson = { delegate_keys?: { public_key?: unknown }[] }
 
 async function getDelegateKeyCount(suiClient: ReturnType<typeof useSuiClient>, accountId: string): Promise<number> {
-    return (await fetchDelegateKeyCount(suiClient, accountId)) ?? 0
+    const json = (await fetchObjectJson(suiClient, accountId)) as AccountJson | null
+    return json?.delegate_keys?.length ?? 0
 }
 
 async function getRegisteredDelegatePublicKeys(suiClient: ReturnType<typeof useSuiClient>, accountId: string): Promise<string[]> {

@@ -169,6 +169,7 @@ export default function ConnectClaude() {
 
     const [step, setStep] = useState<Step>('loading')
     const [errorMsg, setErrorMsg] = useState('')
+    const [isMaxKeysError, setIsMaxKeysError] = useState(false)
     const [walletPickerOpen, setWalletPickerOpen] = useState(false)
     const [session, setSession] = useState<SessionView | null>(null)
 
@@ -177,6 +178,7 @@ export default function ConnectClaude() {
     useEffect(() => {
         if (!sessionValid) {
             setStep('error')
+            setIsMaxKeysError(false)
             setErrorMsg('This link is missing or malformed — ask the connecting app to start over.')
             return
         }
@@ -192,6 +194,7 @@ export default function ConnectClaude() {
             })
             .catch((err) => {
                 if (cancelled) return
+                setIsMaxKeysError(false)
                 setErrorMsg(err instanceof Error ? err.message : String(err))
                 setStep('error')
             })
@@ -306,6 +309,7 @@ export default function ConnectClaude() {
         try {
             await completeSession(payload)
         } catch (err) {
+            setIsMaxKeysError(isMaxDelegateKeysError(err))
             setErrorMsg(err instanceof Error ? err.message : String(err))
             setStep('error')
             trackEvent('claude_connect_failed', { error_type: getAnalyticsErrorType(err) })
@@ -345,6 +349,7 @@ export default function ConnectClaude() {
             if (preflight.needs_onchain_registration) {
                 const delegateKeyCount = await fetchDelegateKeyCount(suiClient, accountId)
                 if (delegateKeyCount !== null && delegateKeyCount >= MAX_DELEGATE_KEYS) {
+                    setIsMaxKeysError(true)
                     setErrorMsg(MAX_DELEGATE_KEYS_CONNECT_MESSAGE)
                     setStep('error')
                     trackEvent('claude_connect_failed', { error_type: 'max_delegate_keys' })
@@ -391,6 +396,7 @@ export default function ConnectClaude() {
                 reused_delegate: !preflight.needs_onchain_registration && !resuming,
             })
         } catch (err) {
+            setIsMaxKeysError(isMaxDelegateKeysError(err))
             setErrorMsg(err instanceof Error ? err.message : String(err))
             if (isRetryableComplete(err)) {
                 // The session is still pending. The terminal error has no
@@ -506,7 +512,7 @@ export default function ConnectClaude() {
                         <div className="setup-classic-intro">
                             <h2 className="setup-classic-title">Something went wrong</h2>
                             <p className="setup-classic-description mcp-error">{errorMsg}</p>
-                            {isMaxDelegateKeysError(errorMsg) && (
+                            {isMaxKeysError && (
                                 <div className="setup-classic-actions">
                                     <Link
                                         to="/dashboard"
