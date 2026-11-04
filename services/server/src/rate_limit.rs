@@ -2061,9 +2061,6 @@ pub async fn mcp_rate_limit_middleware(
 // Signed REST API — pre-authentication admission rate limiting
 // ============================================================
 
-const SIGNED_PREAUTH_GLOBAL_MIN_KEY: &str = "rate:signed:preauth:global:min";
-const SIGNED_PREAUTH_GLOBAL_HR_KEY: &str = "rate:signed:preauth:global:hr";
-
 fn signed_preauth_ip_rate_keys(ip: std::net::IpAddr) -> (String, String) {
     let ip = McpRateLimitConfig::normalize_ip(ip);
     (
@@ -2072,91 +2069,86 @@ fn signed_preauth_ip_rate_keys(ip: std::net::IpAddr) -> (String, String) {
     )
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SignedPreauthDenial {
     IpBurst,
     IpSustained,
-    GlobalBurst,
-    GlobalSustained,
 }
 
-/// Pre-authentication IP and deployment-wide admission windows for signed REST
-/// routes (`/api/*` and `/v1/owners/*`).
+/// Pre-authentication source-IP admission windows for signed REST
+/// routes (`/api/*` and signed `/v1/owners/*`).
 ///
-/// The source IP windows (`rate:signed:preauth:ip:min:{ip}`, `rate:signed:preauth:ip:hr:{ip}`)
-/// are evaluated before the deployment-wide ceiling (`rate:signed:preauth:global:*`),
-/// so a single noisy IP is turned away without consuming the shared global pre-auth
-/// budget that legitimate callers on other IPs use.
+/// Only per-IP sliding windows (`rate:signed:preauth:ip:min:{ip}`,
+/// `rate:signed:preauth:ip:hr:{ip}`) are evaluated here. Global upstream Sui
+/// RPC concurrency is bounded separately by `DelegateVerifyCache`'s
+/// `rpc_semaphore`, avoiding a shared global pre-auth window where a few noisy
+/// external IPs could lock out legitimate traffic across SDK keys, Console,
+/// and MCP.
+///
+/// If `ip_min` admits and `ip_hr` denies, `ip_min` is rolled back so
+/// sustained rejections past the hourly cap do not accumulate in the minute
+/// window and reset `Retry-After`.
 pub(crate) async fn check_signed_preauth_windows<C>(
     redis: &mut C,
     config: &McpRateLimitConfig,
     ip: Option<std::net::IpAddr>,
-    global_keys: (&str, &str),
 ) -> Result<Option<SignedPreauthDenial>, redis::RedisError>
 where
     C: redis::aio::ConnectionLike,
 {
+    let Some(ip) = ip else {
+        return Ok(None);
+    };
+
     let now = chrono::Utc::now().timestamp_millis() as f64;
     let min_start = now - 60_000.0;
     let hr_start = now - 3_600_000.0;
+    let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
+    let request_id = Uuid::new_v4().to_string();
 
-    if let Some(ip) = ip {
-        let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
-        let ip_windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 2] = [
-            (
-                &ip_min,
-                min_start,
-                now,
-                config.per_minute,
-                120,
-                SignedPreauthDenial::IpBurst,
-            ),
-            (
-                &ip_hr,
-                hr_start,
-                now + 0.1,
-                config.per_hour,
-                3700,
-                SignedPreauthDenial::IpSustained,
-            ),
-        ];
+    match check_and_record_window_with_id(
+        redis,
+        &ip_min,
+        min_start,
+        now,
+        config.per_minute,
+        1,
+        120,
+        &request_id,
+    )
+    .await?
+    {
+        WindowCheckResult::Denied => return Ok(Some(SignedPreauthDenial::IpBurst)),
+        WindowCheckResult::Allowed => {}
+    }
 
-        for (key, start, at, limit, ttl, denial) in ip_windows {
-            if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
-                == WindowCheckResult::Denied
-            {
-                return Ok(Some(denial));
+    match check_and_record_window_with_id(
+        redis,
+        &ip_hr,
+        hr_start,
+        now + 0.1,
+        config.per_hour,
+        1,
+        3700,
+        &request_id,
+    )
+    .await
+    {
+        Ok(WindowCheckResult::Denied) => {
+            if let Err(e) = rollback_window_entries(redis, &ip_min, &request_id, 1).await {
+                tracing::warn!(
+                    "signed preauth [sustained] rollback of minute entry failed: {}",
+                    e
+                );
             }
+            Ok(Some(SignedPreauthDenial::IpSustained))
         }
-    }
-
-    let global_windows: [(&str, f64, f64, i64, i64, SignedPreauthDenial); 2] = [
-        (
-            global_keys.0,
-            min_start,
-            now + 0.2,
-            config.global_per_minute,
-            120,
-            SignedPreauthDenial::GlobalBurst,
-        ),
-        (
-            global_keys.1,
-            hr_start,
-            now + 0.3,
-            config.global_per_hour,
-            3700,
-            SignedPreauthDenial::GlobalSustained,
-        ),
-    ];
-
-    for (key, start, at, limit, ttl, denial) in global_windows {
-        if check_and_record_window(redis, key, start, at, limit, 1, ttl).await?
-            == WindowCheckResult::Denied
-        {
-            return Ok(Some(denial));
+        Err(e) => {
+            let _ = rollback_window_entries(redis, &ip_min, &request_id, 1).await;
+            Err(e)
         }
+        Ok(WindowCheckResult::Allowed) => Ok(None),
     }
-    Ok(None)
 }
 
 fn signed_preauth_denial_response(
@@ -2170,30 +2162,35 @@ fn signed_preauth_denial_response(
         SignedPreauthDenial::IpSustained => {
             rate_limit_response("signed_preauth_ip_sustained", config.per_hour, "hour", 300)
         }
-        SignedPreauthDenial::GlobalBurst => rate_limit_response(
-            "signed_preauth_global_burst",
-            config.global_per_minute,
-            "min",
-            60,
-        ),
-        SignedPreauthDenial::GlobalSustained => rate_limit_response(
-            "signed_preauth_global_sustained",
-            config.global_per_hour,
-            "hour",
-            300,
-        ),
     }
+}
+
+fn is_valid_owner_bearer(headers: &axum::http::HeaderMap, secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    crate::owner_token_auth::verify_token(secret, token, chrono::Utc::now().timestamp()).is_ok()
 }
 
 /// Outermost pre-authentication rate limiter for `protected_routes` (`/api/*`)
 /// and `read_api_routes` (`/v1/owners/*`).
 ///
 /// Runs outside `auth::verify_signature` and `auth::verify_read_api_auth` so
-/// source-IP and deployment-wide floods of unregistered delegate keys are
-/// rejected before buffering/hashing the request body, verifying Ed25519
-/// signatures, writing nonces to Redis, or resolving accounts on Sui RPC.
-/// Post-authentication owner and delegate-key budgets still run inside the
-/// auth layer.
+/// source-IP floods of unregistered delegate keys are rejected before
+/// buffering/hashing the request body, verifying Ed25519 signatures, writing
+/// nonces to Redis, or resolving accounts on Sui RPC. Post-authentication
+/// owner and delegate-key budgets still run inside the auth layer.
+///
+/// Verified `Authorization: Bearer` session tokens from Console bypass this
+/// pre-auth IP limiter because HMAC verification is local and stateless with
+/// zero Sui RPC calls.
 pub async fn signed_preauth_rate_limit_middleware(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -2203,10 +2200,14 @@ pub async fn signed_preauth_rate_limit_middleware(
         return next.run(request).await;
     }
 
+    if is_valid_owner_bearer(request.headers(), state.config.owner_token_secret.as_bytes()) {
+        return next.run(request).await;
+    }
+
     let direct_peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
+        .map(|ci| McpRateLimitConfig::normalize_ip(ci.0.ip()));
     let ip = McpRateLimitConfig::normalize_ip(rate_limit_peer_addr(
         &request,
         state.config.trusted_proxy_hops,
@@ -2216,24 +2217,42 @@ pub async fn signed_preauth_rate_limit_middleware(
     let config = &state.config.mcp_rate_limit;
     let mut redis = state.redis.clone();
 
-    match check_signed_preauth_windows(
-        &mut redis,
-        config,
-        ip_window,
-        (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
-    )
-    .await
-    {
-        Ok(None) => next.run(request).await,
+    let redis_down = match check_signed_preauth_windows(&mut redis, config, ip_window).await {
+        Ok(None) => return next.run(request).await,
         Ok(Some(denial)) => {
             tracing::warn!("signed preauth rate limit [{:?}]: ip={} denied", denial, ip);
-            signed_preauth_denial_response(config, denial)
+            return signed_preauth_denial_response(config, denial);
         }
         Err(e) => {
-            tracing::error!("signed_preauth_rate_limit_middleware: Redis error: {}", e);
-            rate_limiter_unavailable_response()
+            tracing::warn!(
+                "signed_preauth_rate_limit_middleware: Redis error: {}, using in-memory fallback",
+                e
+            );
+            true
         }
+    };
+
+    if redis_down {
+        if let Some(ip) = ip_window {
+            tracing::warn!("signed preauth rate limit: Redis is unreachable, using in-memory fallback");
+            crate::observability::record_rate_limit_fallback("signed_preauth");
+            let (ip_min, ip_hr) = signed_preauth_ip_rate_keys(ip);
+            let mut fallback = state.fallback_rate_limit.lock().await;
+
+            if !fallback.can_consume(&ip_min, 1.0, config.per_minute as f64, 60.0) {
+                return signed_preauth_denial_response(config, SignedPreauthDenial::IpBurst);
+            }
+            if !fallback.can_consume(&ip_hr, 1.0, config.per_hour as f64, 3600.0) {
+                return signed_preauth_denial_response(config, SignedPreauthDenial::IpSustained);
+            }
+
+            fallback.consume(&ip_min, 1.0, config.per_minute as f64, 60.0);
+            fallback.consume(&ip_hr, 1.0, config.per_hour as f64, 3600.0);
+        }
+        return next.run(request).await;
     }
+
+    next.run(request).await
 }
 
 // ============================================================
@@ -3470,6 +3489,19 @@ mod tests {
                     })
                     .collect();
                 Box::pin(async move {
+                    if args.first().map(String::as_str) == Some("ZREM") {
+                        let key = &args[1];
+                        let to_remove: std::collections::HashSet<&str> =
+                            args[2..].iter().map(String::as_str).collect();
+                        let mut guard = sets.lock().unwrap();
+                        if let Some(entries) = guard.get_mut(key) {
+                            let before_len = entries.len();
+                            entries.retain(|(_, member)| !to_remove.contains(member.as_str()));
+                            let removed = (before_len - entries.len()) as i64;
+                            return Ok(redis::Value::Int(removed));
+                        }
+                        return Ok(redis::Value::Int(0));
+                    }
                     // EVAL/EVALSHA <script_or_sha> 1 <key> <window_start> <now> <limit> <weight> <ttl> <request_id>
                     assert!(matches!(
                         args.first().map(String::as_str),

@@ -369,6 +369,18 @@ async fn legacy_delegate_registered(
             crate::observability::record_mcp_handshake(route, "ok", "none");
             McpAuthOutcome::Passthrough
         }
+        Err(crate::storage::sui::OnchainVerifyError::ConcurrencyLimitReached(err)) => {
+            tracing::warn!(
+                account_id = %account_id,
+                connect_id = header_str(headers, CONNECT_ID_HEADER).unwrap_or("-"),
+                client = %sanitized_client(headers, CLIENT_NAME_HEADER),
+                error = %err,
+                "mcp delegate on-chain verify concurrency limit reached"
+            );
+            crate::observability::record_mcp_handshake(route, "unavailable", "concurrency_limit");
+            crate::observability::record_app_error("auth_rpc_concurrency_limit");
+            McpAuthOutcome::Unavailable
+        }
         Err(err) if err.is_unavailable() => {
             tracing::warn!(
                 account_id = %account_id,
