@@ -850,3 +850,35 @@ export interface RemoveDelegateKeyOpts extends AccountTxOpts {
     /** Ed25519 public key to remove (32 bytes Uint8Array or hex string) */
     publicKey: Uint8Array | string;
 }
+
+// ============================================================
+// Real-Time Memory Events
+// ============================================================
+
+export type MemoryEventType =
+    | "memory.remember.accepted"
+    | "memory.remember.completed"
+    | "memory.remember.failed"
+    | "memory.forget"
+    | "memory.restore.completed"
+    | "system.lagged";
+
+export interface MemoryEvent {
+    id: string;
+    type: MemoryEventType | string;
+    owner: string;
+    namespace: string;
+    timestamp: string;
+    job_id?: string;
+    blob_id?: string;
+    count?: number;
+    error?: string;
+    skipped?: number;
+}
+
+export interface SubscribeEventsOptions {
+    namespace?: string;
+    types?: string[];
+    signal?: AbortSignal;
+}
+

@@ -199,6 +199,7 @@ pub(crate) async fn warm_blob_cache_after_upload(
 
 async fn update_remember_job_after_wallet_error(
     pool: &sqlx::PgPool,
+    events: Option<&crate::events::EventHub>,
     remember_job_id: Option<&str>,
     error: &WalletJobError,
     msg: &str,
@@ -248,20 +249,34 @@ async fn update_remember_job_after_wallet_error(
     // blob_object_id are untouched, so no data loss, but a client polling
     // GET /api/remember/:job_id (routes/remember.rs) would see a
     // misleadingly stuck row until the unrelated staleness sweep.
-    let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = $1, error_msg = $2, updated_at = NOW() WHERE id = $3 AND status NOT IN ('uploaded', 'done')",
+    let updated = sqlx::query_as::<_, (String, String)>(
+        "UPDATE remember_jobs SET status = $1, error_msg = $2, updated_at = NOW() WHERE id = $3 AND status NOT IN ('uploaded', 'done') RETURNING owner, namespace",
     )
     .bind(status)
     .bind(msg)
     .bind(jid)
-    .execute(pool)
+    .fetch_optional(pool)
     .await;
+
+    if terminal {
+        if let Ok(Some((owner, namespace))) = updated {
+            if let Some(ev) = events {
+                ev.publish_remember_failed(
+                    owner,
+                    namespace,
+                    Some(jid.to_string()),
+                    Some(msg.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Record a metadata failure only while `status = 'uploaded'`, so the other
 /// helper still cannot clobber a winner.
 async fn record_uploaded_metadata_error(
     pool: &sqlx::PgPool,
+    events: Option<&crate::events::EventHub>,
     remember_job_id: Option<&str>,
     error: &WalletJobError,
     msg: &str,
@@ -275,18 +290,26 @@ async fn record_uploaded_metadata_error(
         // Release only if this statement is the one that failed the row.
         // A concurrent winner may already have moved it to `done`, and a
         // `running` row is the other helper's job.
-        let updated = sqlx::query(
-            "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status = 'uploaded'",
+        let updated = sqlx::query_as::<_, (String, String)>(
+            "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status = 'uploaded' RETURNING owner, namespace",
         )
         .bind(msg)
         .bind(jid)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
-        .map(|result| result.rows_affected())
-        .unwrap_or(0);
-        if updated > 0 {
+        .ok()
+        .flatten();
+        if let Some((owner, namespace)) = updated {
             crate::storage::db::release_storage_reservations_with_pool(pool, &[jid.to_string()])
                 .await;
+            if let Some(ev) = events {
+                ev.publish_remember_failed(
+                    owner,
+                    namespace,
+                    Some(jid.to_string()),
+                    Some(msg.to_string()),
+                );
+            }
         }
         return;
     }
@@ -296,6 +319,27 @@ async fn record_uploaded_metadata_error(
     .bind(msg)
     .bind(jid)
     .execute(pool)
+    .await;
+}
+
+#[allow(dead_code)]
+pub(crate) async fn record_wallet_job_failure(
+    state: &AppState,
+    remember_job_id: Option<&str>,
+    _owner: &str,
+    _namespace: &str,
+    error: &WalletJobError,
+    msg: &str,
+    attempt_info: Option<WalletJobAttemptInfo>,
+) {
+    update_remember_job_after_wallet_error(
+        state.db.pool(),
+        Some(&state.events),
+        remember_job_id,
+        error,
+        msg,
+        attempt_info,
+    )
     .await;
 }
 
@@ -326,14 +370,22 @@ async fn finish_metadata_attempt_error(
     .await;
     update_remember_job_after_wallet_error(
         state.db.pool(),
+        Some(&state.events),
         remember_job_id,
         &err,
         &msg,
         Some(attempt_info),
     )
     .await;
-    record_uploaded_metadata_error(state.db.pool(), remember_job_id, &err, &msg, attempt_info)
-        .await;
+    record_uploaded_metadata_error(
+        state.db.pool(),
+        Some(&state.events),
+        remember_job_id,
+        &err,
+        &msg,
+        attempt_info,
+    )
+    .await;
     tracing::error!(
         "[wallet-job:set-metadata] job_id={} {} classification={} retryable={}",
         remember_job_id.unwrap_or("-"),
@@ -448,6 +500,7 @@ async fn schedule_metadata_congestion_retry(
     // and fail the uploaded row.
     record_uploaded_metadata_error(
         state.db.pool(),
+        Some(&state.events),
         remember_job_id,
         err,
         &waiting,
@@ -1471,6 +1524,7 @@ async fn insert_vector_and_mark_remember_done(
         let classified = WalletJobError::classify_sidecar_error(&msg);
         update_remember_job_after_wallet_error(
             state.db.pool(),
+            Some(&state.events),
             remember_job_id,
             &classified,
             &msg,
@@ -1502,6 +1556,14 @@ async fn insert_vector_and_mark_remember_done(
         // neither counts and a concurrent burst could slip past the quota.
         crate::rate_limit::release_storage_quota_one(state, jid).await;
     }
+
+    state.events.publish_remember_completed(
+        owner,
+        namespace,
+        remember_job_id.map(str::to_owned),
+        Some(blob_id.to_string()),
+        Some(1),
+    );
 
     tracing::info!(
         "[wallet-job:upload] done job_id={} blob_id={} owner={} ns={} key={}",
@@ -2313,6 +2375,7 @@ async fn execute_upload_and_transfer(
             // spent queue attempt reported as running until the stale sweep.
             update_remember_job_after_wallet_error(
                 state.db.pool(),
+                Some(&state.events),
                 remember_job_id.as_deref(),
                 &error,
                 error.message(),
@@ -2348,6 +2411,7 @@ async fn execute_upload_and_transfer(
             );
             update_remember_job_after_wallet_error(
                 state.db.pool(),
+                Some(&state.events),
                 Some(jid.as_str()),
                 &error,
                 error.message(),
@@ -2366,6 +2430,7 @@ async fn execute_upload_and_transfer(
                 };
                 update_remember_job_after_wallet_error(
                     state.db.pool(),
+                    Some(&state.events),
                     Some(jid.as_str()),
                     &error,
                     &congestion_wait_message(error.message()),
@@ -2618,6 +2683,7 @@ async fn execute_upload_and_transfer_locked(
             let classified = WalletJobError::Permanent(msg.clone());
             update_remember_job_after_wallet_error(
                 state.db.pool(),
+                Some(&state.events),
                 remember_job_id.as_deref(),
                 &classified,
                 &msg,
@@ -2677,6 +2743,7 @@ async fn execute_upload_and_transfer_locked(
                 {
                     update_remember_job_after_wallet_error(
                         state.db.pool(),
+                        Some(&state.events),
                         Some(jid.as_str()),
                         &err,
                         &congestion_wait_message(&msg),
@@ -2754,6 +2821,7 @@ async fn execute_upload_and_transfer_locked(
                 .await;
                 update_remember_job_after_wallet_error(
                     state.db.pool(),
+                    Some(&state.events),
                     Some(jid.as_str()),
                     &err,
                     &msg,
@@ -2905,6 +2973,7 @@ async fn execute_upload_and_transfer_locked(
                 // while the requeued copy waits out the backlog.
                 update_remember_job_after_wallet_error(
                     state.db.pool(),
+                    Some(&state.events),
                     remember_job_id.as_deref(),
                     &classified,
                     &congestion_wait_message(&msg),
@@ -3023,6 +3092,7 @@ async fn execute_upload_and_transfer_locked(
             .await;
             update_remember_job_after_wallet_error(
                 state.db.pool(),
+                Some(&state.events),
                 remember_job_id.as_deref(),
                 &classified,
                 &msg,
@@ -5776,6 +5846,7 @@ the checkpoint it replied about",
 
         update_remember_job_after_wallet_error(
             &pool,
+            None,
             Some(job_id.as_str()),
             &WalletJobError::Transient("another attempt of upload job is in progress".into()),
             "another attempt of upload job is in progress",
@@ -5846,6 +5917,7 @@ the checkpoint it replied about",
         let msg = err.message().to_string();
         record_uploaded_metadata_error(
             &pool,
+            None,
             Some(job_id.as_str()),
             &err,
             &msg,
@@ -5892,6 +5964,7 @@ the checkpoint it replied about",
         let exhausted_msg = exhausted.message().to_string();
         record_uploaded_metadata_error(
             &pool,
+            None,
             Some(exhausted_id.as_str()),
             &exhausted,
             &exhausted_msg,
@@ -5922,6 +5995,7 @@ the checkpoint it replied about",
         let permanent_msg = permanent.message().to_string();
         record_uploaded_metadata_error(
             &pool,
+            None,
             Some(permanent_id.as_str()),
             &permanent,
             &permanent_msg,
@@ -5956,6 +6030,7 @@ the checkpoint it replied about",
             seed_storage_reservation(&pool, &job_id).await;
             record_uploaded_metadata_error(
                 &pool,
+                None,
                 Some(job_id.as_str()),
                 &err,
                 &msg,
@@ -6099,6 +6174,7 @@ the checkpoint it replied about",
         let msg = congestion_wait_message(err.message());
         record_uploaded_metadata_error(
             &pool,
+            None,
             Some(job_id.as_str()),
             &err,
             &msg,
@@ -6142,6 +6218,7 @@ the checkpoint it replied about",
         );
         update_remember_job_after_wallet_error(
             &pool,
+            None,
             Some(job_id.as_str()),
             &err,
             err.message(),
@@ -6175,6 +6252,7 @@ the checkpoint it replied about",
         insert_job_with_status(&pool, &mid_id, "running", None).await;
         update_remember_job_after_wallet_error(
             &pool,
+            None,
             Some(mid_id.as_str()),
             &err,
             err.message(),
