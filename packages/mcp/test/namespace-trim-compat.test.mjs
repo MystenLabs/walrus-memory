@@ -4,7 +4,6 @@ import test from "node:test";
 import {
     normalizeNamespaceValue,
     normalizeToolNamespace,
-    applyDefaultNamespace,
 } from "../dist/bridge.js";
 
 test("normalizeNamespaceValue trims whitespace and preserves mixed case", () => {
@@ -159,5 +158,25 @@ test("normalizeToolNamespace rejects control characters on tool calls", () => {
     assert.throws(
         () => normalizeToolNamespace(msg),
         /Namespace cannot contain control characters/
+    );
+});
+
+test("normalizeToolNamespace rejects explicit blank restore namespace even when default is configured", () => {
+    const msg = {
+        jsonrpc: "2.0",
+        id: 15,
+        method: "tools/call",
+        params: {
+            name: "memwal_restore",
+            arguments: {
+                namespace: "   ",
+                limit: 10,
+            },
+        },
+    };
+
+    assert.throws(
+        () => normalizeToolNamespace(msg, "work"),
+        /Namespace cannot be empty/
     );
 });

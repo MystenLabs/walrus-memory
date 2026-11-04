@@ -118,12 +118,16 @@ export function normalizeToolNamespace(
     if (!params || typeof params.name !== "string" || !NAMESPACE_TOOLS.has(params.name)) {
         return msg;
     }
+    const toolName = params.name;
     const args = (params.arguments ??= {});
     const normalizedDefault = normalizeNamespaceValue(defaultNamespace);
 
     if ("namespace" in args) {
         const raw = args.namespace;
         if (typeof raw === "string") {
+            if (toolName === "memwal_restore" && raw.trim().length === 0) {
+                throw new Error("Namespace cannot be empty");
+            }
             const normalized = normalizeNamespaceValue(raw);
             if (normalized !== undefined) {
                 args.namespace = normalized;
