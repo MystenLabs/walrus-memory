@@ -524,6 +524,19 @@ class MemoryEvent:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryEvent":
         """Instantiate MemoryEvent from server JSON payload."""
+        if data.get("type") == "system.lagged":
+            return cls(
+                id=data.get("id", ""),
+                type="system.lagged",
+                owner=data.get("owner", ""),
+                namespace=data.get("namespace", ""),
+                timestamp=data.get("timestamp", ""),
+                job_id=data.get("job_id"),
+                blob_id=data.get("blob_id"),
+                count=data.get("count"),
+                error=data.get("error"),
+                skipped=data.get("skipped"),
+            )
         return cls(
             id=data["id"],
             type=data["type"],

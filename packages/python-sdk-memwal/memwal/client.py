@@ -1651,10 +1651,6 @@ class MemWal:
         if self._destroyed:
             raise _destroyed_client_error()
 
-        await self._ensure_compatible_relayer()
-        if self._destroyed:
-            raise _destroyed_client_error()
-
         query_parts: List[Tuple[str, str]] = []
         if namespace is not None:
             if not isinstance(namespace, str) or not namespace.strip():
@@ -1671,6 +1667,10 @@ class MemWal:
                 if not isinstance(t, str) or not t.strip():
                     raise ValueError("each event type in types must be a non-empty string")
             query_parts.append(("types", ",".join(types)))
+
+        await self._ensure_compatible_relayer()
+        if self._destroyed:
+            raise _destroyed_client_error()
 
         qs = urlencode(query_parts) if query_parts else ""
         path = f"/api/events{f'?{qs}' if qs else ''}"
@@ -1706,8 +1706,8 @@ class MemWal:
                         data_lines = []
                         try:
                             yield MemoryEvent.from_dict(json.loads(payload))
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
                     continue
                 if line_stripped.startswith(":"):
                     continue
@@ -1718,8 +1718,8 @@ class MemWal:
                 payload = "\n".join(data_lines)
                 try:
                     yield MemoryEvent.from_dict(json.loads(payload))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
 
 
     # ============================================================
@@ -2362,17 +2362,27 @@ class MemWalRateLimited(MemWalError):
     included, so none of its writes could be confirmed (GH #967). Status reads
     count against the same delegate-key budget as writes."""
 
-    def __init__(self, job_ids: Sequence[str], retry_after: Optional[str] = None) -> None:
-        wait = f" after ~{retry_after}s" if retry_after else ""
-        super().__init__(
-            f"Walrus Memory rate-limited every status read for this batch, so none of its "
-            f"{len(job_ids)} writes could be confirmed. Do not treat them as stored: check them "
-            f"with get_remember_bulk_status(job_ids){wait}. Status reads count against the same "
-            "delegate-key budget as writes."
-        )
-        self.status = 429
-        self.job_ids = list(job_ids)
-        self.retry_after = retry_after
+    def __init__(
+        self,
+        message_or_job_ids: Union[str, Sequence[str]],
+        retry_after: Optional[str] = None,
+    ) -> None:
+        if isinstance(message_or_job_ids, str):
+            super().__init__(message_or_job_ids)
+            self.status = 429
+            self.job_ids: List[str] = []
+            self.retry_after = retry_after
+        else:
+            wait = f" after ~{retry_after}s" if retry_after else ""
+            super().__init__(
+                f"Walrus Memory rate-limited every status read for this batch, so none of its "
+                f"{len(message_or_job_ids)} writes could be confirmed. Do not treat them as stored: check them "
+                f"with get_remember_bulk_status(job_ids){wait}. Status reads count against the same "
+                "delegate-key budget as writes."
+            )
+            self.status = 429
+            self.job_ids = list(message_or_job_ids)
+            self.retry_after = retry_after
 
 
 class MemWalRememberJobTimeout(MemWalError):
@@ -2688,10 +2698,6 @@ class MemWalSync:
         if self._inner._destroyed:
             raise _destroyed_client_error()
 
-        self._run(self._inner._ensure_compatible_relayer())
-        if self._inner._destroyed:
-            raise _destroyed_client_error()
-
         query_parts: List[Tuple[str, str]] = []
         if namespace is not None:
             if not isinstance(namespace, str) or not namespace.strip():
@@ -2709,6 +2715,10 @@ class MemWalSync:
                     raise ValueError("each event type in types must be a non-empty string")
             query_parts.append(("types", ",".join(types)))
 
+        self._run(self._inner._ensure_compatible_relayer())
+        if self._inner._destroyed:
+            raise _destroyed_client_error()
+
         qs = urlencode(query_parts) if query_parts else ""
         path = f"/api/events{f'?{qs}' if qs else ''}"
         url = f"{self._inner._server_url}{path}"
@@ -2720,7 +2730,7 @@ class MemWalSync:
         with httpx.Client(timeout=timeout) as client:
             with client.stream("GET", url, headers=headers) as response:
                 if response.status_code != 200:
-                    err_text = response.text
+                    err_text = response.read().decode("utf-8", errors="replace")
                     if response.status_code == 426:
                         detail = err_text[:300] or "upgrade required"
                         raise MemWalCompatibilityError(
@@ -2744,8 +2754,8 @@ class MemWalSync:
                             data_lines = []
                             try:
                                 yield MemoryEvent.from_dict(json.loads(payload))
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
                         continue
                     if line_stripped.startswith(":"):
                         continue
@@ -2756,8 +2766,8 @@ class MemWalSync:
                     payload = "\n".join(data_lines)
                     try:
                         yield MemoryEvent.from_dict(json.loads(payload))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
 
 
     def remember_manual(self, opts: RememberManualOptions) -> RememberManualResult:

@@ -11,7 +11,14 @@ import nacl.signing
 import pytest
 import respx
 
-from memwal import MemoryEvent, MemWal, MemWalError, MemWalSync
+from memwal import (
+    MemoryEvent,
+    MemWal,
+    MemWalCompatibilityError,
+    MemWalError,
+    MemWalRateLimited,
+    MemWalSync,
+)
 from memwal.utils import bytes_to_hex
 
 _TEST_SEED = b"\x02" * 32
@@ -227,3 +234,163 @@ def test_subscribe_events_sync_wrapper() -> None:
     assert items[0].skipped == 2
 
     client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_subscribe_events_system_lagged_async() -> None:
+    _mock_version()
+
+    lag_event = {"type": "system.lagged", "skipped": 7}
+    normal_event = {
+        "id": "evt-005",
+        "type": "memory.remember.completed",
+        "owner": "0xowner",
+        "namespace": "default",
+        "timestamp": "2026-11-03T00:00:04Z",
+        "job_id": "job-456",
+        "count": 1,
+    }
+    sse_body = (
+        f"event: system.lagged\ndata: {json.dumps(lag_event)}\n\n"
+        f"event: memory.remember.completed\ndata: {json.dumps(normal_event)}\n\n"
+    )
+
+    respx.get(f"{_TEST_SERVER}/api/events").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=sse_body.encode("utf-8"),
+        )
+    )
+
+    client = MemWal.create(
+        key=_TEST_KEY_HEX,
+        account_id=_TEST_ACCOUNT_ID,
+        server_url=_TEST_SERVER,
+    )
+
+    events = []
+    async for evt in client.subscribe_events():
+        events.append(evt)
+
+    assert len(events) == 2
+    assert events[0].type == "system.lagged"
+    assert events[0].skipped == 7
+    assert events[1].type == "memory.remember.completed"
+    assert events[1].id == "evt-005"
+    assert events[1].job_id == "job-456"
+
+    await client.close()
+
+
+@respx.mock
+def test_subscribe_events_system_lagged_sync() -> None:
+    _mock_version()
+
+    lag_event = {"type": "system.lagged", "skipped": 7}
+    normal_event = {
+        "id": "evt-006",
+        "type": "memory.remember.completed",
+        "owner": "0xowner",
+        "namespace": "default",
+        "timestamp": "2026-11-03T00:00:05Z",
+        "job_id": "job-789",
+        "count": 2,
+    }
+    sse_body = (
+        f"event: system.lagged\ndata: {json.dumps(lag_event)}\n\n"
+        f"event: memory.remember.completed\ndata: {json.dumps(normal_event)}\n\n"
+    )
+
+    respx.get(f"{_TEST_SERVER}/api/events").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=sse_body.encode("utf-8"),
+        )
+    )
+
+    client = MemWalSync.create(
+        key=_TEST_KEY_HEX,
+        account_id=_TEST_ACCOUNT_ID,
+        server_url=_TEST_SERVER,
+    )
+
+    events = list(client.subscribe_events())
+    assert len(events) == 2
+    assert events[0].type == "system.lagged"
+    assert events[0].skipped == 7
+    assert events[1].type == "memory.remember.completed"
+    assert events[1].id == "evt-006"
+    assert events[1].count == 2
+
+    client.close()
+
+
+@respx.mock
+def test_subscribe_events_sync_stream_unread_errors() -> None:
+    _mock_version()
+
+    # Streamed 429 rate limited
+    respx.get(f"{_TEST_SERVER}/api/events").mock(
+        return_value=httpx.Response(
+            429,
+            stream=httpx.ByteStream(b"rate limit exceeded"),
+        )
+    )
+
+    client = MemWalSync.create(
+        key=_TEST_KEY_HEX,
+        account_id=_TEST_ACCOUNT_ID,
+        server_url=_TEST_SERVER,
+    )
+
+    with pytest.raises(MemWalRateLimited, match="Rate limited by server"):
+        list(client.subscribe_events())
+
+    # Streamed 426 upgrade required
+    respx.get(f"{_TEST_SERVER}/api/events").mock(
+        return_value=httpx.Response(
+            426,
+            stream=httpx.ByteStream(b"server upgrade required"),
+        )
+    )
+    with pytest.raises(MemWalCompatibilityError, match="HTTP 426 Upgrade Required"):
+        list(client.subscribe_events())
+
+    # Streamed 401 unauthorized
+    respx.get(f"{_TEST_SERVER}/api/events").mock(
+        return_value=httpx.Response(
+            401,
+            stream=httpx.ByteStream(b"unauthorized access"),
+        )
+    )
+    with pytest.raises(MemWalError, match="HTTP 401: unauthorized access"):
+        list(client.subscribe_events())
+
+    client.close()
+
+
+def test_subscribe_events_sync_validations() -> None:
+    client = MemWalSync.create(
+        key=_TEST_KEY_HEX,
+        account_id=_TEST_ACCOUNT_ID,
+        server_url=_TEST_SERVER,
+    )
+
+    with pytest.raises(ValueError, match="namespace must be a non-empty string"):
+        list(client.subscribe_events(namespace=""))
+
+    with pytest.raises(ValueError, match="types must be a non-empty sequence"):
+        list(client.subscribe_events(types=[]))
+
+    with pytest.raises(ValueError, match="types must be a non-empty sequence"):
+        list(client.subscribe_events(types="memory.forget"))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="each event type in types must be a non-empty string"):
+        list(client.subscribe_events(types=[""]))
+
+    client.destroy()
+    with pytest.raises(MemWalError, match="destroyed"):
+        list(client.subscribe_events())

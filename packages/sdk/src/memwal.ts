@@ -1698,6 +1698,7 @@ export class MemWal {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let streamCompleted = false;
 
         const onAbort = () => {
             reader.cancel().catch(() => {});
@@ -1758,9 +1759,13 @@ export class MemWal {
                     }
                 }
             }
+            streamCompleted = true;
         } finally {
             if (options.signal) {
                 options.signal.removeEventListener("abort", onAbort);
+            }
+            if (!streamCompleted) {
+                await reader.cancel().catch(() => {});
             }
             reader.releaseLock();
         }

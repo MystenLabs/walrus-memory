@@ -2682,6 +2682,9 @@ async fn main() {
         .await
         .expect("initial owner policy snapshot unavailable");
 
+    let events = Arc::new(events::EventHub::new());
+    events.start_redis_bridge(config.rate_limit.redis_url.clone(), redis.clone());
+
     let state = Arc::new(AppState {
         owner_policies,
         db,
@@ -2715,7 +2718,7 @@ async fn main() {
         blob_cache_ttl,
         blob_cache_max_bytes,
         embedding_cache_ttl,
-        events: Arc::new(events::EventHub::new()),
+        events,
     });
 
     jobs_security_delete::spawn_reconciler(Arc::clone(&state));

@@ -142,3 +142,54 @@ test("subscribeEvents respects AbortSignal", async (t) => {
     assert.equal(events.length, 1);
     assert.equal(events[0].id, "evt-1");
 });
+
+test("subscribeEvents cancels underlying reader when breaking early", async (t) => {
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+    });
+
+    let cancelled = false;
+
+    globalThis.fetch = async (url) => {
+        const u = new URL(url);
+        if (u.pathname === "/version") {
+            return Response.json({
+                apiVersion: "1.0.0",
+                relayerVersion: "1.0.0",
+                minSupportedSdk: { typescript: "0.0.4" },
+            });
+        }
+        if (u.pathname === "/api/events") {
+            const stream = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(
+                        new TextEncoder().encode(
+                            "id: evt-1\nevent: memory.remember.accepted\ndata: {\"id\":\"evt-1\",\"type\":\"memory.remember.accepted\",\"owner\":\"0x1\",\"namespace\":\"default\",\"timestamp\":\"2026-11-03T00:00:00Z\"}\n\n"
+                        )
+                    );
+                },
+                cancel() {
+                    cancelled = true;
+                },
+            });
+
+            return new Response(stream, {
+                status: 200,
+                headers: { "Content-Type": "text/event-stream" },
+            });
+        }
+        throw new Error(`Unexpected request to ${u.pathname}`);
+    };
+
+    const client = createClient();
+    const events = [];
+
+    for await (const evt of client.subscribeEvents()) {
+        events.push(evt);
+        break;
+    }
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0].id, "evt-1");
+    assert.equal(cancelled, true);
+});
