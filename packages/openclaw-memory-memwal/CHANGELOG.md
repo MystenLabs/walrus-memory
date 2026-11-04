@@ -1,5 +1,15 @@
 # @mysten-incubation/oc-memwal
 
+## 0.0.9
+
+### Fixed
+
+- Keep sub-agent memory separate from the main agent when the derived namespace or legacy alias would collide with `defaultNamespace`. Colliding derived namespaces use a deterministic hashed namespace, and `memory_search` and `memory_store` reject explicit requests for the main namespace from sub-agent sessions.
+
+### Changed
+
+- Update the MemWal SDK dependency to `0.1.13`.
+
 ## 0.0.8
 
 ### Fixed
