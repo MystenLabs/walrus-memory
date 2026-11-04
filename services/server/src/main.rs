@@ -868,6 +868,25 @@ mod mcp_rate_limit_tests {
                 "public, max-age=300"
             );
             assert!(response.headers().contains_key("etag"));
+
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json["$schema"],
+                "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+            );
+            assert_eq!(json["name"], "xyz.walrus.memory/memwal");
+            assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(
+                json["description"],
+                "Portable, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
+            );
+            assert_eq!(json["title"], "Walrus Memory MCP Server");
+            assert!(json["remotes"].as_array().is_some());
+            assert!(json.get("schemaVersion").is_none());
+            assert!(json.get("tools").is_none());
         }
     }
     #[tokio::test]
@@ -1667,14 +1686,17 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
                                         tracing::warn!(
                                             address,
                                             balance = wal_balance,
-                                            threshold = state.config.wallet_balance_low_threshold_wal,
+                                            threshold =
+                                                state.config.wallet_balance_low_threshold_wal,
                                             "balance_monitor: uploader wallet WAL address balance below threshold"
                                         );
                                         let alert = alerts::WalletBalanceLowAlert {
                                             wallet_type: "uploader".to_string(),
                                             address: address.to_string(),
                                             balance: wal_balance,
-                                            threshold: state.config.wallet_balance_low_threshold_wal,
+                                            threshold: state
+                                                .config
+                                                .wallet_balance_low_threshold_wal,
                                             token: "WAL".to_string(),
                                             sui_network: state.config.sui_network.clone(),
                                             wallet_index,
@@ -1712,14 +1734,17 @@ async fn balance_monitor_task(state: Arc<AppState>, interval_secs: u64) {
                                         tracing::warn!(
                                             address,
                                             balance = sui_balance,
-                                            threshold = state.config.wallet_balance_low_threshold_sui,
+                                            threshold =
+                                                state.config.wallet_balance_low_threshold_sui,
                                             "balance_monitor: uploader wallet SUI address balance below threshold"
                                         );
                                         let alert = alerts::WalletBalanceLowAlert {
                                             wallet_type: "uploader".to_string(),
                                             address: address.to_string(),
                                             balance: sui_balance,
-                                            threshold: state.config.wallet_balance_low_threshold_sui,
+                                            threshold: state
+                                                .config
+                                                .wallet_balance_low_threshold_sui,
                                             token: "SUI".to_string(),
                                             sui_network: state.config.sui_network.clone(),
                                             wallet_index,
@@ -1901,7 +1926,7 @@ async fn init_apalis_pool(
             return Err(format!(
                 "timed out after {}s connecting to PostgreSQL for Apalis",
                 startup_timeout.as_secs()
-            ))
+            ));
         }
     };
     tracing::info!("  Apalis: PostgreSQL connected");
@@ -1914,7 +1939,7 @@ async fn init_apalis_pool(
             return Err(format!(
                 "timed out after {}s checking Apalis schema readiness",
                 startup_timeout.as_secs()
-            ))
+            ));
         }
     };
     if schema_ready {
@@ -1933,13 +1958,13 @@ async fn init_apalis_pool(
         Ok(Err(err)) => {
             return Err(format!(
                 "connect to PostgreSQL for Apalis migrations: {err}"
-            ))
+            ));
         }
         Err(_) => {
             return Err(format!(
                 "timed out after {}s connecting to PostgreSQL for Apalis migrations",
                 startup_timeout.as_secs()
-            ))
+            ));
         }
     };
     let setup_result = match tokio::time::timeout(
@@ -3700,7 +3725,9 @@ async fn main() {
             .collect();
 
         if origins.is_empty() {
-            tracing::warn!("ALLOWED_ORIGINS not set — CORS is deny-all (browsers blocked). Set ALLOWED_ORIGINS for frontend access.");
+            tracing::warn!(
+                "ALLOWED_ORIGINS not set — CORS is deny-all (browsers blocked). Set ALLOWED_ORIGINS for frontend access."
+            );
             CorsLayer::new() // deny-all: no Allow-Origin header emitted
         } else {
             tracing::info!("  CORS origins: {}", config.allowed_origins);

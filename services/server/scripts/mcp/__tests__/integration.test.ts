@@ -26,7 +26,7 @@ import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { mountMcpRoutes } from "../index.js";
+import { buildMcpServerCard, computeServerCardEtag, mountMcpRoutes, MCP_SERVER_CARD } from "../index.js";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -529,6 +529,187 @@ test("official stdio bridge authenticates SSE message POSTs", async (t) => {
     child.stdin.end();
 });
 
+function validateServerCardSep2127(card: Record<string, any>): void {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    const schemaPath = join(__dirname, "fixtures/server-card.schema.json");
+    const schema = JSON.parse(readFileSync(schemaPath, "utf-8"));
+    const defs = schema.$defs;
+
+    const allowedRootProps = new Set(Object.keys(defs.ServerCard.properties));
+    for (const key of Object.keys(card)) {
+        assert(
+            allowedRootProps.has(key),
+            `unexpected property on ServerCard: ${key}`
+        );
+    }
+
+    for (const req of ["$schema", "description", "name", "version"]) {
+        assert.ok(req in card, `missing required ServerCard property: ${req}`);
+    }
+
+    assert.equal(
+        card.$schema,
+        "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+    );
+
+    assert.equal(typeof card.name, "string");
+    assert.ok(card.name.length >= 3 && card.name.length <= 200);
+    assert.match(card.name, /^[a-zA-Z0-9.-]+\/[a-zA-Z0-9._-]+$/);
+
+    assert.equal(typeof card.version, "string");
+    assert.ok(card.version.length <= 255);
+
+    assert.equal(typeof card.description, "string");
+    assert.ok(
+        card.description.length >= 1 && card.description.length <= 100,
+        `description length ${card.description.length} exceeds maxLength 100`
+    );
+
+    if (card.title !== undefined) {
+        assert.equal(typeof card.title, "string");
+        assert.ok(card.title.length >= 1 && card.title.length <= 100);
+    }
+
+    if (card.websiteUrl !== undefined) {
+        assert.equal(typeof card.websiteUrl, "string");
+        assert.match(card.websiteUrl, /^https?:\/\//);
+    }
+
+    if (card.repository !== undefined) {
+        const allowedRepoProps = new Set(Object.keys(defs.Repository.properties));
+        for (const key of Object.keys(card.repository)) {
+            assert(
+                allowedRepoProps.has(key),
+                `unexpected property on Repository: ${key}`
+            );
+        }
+        assert.equal(typeof card.repository.source, "string");
+        assert.equal(typeof card.repository.url, "string");
+    }
+
+    assert.ok(Array.isArray(card.remotes), "remotes must be array");
+    assert.ok(card.remotes.length > 0, "remotes must not be empty");
+
+    const allowedRemoteProps = new Set(Object.keys(defs.Remote.properties));
+    const allowedKeyValueProps = new Set(Object.keys(defs.KeyValueInput.properties));
+    const allowedInputProps = new Set(Object.keys(defs.Input.properties));
+
+    for (const remote of card.remotes) {
+        for (const key of Object.keys(remote)) {
+            assert(
+                allowedRemoteProps.has(key),
+                `unexpected property on Remote: ${key}`
+            );
+        }
+        assert.ok(remote.type === "sse" || remote.type === "streamable-http");
+        assert.match(
+            remote.url,
+            /^(https?:\/\/[^\s]+|\{[a-zA-Z_][a-zA-Z0-9_]*\}[^\s]*)$/
+        );
+
+        if (remote.headers !== undefined) {
+            assert.ok(Array.isArray(remote.headers));
+            for (const header of remote.headers) {
+                for (const key of Object.keys(header)) {
+                    assert(
+                        allowedKeyValueProps.has(key),
+                        `unexpected property on KeyValueInput: ${key}`
+                    );
+                }
+                assert.equal(typeof header.name, "string");
+                if (header.variables !== undefined) {
+                    for (const [varName, varDef] of Object.entries<Record<string, any>>(header.variables)) {
+                        for (const key of Object.keys(varDef)) {
+                            assert(
+                                allowedInputProps.has(key),
+                                `unexpected property on Input ${varName}: ${key}`
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if (remote.variables !== undefined) {
+            for (const [varName, varDef] of Object.entries<Record<string, any>>(remote.variables)) {
+                for (const key of Object.keys(varDef)) {
+                    assert(
+                        allowedInputProps.has(key),
+                        `unexpected property on Input ${varName}: ${key}`
+                    );
+                }
+            }
+        }
+    }
+
+    if (card._meta !== undefined) {
+        assert.equal(typeof card._meta, "object");
+        for (const key of Object.keys(card._meta)) {
+            assert.ok(
+                !key.includes("modelcontextprotocol") && !key.includes("mcp"),
+                `reserved prefix in _meta: ${key}`
+            );
+            assert.ok(key.includes("/"), `_meta key must have prefix and name: ${key}`);
+        }
+    }
+
+    // Anti-regression: assert non-standard legacy properties are absent
+    for (const forbidden of [
+        "schemaVersion",
+        "vendor",
+        "documentationUrl",
+        "endpoints",
+        "authentication",
+        "capabilities",
+        "tools",
+    ]) {
+        assert.ok(
+            !(forbidden in card),
+            `non-standard legacy property must not be present: ${forbidden}`
+        );
+    }
+}
+
+test("buildMcpServerCard conforms to SEP-2127 across templated, origin, and OAuth modes", () => {
+    // Templated (no origin)
+    const templated = buildMcpServerCard();
+    validateServerCardSep2127(templated);
+    const templatedRemotes = templated.remotes as Array<Record<string, any>>;
+    assert.equal(templatedRemotes[0].url, "{relayer_url}/api/mcp");
+    assert.equal(templatedRemotes[1].url, "{relayer_url}/api/mcp/sse");
+    assert.ok(templatedRemotes[0].variables.relayer_url);
+    const templatedMeta = (templated._meta as Record<string, any>)["xyz.walrus.memory/auth"];
+    assert.equal(templatedMeta.oauth2.enabled, false);
+
+    // Concrete publicRelayerUrl
+    const withOrigin = buildMcpServerCard({
+        publicRelayerUrl: "https://relayer.memory.walrus.xyz/",
+    });
+    validateServerCardSep2127(withOrigin);
+    const withOriginRemotes = withOrigin.remotes as Array<Record<string, any>>;
+    assert.equal(withOriginRemotes[0].url, "https://relayer.memory.walrus.xyz/api/mcp");
+    assert.equal(withOriginRemotes[1].url, "https://relayer.memory.walrus.xyz/api/mcp/sse");
+    assert.equal(withOriginRemotes[0].variables, undefined);
+
+    // With OAuth enabled
+    const withOauth = buildMcpServerCard({
+        publicRelayerUrl: "https://relayer.memory.walrus.xyz",
+        oauthEnabled: true,
+    });
+    validateServerCardSep2127(withOauth);
+    const withOauthMeta = (withOauth._meta as Record<string, any>)["xyz.walrus.memory/auth"];
+    assert.equal(withOauthMeta.oauth2.enabled, true);
+    assert.equal(
+        withOauthMeta.oauth2.protectedResourceMetadata,
+        "https://relayer.memory.walrus.xyz/.well-known/oauth-protected-resource"
+    );
+    assert.equal(
+        withOauthMeta.oauth2.authorizationServerMetadata,
+        "https://relayer.memory.walrus.xyz/.well-known/oauth-authorization-server"
+    );
+});
+
 test("GET /server-card and /mcp/server-card return 200 with server card and 304 on matching etag", async () => {
     for (const path of ["/server-card", "/mcp/server-card", "/.well-known/mcp/server-card.json"]) {
         const res = await fetch(`${baseUrl}${path}`);
@@ -541,34 +722,16 @@ test("GET /server-card and /mcp/server-card return 200 with server card and 304 
         const etag = res.headers.get("etag");
         assert(etag, "etag must be present");
 
-        const data = await res.json() as Record<string, unknown>;
-        assert.equal(data.name, "memwal");
-        assert.equal(data.schemaVersion, "1.0");
+        const data = (await res.json()) as Record<string, unknown>;
+        validateServerCardSep2127(data);
+
+        assert.equal(data.name, "xyz.walrus.memory/memwal");
         assert.equal(data.title, "Walrus Memory MCP Server");
         assert.equal(
             data.description,
-            "Decentralized, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
+            "Portable, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
         );
-        assert.equal((data.endpoints as Record<string, string>).streamableHttp, "/api/mcp");
-        assert.equal((data.endpoints as Record<string, string>).sse, "/api/mcp/sse");
-        assert.equal((data.authentication as Record<string, unknown>).required, true);
-
-        const tools = data.tools as Array<{ name: string; description: string }>;
-        assert.equal(tools.length, 8);
-        const expectedTools = [
-            "memwal_remember",
-            "memwal_remember_bulk",
-            "memwal_recall",
-            "memwal_analyze",
-            "memwal_ask",
-            "memwal_forget",
-            "memwal_stats",
-            "memwal_restore",
-        ];
-        for (let i = 0; i < expectedTools.length; i++) {
-            assert.equal(tools[i].name, expectedTools[i]);
-            assert(tools[i].description.length > 0);
-        }
+        assert.equal(data.websiteUrl, "https://memory.walrus.xyz");
 
         const cachedRes = await fetch(`${baseUrl}${path}`, {
             headers: { "if-none-match": etag },
@@ -579,4 +742,84 @@ test("GET /server-card and /mcp/server-card return 200 with server card and 304 
         const bodyText = await cachedRes.text();
         assert.equal(bodyText, "");
     }
+});
+
+test("discovery-driven MCP handshake: fetch server-card, substitute templates, initialize succeeds", async () => {
+    // 1. Fetch server card from discovery route
+    const cardRes = await fetch(`${baseUrl}/mcp/server-card`);
+    assert.equal(cardRes.status, 200);
+    const card = (await cardRes.json()) as Record<string, any>;
+    validateServerCardSep2127(card);
+
+    // 2. Discover streamable-http remote
+    const remotes = card.remotes as Array<Record<string, any>>;
+    const remote = remotes.find((r) => r.type === "streamable-http");
+    assert(remote, "streamable-http remote must be discovered from card");
+
+    // 3. Resolve endpoint URL from template
+    let endpointUrl = remote.url as string;
+    if (endpointUrl.includes("{relayer_url}")) {
+        endpointUrl = endpointUrl.replace("{relayer_url}", baseUrl);
+    }
+
+    // 4. Resolve headers from the templates advertised in the card
+    const testDelegateKeyHex = hex(32);
+    const testAccountId = `0x${hex(32)}`;
+    const initHeaders: Record<string, string> = {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+    };
+
+    for (const h of remote.headers ?? []) {
+        if (h.name === "Authorization") {
+            initHeaders["authorization"] = h.value.replace(
+                "{bearer_token}",
+                testDelegateKeyHex
+            );
+        } else if (h.name === "X-MemWal-Account-Id") {
+            initHeaders["x-memwal-account-id"] = testAccountId;
+        } else if (h.name === "X-MemWal-Namespace" && h.default) {
+            initHeaders["x-memwal-namespace"] = h.default;
+        }
+    }
+
+    // 5. POST initialize JSON-RPC envelope to resolved endpoint
+    const initRes = await fetch(endpointUrl, {
+        method: "POST",
+        headers: initHeaders,
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+                protocolVersion: "2024-11-05",
+                capabilities: {},
+                clientInfo: {
+                    name: "sep2127-discovery-test-client",
+                    version: "1.0.0",
+                },
+            },
+        }),
+    });
+
+    assert.equal(initRes.status, 200, `POST ${endpointUrl} must return 200 OK`);
+    const sessionId = initRes.headers.get("mcp-session-id");
+    assert(sessionId, "streamable-http session ID header must be returned");
+
+    const rawText = await initRes.text();
+    let initData: Record<string, any>;
+    if (rawText.startsWith("event:") || rawText.includes("data:")) {
+        const dataLine = rawText.split("\n").find((l) => l.startsWith("data:"));
+        assert(dataLine, `expected data: line in response: ${rawText}`);
+        initData = JSON.parse(dataLine.slice(5).trim());
+    } else {
+        initData = JSON.parse(rawText);
+    }
+
+    assert.equal(initData.jsonrpc, "2.0");
+    assert.equal(initData.id, 1);
+    assert(initData.result, "initialize result must be returned");
+    assert.equal(initData.result.protocolVersion, "2024-11-05");
+    assert(initData.result.serverInfo, "serverInfo must be present");
+    assert.equal(initData.result.serverInfo.name, "memwal");
 });
