@@ -214,6 +214,7 @@ The stdio package accepts CLI flags and environment variables. **CLI takes prece
 | `--label <text>` | `MEMWAL_CLIENT_LABEL` | Friendly delegate-key label shown in the Walrus Memory dashboard. |
 | `--namespace <name>` (alias `--ns`) | `MEMWAL_NAMESPACE` | Default memory namespace injected into memory tool calls that omit one. See [Default namespace](#default-namespace). |
 | `--login` (or `login` subcommand) | Not applicable | Force a re-login even when credentials exist. The existing file is kept until the new sign-in succeeds. |
+| `status` (alias `whoami`, `--status`, `--whoami`) | Not applicable | Print the active account ID, delegate address, key label, effective relayer URL, resolved namespace, and credentials path, then exit. Works without a TTY and exits `1` when not logged in. |
 | `--logout` | Not applicable | Delete the credentials file currently in use and exit. |
 | `approve-project` | Not applicable | Approve the project-local `.memwal/credentials.json` found from the current directory, so it is the file used here. Requires an interactive terminal. See [Approving a project file](#approving-a-project-file). |
 | `revoke-project` | Not applicable | Withdraw that approval. Requires an interactive terminal. |
