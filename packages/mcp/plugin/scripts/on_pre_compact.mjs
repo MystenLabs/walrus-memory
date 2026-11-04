@@ -1,17 +1,30 @@
 /**
- * PreCompact hook. Remind the agent to review the session and save durable
- * facts to Walrus Memory before context compaction.
+ * PreCompact hook. Performs a synchronous host-compatible pre-compaction save
+ * of durable facts to Walrus Memory before Claude Code context compaction.
  *
- * Automatic saving is required. When automatic saving is off, this hook
- * exits quietly with code 0 and emits nothing.
+ * Claude Code PreCompact contract:
+ * - Exit code 0 with empty stdout allows compaction to proceed.
+ * - PreCompact has NO PreCompactHookSpecificOutput variant in Claude Code.
+ * - Claude Code discards `systemMessage` and `continue` on PreCompact.
+ * - The hook receives `{ session_id, transcript_path, cwd, hook_event_name: "PreCompact", trigger, custom_instructions }`
+ *   on stdin and blocks synchronously until this process exits 0.
+ *
+ * When automatic saving is off or unset, exits immediately with code 0 and empty stdout.
  */
-import { readStdin, emitContext } from "./lib/hook-io.mjs";
-import { PRE_COMPACT_PROMPT } from "./lib/memory-policy.mjs";
+import { readStdin } from "./lib/hook-io.mjs";
 import { isAutoSaveEnabled } from "./lib/auto-save.mjs";
 
-readStdin();
+const input = readStdin();
 
-if (!isAutoSaveEnabled()) process.exit(0);
+if (!isAutoSaveEnabled()) {
+    process.exit(0);
+}
 
-emitContext("PreCompact", PRE_COMPACT_PROMPT);
+try {
+    const { runPreCompactSave } = await import("../../dist/pre-compact.js");
+    await runPreCompactSave(input);
+} catch {
+    // Hooks must never fail, crash, or block session compaction
+}
+
 process.exit(0);

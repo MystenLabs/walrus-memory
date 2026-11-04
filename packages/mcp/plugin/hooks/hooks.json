@@ -44,7 +44,7 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/on_pre_compact.mjs\"",
             "statusMessage": "Preserving session context before compaction...",
-            "timeout": 8
+            "timeout": 10
           }
         ]
       }
