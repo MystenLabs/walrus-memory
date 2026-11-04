@@ -120,6 +120,11 @@ const OPT_OUT_PATTERNS: RegExp[] = [
     /\bMEMWAL_IGNORE\b/,
 ];
 
+/** Check whether text contains any opt-out marker. */
+export function hasOptOutMarker(text: string): boolean {
+    return OPT_OUT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 const SECRET_PATTERNS: RegExp[] = [
     // Sui private key (suiprivkey1...)
     /suiprivkey1[0-9a-zA-Z]+/,
@@ -208,53 +213,213 @@ export function discoverImportFiles(targetDir: string): { realRoot: string; file
     return { realRoot, files: discovered };
 }
 
-interface RawSection {
+export interface RawSection {
     heading: string;
     content: string;
+    inheritedOptOut?: boolean;
+    optOutSource?: string;
 }
 
-function parseSections(content: string, relPath: string): RawSection[] {
+function countPrivateTags(text: string): { openings: number; closings: number } {
+    const openMatches = text.match(/<\s*private(?:\s[^>]*)?>/gi);
+    const closeMatches = text.match(/<\s*\/\s*private\s*>/gi);
+    return {
+        openings: openMatches ? openMatches.length : 0,
+        closings: closeMatches ? closeMatches.length : 0,
+    };
+}
+
+function linesContainPrivate(lines: string[]): boolean {
+    for (const l of lines) {
+        if (/<\s*private(?:\s[^>]*)?>/i.test(l) || /<\s*\/\s*private\s*>/i.test(l)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export function parseSections(content: string, relPath: string): RawSection[] {
     const lines = content.split(/\r?\n/);
     const sections: RawSection[] = [];
+    const fallbackHeading = relPath.startsWith(".") ? "Rules" : "General";
+
     let currentHeading = "";
     let currentLines: string[] = [];
+    let currentOptedOut = false;
+    let sectionInPrivate = false;
+    let sectionHasBodyOptOut = false;
+    let sectionStartedInPrivate = false;
 
-    const headingRegex = /^#{1,3}\s+(.+)$/;
+    // Heading ancestor stack: levels 1 through 6
+    const headingStack: Array<{ level: number; heading: string; optedOut: boolean }> = [];
+    let privateDepth = 0;
+
+    // Fenced code block tracking (``` or ~~~)
+    let inCodeFence = false;
+    let codeFenceChar: string | null = null;
+    let codeFenceLen = 0;
+
+    const headingRegex = /^(#{1,6})\s+(.+)$/;
+    const fenceRegex = /^\s*(`{3,}|~{3,})/;
+
+    function flushCurrentSection(): void {
+        if (currentLines.length > 0 || currentHeading) {
+            const text = currentLines.join("\n").trim();
+            if (text) {
+                const isOptedOut = currentOptedOut || sectionInPrivate;
+                sections.push({
+                    heading: currentHeading || fallbackHeading,
+                    content: text,
+                    inheritedOptOut: isOptedOut,
+                });
+            }
+        }
+    }
 
     for (const line of lines) {
-        const match = line.match(headingRegex);
-        if (match) {
-            if (currentLines.length > 0 || currentHeading) {
-                const text = currentLines.join("\n").trim();
-                if (text) {
-                    sections.push({
-                        heading: currentHeading || "Overview",
-                        content: text,
-                    });
+        // Check for fenced code block toggle
+        const fenceMatch = line.match(fenceRegex);
+        if (fenceMatch) {
+            const char = fenceMatch[1][0];
+            const len = fenceMatch[1].length;
+            if (!inCodeFence) {
+                inCodeFence = true;
+                codeFenceChar = char;
+                codeFenceLen = len;
+            } else if (char === codeFenceChar && len >= codeFenceLen) {
+                inCodeFence = false;
+                codeFenceChar = null;
+                codeFenceLen = 0;
+            }
+            currentLines.push(line);
+            continue;
+        }
+
+        // Inside fenced code blocks, lines are literal content:
+        // never parse headings or count tags/opt-out markers inside code fences!
+        if (inCodeFence) {
+            currentLines.push(line);
+            continue;
+        }
+
+        // Outside code fences, check for markdown ATX headings
+        const headingMatch = line.match(headingRegex);
+        if (headingMatch) {
+            // Before flushing previous section on a new heading:
+            // if previous section's accumulated lines contain [no-memory] or MEMWAL_IGNORE,
+            // mark the top entry of headingStack (if any) as optedOut = true!
+            if (sectionHasBodyOptOut) {
+                if (headingStack.length > 0) {
+                    headingStack[headingStack.length - 1].optedOut = true;
+                }
+                currentOptedOut = true;
+            }
+
+            // Check if trailing lines before this heading are standalone <private> tags
+            // intended to open private scope for the upcoming heading/block.
+            let pendingPrivateOpenings = 0;
+            while (
+                currentLines.length > 0 &&
+                currentLines[currentLines.length - 1].trim() === ""
+            ) {
+                currentLines.pop();
+            }
+            while (
+                currentLines.length > 0 &&
+                /^\s*<\s*private(?:\s[^>]*)?>\s*$/i.test(currentLines[currentLines.length - 1])
+            ) {
+                currentLines.pop();
+                pendingPrivateOpenings++;
+                while (
+                    currentLines.length > 0 &&
+                    currentLines[currentLines.length - 1].trim() === ""
+                ) {
+                    currentLines.pop();
                 }
             }
-            currentHeading = match[1].trim();
+
+            if (pendingPrivateOpenings > 0) {
+                if (!sectionStartedInPrivate && !linesContainPrivate(currentLines)) {
+                    sectionInPrivate = false;
+                }
+            }
+
+            if (currentHeading || currentLines.some((l) => l.trim().length > 0)) {
+                flushCurrentSection();
+            }
+
+            const level = headingMatch[1].length;
+            const headingText = headingMatch[2].trim();
+
+            // Pop entries from headingStack while top level >= current level
+            while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
+                headingStack.pop();
+            }
+
+            // Check self and parent opt-out
+            const selfOptOut = hasOptOutMarker(headingText) || privateDepth > 0;
+            const parentOptOut = headingStack.some((h) => h.optedOut);
+            const headingOptedOut = selfOptOut || parentOptOut;
+
+            headingStack.push({
+                level,
+                heading: headingText,
+                optedOut: headingOptedOut,
+            });
+
+            // Update privateDepth if headingText opens or closes <private>
+            const headingTags = countPrivateTags(headingText);
+            let headingTouchesPrivate = false;
+            if (headingTags.openings > 0 || headingTags.closings > 0) {
+                headingTouchesPrivate = true;
+                privateDepth += headingTags.openings;
+                privateDepth = Math.max(0, privateDepth - headingTags.closings);
+            }
+
+            currentHeading = headingText;
+            currentOptedOut = headingOptedOut;
             currentLines = [];
+            sectionStartedInPrivate = privateDepth > 0;
+            sectionInPrivate = privateDepth > 0 || headingTouchesPrivate;
+            sectionHasBodyOptOut = false;
         } else {
+            // Normal line outside code fence
+            if (privateDepth > 0) {
+                sectionInPrivate = true;
+            }
+            const lineTags = countPrivateTags(line);
+            if (lineTags.openings > 0 || lineTags.closings > 0) {
+                sectionInPrivate = true;
+                privateDepth += lineTags.openings;
+                privateDepth = Math.max(0, privateDepth - lineTags.closings);
+            }
+            if (privateDepth > 0) {
+                sectionInPrivate = true;
+            }
+            if (/\[no-memory\]/i.test(line) || /\bMEMWAL_IGNORE\b/.test(line)) {
+                sectionHasBodyOptOut = true;
+            }
             currentLines.push(line);
         }
     }
 
-    if (currentLines.length > 0 || currentHeading) {
-        const text = currentLines.join("\n").trim();
-        if (text) {
-            sections.push({
-                heading: currentHeading || "Overview",
-                content: text,
-            });
+    // EOF: check body opt-out on final section
+    if (sectionHasBodyOptOut) {
+        if (headingStack.length > 0) {
+            headingStack[headingStack.length - 1].optedOut = true;
         }
+        currentOptedOut = true;
     }
 
+    flushCurrentSection();
+
     if (sections.length === 0 && content.trim()) {
-        const defaultHeading = relPath.startsWith(".") ? "Rules" : "General";
+        const isOptedOut =
+            hasOptOutMarker(content) || sectionInPrivate || sectionHasBodyOptOut;
         sections.push({
-            heading: defaultHeading,
+            heading: fallbackHeading,
             content: content.trim(),
+            inheritedOptOut: isOptedOut,
         });
     }
 
@@ -316,6 +481,16 @@ export function extractCandidateChunks(
     const skipped: SkippedSection[] = [];
 
     for (const section of rawSections) {
+        if (section.inheritedOptOut) {
+            skipped.push({
+                file: relPath,
+                section: section.heading,
+                reason: "opt_out_marker",
+                snippet: makeSnippet(section.content || section.heading),
+            });
+            continue;
+        }
+
         const headingSafety = screenContentForSafety(section.heading);
         if (!headingSafety.safe) {
             skipped.push({
@@ -580,6 +755,11 @@ export async function importProjectMemories(options: ImportOptions = {}): Promis
             print(`Error: ${missingMsg}`);
             throw new Error(missingMsg);
         }
+
+        log.info("import.target_relayer", {
+            relayerUrl: serverUrl,
+            accountId,
+        });
 
         client = createSignedRelayerClient({
             key,

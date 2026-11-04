@@ -497,7 +497,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
                 yes: args.yes,
                 namespace,
                 maxItems: args.maxItems,
-                relayerUrl,
+                relayerUrl: args.relayerUrl,
             });
         } catch (err) {
             log.error("import.failed", { error: (err as Error).message });
@@ -920,8 +920,10 @@ export {
     createSignedRelayerClient,
     discoverImportFiles,
     extractCandidateChunks,
+    hasOptOutMarker,
     importProjectMemories,
     makeSnippet,
+    parseSections,
     screenContentForSafety,
 } from "./import.js";
 export type {
@@ -931,6 +933,7 @@ export type {
     ImportPreviewResult,
     ImportResult,
     ImportUploadResult,
+    RawSection,
     SkippedSection,
 } from "./import.js";
 export type { MemWalCredentials, CredsResolution, ProjectCredsDecision } from "./auth.js";
