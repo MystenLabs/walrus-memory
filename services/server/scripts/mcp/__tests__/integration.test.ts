@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildMcpServerCard, computeServerCardEtag, mountMcpRoutes, MCP_SERVER_CARD } from "../index.js";
+import { buildMcpServerCard, mountMcpRoutes } from "../index.js";
 
 // ---- helpers --------------------------------------------------------------
 
