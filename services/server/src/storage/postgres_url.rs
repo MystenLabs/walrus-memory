@@ -112,7 +112,18 @@ pub fn postgres_urls_share_target(a: &str, b: &str) -> bool {
     let effective_schema_a = schema_a.as_deref().unwrap_or("public");
     let effective_schema_b = schema_b.as_deref().unwrap_or("public");
 
-    effective_schema_a == effective_schema_b
+    let schemas_a: Vec<&str> = effective_schema_a
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let schemas_b: Vec<&str> = effective_schema_b
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    schemas_a.iter().any(|sa| schemas_b.contains(sa))
 }
 
 #[cfg(test)]
@@ -214,5 +225,10 @@ mod tests {
 
         // Explicit public schema matches default public schema
         assert!(postgres_urls_share_target(base, public_query));
+
+        // Fallback search_path containing public overlaps with default public schema
+        let fallback_public = "postgresql://user:pass@localhost:5432/db?search_path=legacy,public";
+        assert!(postgres_urls_share_target(base, fallback_public));
+        assert!(postgres_urls_share_target(public_query, fallback_public));
     }
 }

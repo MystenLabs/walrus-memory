@@ -46,12 +46,13 @@ impl LegacyDb {
                 "failed to begin primary db transaction for identity check: {error}"
             ))
         })?;
-        let primary_schema: String = sqlx::query_scalar("SELECT current_schema()")
-            .fetch_one(&mut *primary_tx)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to query primary schema: {error}"))
-            })?;
+        let primary_schemas: Vec<String> =
+            sqlx::query_scalar("SELECT unnest(current_schemas(false))")
+                .fetch_all(&mut *primary_tx)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!("failed to query primary schemas: {error}"))
+                })?;
 
         let uuid_val = uuid::Uuid::new_v4().as_u128();
         let k1 = (uuid_val as u32) as i32;
@@ -81,18 +82,39 @@ impl LegacyDb {
                 AppError::Internal(format!("legacy db identity probe connect failed: {error}"))
             })?;
 
-        let legacy_schema: String = sqlx::query_scalar("SELECT current_schema()")
-            .fetch_one(&mut legacy_conn)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to query legacy schema: {error}"))
-            })?;
+        let legacy_schemas: Vec<String> =
+            sqlx::query_scalar("SELECT unnest(current_schemas(false))")
+                .fetch_all(&mut legacy_conn)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!("failed to query legacy schemas: {error}"))
+                })?;
 
         let mut legacy_tx = legacy_conn.begin().await.map_err(|error| {
             AppError::Internal(format!(
                 "failed to begin legacy db transaction for identity check: {error}"
             ))
         })?;
+
+        let primary_table_oid: Option<i64> = sqlx::query_scalar(
+            "SELECT to_regclass('vector_entries')::oid::int8",
+        )
+        .fetch_optional(&mut *primary_tx)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("failed to resolve primary vector_entries oid: {error}"))
+        })?
+        .flatten();
+
+        let legacy_table_oid: Option<i64> = sqlx::query_scalar(
+            "SELECT to_regclass('vector_entries')::oid::int8",
+        )
+        .fetch_optional(&mut *legacy_tx)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("failed to resolve legacy vector_entries oid: {error}"))
+        })?
+        .flatten();
 
         let probe_result: Result<(bool, bool), sqlx::Error> = sqlx::query_as(
             "SELECT pg_try_advisory_xact_lock(21318, $1), pg_try_advisory_xact_lock(21318, $2)",
@@ -110,10 +132,19 @@ impl LegacyDb {
             AppError::Internal(format!("legacy db advisory lock probe failed: {error}"))
         })?;
 
-        if !locked_a && !locked_b && primary_schema == legacy_schema {
-            return Err(AppError::Internal(
-                "LEGACY_DB_URL points to the same PostgreSQL database and schema as DATABASE_URL; refusing to run legacy security-delete migrations on the primary database".into(),
-            ));
+        if !locked_a && !locked_b {
+            let same_table = matches!(
+                (primary_table_oid, legacy_table_oid),
+                (Some(p_oid), Some(l_oid)) if p_oid == l_oid
+            );
+            let overlapping_schemas = primary_schemas
+                .iter()
+                .any(|s| legacy_schemas.contains(s));
+            if same_table || overlapping_schemas {
+                return Err(AppError::Internal(
+                    "LEGACY_DB_URL points to the same PostgreSQL database and schema or resolves vector_entries to the primary table; refusing to run legacy security-delete migrations on the primary database".into(),
+                ));
+            }
         }
 
         Ok(())
@@ -561,7 +592,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn ensure_distinct_from_primary_rejects_same_schema_and_accepts_different() {
+    async fn ensure_distinct_from_primary_rejects_same_or_fallback_schema_and_accepts_disjoint() {
         let Some(url) = std::env::var("TEST_LEGACY_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .ok()
@@ -579,6 +610,12 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         }
+        sqlx::query(&format!(
+            "CREATE TABLE {schema_a}.vector_entries (blob_id TEXT PRIMARY KEY)"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
 
         let pool_a = PgPoolOptions::new()
             .max_connections(2)
@@ -594,10 +631,23 @@ pub(crate) mod tests {
         let same_res = LegacyDb::ensure_distinct_from_primary(&pool_a, &url, Some(&schema_a)).await;
         assert!(same_res.is_err());
         assert!(same_res.unwrap_err().to_string().contains(
-            "LEGACY_DB_URL points to the same PostgreSQL database and schema as DATABASE_URL"
+            "LEGACY_DB_URL points to the same PostgreSQL database and schema or resolves vector_entries to the primary table"
         ));
 
-        // 2. Same database but different schemas must be accepted
+        // 2. Fallback search_path whose first schema lacks vector_entries resolves to primary table and must be rejected
+        let fallback_search_path = format!("{schema_b}, {schema_a}");
+        let fallback_res = LegacyDb::ensure_distinct_from_primary(
+            &pool_a,
+            &url,
+            Some(&fallback_search_path),
+        )
+        .await;
+        assert!(fallback_res.is_err());
+        assert!(fallback_res.unwrap_err().to_string().contains(
+            "LEGACY_DB_URL points to the same PostgreSQL database and schema or resolves vector_entries to the primary table"
+        ));
+
+        // 3. Disjoint isolated schema must be accepted
         let diff_res = LegacyDb::ensure_distinct_from_primary(&pool_a, &url, Some(&schema_b)).await;
         assert!(diff_res.is_ok());
 
