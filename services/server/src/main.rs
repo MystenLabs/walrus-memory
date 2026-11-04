@@ -805,6 +805,67 @@ mod mcp_rate_limit_tests {
     }
 
     #[tokio::test]
+    async fn redis_charged_rate_limit_charge_does_not_credit_fallback_on_failure() {
+        let redis = denying_redis().await;
+        let state = test_state(redis).await;
+
+        let pk = "0xpk_redis_only";
+        let dk_key = format!("rate:dk:{}", pk);
+
+        // Pre-fill the fallback bucket to 10 tokens
+        {
+            let mut fb = state.fallback_rate_limit.lock().await;
+            fb.consume_tracked(&dk_key, Some("req-init"), 20, 30.0, 60.0);
+            assert_eq!(fb.buckets.get(&dk_key).unwrap().tokens, 10.0);
+        }
+
+        // Create a charge that was recorded via Redis
+        let redis_charge = rate_limit::RateLimitCharge {
+            request_id: "req-from-redis".to_string(),
+            public_key: pk.to_string(),
+            owner: "0xowner_redis".to_string(),
+            weight: 5,
+            member_offset: 0,
+            backend: rate_limit::RateLimitBackend::Redis,
+            delegate_key_capacity: 30,
+        };
+
+        // Call refund_delegate_key_rate_limit: Redis fails, but fallback bucket MUST NOT be credited
+        rate_limit::refund_delegate_key_rate_limit(&state, &redis_charge).await;
+
+        {
+            let fb = state.fallback_rate_limit.lock().await;
+            let current_tokens = fb.buckets.get(&dk_key).unwrap().tokens;
+            assert_eq!(
+                current_tokens, 10.0,
+                "Redis-charged RateLimitCharge must NOT credit fallback bucket even if Redis fails"
+            );
+        }
+
+        // Conversely, a Fallback-charged RateLimitCharge DOES credit the fallback bucket
+        let fallback_charge = rate_limit::RateLimitCharge {
+            request_id: "req-init".to_string(),
+            public_key: pk.to_string(),
+            owner: "0xowner_redis".to_string(),
+            weight: 5,
+            member_offset: 0,
+            backend: rate_limit::RateLimitBackend::Fallback,
+            delegate_key_capacity: 30,
+        };
+
+        rate_limit::refund_delegate_key_rate_limit(&state, &fallback_charge).await;
+
+        {
+            let fb = state.fallback_rate_limit.lock().await;
+            let current_tokens = fb.buckets.get(&dk_key).unwrap().tokens;
+            assert_eq!(
+                current_tokens, 15.0,
+                "Fallback-charged RateLimitCharge MUST credit fallback bucket"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_rate_limit_routes_use_their_own_ip_bucket() {
         let state = test_state(denying_redis().await).await;
         // Merged the same way `main` merges `mcp_routes` into `public_routes`.

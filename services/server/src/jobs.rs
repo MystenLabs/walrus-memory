@@ -258,7 +258,7 @@ pub(crate) async fn update_remember_job_after_wallet_error(
 
         matches!(res, Ok(r) if r.rows_affected() == 1)
     } else {
-        // Guard against downgrading a row a concurrent attempt already finished or
+        // Guard against downgrading a row a concurrent attempt already finished, marked failed, or
         // that `delete_by_namespace` already fenced as forgotten.
         // Every pre-existing caller only runs while holding the per-job upload
         // lock (JobUploadLock), so it was never the current status writer's own
@@ -284,11 +284,12 @@ pub(crate) async fn update_remember_job_after_wallet_error(
                  error_msg = $2,
                  updated_at = NOW()
              WHERE id = $3
-               AND status NOT IN ('uploaded', 'done')
+               AND status NOT IN ('uploaded', 'done', 'failed')
                AND COALESCE(error_msg, '') <> $4
                AND NOT EXISTS (
                    SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
                )",
+        )
         )
         .bind(status)
         .bind(msg)
@@ -4543,12 +4544,10 @@ pub async fn execute_bulk_remember(
     }
 
     let items_total = job.items.len();
-    let child_charge = job.rate_limit_charge.as_ref().map(|c| crate::rate_limit::RateLimitCharge {
-        request_id: c.request_id.clone(),
-        public_key: c.public_key.clone(),
-        owner: c.owner.clone(),
-        weight: (c.weight / items_total as i64).max(1),
-    });
+    let child_charges = match job.rate_limit_charge.as_ref() {
+        Some(c) => c.partition_across(items_total),
+        None => vec![None; items_total],
+    };
 
     tracing::info!(
         "[bulk-remember] start: {} items owner={} epochs={}",
@@ -4559,7 +4558,7 @@ pub async fn execute_bulk_remember(
 
     let mut storage = state.wallet_storage.clone();
     let mut enqueued_count = 0usize;
-    for item in job.items {
+    for (item, child_charge) in job.items.into_iter().zip(child_charges) {
         let job_id = item.job_id.clone();
         let namespace = item.namespace.clone();
         let wallet_index = item.wallet_index;
@@ -4579,7 +4578,7 @@ pub async fn execute_bulk_remember(
                     remember_job_id: Some(job_id.clone()),
                     prepare_claim_token: None,
                     epochs: job.epochs,
-                    rate_limit_charge: child_charge.clone(),
+                    rate_limit_charge: child_charge,
                 },
             }))
             .await
@@ -7091,6 +7090,116 @@ the checkpoint it replied about",
             .await
             .unwrap();
         assert_eq!(row.0, "running", "row stays running during retries");
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
+            .bind(&job_id)
+            .execute(&pool)
+            .await;
+    }
+    #[tokio::test]
+    async fn wallet_error_nonterminal_attempt_does_not_resurrect_failed_job() {
+        let pool = test_pool().await;
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        insert_job_with_status(&pool, &job_id, "running", None).await;
+
+        let terminal_err =
+            WalletJobError::Permanent("walrus upload failed: connection refused".into());
+        let terminal_msg = "walrus upload failed: connection refused";
+
+        // Step 1: terminal failure transitions the job to 'failed'
+        let transitioned = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &terminal_err,
+            terminal_msg,
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(
+            transitioned,
+            "initial terminal failure must transition to failed"
+        );
+
+        // Verify status is 'failed' and error_msg is recorded
+        let (status, err_msg): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(err_msg.as_deref(), Some(terminal_msg));
+
+        // Step 2: concurrent or delayed lock-losing attempt arrives with attempt_info = None
+        let retryable_err =
+            WalletJobError::Transient("another attempt of upload job is in progress".into());
+        let retryable_msg = "another attempt of upload job is in progress";
+        let nonterminal_transitioned = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &retryable_err,
+            retryable_msg,
+            None,
+        )
+        .await;
+        assert!(
+            !nonterminal_transitioned,
+            "nonterminal attempt must return false"
+        );
+
+        // Status MUST NOT have been resurrected back to 'running', and error_msg must be preserved
+        let (status2, err_msg2): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status2, "failed",
+            "lock-losing nonterminal attempt must not resurrect failed row back to running"
+        );
+        assert_eq!(
+            err_msg2.as_deref(),
+            Some(terminal_msg),
+            "terminal error message must not be overwritten"
+        );
+
+        // Step 3: another retryable attempt (e.g. attempt 2 of 5) arrives
+        let nonterminal_retry = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &retryable_err,
+            retryable_msg,
+            Some(WalletJobAttemptInfo { current: 2, max: 5 }),
+        )
+        .await;
+        assert!(!nonterminal_retry, "retryable attempt must return false");
+
+        let (status3, err_msg3): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status3, "failed",
+            "retryable attempt must not resurrect failed row back to running"
+        );
+        assert_eq!(err_msg3.as_deref(), Some(terminal_msg));
+
+        // Step 4: subsequent terminal failure cannot trigger a second refund or transition
+        let repeat_terminal = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &terminal_err,
+            terminal_msg,
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(
+            !repeat_terminal,
+            "repeat terminal failure must return false (no double refund)"
+        );
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
             .bind(&job_id)
