@@ -35,6 +35,14 @@ Do not save passwords, payment details, API keys, or government identifiers. Aft
 Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.
 ```
 
+If you prefer to keep the client's built-in memory on and use Walrus Memory only when explicitly requested, paste this alternative instruction instead:
+
+```text
+Keep using the client's built-in memory by default. Save to or recall from the user's Walrus Memory only when the user explicitly names Walrus Memory or memwal. When asked to save, pass the user's complete statement verbatim, never a summary, and briefly confirm what you stored.
+
+Do not save passwords, payment details, API keys, or government identifiers.
+```
+
 ## Personal assistant
 
 For a daily-driver assistant: scheduling, drafting, errands, general questions. The value here is accumulating a profile of the person, so the bias runs toward writing.

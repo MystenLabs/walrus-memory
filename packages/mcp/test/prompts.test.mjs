@@ -5,6 +5,7 @@ import {
     ENABLE_PROACTIVE_PROMPT_DESCRIPTION,
     ENABLE_PROACTIVE_PROMPT_NAME,
     ENABLE_PROACTIVE_PROMPT_TITLE,
+    EXPLICIT_ONLY_INSTRUCTION,
     localPromptReply,
 } from "../dist/consent-instruction.js";
 
@@ -13,6 +14,13 @@ test("canonical consent instruction excludes secrets and names Always allow", ()
     assert.match(CONSENT_INSTRUCTION, /passwords/);
     assert.match(CONSENT_INSTRUCTION, /API keys/);
     assert.match(CONSENT_INSTRUCTION, /Always allow/);
+});
+
+test("canonical explicit-only instruction excludes secrets and restricts saving to explicit requests", () => {
+    assert.match(EXPLICIT_ONLY_INSTRUCTION, /built-in memory/);
+    assert.match(EXPLICIT_ONLY_INSTRUCTION, /explicitly names Walrus Memory or memwal/);
+    assert.match(EXPLICIT_ONLY_INSTRUCTION, /passwords/);
+    assert.match(EXPLICIT_ONLY_INSTRUCTION, /API keys/);
 });
 
 test("prompts/list advertises memwal_enable_proactive", () => {

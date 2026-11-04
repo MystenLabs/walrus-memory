@@ -126,6 +126,66 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.getByText(/other clients use the same three steps/i)).toBeInTheDocument()
     })
 
+    it('defaults to proactive mode, rendering and copying the proactive instruction', async () => {
+        const user = userEvent.setup()
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined)
+        stubListener(async () => new Response('{}', { status: 200 }))
+        await signIn()
+
+        const proactiveBtn = await screen.findByRole('button', {
+            name: /portable across apps/i,
+        })
+        const explicitBtn = screen.getByRole('button', {
+            name: /keep native memory/i,
+        })
+
+        expect(proactiveBtn).toHaveAttribute('aria-pressed', 'true')
+        expect(explicitBtn).toHaveAttribute('aria-pressed', 'false')
+        expect(
+            screen.getByText(/Save durable facts to the user's Walrus Memory proactively/i),
+        ).toBeInTheDocument()
+
+        await user.click(screen.getByRole('button', { name: /copy instruction/i }))
+        expect(writeText).toHaveBeenCalledTimes(1)
+        expect(writeText.mock.calls[0]?.[0]).toContain(
+            "Save durable facts to the user's Walrus Memory proactively",
+        )
+    })
+
+    it('switches to explicit mode when toggled, updating the instruction and copy handler', async () => {
+        const user = userEvent.setup()
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined)
+        stubListener(async () => new Response('{}', { status: 200 }))
+        await signIn()
+
+        const explicitBtn = await screen.findByRole('button', {
+            name: /keep native memory/i,
+        })
+        const proactiveBtn = screen.getByRole('button', {
+            name: /portable across apps/i,
+        })
+
+        await user.click(explicitBtn)
+        expect(explicitBtn).toHaveAttribute('aria-pressed', 'true')
+        expect(proactiveBtn).toHaveAttribute('aria-pressed', 'false')
+
+        expect(
+            screen.getByText(/Keep using the client's built-in memory by default/i),
+        ).toBeInTheDocument()
+        expect(
+            screen.queryByText(/Save durable facts to the user's Walrus Memory proactively/i),
+        ).not.toBeInTheDocument()
+        expect(
+            screen.getByText(/Write tools run only when you explicitly ask for Walrus Memory/i),
+        ).toBeInTheDocument()
+
+        await user.click(screen.getByRole('button', { name: /copy instruction/i }))
+        expect(writeText).toHaveBeenCalledTimes(1)
+        expect(writeText.mock.calls[0]?.[0]).toContain(
+            "Keep using the client's built-in memory by default",
+        )
+    })
+
     it('withholds the one-time setup when the hand-off never landed', async () => {
         stubListener(async () => {
             throw new TypeError('Failed to fetch')

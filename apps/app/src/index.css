@@ -14784,6 +14784,48 @@ h1, h2, h3 {
   color: #8f9294;
 }
 
+.mcp-connect .mcp-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 16px;
+}
+
+.mcp-connect .mcp-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 6px 16px;
+  border: 1px solid #54575a;
+  border-radius: 999px;
+  background: transparent;
+  color: #b1b4b6;
+  font-family: "Google Sans Flex", sans-serif;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.35;
+  text-align: center;
+  max-width: 100%;
+  white-space: normal;
+  word-break: break-word;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.mcp-connect .mcp-mode-btn:hover {
+  border-color: #faf8f5;
+  color: #faf8f5;
+}
+
+.mcp-connect .mcp-mode-btn--active,
+.mcp-connect .mcp-mode-btn--active:hover {
+  border-color: #faf8f5;
+  background: #faf8f5;
+  color: #000000;
+  font-weight: 500;
+}
+
 .mcp-connect .mcp-prompt-intro {
   margin: 0 0 14px;
   color: #b1b4b6;

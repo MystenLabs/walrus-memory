@@ -99,7 +99,9 @@ Ask. After the server is connected and you are signed in, do these three steps o
   <Step>
     ### Paste the standing instruction
 
-    Open **Settings → Profile (or General) → Instructions for Claude / Personal Preferences** (applies to every conversation), or a single **Project's instructions** (applies only inside that project), and paste this block, then start a new chat:
+    Open **Settings → Profile (or General) → Instructions for Claude / Personal Preferences** (applies to every conversation), or a single **Project's instructions** (applies only inside that project), and paste the matching block below, then start a new chat:
+
+    For portable memory across apps (native memory turned off):
 
     ```text
     Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
@@ -107,6 +109,14 @@ Ask. After the server is connected and you are signed in, do these three steps o
     Do not save passwords, payment details, API keys, or government identifiers. After saving, briefly confirm what you stored.
 
     Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.
+    ```
+
+    For explicit-only memory (native memory kept on):
+
+    ```text
+    Keep using the client's built-in memory by default. Save to or recall from the user's Walrus Memory only when the user explicitly names Walrus Memory or memwal. When asked to save, pass the user's complete statement verbatim, never a summary, and briefly confirm what you stored.
+
+    Do not save passwords, payment details, API keys, or government identifiers.
     ```
   </Step>
   <Step>

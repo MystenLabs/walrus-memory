@@ -14,4 +14,9 @@ describe('setup skill one-time consent copy', () => {
         expect(skill).toContain('API keys')
         expect(skill).toContain('government identifiers')
     })
+
+    it('contains the canonical explicit-only instruction block', () => {
+        expect(skill).toContain("Keep using the client's built-in memory by default.")
+        expect(skill).toContain('Save to or recall from the user\'s Walrus Memory only when the user explicitly names Walrus Memory or memwal.')
+    })
 })

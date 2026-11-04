@@ -7,7 +7,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CONSENT_INSTRUCTION } from "../dist/consent-instruction.js";
+import {
+    CONSENT_INSTRUCTION,
+    EXPLICIT_ONLY_INSTRUCTION,
+} from "../dist/consent-instruction.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -18,6 +21,12 @@ function read(rel) {
 function extractTsConsent(src, label) {
     const match = src.match(/CONSENT_INSTRUCTION = `([\s\S]*?)`/);
     assert.ok(match, `${label}: missing CONSENT_INSTRUCTION template literal`);
+    return match[1];
+}
+
+function extractTsExplicit(src, label) {
+    const match = src.match(/EXPLICIT_ONLY_INSTRUCTION = `([\s\S]*?)`/);
+    assert.ok(match, `${label}: missing EXPLICIT_ONLY_INSTRUCTION template literal`);
     return match[1];
 }
 
@@ -43,22 +52,54 @@ function extractFencedConsent(src, label) {
     assert.fail(`${label}: no fenced consent instruction block`);
 }
 
-const copies = [
-    ["services/server/scripts/mcp/consent-instruction.ts", (s, l) => extractTsConsent(s, l)],
-    ["apps/app/src/pages/ConnectMcp.tsx", (s, l) => extractTsConsent(s, l)],
+function extractFencedExplicit(src, label) {
+    const re = /```text\n([\s\S]*?)```/g;
+    let match;
+    while ((match = re.exec(src))) {
+        const body = dedent(match[1]).replace(/\n$/, "");
+        if (body.startsWith("Keep using the client's built-in memory by default")) {
+            return body;
+        }
+    }
+    assert.fail(`${label}: no fenced explicit-only instruction block`);
+}
+
+const consentCopies = [
+    ["services/server/scripts/mcp/consent-instruction.ts", extractTsConsent],
+    ["apps/app/src/pages/ConnectMcp.tsx", extractTsConsent],
     ["apps/app/public/skills/setup", extractFencedConsent],
     ["docs/guides/system-prompt-templates.md", extractFencedConsent],
     ["docs/mcp/claude-desktop.md", extractFencedConsent],
     ["docs/mcp/claude-connector.md", extractFencedConsent],
 ];
 
+const explicitCopies = [
+    ["services/server/scripts/mcp/consent-instruction.ts", extractTsExplicit],
+    ["apps/app/src/pages/ConnectMcp.tsx", extractTsExplicit],
+    ["apps/app/public/skills/setup", extractFencedExplicit],
+    ["docs/guides/system-prompt-templates.md", extractFencedExplicit],
+    ["docs/mcp/claude-desktop.md", extractFencedExplicit],
+    ["docs/mcp/claude-connector.md", extractFencedExplicit],
+];
+
 test("CONSENT_INSTRUCTION is byte-equal in every user-pasteable copy", () => {
-    for (const [rel, extract] of copies) {
+    for (const [rel, extract] of consentCopies) {
         const got = extract(read(rel), rel);
         assert.equal(
             got,
             CONSENT_INSTRUCTION,
-            `${rel} drifted from packages/mcp/src/consent-instruction.ts`,
+            `${rel} drifted from packages/mcp/src/consent-instruction.ts (CONSENT_INSTRUCTION)`,
+        );
+    }
+});
+
+test("EXPLICIT_ONLY_INSTRUCTION is byte-equal in every user-pasteable copy", () => {
+    for (const [rel, extract] of explicitCopies) {
+        const got = extract(read(rel), rel);
+        assert.equal(
+            got,
+            EXPLICIT_ONLY_INSTRUCTION,
+            `${rel} drifted from packages/mcp/src/consent-instruction.ts (EXPLICIT_ONLY_INSTRUCTION)`,
         );
     }
 });

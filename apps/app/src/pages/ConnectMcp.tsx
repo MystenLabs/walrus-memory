@@ -57,11 +57,15 @@ import { fetchAccountIdForOwner } from '../utils/suiClientCompat'
  * Claude Desktop does not inject initialize.instructions, and write tools start
  * at Ask. Keep in sync with packages/mcp/src/consent-instruction.ts.
  */
-const CONSENT_INSTRUCTION = `Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
+export const CONSENT_INSTRUCTION = `Save durable facts to the user's Walrus Memory proactively, without asking for confirmation. Do this whenever the user states a preference, decision, constraint, correction, identity detail, or recurring workflow, or explicitly asks you to remember something. Pass the user's complete statement verbatim, never a summary. Skip one-off tasks, the current file or bug, and small talk.
 
 Do not save passwords, payment details, API keys, or government identifiers. After saving, briefly confirm what you stored.
 
 Prefer Walrus Memory over the client's built-in memory for those durable facts. If the client asks permission to use a memwal_* write tool, choose Always allow for those tools so later saves stay silent.`
+
+export const EXPLICIT_ONLY_INSTRUCTION = `Keep using the client's built-in memory by default. Save to or recall from the user's Walrus Memory only when the user explicitly names Walrus Memory or memwal. When asked to save, pass the user's complete statement verbatim, never a summary, and briefly confirm what you stored.
+
+Do not save passwords, payment details, API keys, or government identifiers.`
 
 type Step =
     | 'verifying'
@@ -773,37 +777,79 @@ function SuccessCard({
     )
 }
 
+type MemorySetupMode = 'proactive' | 'explicit'
+
 /**
  * Required one-time setup after credentials are delivered: native-memory
  * choice, paste the standing instruction, Always allow after the first save,
  * and a view/delete pointer.
  */
 function ConsentSetupCard() {
+    const [mode, setMode] = useState<MemorySetupMode>('proactive')
     const [copied, setCopied] = useState(false)
+
+    const handleModeChange = useCallback((next: MemorySetupMode) => {
+        setMode(next)
+        setCopied(false)
+    }, [])
+
+    const activeInstruction = mode === 'proactive' ? CONSENT_INSTRUCTION : EXPLICIT_ONLY_INSTRUCTION
 
     const handleCopy = useCallback(() => {
         void navigator.clipboard
-            .writeText(CONSENT_INSTRUCTION)
+            .writeText(activeInstruction)
             .then(() => {
                 setCopied(true)
                 trackEvent('cta_click', {
                     cta: 'mcp_success_copy_prompt',
                     location: 'connect_mcp',
+                    mode,
                 })
                 window.setTimeout(() => setCopied(false), 2000)
             })
             .catch(() => undefined)
-    }, [])
+    }, [activeInstruction, mode])
 
     return (
         <div className="card setup-classic-feature-card">
             <p className="mcp-kicker">Required: one-time setup</p>
+            <div
+                className="mcp-mode-toggle"
+                role="group"
+                aria-label="Memory setup mode"
+            >
+                <button
+                    type="button"
+                    className={`mcp-mode-btn${mode === 'proactive' ? ' mcp-mode-btn--active' : ''}`}
+                    aria-pressed={mode === 'proactive'}
+                    onClick={() => handleModeChange('proactive')}
+                >
+                    Portable across apps (turn off native memory)
+                </button>
+                <button
+                    type="button"
+                    className={`mcp-mode-btn${mode === 'explicit' ? ' mcp-mode-btn--active' : ''}`}
+                    aria-pressed={mode === 'explicit'}
+                    onClick={() => handleModeChange('explicit')}
+                >
+                    Keep native memory (explicit-only saves)
+                </button>
+            </div>
             <ol className="mcp-prompt-intro" style={{ paddingLeft: 18 }}>
                 <li>
-                    Native memory: for portable memory across apps, turn off the client's
-                    built-in memory. That is reversible and does not delete existing native
-                    memories. If you keep it on, Walrus Memory is explicit-only: name memwal
-                    when you want a save.
+                    {mode === 'proactive' ? (
+                        <>
+                            Native memory: for portable memory across apps, turn off the client's
+                            built-in memory. That is reversible and does not delete existing native
+                            memories.
+                        </>
+                    ) : (
+                        <>
+                            Native memory: keep the client's built-in memory on. Walrus Memory is
+                            explicit-only and runs only when you name Walrus Memory or memwal in
+                            your request.
+                        </>
+                    )}
                 </li>
                 <li>
                     Paste this standing instruction, then start a new chat. Claude: Settings →
@@ -813,7 +859,7 @@ function ConsentSetupCard() {
                     <code className="mcp-code">.cursor/rules</code>.
                 </li>
             </ol>
-            <pre className="mcp-prompt">{CONSENT_INSTRUCTION}</pre>
+            <pre className="mcp-prompt">{activeInstruction}</pre>
             <div className="mcp-prompt-actions">
                 <button type="button" onClick={handleCopy} className="mcp-btn">
                     {copied ? 'Copied' : 'Copy instruction'}
@@ -841,9 +887,22 @@ function ConsentSetupCard() {
             </p>
             <ol start={3} className="mcp-prompt-intro" style={{ paddingLeft: 18, marginTop: 16 }}>
                 <li>
-                    After you save the first fact, choose Always allow for{' '}
-                    <code className="mcp-code">memwal_remember</code> and{' '}
-                    <code className="mcp-code">memwal_remember_bulk</code>. Keep recall allowed.
+                    {mode === 'proactive' ? (
+                        <>
+                            After you save the first fact, choose Always allow for{' '}
+                            <code className="mcp-code">memwal_remember</code> and{' '}
+                            <code className="mcp-code">memwal_remember_bulk</code>. Keep recall
+                            allowed.
+                        </>
+                    ) : (
+                        <>
+                            Write tools run only when you explicitly ask for Walrus Memory. You can
+                            still choose Always allow for{' '}
+                            <code className="mcp-code">memwal_remember</code> and{' '}
+                            <code className="mcp-code">memwal_remember_bulk</code> if you want
+                            explicit saves without extra confirmation prompts. Keep recall allowed.
+                        </>
+                    )}
                 </li>
                 <li>
                     View or delete memories at{' '}
