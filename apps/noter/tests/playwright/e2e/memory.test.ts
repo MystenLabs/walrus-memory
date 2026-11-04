@@ -7,9 +7,12 @@ const SAMPLE_TEXT =
 test.describe("Memory API contract", () => {
   test("rejects an unauthenticated request", async ({ request }) => {
     // memory-request.ts's authorizeMemoryRequest runs before any body
-    // parsing — no session header fails closed with 401, not the 400 the
+    // parsing: no session header fails closed with 401, not the 400 the
     // route used to return for a missing `text` field.
-    const response = await request.post("/api/memory/remember", { data: {} });
+    const response = await request.post("/api/memory/remember", {
+      headers: { connection: "close" },
+      data: {},
+    });
 
     expect(response.status()).toBe(401);
     expect((await response.json()).error).toMatch(/authentication required/i);
@@ -19,7 +22,10 @@ test.describe("Memory API contract", () => {
     const sessionId = await signInAndGetSessionId(page);
 
     const response = await request.post("/api/memory/remember", {
-      headers: { "x-session-id": sessionId },
+      headers: {
+        "x-session-id": sessionId,
+        connection: "close",
+      },
       data: {},
     });
 
@@ -31,7 +37,10 @@ test.describe("Memory API contract", () => {
     const sessionId = await signInAndGetSessionId(page);
 
     const response = await request.post("/api/memory/remember", {
-      headers: { "x-session-id": sessionId },
+      headers: {
+        "x-session-id": sessionId,
+        connection: "close",
+      },
       data: { text: "short" },
     });
 
@@ -45,17 +54,20 @@ test.describe("Memory write", () => {
     const sessionId = await signInAndGetSessionId(page);
 
     const response = await request.post("/api/memory/remember", {
-      headers: { "x-session-id": sessionId },
+      headers: {
+        "x-session-id": sessionId,
+        connection: "close",
+      },
       data: { text: SAMPLE_TEXT },
       timeout: 30_000,
     });
 
     // assertDelegateAccountBinding only checks the fixture pool
-    // (delegate-account.mock.ts, gated by isTestEnvironment) — it never
+    // (delegate-account.mock.ts, gated by isTestEnvironment), it never
     // touches the real chain, so the session resolves a key that isn't
     // registered with production Walrus Memory. The route attempts a real
     // write and the relayer rejects it. Either a 500 with an error or a 200
-    // with no facts is a legitimate outcome — what must not happen is a
+    // with no facts is a legitimate outcome: what must not happen is a
     // silent claim that facts were persisted.
     if (response.status() === 200) {
       expect((await response.json()).count).toBe(0);
@@ -69,9 +81,9 @@ test.describe("Memory write", () => {
 // No "real credentials" write path here by design: isTestEnvironment is
 // unconditionally true for every Playwright run (playwright.config.ts sets
 // PLAYWRIGHT=True on the webServer), so connectDelegateKey's binding check
-// only ever consults the fixture pool — a real, on-chain-registered key
+// only ever consults the fixture pool: a real, on-chain-registered key
 // would fail at login before it ever reached this route. The live
-// remember -> recall round trip against the production relayer stays a
+// remember to recall round trip against the production relayer stays a
 // manual check, same as researcher's PR #680 documents for its live-Walrus
 // canary.
 
