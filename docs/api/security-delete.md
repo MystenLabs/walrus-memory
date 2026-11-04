@@ -44,10 +44,13 @@ disabled deployment.
 Enabling the API requires `DATABASE_URL`, `SUI_GRPC_URL`, `WALRUS_PACKAGE_ID`,
 `WALRUS_SYSTEM_OBJECT_ID`, `DELETION_TOKEN_SECRET`, and a base64-encoded
 32-byte `SPONSOR_PRIVATE_KEY`. `LEGACY_DB_URL` is optional: when configured,
-both `scope=current` and `scope=legacy` are served against their respective
-databases; when `LEGACY_DB_URL` is unset, `scope=current` operates normally and
-requests with `scope=legacy` return `404 FEATURE_DISABLED`. Configuration
-changes require a restart or rolling deployment.
+it must reference a dedicated pre-migration database distinct from `DATABASE_URL`
+(pointing `LEGACY_DB_URL` at the primary database is rejected at boot because
+pre-existing `vector_entries` rows lack unambiguous scope provenance).
+When configured, both `scope=current` and `scope=legacy` are served against their
+respective databases; when `LEGACY_DB_URL` is unset, `scope=current` operates
+normally and requests with `scope=legacy` return `404 FEATURE_DISABLED`.
+Configuration changes require a restart or rolling deployment.
 
 The API supports browser requests from any origin. Cross-origin preflight
 requests allow `GET`, `POST`, and `DELETE`, plus the `Content-Type` and

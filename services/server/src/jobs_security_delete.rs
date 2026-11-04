@@ -622,9 +622,7 @@ fn background_deletion_pools(state: &AppState) -> Vec<(&'static str, &PgPool)> {
     if let Some(legacy_db) = state.legacy_db.as_deref() {
         pools.push(("legacy", legacy_db.pool()));
     }
-    if state.config.legacy_db_url.as_deref() != Some(state.config.database_url.as_str()) {
-        pools.push(("current", state.db.pool()));
-    }
+    pools.push(("current", state.db.pool()));
     pools
 }
 
@@ -1007,9 +1005,16 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", batch, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            batch,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE deletion_batches SET claimed_at=NOW()-INTERVAL '2 minutes' WHERE id=$1",
         )
@@ -1055,9 +1060,16 @@ mod tests {
                 .into_iter()
                 .enumerate()
         {
-            store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", id, &[blob.into()], 16)
-                .await
-                .unwrap();
+            store::create_batch_and_claim_selection(
+                legacy.pool(),
+                OWNER,
+                "legacy",
+                id,
+                &[blob.into()],
+                16,
+            )
+            .await
+            .unwrap();
             store::set_batch_prepared(
                 legacy.pool(),
                 id,
@@ -1129,9 +1141,16 @@ mod tests {
         };
         seed(legacy.pool(), "retry", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", batch, &["retry".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            batch,
+            &["retry".into()],
+            16,
+        )
+        .await
+        .unwrap();
         let (built, object) = prepared_blob_tx("retry", "0x1");
         store::set_batch_prepared(
             legacy.pool(),
@@ -1424,9 +1443,16 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let old = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", old, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            old,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         store::set_batch_prepared(
             legacy.pool(),
             old,
@@ -1491,9 +1517,16 @@ mod tests {
         .await
         .unwrap());
         let new = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", new, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            new,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         resume.notify_one();
         let report = task.await.unwrap();
         assert_eq!(report.failed, 0, "old batch CAS must lose");

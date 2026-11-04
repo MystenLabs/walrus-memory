@@ -295,10 +295,9 @@ CREATE INDEX IF NOT EXISTS idx_members_outcome_audit
 /// Ensures the primary database holds the security-delete tracking and batch
 /// tables used by `scope=current` post-migration memory deletion.
 ///
-/// Called after `LegacyDb::new()` so single-database deployments (`LEGACY_DB_URL == DATABASE_URL`)
-/// apply sqlx's `migrations_legacy` first without any `already exists` conflict, while two-database
-/// deployments (`LEGACY_DB_URL != DATABASE_URL`) and post-migration-only deployments get the full
-/// idempotent schema on the primary database with zero boot-time table scans.
+/// Called after `LegacyDb::new_checked()` so the primary database receives the full
+/// idempotent schema with zero boot-time table scans. When `LEGACY_DB_URL` is configured,
+/// it must reference a dedicated pre-migration database distinct from `DATABASE_URL`.
 pub async fn ensure_post_migration_schema(pool: &PgPool) -> Result<(), AppError> {
     let mut tx = pool
         .begin()
@@ -1489,9 +1488,16 @@ mod tests {
             .await
             .unwrap();
         let cursor = (first[1].created_at, first[1].blob_id.clone());
-        let second = list_blobs(legacy.pool(), OWNER, "legacy", &[BLOB_DELETABLE], Some(cursor), 10)
-            .await
-            .unwrap();
+        let second = list_blobs(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            &[BLOB_DELETABLE],
+            Some(cursor),
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 3);
         let counts = counts(legacy.pool(), OWNER, "legacy").await.unwrap();
@@ -1770,8 +1776,22 @@ mod tests {
         seed(legacy.pool(), &["a"]).await;
         let contested: Vec<String> = vec!["a".into()];
         let (left, right) = tokio::join!(
-            create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", Uuid::new_v4(), &contested, 16),
-            create_batch_and_claim_selection(legacy.pool(), OWNER, "legacy", Uuid::new_v4(), &contested, 16),
+            create_batch_and_claim_selection(
+                legacy.pool(),
+                OWNER,
+                "legacy",
+                Uuid::new_v4(),
+                &contested,
+                16
+            ),
+            create_batch_and_claim_selection(
+                legacy.pool(),
+                OWNER,
+                "legacy",
+                Uuid::new_v4(),
+                &contested,
+                16
+            ),
         );
         assert_eq!(
             [&left, &right].iter().filter(|r| r.is_ok()).count(),

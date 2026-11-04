@@ -2333,7 +2333,7 @@ async fn main() {
     let legacy_db = if security_delete_component_enabled {
         match config.legacy_db_url.as_deref() {
             Some(legacy_url) => Some(Arc::new(
-                LegacyDb::new(legacy_url)
+                LegacyDb::new_checked(legacy_url, db.pool())
                     .await
                     .expect("Failed to initialize legacy security-delete database"),
             )),
@@ -2346,8 +2346,7 @@ async fn main() {
         storage::security_delete_store::ensure_post_migration_schema(db.pool())
             .await
             .expect("Failed to initialize post-migration security-delete schema");
-        // Both `LegacyDb` (single-DB mode) and `ensure_post_migration_schema`
-        // (two-DB or post-migration-only mode) create `delete_blobs_tracking`
+        // `ensure_post_migration_schema` creates `delete_blobs_tracking`
         // after `VectorDb::new()` probed for it. Re-probe now so the first boot
         // immediately hides claimed-for-deletion memories from recall.
         db.refresh_pending_delete_filter().await;

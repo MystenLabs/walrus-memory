@@ -12,13 +12,111 @@ use crate::types::AppError;
 const LEGACY_MIGRATION_LOCK_TIMEOUT: &str = "5s";
 const LEGACY_MIGRATION_MAX_ATTEMPTS: u32 = 6;
 
+#[derive(Debug)]
 pub struct LegacyDb {
     pool: PgPool,
 }
 
 impl LegacyDb {
+    #[allow(dead_code)]
     pub async fn new(database_url: &str) -> Result<Self, AppError> {
         Self::new_with_search_path(database_url, None).await
+    }
+
+    pub async fn new_checked(database_url: &str, primary_pool: &PgPool) -> Result<Self, AppError> {
+        Self::new_checked_with_search_path(database_url, None, primary_pool).await
+    }
+
+    pub(crate) async fn new_checked_with_search_path(
+        database_url: &str,
+        search_path: Option<&str>,
+        primary_pool: &PgPool,
+    ) -> Result<Self, AppError> {
+        Self::ensure_distinct_from_primary(primary_pool, database_url, search_path).await?;
+        Self::new_with_search_path(database_url, search_path).await
+    }
+
+    pub async fn ensure_distinct_from_primary(
+        primary_pool: &PgPool,
+        legacy_database_url: &str,
+        legacy_search_path: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut primary_tx = primary_pool.begin().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to begin primary db transaction for identity check: {error}"
+            ))
+        })?;
+        let primary_schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&mut *primary_tx)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("failed to query primary schema: {error}"))
+            })?;
+
+        let uuid_val = uuid::Uuid::new_v4().as_u128();
+        let k1 = (uuid_val as u32) as i32;
+        let k2 = ((uuid_val >> 32) as u32) as i32;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(21318, $1), pg_advisory_xact_lock(21318, $2)")
+            .bind(k1)
+            .bind(k2)
+            .execute(&mut *primary_tx)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to acquire advisory lock on primary db for identity check: {error}"
+                ))
+            })?;
+
+        let migrate_url = direct_postgres_url(legacy_database_url);
+        let mut options = PgConnectOptions::from_str(migrate_url.as_ref())
+            .map_err(|error| AppError::Internal(format!("legacy db URL invalid: {error}")))?;
+        if let Some(search_path) = legacy_search_path {
+            options = options.options([("search_path", search_path)]);
+        }
+
+        let mut legacy_conn = PgConnection::connect_with(&options)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("legacy db identity probe connect failed: {error}"))
+            })?;
+
+        let legacy_schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&mut legacy_conn)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("failed to query legacy schema: {error}"))
+            })?;
+
+        let mut legacy_tx = legacy_conn.begin().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to begin legacy db transaction for identity check: {error}"
+            ))
+        })?;
+
+        let probe_result: Result<(bool, bool), sqlx::Error> = sqlx::query_as(
+            "SELECT pg_try_advisory_xact_lock(21318, $1), pg_try_advisory_xact_lock(21318, $2)",
+        )
+        .bind(k1)
+        .bind(k2)
+        .fetch_one(&mut *legacy_tx)
+        .await;
+
+        let _ = legacy_tx.rollback().await;
+        let _ = legacy_conn.close().await;
+        let _ = primary_tx.rollback().await;
+
+        let (locked_a, locked_b) = probe_result.map_err(|error| {
+            AppError::Internal(format!("legacy db advisory lock probe failed: {error}"))
+        })?;
+
+        if !locked_a && !locked_b && primary_schema == legacy_schema {
+            return Err(AppError::Internal(
+                "LEGACY_DB_URL points to the same PostgreSQL database and schema as DATABASE_URL; refusing to run legacy security-delete migrations on the primary database".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn new_with_search_path(
@@ -431,19 +529,17 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
-        let pre_scope: String = sqlx::query_scalar(
-            "SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'pre'",
-        )
-        .fetch_one(legacy.pool())
-        .await
-        .unwrap();
+        let pre_scope: String =
+            sqlx::query_scalar("SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'pre'")
+                .fetch_one(legacy.pool())
+                .await
+                .unwrap();
         assert_eq!(pre_scope, "legacy");
-        let post_scope: String = sqlx::query_scalar(
-            "SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'post'",
-        )
-        .fetch_one(legacy.pool())
-        .await
-        .unwrap();
+        let post_scope: String =
+            sqlx::query_scalar("SELECT scope FROM delete_blobs_tracking WHERE blob_id = 'post'")
+                .fetch_one(legacy.pool())
+                .await
+                .unwrap();
         assert_eq!(post_scope, "current");
         let url = std::env::var("TEST_LEGACY_DATABASE_URL").unwrap();
         let reopened = LegacyDb::new_with_search_path(&url, Some(&schema))
@@ -461,5 +557,56 @@ pub(crate) mod tests {
             .execute(&admin)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_distinct_from_primary_rejects_same_schema_and_accepts_different() {
+        let Some(url) = std::env::var("TEST_LEGACY_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+        else {
+            return;
+        };
+        let Ok(admin) = sqlx::PgPool::connect(&url).await else {
+            return;
+        };
+        let schema_a = format!("sd_test_a_{}", Uuid::new_v4().simple());
+        let schema_b = format!("sd_test_b_{}", Uuid::new_v4().simple());
+        for s in [&schema_a, &schema_b] {
+            sqlx::query(&format!("CREATE SCHEMA {s}"))
+                .execute(&admin)
+                .await
+                .unwrap();
+        }
+
+        let pool_a = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                PgConnectOptions::from_str(&url)
+                    .unwrap()
+                    .options([("search_path", schema_a.as_str())]),
+            )
+            .await
+            .unwrap();
+
+        // 1. Same database and same schema must be rejected
+        let same_res = LegacyDb::ensure_distinct_from_primary(&pool_a, &url, Some(&schema_a)).await;
+        assert!(same_res.is_err());
+        assert!(same_res.unwrap_err().to_string().contains(
+            "LEGACY_DB_URL points to the same PostgreSQL database and schema as DATABASE_URL"
+        ));
+
+        // 2. Same database but different schemas must be accepted
+        let diff_res = LegacyDb::ensure_distinct_from_primary(&pool_a, &url, Some(&schema_b)).await;
+        assert!(diff_res.is_ok());
+
+        drop(pool_a);
+        for s in [&schema_a, &schema_b] {
+            sqlx::query(&format!("DROP SCHEMA {s} CASCADE"))
+                .execute(&admin)
+                .await
+                .unwrap();
+        }
     }
 }
