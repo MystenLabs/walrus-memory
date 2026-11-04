@@ -787,16 +787,16 @@ async fn keep_upload_storage_reservation(
 }
 
 /// Prove or renew a job's storage reservation under the owner's quota lock
-/// before an unpaid upload step spends Walrus storage.
-pub(crate) async fn ensure_upload_storage_reservation_with_db(
+/// Try to extend an active (live) storage reservation for a job whose earlier
+/// allocation has not expired yet. Returns `Ok(true)` if `max_storage_bytes <= 0`
+/// or the row was still live (`expires_at > NOW()`) and was extended.
+pub(crate) async fn try_extend_live_storage_reservation(
     db: &crate::storage::db::VectorDb,
     max_storage_bytes: i64,
     job_id: &str,
-    owner: &str,
-    bytes: i64,
-) -> Result<(), WalletJobError> {
+) -> Result<bool, WalletJobError> {
     if max_storage_bytes <= 0 {
-        return Ok(());
+        return Ok(true);
     }
     let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
     let extended = sqlx::query(
@@ -815,10 +815,20 @@ pub(crate) async fn ensure_upload_storage_reservation_with_db(
         ))
     })?;
 
-    if extended.rows_affected() > 0 {
+    Ok(extended.rows_affected() > 0)
+}
+
+/// Re-admit an expired or missing storage reservation against owner storage quota.
+pub(crate) async fn admit_expired_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if max_storage_bytes <= 0 {
         return Ok(());
     }
-
     let lock_key = crate::rate_limit::stable_hash_i64(owner);
     let reservations = [crate::storage::db::StorageReservationRequest {
         id: job_id.to_string(),
@@ -848,6 +858,24 @@ pub(crate) async fn ensure_upload_storage_reservation_with_db(
     }
 }
 
+/// Ensure a live reservation exists for this job, renewing it if still active
+/// or re-evaluating owner quota if expired, without running a transaction
+/// before an unpaid upload step spends Walrus storage.
+#[allow(dead_code)]
+pub(crate) async fn ensure_upload_storage_reservation_with_db(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if try_extend_live_storage_reservation(db, max_storage_bytes, job_id).await? {
+        return Ok(());
+    }
+
+    admit_expired_upload_storage_reservation(db, max_storage_bytes, job_id, owner, bytes).await
+}
+
 /// Before enforcing expired-quota re-admission on a resumed `encoded` journal
 /// that already holds a saved `register_transaction`, reconcile that digest
 /// against the sidecar without permitting a new submission. If the prepared
@@ -872,6 +900,10 @@ pub(crate) async fn reconcile_or_ensure_upload_storage_reservation(
     needs_prepared_reconcile: bool,
 ) -> Result<Option<DurableUploadAdvance>, WalletJobError> {
     if upload_journal_signer_committed(journal) {
+        return Ok(None);
+    }
+
+    if try_extend_live_storage_reservation(db, max_storage_bytes, remember_job_id).await? {
         return Ok(None);
     }
 
@@ -929,7 +961,7 @@ pub(crate) async fn reconcile_or_ensure_upload_storage_reservation(
         }
     }
 
-    ensure_upload_storage_reservation_with_db(
+    admit_expired_upload_storage_reservation(
         db,
         max_storage_bytes,
         remember_job_id,
@@ -2220,6 +2252,21 @@ async fn execute_durable_upload(
         let advanced = if let Some(advanced) = reconciled_advance {
             advanced
         } else {
+            let is_encoded = journal
+                .resume_step
+                .as_ref()
+                .and_then(|step| step.get("step"))
+                .and_then(serde_json::Value::as_str)
+                == Some("encoded");
+            if is_encoded {
+                if let Some(tx) = journal.register_transaction.as_mut() {
+                    if tx.execution_started != Some(true) {
+                        tx.execution_started = Some(true);
+                        persist_upload_journal(state.db.pool(), remember_job_id, &journal).await?;
+                    }
+                }
+            }
+
             let mut attaches = 0u32;
             loop {
                 let _ = sqlx::query(
@@ -4641,6 +4688,7 @@ the checkpoint it replied about",
                 signature: "bb".into(),
                 digest: "cc".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         assert!(pin_journal_wallet(&prepared, 1));
@@ -5143,6 +5191,7 @@ the checkpoint it replied about",
             signature: "bb".into(),
             digest: "cc".into(),
             sponsor_digest: None,
+            execution_started: None,
         }
     }
 
@@ -5822,6 +5871,7 @@ the checkpoint it replied about",
                 signature: "signature".into(),
                 digest: "digest-1".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
 

@@ -47,6 +47,8 @@ pub struct PreparedRegisterTransaction {
     /// Enoki sponsorship handle. Absent for legacy/direct-signed journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -282,6 +284,8 @@ struct DurableUploadRequest<'a> {
     register_transaction: Option<&'a PreparedRegisterTransaction>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     reconcile_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    may_have_been_submitted: Option<bool>,
     epochs: u64,
 }
 
@@ -708,6 +712,14 @@ async fn send_durable_upload_step(
     reconcile_only: bool,
 ) -> Result<PreparedRegisterReconciliation, AppError> {
     let url = format!("{}/walrus/upload-step-v3", sidecar_url);
+    let may_have_been_submitted = if reconcile_only {
+        journal
+            .register_transaction
+            .as_ref()
+            .map(|tx| tx.execution_started.unwrap_or(true))
+    } else {
+        None
+    };
     let mut req = client.post(&url).json(&DurableUploadRequest {
         data: BASE64.encode(data),
         key_index: journal.wallet_index,
@@ -724,6 +736,7 @@ async fn send_durable_upload_step(
             journal.register_transaction.as_ref(),
         ),
         reconcile_only,
+        may_have_been_submitted,
         epochs,
     });
     if let Some(secret) = sidecar_secret {
@@ -817,13 +830,18 @@ async fn send_durable_upload_step(
     })?;
     let returned_step = parsed.step.as_ref();
     let next_resume_step = parsed.resume_step.or(journal.resume_step);
-    let next_register_transaction = if returned_step.is_some() {
+    let mut next_register_transaction = if returned_step.is_some() {
         // A returned checkpoint consumed any prepared transaction. The only
         // returned step before preparation is `encoded`, when none exists yet.
         parsed.register_transaction
     } else {
         parsed.register_transaction.or(journal.register_transaction)
     };
+    if let Some(tx) = next_register_transaction.as_mut() {
+        if tx.execution_started.is_none() {
+            tx.execution_started = Some(false);
+        }
+    }
     let next = UploadJournal {
         wallet_index: journal.wallet_index,
         wallet_address: parsed.wallet_address.or(journal.wallet_address),
@@ -1526,6 +1544,7 @@ mod tests {
             signature: "signature".into(),
             digest: "digest".into(),
             sponsor_digest: None,
+            execution_started: None,
         };
         let encoded = serde_json::json!({ "step": "encoded" });
         let registered = serde_json::json!({ "step": "registered" });
@@ -1542,6 +1561,7 @@ mod tests {
             signature: "signature".into(),
             digest: "digest".into(),
             sponsor_digest: None,
+            execution_started: None,
         };
         let sponsored = PreparedRegisterTransaction {
             sponsor_digest: Some("sponsor".into()),
@@ -1577,6 +1597,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "cancelled-digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         discard_cancelled_register(&mut journal);
@@ -1832,6 +1853,7 @@ mod tests {
                     signature: "signature".into(),
                     digest: "digest".into(),
                     sponsor_digest: Some("sponsor".into()),
+                    execution_started: None,
                 }),
             };
             let result = super::advance_durable_upload(
@@ -1923,6 +1945,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "cancelled-digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         let reset = super::advance_durable_upload(
@@ -2006,6 +2029,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         for _ in 0..2 {
