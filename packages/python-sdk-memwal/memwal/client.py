@@ -1743,7 +1743,11 @@ class MemWal:
                         try:
                             yield MemoryEvent.from_dict(json.loads(payload))
                         except Exception as exc:
-                            logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
+                            logger.debug(
+                                "Ignoring malformed SSE event payload: %s",
+                                payload,
+                                exc_info=exc,
+                            )
                     continue
                 if line_stripped.startswith(":"):
                     continue
@@ -2411,10 +2415,11 @@ class MemWalRateLimited(MemWalError):
         else:
             wait = f" after ~{retry_after}s" if retry_after else ""
             super().__init__(
-                f"Walrus Memory rate-limited every status read for this batch, so none of its "
-                f"{len(message_or_job_ids)} writes could be confirmed. Do not treat them as stored: check them "
-                f"with get_remember_bulk_status(job_ids){wait}. Status reads count against the same "
-                "delegate-key budget as writes."
+                "Walrus Memory rate-limited every status read for this batch, so none of its "
+                f"{len(message_or_job_ids)} writes could be confirmed. "
+                "Do not treat them as stored: check them "
+                f"with get_remember_bulk_status(job_ids){wait}. Status reads count against "
+                "the same delegate-key budget as writes."
             )
             self.status = 429
             self.job_ids = list(message_or_job_ids)
@@ -2821,7 +2826,11 @@ class MemWalSync:
                             try:
                                 yield MemoryEvent.from_dict(json.loads(payload))
                             except Exception as exc:
-                                logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
+                                logger.debug(
+                                    "Ignoring malformed SSE event payload: %s",
+                                    payload,
+                                    exc_info=exc,
+                                )
                         continue
                     if line_stripped.startswith(":"):
                         continue
@@ -2833,7 +2842,11 @@ class MemWalSync:
                     try:
                         yield MemoryEvent.from_dict(json.loads(payload))
                     except Exception as exc:
-                        logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
+                        logger.debug(
+                            "Ignoring malformed SSE event payload: %s",
+                            payload,
+                            exc_info=exc,
+                        )
 
 
     def remember_manual(self, opts: RememberManualOptions) -> RememberManualResult:
