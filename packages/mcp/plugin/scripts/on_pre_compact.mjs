@@ -11,8 +11,12 @@
  *
  * When automatic saving is off or unset, exits immediately with code 0 and empty stdout.
  */
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
 import { readStdin } from "./lib/hook-io.mjs";
 import { isAutoSaveEnabled } from "./lib/auto-save.mjs";
+import { ensureTrustedEntry } from "./lib/mcp-launch.mjs";
 
 const input = readStdin();
 
@@ -21,8 +25,23 @@ if (!isAutoSaveEnabled()) {
 }
 
 try {
-    const { runPreCompactSave } = await import("../../dist/pre-compact.js");
-    await runPreCompactSave(input);
+    let preCompactPath;
+    const localMonorepoDist = fileURLToPath(new URL("../../dist/pre-compact.js", import.meta.url));
+    if (existsSync(localMonorepoDist)) {
+        preCompactPath = localMonorepoDist;
+    } else {
+        const entry = ensureTrustedEntry();
+        const distDir = dirname(dirname(entry));
+        const installedPath = join(distDir, "pre-compact.js");
+        if (existsSync(installedPath)) {
+            preCompactPath = installedPath;
+        }
+    }
+
+    if (preCompactPath) {
+        const { runPreCompactSave } = await import(preCompactPath);
+        await runPreCompactSave(input);
+    }
 } catch {
     // Hooks must never fail, crash, or block session compaction
 }

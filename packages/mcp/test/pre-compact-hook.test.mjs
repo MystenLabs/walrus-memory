@@ -14,6 +14,9 @@ import {
     AUTO_SAVE_ENV,
 } from "../dist/auto-save.js";
 import {
+    redactSecrets,
+} from "../dist/pre-compact.js";
+import {
     SECRET_EXCLUSION_RULES,
     PRE_COMPACT_PROMPT,
 } from "../dist/memory-policy.js";
@@ -816,4 +819,21 @@ test("relayer HTTP 500 degrades gracefully and does not advance watermark so com
         await mock.close();
         rmSync(tempDir, { recursive: true, force: true });
     }
+});
+
+test("redactSecrets redacts labelled private keys, delegate keys, and mnemonic seed phrases", () => {
+    const rawKey = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+    const sample1 = `Please remember that my delegate private key is ${rawKey} for future sessions.`;
+    const redacted1 = redactSecrets(sample1);
+    assert.doesNotMatch(redacted1, new RegExp(rawKey));
+    assert.match(redacted1, /\[redacted:private-key\]/);
+
+    const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const sample2 = `Account recovery seed phrase is ${mnemonic} please do not share.`;
+    const redacted2 = redactSecrets(sample2);
+    assert.doesNotMatch(redacted2, new RegExp(mnemonic));
+    assert.match(redacted2, /\[redacted:seed-phrase\]/);
+
+    const benign = "This project uses Sui TypeScript SDK version 1.2.0 with PostgreSQL storage.";
+    assert.equal(redactSecrets(benign), benign);
 });

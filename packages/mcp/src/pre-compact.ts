@@ -333,6 +333,26 @@ export function redactSecrets(input: string): string {
         "$1$2[redacted:credential]"
     );
 
+    // 8. Plainly labelled private keys, delegate keys, or hex keys in prose
+    s = s.replace(
+        /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our|his|her|their)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/gi,
+        "[redacted:private-key]"
+    );
+    s = s.replace(
+        /(?:(?:my|the|our|his|her|their)\s+)?(?:delegate[\s_-]*)?(?:private[\s_-]*key|secret[\s_-]*key|signing[\s_-]*key|priv[\s_-]*key)\s*(?:is|was|[:=])\s*(?:0x)?[0-9a-fA-F]{32,}\b/gi,
+        "[redacted:private-key]"
+    );
+    s = s.replace(
+        /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{32,}\b/gi,
+        "[redacted:private-key]"
+    );
+
+    // 9. Labelled seed / recovery mnemonic phrases
+    s = s.replace(
+        /(?:\b|(?<=[a-z]))((?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)([^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4})((?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8})\b/gi,
+        "$1$2[redacted:seed-phrase]"
+    );
+
     return s;
 }
 
