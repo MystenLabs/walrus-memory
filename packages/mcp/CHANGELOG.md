@@ -1,5 +1,11 @@
 # @mysten-incubation/memwal-mcp
 
+## Unreleased
+
+### Added
+
+- Add `memwal-mcp status` and `whoami` CLI subcommand to inspect current account, delegate, label, relayer, namespace, credentials file, and auto-save configuration without interactive prompts. (#1340)
+
 ## 0.0.18
 
 ### Fixed
