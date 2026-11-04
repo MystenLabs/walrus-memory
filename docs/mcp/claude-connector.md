@@ -114,7 +114,7 @@ The relayer supports three scopes, and a client requests the subset it needs. Th
 2. `memwal:write`, which lets the client store memories.
 3. `offline_access`, which lets a client refresh its access token without sending you back through consent.
 
-Access tokens last 1 hour and refresh tokens last 30 days by default. A self-hosted relayer can change both. See [MCP OAuth 2.1 configuration](/mcp/reference#mcp-oauth-2-1-configuration).
+Access tokens last 1 hour and refresh tokens last 30 days by default. A self-hosted relayer can change both. See [MCP OAuth 2.1 configuration](/mcp/reference#mcp-oauth-21-configuration).
 
 <Warning>
 The connector flow puts a delegate private key on the server. Claude cannot hold a Sui wallet key, so the relayer generates a delegate keypair, encrypts the private key with AES-256-GCM before it stores the key, and decrypts it in memory to sign your MCP calls. The [stdio client](/mcp/overview) and the header flow keep the delegate key on your own machine instead. Choose the flow whose trust boundary you accept, and use the dashboard to remove a delegate you no longer want.
@@ -144,7 +144,7 @@ The same split applies to the [stdio client](/mcp/overview): `memwal_logout` cle
 
 ## Troubleshooting
 
-- **Claude reports that it cannot find an authorization server**: that relayer might have no OAuth configuration. Check `GET /.well-known/oauth-authorization-server` on the host, and see [MCP OAuth 2.1 configuration](/mcp/reference#mcp-oauth-2-1-configuration) for what an operator sets to enable it.
+- **Claude reports that it cannot find an authorization server**: that relayer might have no OAuth configuration. Check `GET /.well-known/oauth-authorization-server` on the host, and see [MCP OAuth 2.1 configuration](/mcp/reference#mcp-oauth-21-configuration) for what an operator sets to enable it.
 - **The consent screen rejects the link**: the session ID never arrived, or the relayer already expired it. Consent sessions last 15 minutes by default. Start the connector flow again from Claude.
 - **The consent screen asks you to create an account**: the connected wallet owns no Walrus Memory account. Follow the setup link, create the account, and the app returns you to the connector flow.
 - **Claude connects but the tools never appear**: restart the client. MCP clients load their tool list at startup.
