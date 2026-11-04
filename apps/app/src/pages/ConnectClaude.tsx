@@ -40,6 +40,12 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useSponsoredTransaction } from '../hooks/useSponsoredTransaction'
 import { config } from '../config'
 import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
+import {
+    fetchDelegateKeyCount,
+    isMaxDelegateKeysError,
+    MAX_DELEGATE_KEYS,
+    MAX_DELEGATE_KEYS_CONNECT_MESSAGE,
+} from '../utils/delegateKeys'
 import { fetchAccountIdForOwner } from '../utils/suiClientCompat'
 
 
@@ -163,6 +169,7 @@ export default function ConnectClaude() {
 
     const [step, setStep] = useState<Step>('loading')
     const [errorMsg, setErrorMsg] = useState('')
+    const [isMaxKeysError, setIsMaxKeysError] = useState(false)
     const [walletPickerOpen, setWalletPickerOpen] = useState(false)
     const [session, setSession] = useState<SessionView | null>(null)
 
@@ -171,6 +178,7 @@ export default function ConnectClaude() {
     useEffect(() => {
         if (!sessionValid) {
             setStep('error')
+            setIsMaxKeysError(false)
             setErrorMsg('This link is missing or malformed — ask the connecting app to start over.')
             return
         }
@@ -186,6 +194,7 @@ export default function ConnectClaude() {
             })
             .catch((err) => {
                 if (cancelled) return
+                setIsMaxKeysError(false)
                 setErrorMsg(err instanceof Error ? err.message : String(err))
                 setStep('error')
             })
@@ -300,6 +309,7 @@ export default function ConnectClaude() {
         try {
             await completeSession(payload)
         } catch (err) {
+            setIsMaxKeysError(isMaxDelegateKeysError(err))
             setErrorMsg(err instanceof Error ? err.message : String(err))
             setStep('error')
             trackEvent('claude_connect_failed', { error_type: getAnalyticsErrorType(err) })
@@ -337,6 +347,15 @@ export default function ConnectClaude() {
 
             let txDigest = ''
             if (preflight.needs_onchain_registration) {
+                const delegateKeyCount = await fetchDelegateKeyCount(suiClient, accountId)
+                if (delegateKeyCount !== null && delegateKeyCount >= MAX_DELEGATE_KEYS) {
+                    setIsMaxKeysError(true)
+                    setErrorMsg(MAX_DELEGATE_KEYS_CONNECT_MESSAGE)
+                    setStep('error')
+                    trackEvent('claude_connect_failed', { error_type: 'max_delegate_keys' })
+                    return
+                }
+
                 const tx = new Transaction()
                 tx.moveCall({
                     target: `${config.memwalPackageId}::account::add_delegate_key`,
@@ -349,17 +368,12 @@ export default function ConnectClaude() {
                         tx.object('0x6'),
                     ],
                 })
-                // Deliberately no `account.move` abort-code branches here.
-                // This page signs through `useSponsoredTransaction`, which
-                // throws `new Error(sponsorFailureMessage(...))`, and the
-                // relayer's `sponsor::mask_upstream` collapses any upstream
-                // 5xx into a bare 502 `sponsor_upstream_error` that never
-                // echoes the Move abort. `EDelegateKeyAlreadyExists` (0),
-                // `ETooManyDelegateKeys` (2) and `ENotOwner` (4) therefore all
-                // reach us as the same opaque sponsor string; matching on them
-                // read like recovery while never firing. The duplicate-key
-                // case is settled before this point, by `/account`'s on-chain
-                // check (`resume_pending_registration`).
+                // Deliberately no `EDelegateKeyAlreadyExists` (0) or `ENotOwner` (4)
+                // abort-code branches here. Duplicate keys are settled before this
+                // point by `/account`'s on-chain check (`resume_pending_registration`),
+                // and `ETooManyDelegateKeys` (2) is preflighted above and classified
+                // as `max_delegate_keys` (409) by `/sponsor`. Unclassified 502s remain
+                // terminal errors rather than being guessed as already-registered.
                 const result = await signAndExecute({ transaction: tx })
                 await suiClient.waitForTransaction({ digest: result.digest })
                 txDigest = result.digest
@@ -382,6 +396,7 @@ export default function ConnectClaude() {
                 reused_delegate: !preflight.needs_onchain_registration && !resuming,
             })
         } catch (err) {
+            setIsMaxKeysError(isMaxDelegateKeysError(err))
             setErrorMsg(err instanceof Error ? err.message : String(err))
             if (isRetryableComplete(err)) {
                 // The session is still pending. The terminal error has no
@@ -497,6 +512,17 @@ export default function ConnectClaude() {
                         <div className="setup-classic-intro">
                             <h2 className="setup-classic-title">Something went wrong</h2>
                             <p className="setup-classic-description mcp-error">{errorMsg}</p>
+                            {isMaxKeysError && (
+                                <div className="setup-classic-actions">
+                                    <Link
+                                        to="/dashboard"
+                                        className="mcp-btn"
+                                        onClick={() => trackEvent('cta_click', { cta: 'claude_error_dashboard', location: 'connect_claude' })}
+                                    >
+                                        Go to dashboard
+                                    </Link>
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>

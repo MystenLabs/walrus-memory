@@ -138,6 +138,10 @@ The fastest way to get Walrus Memory running is through the TypeScript SDK.
     | **Walrus Memory Playground** | [memory.walrus.xyz](https://memory.walrus.xyz) |
 
     For the contract-based setup flow, see [Delegate Key Management](/contract/delegate-key-management) and [Walrus Memory smart contract](/contract/overview).
+
+    <Note>
+    Your delegate public key is also your **Agent ID** (`MEMWAL_AGENT_ID`). To collect it later, see [Find Your Agent ID](/getting-started/find-your-agent-id).
+    </Note>
   </Step>
 
   <Step>

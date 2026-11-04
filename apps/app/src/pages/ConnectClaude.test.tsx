@@ -19,6 +19,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
     address: '0xowner',
     accountId: '0xaccount',
+    accountObjectJson: null as Record<string, unknown> | null,
     signAndExecute: vi.fn(),
     signPersonalMessage: vi.fn(),
 }))
@@ -43,6 +44,7 @@ vi.mock('../hooks/useSponsoredTransaction', () => ({
 }))
 vi.mock('../utils/suiClientCompat', () => ({
     fetchAccountIdForOwner: vi.fn().mockResolvedValue(mocks.accountId),
+    fetchObjectJson: vi.fn(async () => mocks.accountObjectJson),
 }))
 vi.mock('../utils/analytics', () => ({
     trackEvent: vi.fn(),
@@ -128,6 +130,7 @@ async function approve() {
 beforeEach(() => {
     vi.clearAllMocks()
     sessionStorage.clear()
+    mocks.accountObjectJson = null
     mocks.signPersonalMessage.mockResolvedValue({ signature: 'sig' })
     // jsdom refuses a real navigation; the page only needs the call to not throw.
     vi.stubGlobal('location', { ...window.location, replace: vi.fn() })
@@ -366,5 +369,40 @@ describe('ConnectClaude /complete recovery', () => {
 
         await screen.findByText('Something went wrong')
         expect(screen.queryByRole('button', { name: /finish connecting/i })).toBeNull()
+    })
+
+    it('fails fast on preflight when registration is needed and the account has 20 delegate keys', async () => {
+        const calls = stubRelayer([() => json({ redirect_url: 'https://claude.ai/callback?code=abc' })], {
+            needsOnchainRegistration: true,
+        })
+        mocks.accountObjectJson = {
+            delegate_keys: Array.from({ length: 20 }, (_, idx) => ({ public_key: `key_${idx}` })),
+        }
+
+        await approve()
+
+        expect(
+            await screen.findByText(
+                /already has the maximum number of delegate keys \(20\)\. Go to \/dashboard and revoke an unused key/i,
+            ),
+        ).toBeInTheDocument()
+        expect(screen.getByRole('link', { name: /go to dashboard/i })).toHaveAttribute('href', '/dashboard')
+        expect(mocks.signAndExecute).not.toHaveBeenCalled()
+        expect(calls.complete).toBe(0)
+    })
+
+    it('still allows reusing an existing OAuth delegate when the account is at 20 delegate keys', async () => {
+        const calls = stubRelayer([() => json({ redirect_url: 'https://claude.ai/callback?code=abc' })], {
+            needsOnchainRegistration: false,
+        })
+        mocks.accountObjectJson = {
+            delegate_keys: Array.from({ length: 20 }, (_, idx) => ({ public_key: `key_${idx}` })),
+        }
+
+        await approve()
+
+        await screen.findByText(/Redirecting you back/)
+        expect(mocks.signAndExecute).not.toHaveBeenCalled()
+        expect(calls.complete).toBe(1)
     })
 })

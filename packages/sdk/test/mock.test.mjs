@@ -301,15 +301,15 @@ test("MemWalMock.listNamespaces rejects a non-positive limit instead of paging f
 
     await assert.rejects(
         () => mock.listNamespaces({ limit: 0 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
     await assert.rejects(
         () => mock.listNamespaces({ limit: -1 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
     await assert.rejects(
         () => mock.listNamespaces({ limit: 1.5 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
 
     const page = await mock.listNamespaces({ limit: 1 });

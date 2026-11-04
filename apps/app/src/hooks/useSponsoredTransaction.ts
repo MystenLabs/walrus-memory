@@ -25,6 +25,7 @@ import { useCurrentAccount, useSignPersonalMessage, useSignTransaction, useSuiCl
 import { createSponsorAuthorization } from '@mysten-incubation/memwal'
 import { Transaction } from '@mysten/sui/transactions'
 import { config } from '../config'
+import { MAX_DELEGATE_KEYS_CONNECT_MESSAGE } from '../utils/delegateKeys'
 
 const MAX_ATTEMPTS = 3
 const BASE_DELAY_MS = 500
@@ -105,6 +106,9 @@ export function sponsorFailureMessage(err: unknown): string {
         }
         if (err.code === 'account_quarantined') {
             return withTrace('This account is still locked, so it cannot be reactivated yet.', err.traceId)
+        }
+        if (err.code === 'max_delegate_keys') {
+            return withTrace(MAX_DELEGATE_KEYS_CONNECT_MESSAGE, err.traceId)
         }
         if (err.code === 'sponsor_misconfigured') {
             return withTrace('The sponsor service is misconfigured, so this transaction could not be sponsored. Please report this.', err.traceId)

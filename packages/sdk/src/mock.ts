@@ -26,7 +26,14 @@ import type {
 } from "./types.js";
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
 import { resolveRecallCall } from "./recall-args.js";
-import { derivedBulkIdempotencyKey } from "./utils.js";
+import {
+    assertFiniteScoringWeights,
+    assertNonBlankText,
+    assertReadableNamespace,
+    assertPositiveIntegerLimit,
+    derivedBulkIdempotencyKey,
+    validateIdempotencyKey,
+} from "./utils.js";
 import { MemWalRememberJobNotFoundError } from "./errors.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
@@ -115,12 +122,8 @@ function requireRememberText(text: unknown): asserts text is string {
     }
 }
 
-const ZERO_WIDTH_ONLY = /^[\s\u200B-\u200D\u2060\uFEFF]*$/;
-
 function validateText(text: string, field = "text"): void {
-    if (typeof text !== "string" || text.trim().length === 0 || ZERO_WIDTH_ONLY.test(text)) {
-        throw new Error(`${field} cannot be empty`);
-    }
+    assertNonBlankText(text, `${field} cannot be empty`);
 }
 
 function assertOccurredAt(occurredAt?: string | Date): void {
@@ -130,20 +133,6 @@ function assertOccurredAt(occurredAt?: string | Date): void {
         "malformed string. `Date` accepts garbage silently; check " +
         "the source value before passing it as occurredAt.",
     );
-}
-
-const MAX_IDEMPOTENCY_KEY_BYTES = 255;
-
-function validateIdempotencyKey(key: string | undefined): void {
-    if (key === undefined) return;
-    if (key.length === 0) {
-        throw new Error("idempotency_key cannot be empty (omit it instead)");
-    }
-    if (new TextEncoder().encode(key).length > MAX_IDEMPOTENCY_KEY_BYTES) {
-        throw new Error(
-            `idempotency_key exceeds maximum length of ${MAX_IDEMPOTENCY_KEY_BYTES} bytes`,
-        );
-    }
 }
 
 /** How many semantic candidates `sort: "recent"` reorders. Mirrors `RecallSort::candidate_limit`. */
@@ -214,8 +203,10 @@ export class MemWalMock {
 
     private constructor(config: MemWalMockConfig = {}) {
         this.owner = config.owner ?? "mock-owner";
+        if (config.namespace !== undefined) {
+            assertNonBlankText(config.namespace, "namespace cannot be empty");
+        }
         this.namespace = config.namespace ?? "default";
-        if (!this.namespace) throw new Error("namespace cannot be empty");
         for (const seed of config.initialMemories ?? []) {
             this.store(seed.text, seed.namespace, seed.blobId);
         }
@@ -306,6 +297,9 @@ export class MemWalMock {
         }
         items.forEach((item, i) => {
             validateText(item?.text, `items[${i}].text`);
+            if (item?.namespace !== undefined) {
+                validateText(item.namespace, `items[${i}].namespace`);
+            }
         });
 
         validateIdempotencyKey(options.idempotencyKey);
@@ -424,10 +418,11 @@ export class MemWalMock {
         validateText(query, "query");
         validateMaxTokens(options.maxTokens);
         const resolvedNamespace = options.namespace ?? this.namespace;
-        const resolvedLimit = options.topK ?? options.limit ?? 10;
-        if (!Number.isInteger(resolvedLimit) || resolvedLimit < 0) {
-            throw new Error("limit must be a non-negative integer");
-        }
+        assertReadableNamespace(resolvedNamespace);
+        const rawLimit = options.topK !== undefined ? options.topK : options.limit;
+        const resolvedLimit = rawLimit !== undefined ? rawLimit : 10;
+        assertPositiveIntegerLimit(resolvedLimit);
+        assertFiniteScoringWeights(options.scoringWeights);
         if (
             options.maxDistance !== undefined
             && (typeof options.maxDistance !== "number"
@@ -555,7 +550,9 @@ export class MemWalMock {
         return { vector: vector.map((value) => value / magnitude) };
     }
 
-    async restore(namespace: string, _limit = 10): Promise<RestoreResult> {
+    async restore(namespace: string, limit = 10): Promise<RestoreResult> {
+        assertReadableNamespace(namespace);
+        assertPositiveIntegerLimit(limit);
         return {
             restored: 0,
             skipped: 0,
@@ -571,11 +568,8 @@ export class MemWalMock {
         // The relayer rejects limit < 1 with this message. slice(0, 0) would
         // otherwise report has_more with a null cursor, and slice(0, -1)
         // would drop the last namespace. (#1144, #1145)
-        if (
-            options.limit !== undefined &&
-            (!Number.isInteger(options.limit) || options.limit < 1)
-        ) {
-            throw new Error("limit must be positive");
+        if (options.limit !== undefined) {
+            assertPositiveIntegerLimit(options.limit);
         }
         const grouped = new Map<string, { count: number; bytes: number; sequence: number }>();
         for (const memory of this.memories) {
@@ -689,7 +683,7 @@ export class MemWalMock {
             validateIdempotencyKey(idempotencyKey);
         }
         const resolvedNamespace = namespace ?? this.namespace;
-        if (!resolvedNamespace) throw new Error("namespace cannot be empty");
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         if (dedupe) {
             const dedupeKey = `${resolvedNamespace}\0${text}`;
             const existingId = this.dedupe.get(dedupeKey);

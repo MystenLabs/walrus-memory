@@ -8,17 +8,32 @@
 import express, { type Express } from "express";
 import { suiClient } from "../clients.js";
 import { ENOKI_API_KEY, ENOKI_NETWORK, JSON_LIMIT_METADATA } from "../config.js";
-import { callEnoki, reactivateRejectionCode, type EnokiExecuteResponse, type EnokiSponsorResponse } from "../enoki.js";
+import {
+    addDelegateKeyRejectionCode,
+    callEnoki,
+    reactivateRejectionCode,
+    type EnokiExecuteResponse,
+    type EnokiSponsorResponse,
+} from "../enoki.js";
 import { requestIdFor, sidecarLog } from "../log.js";
 import { errorMessage } from "../util.js";
 
-function reactivateRejection(message: string): { code: "account_already_active" | "account_quarantined"; error: string } | null {
+const MAX_DELEGATE_KEYS_MESSAGE =
+    "This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.";
+
+function sponsorAbortRejection(
+    message: string,
+): { code: "account_already_active" | "account_quarantined" | "max_delegate_keys"; error: string } | null {
     const code = reactivateRejectionCode(message);
     if (code === "account_already_active") {
         return { code, error: "This account is already active, so it cannot be reactivated." };
     }
     if (code === "account_quarantined") {
         return { code, error: "This account is still locked, so it cannot be reactivated yet." };
+    }
+    const addKeyCode = addDelegateKeyRejectionCode(message);
+    if (addKeyCode === "max_delegate_keys") {
+        return { code: addKeyCode, error: MAX_DELEGATE_KEYS_MESSAGE };
     }
     return null;
 }
@@ -92,7 +107,7 @@ export function registerSponsorRoutes(app: Express): void {
                 requestId: traceId,
                 error: message,
             });
-            const rejection = reactivateRejection(message);
+            const rejection = sponsorAbortRejection(message);
             if (rejection) {
                 return res.status(409).json({ error: rejection.error, code: rejection.code, traceId });
             }
@@ -152,7 +167,7 @@ export function registerSponsorRoutes(app: Express): void {
                 requestId: traceId,
                 error: message,
             });
-            const rejection = reactivateRejection(message);
+            const rejection = sponsorAbortRejection(message);
             if (rejection) {
                 return res.status(409).json({ error: rejection.error, code: rejection.code, traceId });
             }
