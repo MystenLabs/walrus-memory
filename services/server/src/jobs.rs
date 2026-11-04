@@ -2324,6 +2324,7 @@ fn build_resume_transfer_job(
     blob_size_bytes: i64,
     importance: f32,
     seal_policy_package_id: &str,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> WalletJob {
     WalletJob {
         wallet_index,
@@ -2347,7 +2348,7 @@ fn build_resume_transfer_job(
             // re-verification sweep backfills it on its next pass, same as
             // any other row that starts out with an unknown expiry.
             end_epoch: None,
-            rate_limit_charge: None,
+            rate_limit_charge,
         },
     }
 }
@@ -2373,6 +2374,7 @@ async fn resume_metadata_and_transfer(
     vector: &[f32],
     blob_size_bytes: i64,
     importance: f32,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     let job = build_resume_transfer_job(
         wallet_index,
@@ -2389,13 +2391,15 @@ async fn resume_metadata_and_transfer(
         blob_size_bytes,
         importance,
         &state.config.seal_policy_package_id,
+        rate_limit_charge.clone(),
     );
     let mut storage = wallet_job_queue(state, &job.operation);
     if let Err(e) = storage.push_request(wallet_job_request(job)).await {
+        let err_msg = format!("failed to enqueue metadata/transfer recovery job: {}", e);
         let classified = classify_wallet_remember_handoff_failure(
             state.db.pool(),
             Some(remember_job_id),
-            format!("failed to enqueue metadata/transfer recovery job: {}", e),
+            err_msg.clone(),
         )
         .await;
         tracing::error!(
@@ -2403,6 +2407,13 @@ async fn resume_metadata_and_transfer(
             remember_job_id,
             classified,
         );
+        if matches!(classified, WalletJobError::Permanent(_))
+            && is_infrastructure_job_failure(&err_msg)
+        {
+            if let Some(ref c) = rate_limit_charge {
+                crate::rate_limit::refund_delegate_key_rate_limit(state, c).await;
+            }
+        }
         return Err(classified);
     }
     tracing::info!(
@@ -2491,6 +2502,7 @@ async fn execute_durable_upload(
     agent_public_key: Option<&str>,
     remember_job_id: &str,
     epochs: u32,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     let mut journal =
         load_upload_journal(state.db.pool(), remember_job_id, fallback_wallet_index).await?;
@@ -2664,6 +2676,7 @@ async fn execute_durable_upload(
                     vector,
                     encrypted.len() as i64,
                     importance,
+                    rate_limit_charge,
                 )
                 .await;
             }
@@ -3071,6 +3084,7 @@ async fn execute_upload_and_transfer_locked(
                     &vector,
                     blob_size_bytes,
                     importance,
+                    rate_limit_charge,
                 )
                 .await;
             }
@@ -3205,6 +3219,7 @@ async fn execute_upload_and_transfer_locked(
             agent_public_key.as_deref(),
             jid,
             epochs,
+            rate_limit_charge.clone(),
         )
         .await
         {
@@ -6788,10 +6803,19 @@ the checkpoint it replied about",
     }
 
     // RC-4: an uploaded-but-pending resume must route to the TRANSFER recovery op
-    // (carrying the stored object id), NOT to an index/done finalize — otherwise a
+    // (carrying the stored object id and rate_limit_charge), NOT to an index/done finalize — otherwise a
     // never-transferred blob is prematurely marked done.
     #[test]
     fn resume_builds_a_set_metadata_and_transfer_job_with_object_id() {
+        let charge = crate::rate_limit::RateLimitCharge {
+            request_id: "req-resume".into(),
+            public_key: "pk-resume".into(),
+            owner: "0xowner".into(),
+            weight: 1,
+            member_offset: 0,
+            backend: crate::rate_limit::RateLimitBackend::Fallback,
+            delegate_key_capacity: 30,
+        };
         let job = build_resume_transfer_job(
             3,
             "job-abc",
@@ -6807,6 +6831,7 @@ the checkpoint it replied about",
             123,
             0.5,
             "0xpolicy",
+            Some(charge.clone()),
         );
         match job.operation {
             WalletOperation::SetMetadataAndTransfer {
@@ -6814,6 +6839,7 @@ the checkpoint it replied about",
                 blob_id,
                 remember_job_id,
                 encrypted_b64,
+                rate_limit_charge,
                 ..
             } => {
                 assert_eq!(
@@ -6827,6 +6853,7 @@ the checkpoint it replied about",
                     Some("ciphertext-b64"),
                     "ciphertext needed for SEAL persistence"
                 );
+                assert_eq!(rate_limit_charge, Some(charge));
             }
             other => panic!("resume must build SetMetadataAndTransfer, got {other:?}"),
         }

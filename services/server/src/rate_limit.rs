@@ -428,12 +428,62 @@ where
 // ============================================================
 
 #[derive(Default)]
+struct FallbackOriginRegistry {
+    instances: std::collections::HashMap<u64, usize>,
+    request_origins: std::collections::HashMap<(String, String), u64>,
+}
+
+static NEXT_FALLBACK_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static FALLBACK_ORIGIN_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FallbackOriginRegistry>> =
+    std::sync::OnceLock::new();
+
+fn fallback_origin_registry() -> &'static std::sync::Mutex<FallbackOriginRegistry> {
+    FALLBACK_ORIGIN_REGISTRY
+        .get_or_init(|| std::sync::Mutex::new(FallbackOriginRegistry::default()))
+}
+
+struct FallbackOriginGuard(u64);
+
+impl Drop for FallbackOriginGuard {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            reg.instances.remove(&self.0);
+            let id = self.0;
+            reg.request_origins.retain(|_, origin_id| *origin_id != id);
+        }
+    }
+}
+
 pub struct InMemoryFallback {
     pub buckets: std::collections::HashMap<String, TokenBucket>,
     pub cleanup_counter: usize,
+    origin_guard: FallbackOriginGuard,
+}
+
+impl Default for InMemoryFallback {
+    fn default() -> Self {
+        Self {
+            buckets: std::collections::HashMap::new(),
+            cleanup_counter: 0,
+            origin_guard: FallbackOriginGuard(
+                NEXT_FALLBACK_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl InMemoryFallback {
+    fn refresh_registry_ptr(&mut self) {
+        let instance_id = self.origin_guard.0;
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            if reg.instances.contains_key(&instance_id) {
+                reg.instances
+                    .insert(instance_id, self as *mut InMemoryFallback as usize);
+            }
+        }
+    }
+
     pub fn can_consume(
         &mut self,
         key: &str,
@@ -458,12 +508,13 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) -> bool {
+        self.refresh_registry_ptr();
         let refill_rate = capacity / refill_duration_secs;
         let bucket = self
             .buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new_at(capacity, now));
-        bucket.peek_at(weight, capacity, refill_rate, now)
+        bucket.can_consume_at(weight, capacity, refill_rate, now)
     }
 
     pub fn consume(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
@@ -484,6 +535,7 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) {
+        self.refresh_registry_ptr();
         let refill_rate = capacity / refill_duration_secs;
         if let Some(bucket) = self.buckets.get_mut(key) {
             bucket.consume_at(weight, capacity, refill_rate, now);
@@ -531,6 +583,21 @@ impl InMemoryFallback {
             .or_insert_with(|| TokenBucket::new_at(capacity, now));
         bucket.consume_tracked_at(request_id, weight, capacity, refill_rate, now);
 
+        if let Some(req_id) = request_id {
+            if weight > 0 {
+                let instance_id = self.origin_guard.0;
+                if let Ok(mut reg) = fallback_origin_registry().lock() {
+                    reg.instances
+                        .insert(instance_id, self as *mut InMemoryFallback as usize);
+                    if reg.request_origins.len() >= 10_000 {
+                        reg.request_origins.clear();
+                    }
+                    reg.request_origins
+                        .insert((key.to_string(), req_id.to_string()), instance_id);
+                }
+            }
+        }
+
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 1000 {
             self.cleanup_counter = 0;
@@ -559,7 +626,7 @@ impl InMemoryFallback {
         )
     }
 
-    pub fn refund_tracked_at(
+    fn refund_tracked_local_at(
         &mut self,
         key: &str,
         request_id: &str,
@@ -584,8 +651,79 @@ impl InMemoryFallback {
         }
     }
 
+    pub fn refund_tracked_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.refresh_registry_ptr();
+        let has_local_unit = self.buckets.get(key).is_some_and(|bucket| {
+            bucket
+                .outstanding_units
+                .iter()
+                .any(|u| u.request_id == request_id)
+        });
+        if has_local_unit {
+            return self.refund_tracked_local_at(
+                key,
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_duration_secs,
+                now,
+            );
+        }
+
+        let instance_id = self.origin_guard.0;
+        if let Ok(reg) = fallback_origin_registry().lock() {
+            if let Some(&origin_id) = reg
+                .request_origins
+                .get(&(key.to_string(), request_id.to_string()))
+            {
+                if origin_id != instance_id {
+                    if let Some(&origin_ptr) = reg.instances.get(&origin_id) {
+                        if origin_ptr != 0 {
+                            // SAFETY: `origin_ptr` is registered by a live `InMemoryFallback`
+                            // instance, updated whenever that instance is accessed, and removed
+                            // in `Drop` while holding `FALLBACK_ORIGIN_REGISTRY`. Because
+                            // `origin_id != self.instance_id` and `reg` is held for the duration
+                            // of this call, `origin` does not alias `self`.
+                            let origin = unsafe { &mut *(origin_ptr as *mut InMemoryFallback) };
+                            return origin.refund_tracked_local_at(
+                                key,
+                                request_id,
+                                member_offset,
+                                weight,
+                                capacity,
+                                refill_duration_secs,
+                                now,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.refund_tracked_local_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
     #[allow(dead_code)]
     pub fn refund(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
+        self.refresh_registry_ptr();
         let refill_rate = capacity / refill_duration_secs;
         let bucket = self
             .buckets
@@ -604,6 +742,8 @@ pub struct OutstandingFallbackUnit {
 
 pub struct TokenBucket {
     pub tokens: f64,
+    pub capacity: f64,
+    pub refill_rate_per_sec: f64,
     pub last_update: std::time::Instant,
     pub outstanding_units: std::collections::VecDeque<OutstandingFallbackUnit>,
 }
@@ -612,6 +752,8 @@ impl TokenBucket {
     pub fn new(capacity: f64) -> Self {
         Self {
             tokens: capacity,
+            capacity,
+            refill_rate_per_sec: capacity / 60.0,
             last_update: std::time::Instant::now(),
             outstanding_units: std::collections::VecDeque::new(),
         }
@@ -620,8 +762,22 @@ impl TokenBucket {
     pub fn new_at(capacity: f64, now: std::time::Instant) -> Self {
         Self {
             tokens: capacity,
+            capacity,
+            refill_rate_per_sec: capacity / 60.0,
             last_update: now,
             outstanding_units: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn apply_policy_capacity(&mut self, capacity: f64, refill_rate_per_sec: f64) {
+        if self.capacity > 0.0 && capacity > self.capacity {
+            self.tokens = (self.tokens + (capacity - self.capacity)).min(capacity);
+        }
+        if capacity > 0.0 {
+            self.capacity = capacity;
+        }
+        if refill_rate_per_sec > 0.0 {
+            self.refill_rate_per_sec = refill_rate_per_sec;
         }
     }
 
@@ -642,11 +798,22 @@ impl TokenBucket {
                 break;
             }
         }
-        self.tokens = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
-        if self.tokens >= capacity - 1e-9 {
-            self.outstanding_units.clear();
+        if self.tokens < capacity {
+            self.tokens = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
         }
         self.last_update = now;
+    }
+
+    pub fn can_consume_at(
+        &mut self,
+        weight: f64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
+        self.advance_to(now, capacity, refill_rate_per_sec);
+        self.tokens >= weight
     }
 
     pub fn peek(&self, weight: f64, capacity: f64, refill_rate_per_sec: f64) -> bool {
@@ -668,7 +835,16 @@ impl TokenBucket {
         let elapsed = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64();
-        let projected = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
+        let base_tokens = if self.capacity > 0.0 && capacity > self.capacity {
+            (self.tokens + (capacity - self.capacity)).min(capacity)
+        } else {
+            self.tokens
+        };
+        let projected = if base_tokens < capacity {
+            (base_tokens + elapsed * refill_rate_per_sec).min(capacity)
+        } else {
+            base_tokens
+        };
         projected >= weight
     }
 
@@ -688,6 +864,7 @@ impl TokenBucket {
         refill_rate_per_sec: f64,
         now: std::time::Instant,
     ) {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
         self.advance_to(now, capacity, refill_rate_per_sec);
         self.tokens -= weight;
     }
@@ -717,6 +894,7 @@ impl TokenBucket {
         refill_rate_per_sec: f64,
         now: std::time::Instant,
     ) {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
         self.advance_to(now, capacity, refill_rate_per_sec);
         self.tokens -= weight as f64;
         if let Some(req_id) = request_id {
@@ -760,7 +938,17 @@ impl TokenBucket {
         refill_rate_per_sec: f64,
         now: std::time::Instant,
     ) -> f64 {
-        self.advance_to(now, capacity, refill_rate_per_sec);
+        let effective_capacity = if self.capacity > 0.0 {
+            self.capacity
+        } else {
+            capacity
+        };
+        let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
+            self.refill_rate_per_sec
+        } else {
+            refill_rate_per_sec
+        };
+        self.advance_to(now, effective_capacity, effective_refill_rate);
         if weight <= 0 || member_offset < 0 {
             return 0.0;
         }
@@ -777,8 +965,8 @@ impl TokenBucket {
                 true
             }
         });
-        if refundable > 0.0 {
-            self.tokens = (self.tokens + refundable).min(capacity);
+        if refundable > 0.0 && self.tokens < effective_capacity {
+            self.tokens = (self.tokens + refundable).min(effective_capacity);
         }
         refundable
     }
@@ -801,8 +989,20 @@ impl TokenBucket {
         refill_rate_per_sec: f64,
         now: std::time::Instant,
     ) {
-        self.advance_to(now, capacity, refill_rate_per_sec);
-        self.tokens = (self.tokens + weight.max(0.0)).min(capacity);
+        let effective_capacity = if self.capacity > 0.0 {
+            self.capacity
+        } else {
+            capacity
+        };
+        let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
+            self.refill_rate_per_sec
+        } else {
+            refill_rate_per_sec
+        };
+        self.advance_to(now, effective_capacity, effective_refill_rate);
+        if self.tokens < effective_capacity {
+            self.tokens = (self.tokens + weight.max(0.0)).min(effective_capacity);
+        }
     }
 }
 
@@ -1275,17 +1475,18 @@ pub async fn refund_delegate_key_rate_limit(state: &AppState, charge: &RateLimit
 
     let dk_key = format!("rate:dk:{}", charge.public_key);
 
+    let now = chrono::Utc::now();
+    let policy = state
+        .owner_policies
+        .policy_for(&charge.owner)
+        .ok()
+        .flatten();
+    let current_capacity = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now)
+        .max_requests_per_delegate_key;
     let capacity = if charge.delegate_key_capacity > 0 {
-        charge.delegate_key_capacity
+        current_capacity.max(charge.delegate_key_capacity)
     } else {
-        let now = chrono::Utc::now();
-        let policy = state
-            .owner_policies
-            .policy_for(&charge.owner)
-            .ok()
-            .flatten();
-        effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now)
-            .max_requests_per_delegate_key
+        current_capacity
     };
 
     match charge.backend {
@@ -3327,12 +3528,138 @@ mod tests {
     }
 
     #[test]
+    fn test_in_memory_fallback_policy_capacity_change_avoids_bucket_truncation() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_policy_change";
+        let initial_capacity = 60.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Consume 5 units under 60.0 capacity -> 55.0 tokens remaining
+        fallback.consume_tracked_at(key, Some("req-1"), 5, initial_capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 55.0).abs() < 1e-4);
+
+        // 2. Policy decreases to 30.0 while job is in-flight.
+        // Refund arriving with settled policy must NOT truncate the 55.0 tokens down to 30.0.
+        let decreased_capacity = 30.0;
+        let refunded = fallback.refund_tracked_at(
+            key,
+            "req-1",
+            0,
+            5,
+            decreased_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        let tokens_after = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            tokens_after >= 55.0,
+            "tokens must not be truncated to 30.0 when bucket holds 55.0 tokens; got {}",
+            tokens_after
+        );
+    }
+
+    #[test]
     fn test_in_memory_fallback_refund_missing_bucket_returns_zero_without_inserting() {
         let mut fallback = InMemoryFallback::default();
         let refunded =
             fallback.refund_tracked("rate:dk:pk_nonexistent", "req-none", 0, 5, 30.0, 60.0);
         assert_eq!(refunded, 0.0);
         assert!(!fallback.buckets.contains_key("rate:dk:pk_nonexistent"));
+    }
+
+    #[test]
+    fn test_in_memory_fallback_expired_lower_policy_override_preserves_current_capacity_and_outstanding() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_expired_override";
+        let override_capacity = 10.0;
+        let restored_capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Async job admitted while owner override lowered budget to 10.0 -> 9.0/10.0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-old"),
+            1,
+            override_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key).unwrap().tokens - 9.0).abs() < 1e-4);
+
+        // 2. Override expires back to 30.0 and a subsequent request consumes 1 unit -> 28.0/30.0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-new"),
+            1,
+            restored_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key).unwrap().tokens - 28.0).abs() < 1e-4);
+
+        // 3. Older job fails on infrastructure and settles with historical override_capacity (10.0).
+        // Must credit 1.0 back to 29.0/30.0 without clamping to 10.0 or clearing `req-new`.
+        let refunded_old = fallback.refund_tracked_at(
+            key,
+            "req-old",
+            0,
+            1,
+            override_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded_old, 1.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 29.0).abs() < 1e-4);
+
+        // 4. Newer request's outstanding unit is still intact and refunds to 30.0/30.0.
+        let refunded_new = fallback.refund_tracked_at(
+            key,
+            "req-new",
+            0,
+            1,
+            restored_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded_new, 1.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_in_memory_fallback_routes_cross_instance_refund_to_admitting_instance() {
+        let mut instance_a = InMemoryFallback::default();
+        let mut instance_b = InMemoryFallback::default();
+        let key = "rate:dk:pk_cross_instance";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // Instance A admits the request under fallback -> 25.0/30.0
+        instance_a.consume_tracked_at(key, Some("req-cross-1"), 5, capacity, refill_duration_secs, t0);
+        assert!((instance_a.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // Worker on Instance B claims the wallet_job and refunds the charge
+        let refunded = instance_b.refund_tracked_at(
+            key,
+            "req-cross-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        assert!(
+            !instance_b.buckets.contains_key(key),
+            "Instance B must not create a phantom bucket when routing to Instance A"
+        );
+        assert!(
+            (instance_a.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4,
+            "Instance A must be restored to 30.0/30.0"
+        );
     }
 
     #[test]

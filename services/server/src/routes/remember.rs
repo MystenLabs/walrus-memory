@@ -394,6 +394,8 @@ fn spawn_prepare_remember_job(
                 if transitioned_failed
                     && (is_upstream_inference_job_error(&client_msg)
                         || is_upstream_inference_job_error(&raw_msg)
+                        || crate::jobs::is_infrastructure_job_failure(&client_msg)
+                        || crate::jobs::is_infrastructure_job_failure(&raw_msg)
                         || raw_msg.contains("Memory encryption backend is unavailable")
                         || raw_msg.contains("seal encrypt failed"))
                 {
@@ -565,6 +567,8 @@ fn spawn_prepare_bulk_remember_job(
                 if affected > 0
                     && (is_upstream_inference_job_error(&client_msg)
                         || is_upstream_inference_job_error(&raw_msg)
+                        || crate::jobs::is_infrastructure_job_failure(&client_msg)
+                        || crate::jobs::is_infrastructure_job_failure(&raw_msg)
                         || raw_msg.contains("Memory encryption backend is unavailable")
                         || raw_msg.contains("seal encrypt failed"))
                 {
