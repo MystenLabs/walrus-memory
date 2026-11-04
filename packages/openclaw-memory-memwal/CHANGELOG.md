@@ -5,6 +5,7 @@
 ### Fixed
 
 - Keep sub-agent memory separate from the main agent when the derived namespace or legacy alias would collide with `defaultNamespace`. Colliding derived namespaces use a deterministic hashed namespace, and `memory_search` and `memory_store` reject explicit requests for the main namespace from sub-agent sessions.
+- When a sub-agent's derived namespace previously equaled `defaultNamespace`, it now uses the hashed namespace. Memories already stored under `defaultNamespace` remain there and are no longer automatically recalled by that sub-agent.
 
 ### Changed
 
