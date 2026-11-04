@@ -28,8 +28,14 @@ questions:
   - What changed in the MemWal MCP changelog?
   - When was the automatic memory plugin added to MemWal MCP?
 answer: >-
-  The prepared 0.0.18 release fixes environment-based auto-save consent overrides, wakes aborted SSE readers for reliable reconnects, and prepares a matching stable launcher pin with a published fixed bootstrap. The published 0.0.17 release prevents duplicate bulk writes during bridge replay. Version 0.0.16 hardened transport dependencies and authenticated redirects.
+  Version 0.1.0 adds non-interactive status and whoami commands that report the active account, delegate, label, relayer, namespace, credentials file, and auto-save configuration. Version 0.0.18 fixes environment-based auto-save consent overrides and wakes aborted SSE readers for reliable reconnects. Version 0.0.17 prevents duplicate bulk writes during bridge replay. Version 0.0.16 hardened transport dependencies and authenticated redirects.
 ---
+
+## 0.1.0
+
+### Added
+
+- Add `memwal-mcp status` and `whoami` CLI subcommand to inspect current account, delegate, label, relayer, namespace, credentials file, and auto-save configuration without interactive prompts. (#1340)
 
 ## 0.0.18
 

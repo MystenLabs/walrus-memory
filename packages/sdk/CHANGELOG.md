@@ -1,10 +1,15 @@
 # @mysten-incubation/memwal
 
-## 0.1.12
+## 0.1.13
 
 ### Fixed
 
 - `MemWal` and `MemWalMock` share input validation on `remember*`, `rememberBulk*`, `analyze*`, `embed`, `recall`, `restore`, and `listNamespaces`, rejecting invalid `idempotencyKey` values before signing and rejecting `limit: 0` consistently. On read paths (`recall`, `recallManual`, `restore`, and `listMemories`), empty string `""` is rejected while whitespace namespaces remain readable to match the server's namespace validation. (Refs #978)
+
+## 0.1.12
+
+### Fixed
+
 - `withMemWal` bounds the recall query (preserving both head context and tail question/instructions via `strategy: "head-tail"`) to 16,384 UTF-8 bytes and auto-save `analyze()` input to 65,536 UTF-8 bytes without splitting multi-byte UTF-8 codepoints across boundaries, while keeping the full user turn in the language model prompt. User turns exceeding the embedder's 16 KiB limit still inject relevant memories without HTTP 400 errors, and auto-save extracts facts across turns up to 64 KiB. (#1037)
 
 ## 0.1.11
