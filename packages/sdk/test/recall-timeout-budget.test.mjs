@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { MemWal } from "../dist/memwal.js";
+import { MemWalManual } from "../dist/manual.js";
+import { SessionKey } from "@mysten/seal";
 import { fetchWithDeadline, isTimeoutError, DEFAULT_RECALL_TIMEOUT_MS } from "../dist/utils.js";
 
 // The shipped deadline contract (WALM-648): name `MemWalRequestTimeout`, status
@@ -26,9 +28,11 @@ const isRequestTimeout = (err) =>
 // their own independent deadlines.
 
 const originalFetch = globalThis.fetch;
+const originalSessionKeyCreate = SessionKey.create;
 
 test.afterEach(() => {
     globalThis.fetch = originalFetch;
+    SessionKey.create = originalSessionKeyCreate;
 });
 
 /**
@@ -355,31 +359,14 @@ test("a stalled SessionKey.create rejects within preflightTimeoutMs with classif
         throw new Error(path);
     };
 
+    SessionKey.create = () => new Promise((resolve) => setTimeout(resolve, 500));
+
     const c = MemWal.create({
         key: new Uint8Array(32).fill(1),
         accountId: "0x1",
         serverUrl: "https://relayer.example",
         preflightTimeoutMs: 35,
     });
-
-    // Stalled Sui endpoint inside buildSealSessionInner
-    const origBuildInner = c.buildSealSessionInner;
-    c.buildSealSessionInner = async function () {
-        await c.fetchServerConfig();
-        const deadline = c.preflightTimeoutMs;
-        return new Promise((_, reject) => {
-            setTimeout(() => {
-                const err = new Error(
-                    `Walrus Memory request timed out after ${deadline}ms during preflight SessionKey.create. The relayer accepted the connection but did not answer in time.`,
-                );
-                err.name = "MemWalRequestTimeout";
-                err.status = 504;
-                err.phase = "preflight SessionKey.create";
-                err.timeoutMs = deadline;
-                reject(err);
-            }, deadline);
-        });
-    };
 
     await assert.rejects(
         c.recall({ query: "allergies" }),
@@ -394,6 +381,31 @@ test("a stalled SessionKey.create rejects within preflightTimeoutMs with classif
     assert.deepEqual(seen, ["/version", "/config"]);
 });
 
+test("MemWalManual buildSealSession rejects within preflightTimeoutMs when SessionKey.create stalls (#1367)", async () => {
+    SessionKey.create = () => new Promise((resolve) => setTimeout(resolve, 500));
+
+    const m = MemWalManual.create({
+        key: new Uint8Array(32).fill(1),
+        suiPrivateKey: new Uint8Array(32).fill(2),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        packageId: "0x123",
+        suiRpcUrl: "http://127.0.0.1:9999",
+        preflightTimeoutMs: 40,
+    });
+
+    await assert.rejects(
+        m.buildSealSession(),
+        (err) => {
+            assert.ok(isRequestTimeout(err));
+            assert.equal(err.phase, "preflight SessionKey.create");
+            assert.equal(err.timeoutMs, 40);
+            assert.equal(err.status, 504);
+            return true;
+        },
+    );
+});
+
 test("SessionKey.create timeout clears single-flight state and allows recovery (#1367)", async () => {
     let callCount = 0;
     const c = MemWal.create({
@@ -406,31 +418,36 @@ test("SessionKey.create timeout clears single-flight state and allows recovery (
     globalThis.fetch = async (url) => {
         const path = new URL(url).pathname;
         if (path === "/version") return Response.json(VERSION_BODY);
+        if (path === "/config") {
+            return Response.json({
+                packageId: "0x123",
+                network: "testnet",
+                suiGrpcUrl: "http://127.0.0.1:9999",
+                suiTransport: "grpc",
+            });
+        }
         if (path === "/api/recall") return Response.json({ results: [{ id: "mem1" }], total: 1 });
         throw new Error(path);
     };
 
-    c.buildSealSessionInner = async () => {
+    SessionKey.create = async () => {
         callCount++;
         if (callCount === 1) {
-            // First call stalls and times out
-            await new Promise((r) => setTimeout(r, 40));
-            const err = new Error(
-                "Walrus Memory request timed out after 30ms during preflight SessionKey.create.",
-            );
-            err.name = "MemWalRequestTimeout";
-            err.status = 504;
-            err.phase = "preflight SessionKey.create";
-            err.timeoutMs = 30;
-            throw err;
+            return new Promise((resolve) => setTimeout(resolve, 500));
         }
-        return "healthy-session-token";
+        return {
+            getPersonalMessage: () => new Uint8Array([1, 2, 3]),
+            setPersonalMessageSignature: async () => {},
+            export: () => ({ version: 1, bytes: "fake-seal-session" }),
+        };
     };
 
     // First call rejects with timeout
     await assert.rejects(c.recall({ query: "first" }), (err) => {
         assert.ok(isRequestTimeout(err));
         assert.equal(err.phase, "preflight SessionKey.create");
+        assert.equal(err.status, 504);
+        assert.equal(err.timeoutMs, 30);
         return true;
     });
 
