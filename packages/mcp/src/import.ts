@@ -140,6 +140,17 @@ const SECRET_PATTERNS: RegExp[] = [
     /\bAKIA[0-9A-Z]{16}\b/,
     // JSON Web Token
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+    // Plainly labelled private keys and delegate keys
+    /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\s*[:=]\s*\S+/i,
+    /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{32,}\b/i,
+    /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
+    /\bsui[\s._-]*keystore\b/i,
+    // Credential assignments
+    /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
+    // Auth and bearer headers
+    /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+    // Seed phrases
+    /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4}(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}\b/i,
     // .env style secret assignments
     /(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*\S+/i,
 ];

@@ -150,6 +150,18 @@ test("secret screening identifies private keys, tokens, and env assignments", ()
     const envAssignment = screenContentForSafety("Set API_KEY=mysupersecretvalue123 in your environment.");
     assert.equal(envAssignment.safe, false);
     assert.equal(envAssignment.reason, "secret_detected");
+
+    const labelledPrivateKey = screenContentForSafety("private key: 0x11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff");
+    assert.equal(labelledPrivateKey.safe, false);
+    assert.equal(labelledPrivateKey.reason, "secret_detected");
+
+    const colonDelegateKey = screenContentForSafety("delegate_private_key: 11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff");
+    assert.equal(colonDelegateKey.safe, false);
+    assert.equal(colonDelegateKey.reason, "secret_detected");
+
+    const proseKey = screenContentForSafety("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff is my private key for signing");
+    assert.equal(proseKey.safe, false);
+    assert.equal(proseKey.reason, "secret_detected");
 });
 
 test("opt-out markers are detected and recorded with opt_out_marker reason", () => {
