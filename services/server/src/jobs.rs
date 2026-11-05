@@ -7838,6 +7838,7 @@ the checkpoint it replied about",
         // then verify completion once the lock is released.
         let deferred_job_id = format!("worker-deferred-{}", uuid::Uuid::new_v4());
         insert_job_with_status(pool, &deferred_job_id, "pending", None).await;
+        seed_storage_reservation(pool, &deferred_job_id).await;
         let held_lock = JobUploadLock::try_acquire(&state.wallet_lock_pool, &deferred_job_id)
             .await
             .unwrap()
