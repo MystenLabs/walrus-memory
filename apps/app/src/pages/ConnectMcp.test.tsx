@@ -249,6 +249,25 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.queryByText(/Almost there/i)).not.toBeInTheDocument()
     })
 
+    it('retains the selected environment in the remote CLI login command when preflight fails', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                const url = String(input)
+                if (url.endsWith('/preflight')) throw new TypeError('Failed to fetch')
+                throw new Error(`unexpected fetch: ${url}`)
+            }),
+        )
+        const query = `?port=${PORT}&publicKey=${PUBLIC_KEY}&relayer=${encodeURIComponent('https://relayer.dev.memwal.ai')}&connectState=${STATE}`
+        render(
+            <MemoryRouter initialEntries={[`/connect/mcp${query}`]}>
+                <ConnectMcp />
+            </MemoryRouter>,
+        )
+
+        expect(await screen.findByText(/npx -y @mysten-incubation\/memwal-mcp login --dev/i)).toBeInTheDocument()
+    })
+
     it('tells a refused hand-off apart from an absent one', async () => {
         stubListener(async () => new Response('nope', { status: 409 }))
         await signIn()

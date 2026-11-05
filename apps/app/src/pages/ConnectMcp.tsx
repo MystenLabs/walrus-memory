@@ -147,6 +147,29 @@ function localBridgeUnreachableMessage(port: string): string {
     )
 }
 
+function mcpCliLoginCommand(relayerUrl: string, origin?: string): string {
+    const normRelayer = relayerUrl.trim().replace(/\/+$/, '').toLowerCase()
+    const normOrigin = origin ? origin.trim().replace(/\/+$/, '').toLowerCase() : ''
+    if (normRelayer.includes('dev.memwal.ai') || normOrigin.includes('dev.memwal.ai')) {
+        return 'npx -y @mysten-incubation/memwal-mcp login --dev'
+    }
+    if (
+        normRelayer.includes('localhost') ||
+        normRelayer.includes('127.0.0.1:8000') ||
+        normOrigin.includes('localhost:5173') ||
+        normOrigin.includes('127.0.0.1:5173')
+    ) {
+        return 'npx -y @mysten-incubation/memwal-mcp login --local'
+    }
+    if (normRelayer.includes('staging')) {
+        return 'npx -y @mysten-incubation/memwal-mcp login --staging'
+    }
+    if (normRelayer && !normRelayer.includes('memory.walrus.xyz') && !normRelayer.includes('relayer.test')) {
+        return `npx -y @mysten-incubation/memwal-mcp login --relayer ${relayerUrl.trim()}`
+    }
+    return 'npx -y @mysten-incubation/memwal-mcp login'
+}
+
 /** Ask the local bridge again. Network and abort errors propagate to the caller. */
 async function confirmLocalBridge(
     port: string,
@@ -588,7 +611,7 @@ export default function ConnectMcp() {
                                     new link right away. If it runs on a remote host, container, or
                                     bot without a local browser, run{' '}
                                     <code className="mcp-code">
-                                        npx -y @mysten-incubation/memwal-mcp login
+                                        {mcpCliLoginCommand(relayer, typeof window !== 'undefined' ? window.location.origin : '')}
                                     </code>{' '}
                                     on the machine with your browser and copy{' '}
                                     <code className="mcp-code">~/.memwal/credentials.json</code> (mode{' '}

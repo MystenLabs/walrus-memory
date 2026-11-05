@@ -100,7 +100,7 @@ This section covers problems that appear before the memory tools work.
 1. **If `memwal-mcp` runs on the same computer as your browser:** Call `memwal_login` again to start a fresh 5-minute listener and open the new link right away. If it still fails, check whether a browser shield (for example Brave Shields or a privacy extension) is blocking localhost requests from the Walrus Memory web app.
 2. **If `memwal-mcp` runs on a remote host, container, or bot without a local browser:** Do not use the remote `memwal_login` URL on your laptop unless you forward the exact loopback port over SSH. Instead, sign in on the machine that has your browser and wallet, then copy the credentials file to the remote host:
    ```bash
-   # 1. On your local machine (with browser and Sui wallet):
+   # 1. On your local machine (with browser and Sui wallet; add --dev or --local for non-production environments):
    npx -y @mysten-incubation/memwal-mcp login
 
    # 2. Copy ~/.memwal/credentials.json to the remote host with 0600 permissions:
