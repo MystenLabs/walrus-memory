@@ -2,7 +2,7 @@
 
 Use this skill when a user asks to connect, test, troubleshoot, or configure Walrus Memory.
 
-This setup path uses local stdio MCP plus delegate-key custom-header auth through `@mysten-incubation/memwal-mcp@0.0.18`. It is separate from the hosted Claude custom-connector OAuth endpoint.
+This setup path uses local stdio MCP plus delegate-key custom-header auth through `@mysten-incubation/memwal-mcp@0.1.0`. It is separate from the hosted Claude custom-connector OAuth endpoint.
 
 ## Fast Path
 

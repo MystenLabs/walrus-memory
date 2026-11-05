@@ -19,12 +19,12 @@ claude --plugin-dir .
 
 Then restart Claude Code or run `/reload-plugins`, and confirm `/plugin` and `/mcp` show `memwal`.
 
-The plugin starts the MCP server with `node ${CLAUDE_PLUGIN_ROOT}/scripts/launch_mcp.mjs`. That launcher installs `@mysten-incubation/memwal-mcp@0.0.18` once under `~/.memwal/runtime/` and runs it from an absolute path it owns, so the package name is never resolved against the project directory.
+The plugin starts the MCP server with `node ${CLAUDE_PLUGIN_ROOT}/scripts/launch_mcp.mjs`. That launcher installs `@mysten-incubation/memwal-mcp@0.1.0` once under `~/.memwal/runtime/` and runs it from an absolute path it owns, so the package name is never resolved against the project directory.
 
 MCP-only (tools, no plugin hooks, no trusted launcher):
 
 ```bash
-claude mcp add --scope user memwal -- npx -y @mysten-incubation/memwal-mcp@0.0.18 --label "Claude Code"
+claude mcp add --scope user memwal -- npx -y @mysten-incubation/memwal-mcp@0.1.0 --label "Claude Code"
 ```
 
 ## Setup
