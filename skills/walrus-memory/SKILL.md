@@ -23,7 +23,7 @@ Run the browser-based login flow once in your terminal to authenticate with a Su
 npx -y @mysten-incubation/memwal-mcp login
 ```
 
-This command opens the Walrus Memory dashboard in your default browser, requests a wallet signature to register a delegate key on the Sui blockchain, and stores encrypted credentials locally at `~/.memwal/credentials.json`.
+This command opens the Walrus Memory dashboard in your default browser, requests a wallet signature to register a delegate key on the Sui blockchain, and writes credentials to `~/.memwal/credentials.json`. The file stores the sensitive delegate private key in plaintext protected by strict file permissions (mode 0600), so local copies or backups must be handled with care.
 
 For development or local testing environments, pass the appropriate target flag:
 
