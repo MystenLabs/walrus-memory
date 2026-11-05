@@ -2,6 +2,10 @@ import type {
     AnalyzeOptions,
     AnalyzeResult,
     AnalyzeWaitResult,
+    AskMemory,
+    AskOptions,
+    AskParams,
+    AskResult,
     EmbedResult,
     HealthResult,
     RecallOptions,
@@ -25,7 +29,7 @@ import type {
     ListNamespacesOptions,
 } from "./types.js";
 import { applyTokenBudget, estimateTokens, validateMaxTokens } from "./tokens.js";
-import { resolveRecallCall } from "./recall-args.js";
+import { resolveAskCall, resolveRecallCall } from "./recall-args.js";
 import {
     assertFiniteScoringWeights,
     assertNonBlankText,
@@ -554,6 +558,52 @@ export class MemWalMock {
         }
         const magnitude = Math.hypot(...vector) || 1;
         return { vector: vector.map((value) => value / magnitude) };
+    }
+
+    async ask(params: AskParams): Promise<AskResult>;
+    async ask(question: string, options: AskOptions): Promise<AskResult>;
+    async ask(
+        question: string,
+        limit?: number,
+        namespace?: string,
+    ): Promise<AskResult>;
+    async ask(
+        questionOrParams: string | AskParams,
+        limitOrOptions: number | AskOptions | undefined = 5,
+        namespace?: string,
+    ): Promise<AskResult> {
+        const { question, options } = resolveAskCall(
+            questionOrParams,
+            limitOrOptions,
+            namespace,
+        );
+        assertNonBlankText(question, "question cannot be empty");
+        const resolvedNamespace =
+            options.namespace === undefined ? this.namespace : options.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        const limit = options.limit !== undefined ? options.limit : 5;
+        assertPositiveIntegerLimit(limit);
+        assertFiniteScoringWeights(options.scoringWeights);
+
+        const recalled = await this.recall({
+            query: question,
+            limit,
+            namespace: resolvedNamespace,
+            scoringWeights: options.scoringWeights,
+        });
+        const memories: AskMemory[] = recalled.results.map((memory) => ({
+            blob_id: memory.blob_id,
+            text: memory.text,
+            distance: memory.distance,
+        }));
+        return {
+            answer:
+                memories.length > 0
+                    ? memories.map((m) => m.text).join(" ")
+                    : "No relevant memories found.",
+            memories_used: memories.length,
+            memories,
+        };
     }
 
     async restore(namespace: string, limit = 10): Promise<RestoreResult> {

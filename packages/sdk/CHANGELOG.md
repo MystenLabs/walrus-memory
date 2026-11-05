@@ -4,6 +4,7 @@
 
 ### Added
 
+- `ask()` on `MemWal` and `MemWalMock` wraps `POST /api/ask` and returns `AskResult` (`answer`, `memories_used`, `memories`), supporting both object-style `ask({ question, limit, namespace, scoringWeights, timeoutMs })` and positional `ask(question, limit?, namespace?)` / `ask(question, options?)` while validating `question`, `namespace`, `limit`, `scoringWeights`, and the response `memories` array before returning. (#1067)
 - `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results: []`, `degraded: true`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070)
 - `RecallOptions` accepts `onDropped?: "ignore" | "throw"` (defaulting to `"ignore"`). Passing `onDropped: "throw"` throws `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`, exposing `total`, `droppedCount`, and `namespace`) when every vector search match is dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
 
