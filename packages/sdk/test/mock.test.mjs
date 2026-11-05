@@ -671,4 +671,25 @@ test("MemWalMock.remember with dedupe: true does not collapse onto a prior norma
     assert.equal(secondDedupe.blob_id, firstDedupe.blob_id);
 });
 
+test("MemWalMock.recall accepts omitted, ignore, and throw onDropped policies and rejects invalid values", async () => {
+    const mock = MemWalMock.create({
+        initialMemories: [{ text: "Morning coffee routine", namespace: "ns", blobId: "b1" }],
+    });
+
+    const omitted = await mock.recall({ query: "coffee", namespace: "ns" });
+    assert.equal(omitted.results.length, 1);
+
+    const ignored = await mock.recall({ query: "coffee", namespace: "ns", onDropped: "ignore" });
+    assert.equal(ignored.results.length, 1);
+
+    const strict = await mock.recall({ query: "coffee", namespace: "ns", onDropped: "throw" });
+    assert.equal(strict.results.length, 1);
+
+    await assert.rejects(
+        () => mock.recall({ query: "coffee", namespace: "ns", onDropped: /** @type {any} */ ("warn") }),
+        TypeError,
+    );
+});
+
+
 

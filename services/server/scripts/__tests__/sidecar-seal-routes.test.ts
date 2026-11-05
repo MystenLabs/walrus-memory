@@ -22,6 +22,7 @@ const { appendSealPersistenceFence, InvalidSealPersistenceFenceError, parseSealP
 const {
     parseSealDecryptBatchItems,
     registerSealRoutes,
+    retryTransientSealDecryptRpc,
     sealEncryptCommitteeFailure,
 } = await import("../sidecar/routes/seal.js");
 const { SEAL_COMMITTEE_IDENTITY } = await import("../sidecar/config.js");
@@ -406,4 +407,40 @@ test("/seal/decrypt-batch 400s when sealAbi=v1 carries a registryId", async () =
         assert.equal(r.status, 400);
         assert.match(r.body.error!, /not valid/);
     });
+});
+
+test("retryTransientSealDecryptRpc retries transient key-server errors once and skips permanent errors", async () => {
+    let transientCalls = 0;
+    const sleeps: number[] = [];
+    const recovered = await retryTransientSealDecryptRpc(
+        async () => {
+            transientCalls += 1;
+            if (transientCalls === 1) {
+                throw new TypeError("fetch failed");
+            }
+            return "keys-ready";
+        },
+        async (ms: number) => {
+            sleeps.push(ms);
+        },
+    );
+    assert.equal(recovered, "keys-ready");
+    assert.equal(transientCalls, 2);
+    assert.deepEqual(sleeps, [250]);
+
+    let permanentCalls = 0;
+    await assert.rejects(
+        () =>
+            retryTransientSealDecryptRpc(
+                async () => {
+                    permanentCalls += 1;
+                    const err = new Error("NoAccessError: user does not have access");
+                    err.name = "NoAccessError";
+                    throw err;
+                },
+                async () => {},
+            ),
+        /NoAccessError/,
+    );
+    assert.equal(permanentCalls, 1);
 });
