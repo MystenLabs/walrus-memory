@@ -162,6 +162,24 @@ test("secret screening identifies private keys, tokens, and env assignments", ()
     const proseKey = screenContentForSafety("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff is my private key for signing");
     assert.equal(proseKey.safe, false);
     assert.equal(proseKey.reason, "secret_detected");
+
+    const urlWithPassword = screenContentForSafety(
+        "Connect to postgres://demo:synthetic-password@db.example.invalid:5432/project for local testing.",
+    );
+    assert.equal(urlWithPassword.safe, false);
+    assert.equal(urlWithPassword.reason, "secret_detected");
+
+    const cookieHeader = screenContentForSafety(
+        "Cookie: session=synthetic-session-cookie-value-for-tests; theme=dark",
+    );
+    assert.equal(cookieHeader.safe, false);
+    assert.equal(cookieHeader.reason, "secret_detected");
+
+    const setCookieHeader = screenContentForSafety(
+        "Set-Cookie: auth_token=synthetic-cookie-token; HttpOnly; Secure",
+    );
+    assert.equal(setCookieHeader.safe, false);
+    assert.equal(setCookieHeader.reason, "secret_detected");
 });
 
 test("opt-out markers are detected and recorded with opt_out_marker reason", () => {
@@ -299,6 +317,57 @@ test("importProjectMemories confirmed upload batches items and reports accurate 
     assert.ok(logged.some((line) => line.includes("Completed: 1")));
     assert.ok(logged.some((line) => line.includes("Pending:   1")));
     assert.ok(logged.some((line) => line.includes("Failed:    1")));
+});
+
+test("importProjectMemories skips URL passwords and session cookies before upload", async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "memwal-url-cookie-test-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+    writeFileSync(
+        join(dir, "MEMORY.md"),
+        [
+            "# Safe Rule",
+            "Always run unit tests before opening a pull request on this repository.",
+            "",
+            "# Database URL",
+            "Use postgres://demo:synthetic-password@db.example.invalid/project when debugging locally.",
+            "",
+            "# Session Header",
+            "Send Cookie: session=synthetic-session-cookie-value-for-tests when reproducing the issue.",
+        ].join("\n"),
+    );
+
+    const batchesReceived = [];
+    const mockClient = {
+        async rememberBulk(items) {
+            batchesReceived.push(items);
+            return { job_ids: items.map((_, idx) => `job-${idx + 1}`) };
+        },
+        async waitForRememberJobs(jobIds, namespaces) {
+            return {
+                results: jobIds.map((id, idx) => ({ id, status: "done", namespace: namespaces[idx] })),
+                total: jobIds.length,
+                succeeded: jobIds.length,
+                failed: 0,
+            };
+        },
+    };
+
+    const result = await importProjectMemories({
+        targetDir: dir,
+        yes: true,
+        client: mockClient,
+        namespace: "test-ns",
+        print: () => {},
+    });
+
+    assert.equal(result.mode, "uploaded");
+    assert.equal(result.accepted, 1);
+    assert.equal(result.skipped.length, 2);
+    assert.equal(batchesReceived.length, 1);
+    assert.equal(batchesReceived[0].length, 1);
+    assert.ok(!batchesReceived[0][0].text.includes("synthetic-password"));
+    assert.ok(!batchesReceived[0][0].text.includes("synthetic-session-cookie-value-for-tests"));
 });
 
 test("importProjectMemories caps candidates by maxItems", async (t) => {

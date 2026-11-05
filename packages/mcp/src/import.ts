@@ -118,6 +118,8 @@ const OPT_OUT_PATTERNS: RegExp[] = [
     /<\s*\/?\s*private\s*>/i,
     /\[no-memory\]/i,
     /\bMEMWAL_IGNORE\b/,
+    /\b(?:do\s+not|don'?t|dont|never|please\s+do\s+not|please\s+don'?t)\s+(?:save|store|remember|record|keep|persist|log)\s+(?:this|that|it|these|those|any\s+of\s+(?:this|that|it))\b/i,
+    /\boff[-\s]the[-\s]record\b/i,
 ];
 
 /** Check whether text contains any opt-out marker. */
@@ -130,16 +132,26 @@ const SECRET_PATTERNS: RegExp[] = [
     /suiprivkey1[0-9a-zA-Z]+/,
     // PEM private key block
     /-----BEGIN [A-Z0-9_\s-]+PRIVATE KEY-----/,
-    // Standard API keys: sk-..., ghp_..., github_pat_...
+    // Embedded URL credentials (scheme://user:password@host)
+    /([A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/)([^\s/@:?=&]+):([^\s/@?=&]+)@/,
+    // Standard and vendor API keys
+    /\bsk-ant-[A-Za-z0-9_-]{16,}/,
+    /\bsk-proj-[A-Za-z0-9_-]{16,}/,
     /\bsk-[0-9a-zA-Z_-]{20,}/,
-    /\bghp_[0-9a-zA-Z]{36,}/,
-    /\bgithub_pat_[0-9a-zA-Z_]{22,}/,
-    // Slack tokens
+    /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9a-zA-Z]{20,}/,
+    /\bgithub_pat_[0-9a-zA-Z_]{20,}/,
     /\bxox[baprs]-[0-9a-zA-Z-]{10,}/,
-    // AWS access key ID
-    /\bAKIA[0-9A-Z]{16}\b/,
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+    /\bAIza[0-9A-Za-z_-]{35}\b/,
+    /\bglpat-[A-Za-z0-9_-]{16,}/,
+    /\bnpm_[A-Za-z0-9]{36}\b/,
+    /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/,
+    /\b[sprk]k_(?:live|test)_[A-Za-z0-9]{16,}/,
+    /\bshp(?:at|ss|ca|pa)_[a-fA-F0-9]{32}\b/,
+    /\bdop_v1_[a-f0-9]{64}\b/,
+    /\bhf_[A-Za-z0-9]{30,}/,
     // JSON Web Token
-    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
     // Plainly labelled private keys and delegate keys
     /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\s*[:=]\s*\S+/i,
     /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{32,}\b/i,
@@ -147,8 +159,9 @@ const SECRET_PATTERNS: RegExp[] = [
     /\bsui[\s._-]*keystore\b/i,
     // Credential assignments
     /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
-    // Auth and bearer headers
-    /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+    // Auth, bearer, and cookie headers
+    /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+    /\b(?:set-)?cookie\s*[:=]\s*[^\s;]+(?:\s*;\s*[^\s;]+)*/i,
     // Seed phrases
     /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4}(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}\b/i,
     // .env style secret assignments
