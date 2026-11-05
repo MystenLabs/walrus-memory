@@ -24,8 +24,7 @@ use crate::alerts::{
     WalrusUploadExhaustedAlert, WalrusWalletBalanceLowAlert, SIDECAR_WALRUS_DEP_VERSION,
 };
 use crate::storage::walrus::{
-    DurableUploadAdvance, PreparedRegisterTransaction, SetMetadataBatchEntry, UploadBlobError,
-    UploadExecutionIdentity, UploadJournal,
+    DurableUploadAdvance, SetMetadataBatchEntry, UploadBlobError, UploadJournal,
 };
 use crate::types::{configured_walrus_storage_epochs, AppState, BLOB_CACHE_KEY_PREFIX};
 
@@ -7646,6 +7645,7 @@ the checkpoint it replied about",
         // 1. Direct durable upload call returns retryable UploadSlotCongestion while busy.
         let probe_job_id = format!("worker-probe-{}", uuid::Uuid::new_v4());
         insert_job_with_status(pool, &probe_job_id, "running", None).await;
+        seed_storage_reservation(pool, &probe_job_id).await;
         let probe_err = execute_durable_upload(
             &state,
             0,
