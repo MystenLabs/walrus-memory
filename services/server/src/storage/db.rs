@@ -241,6 +241,11 @@ const SEARCH_SIMILAR_EXCLUDING_PENDING_DELETES_SQL: &str =
              ORDER BY v.embedding <=> $1
              LIMIT $4";
 
+/// Error message recorded on non-terminal `remember_jobs` rows when their
+/// namespace is forgotten (`POST /api/forget`) before the job finishes.
+pub const FORGOTTEN_IN_FLIGHT_JOB_ERROR: &str =
+    "namespace forgotten while remember job was in flight";
+
 /// One `vector_entries` row queued for an all-or-nothing batch insert.
 ///
 /// Mirrors the argument list of [`VectorDb::insert_vector`]; see that method
@@ -3002,10 +3007,10 @@ impl VectorDb {
         Ok(())
     }
 
-    /// Shared statement pair behind [`Self::insert_vector`] and
-    /// [`Self::insert_vectors_atomic`]: upsert the row, then clear any
-    /// tombstone for the same memory id. Runs on the caller's transaction so a
-    /// batch can span many rows without an intermediate commit.
+    /// Shared statement behind [`Self::insert_vector`] and
+    /// [`Self::insert_vectors_atomic`]: insert or update the row only if it has
+    /// not been tombstoned by a namespace/blob delete. Runs on the caller's
+    /// transaction so a batch can span many rows without an intermediate commit.
     async fn insert_vector_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -3014,9 +3019,20 @@ impl VectorDb {
         let embedding = Vector::from(row.vector.to_vec());
 
         let started = std::time::Instant::now();
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2))")
+            .bind(row.owner)
+            .bind(row.namespace)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
+            })?;
         let result = sqlx::query(
             "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM memory_tombstones WHERE memory_id = $1
+             )
              ON CONFLICT (id) DO UPDATE SET
                 owner = EXCLUDED.owner,
                 namespace = EXCLUDED.namespace,
@@ -3050,21 +3066,26 @@ impl VectorDb {
         let result =
             result.map_err(|e| AppError::Internal(format!("Failed to insert vector: {}", e)));
         crate::observability::observe_db("vector.insert", db_status(&result), started.elapsed());
-        result?;
-        sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = $1")
-            .bind(row.id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to clear tombstone: {}", e)))?;
+        let query_result = result?;
 
-        tracing::debug!(
-            "inserted vector: id={}, blob_id={}, owner={}, ns={}, size={}B",
-            row.id,
-            row.blob_id,
-            row.owner,
-            row.namespace,
-            row.blob_size_bytes
-        );
+        if query_result.rows_affected() == 0 {
+            tracing::info!(
+                "skipped vector insert for tombstoned memory: id={}, blob_id={}, owner={}, ns={}",
+                row.id,
+                row.blob_id,
+                row.owner,
+                row.namespace,
+            );
+        } else {
+            tracing::debug!(
+                "inserted vector: id={}, blob_id={}, owner={}, ns={}, size={}B",
+                row.id,
+                row.blob_id,
+                row.owner,
+                row.namespace,
+                row.blob_size_bytes
+            );
+        }
         Ok(())
     }
 
@@ -3092,9 +3113,20 @@ impl VectorDb {
         let mut tx = self.pool.begin().await.map_err(|e| {
             AppError::Internal(format!("Failed to begin plaintext insert tx: {}", e))
         })?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2))")
+            .bind(owner)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
+            })?;
         let result = sqlx::query(
             "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM memory_tombstones WHERE memory_id = $1
+             )
              ON CONFLICT (id) DO UPDATE SET
                 owner = EXCLUDED.owner,
                 namespace = EXCLUDED.namespace,
@@ -3122,11 +3154,6 @@ impl VectorDb {
             started.elapsed(),
         );
         result?;
-        sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to clear tombstone: {}", e)))?;
         tx.commit().await.map_err(|e| {
             AppError::Internal(format!("Failed to commit plaintext insert tx: {}", e))
         })?;
@@ -3359,13 +3386,14 @@ impl VectorDb {
             })?;
         let outcome = sqlx::query_as::<_, (i64, i64)>(
             "SELECT
-               count(*) FILTER (WHERE status = 'failed'),
+               count(*) FILTER (WHERE status = 'failed' AND COALESCE(error_msg, '') <> $2),
                count(*) FILTER (WHERE status IN ('done', 'uploaded'))
              FROM remember_jobs
              WHERE status IN ('failed', 'done', 'uploaded')
                AND updated_at >= $1",
         )
         .bind(since)
+        .bind(FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .fetch_one(&mut *tx)
         .await;
         let _ = tx.rollback().await;
@@ -3399,10 +3427,12 @@ impl VectorDb {
     /// retrievable and stop counting toward storage quota.) Reachable via
     /// `POST /api/forget` — authed, owner-scoped.
     ///
-    /// Also NULLs `remember_jobs.idempotency_key` for the same owner +
-    /// namespace. Analyze (and client-keyed remember) collapse retries on
-    /// that unique key; leaving it set after forget makes a later write of
-    /// the same text return success without storing anything.
+    /// Also fences any non-terminal `remember_jobs` (`pending`, `running`,
+    /// `uploaded`) for the same owner + namespace, records tombstones for
+    /// their IDs so a completing worker cannot resurrect the forgotten
+    /// namespace, releases their storage quota reservations, and NULLs
+    /// `remember_jobs.idempotency_key` so subsequent writes of the same text
+    /// are not collapsed onto forgotten jobs.
     pub async fn delete_by_namespace(&self, owner: &str, namespace: &str) -> Result<u64, AppError> {
         let started = std::time::Instant::now();
         let mut tx = self
@@ -3410,6 +3440,22 @@ impl VectorDb {
             .begin()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to begin forget tx: {}", e)))?;
+        if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(owner)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await
+        {
+            crate::observability::observe_db(
+                "vector.delete_by_namespace",
+                "error",
+                started.elapsed(),
+            );
+            return Err(AppError::Internal(format!(
+                "Failed to acquire namespace forget lock: {}",
+                e
+            )));
+        }
         let result = sqlx::query(
             "WITH removed AS (
                 DELETE FROM vector_entries
@@ -3436,6 +3482,52 @@ impl VectorDb {
                 return Err(e);
             }
         };
+        let fence_in_flight = sqlx::query(
+            "WITH fenced_jobs AS (
+                UPDATE remember_jobs
+                SET status = 'failed',
+                    error_msg = CASE
+                        WHEN status IN ('pending', 'running', 'uploaded') THEN $3
+                        ELSE COALESCE(error_msg, $3)
+                    END,
+                    idempotency_key = NULL,
+                    prepare_claimed_at = NULL,
+                    prepare_claim_token = NULL,
+                    recovery_claimed_at = NULL,
+                    recovery_claim_token = NULL,
+                    updated_at = NOW()
+                WHERE owner = $1
+                  AND namespace = $2
+                  AND status IN ('pending', 'running', 'uploaded', 'failed')
+                RETURNING id, owner, namespace, COALESCE(blob_id, '') AS blob_id
+             ),
+             fenced_tombstones AS (
+                INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+                SELECT id, owner, namespace, blob_id FROM fenced_jobs
+                ON CONFLICT (memory_id) DO UPDATE SET
+                    owner = EXCLUDED.owner,
+                    namespace = EXCLUDED.namespace,
+                    blob_id = EXCLUDED.blob_id,
+                    deleted_at = NOW()
+             )
+             DELETE FROM storage_reservations
+             WHERE owner = $1
+               AND id IN (SELECT id FROM fenced_jobs)",
+        )
+        .bind(owner)
+        .bind(namespace)
+        .bind(FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fence in-flight remember jobs: {}", e)));
+        if let Err(e) = fence_in_flight {
+            crate::observability::observe_db(
+                "vector.delete_by_namespace",
+                "error",
+                started.elapsed(),
+            );
+            return Err(e);
+        }
         let clear = sqlx::query(
             "UPDATE remember_jobs
              SET idempotency_key = NULL, updated_at = NOW()
@@ -3692,6 +3784,10 @@ impl VectorDb {
                  error_msg = COALESCE(error_msg, 'stale/orphaned remember job'),
                  updated_at = NOW()
              WHERE status IN ('running', 'uploaded')
+               AND COALESCE(error_msg, '') <> $4
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )
                AND updated_at < NOW() - ($1 * INTERVAL '1 second')
                AND (
                     error_msg IS NULL
@@ -3702,6 +3798,7 @@ impl VectorDb {
         .bind(stale_after_secs)
         .bind(crate::jobs::CONGESTION_WAIT_ERROR_PREFIX)
         .bind(congestion_wait_stale_secs)
+        .bind(FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fail stale remember jobs: {}", e)))?;
@@ -3726,11 +3823,16 @@ impl VectorDb {
                  prepare_claimed_at = NULL,
                  updated_at = NOW()
              WHERE status = 'pending'
+               AND COALESCE(error_msg, '') <> $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )
                AND prepare_claimed_at IS NOT NULL
                AND preparation_encrypted_b64 IS NULL
                AND updated_at < NOW() - ($1 * INTERVAL '1 second')",
         )
         .bind(stale_after_secs)
+        .bind(FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -5645,5 +5747,469 @@ mod stale_sweep_tests {
             .expect("sweep");
 
         assert_eq!(status_of(&db, &id).await, "done");
+    }
+
+    #[tokio::test]
+    async fn insert_vector_does_not_resurrect_tombstoned_row_or_delete_tombstone() {
+        let db = test_db().await;
+        let owner = unique_owner("forget-tombstone-fence");
+        let namespace = "ns-forget-fence";
+        let id = format!("vec-{}", uuid::Uuid::new_v4());
+        let vec_data = vec![0.25_f32; 1536];
+
+        db.insert_vector(
+            &id,
+            &owner,
+            namespace,
+            "blob-initial",
+            &vec_data,
+            512,
+            0.5,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("initial insert_vector");
+
+        let deleted = db
+            .delete_by_namespace(&owner, namespace)
+            .await
+            .expect("delete_by_namespace");
+        assert_eq!(deleted, 1);
+
+        let tombstone_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_tombstones WHERE memory_id = $1")
+                .bind(&id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count tombstones before");
+        assert_eq!(tombstone_before, 1, "tombstone must exist after forget");
+
+        // Attempt to re-insert the same memory id after forget (simulating an
+        // in-flight remember worker finishing after delete_by_namespace).
+        db.insert_vector(
+            &id,
+            &owner,
+            namespace,
+            "blob-late-worker",
+            &vec_data,
+            512,
+            0.5,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("late insert_vector should succeed as a fenced no-op");
+
+        db.insert_vector_plaintext(
+            &id,
+            &owner,
+            namespace,
+            "blob-late-plaintext",
+            &vec_data,
+            "late plaintext",
+            512,
+            0.5,
+        )
+        .await
+        .expect("late insert_vector_plaintext should succeed as a fenced no-op");
+
+        let live_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vector_entries WHERE id = $1")
+                .bind(&id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count vector_entries");
+        assert_eq!(
+            live_rows, 0,
+            "tombstoned memory must not be resurrected in vector_entries"
+        );
+
+        let tombstone_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_tombstones WHERE memory_id = $1")
+                .bind(&id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count tombstones after");
+        assert_eq!(
+            tombstone_after, 1,
+            "insert_vector must never delete an existing tombstone"
+        );
+
+        let _ = sqlx::query("DELETE FROM memory_tombstones WHERE memory_id = $1")
+            .bind(&id)
+            .execute(&db.pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delete_by_namespace_fences_in_flight_remember_jobs_and_releases_reservations() {
+        let db = test_db().await;
+        let owner = unique_owner("forget-inflight");
+        let namespace = "target-ns";
+        let other_ns = "other-ns";
+
+        let pending_id = format!("job-pending-{}", uuid::Uuid::new_v4());
+        let running_id = format!("job-running-{}", uuid::Uuid::new_v4());
+        let uploaded_id = format!("job-uploaded-{}", uuid::Uuid::new_v4());
+        let done_id = format!("job-done-{}", uuid::Uuid::new_v4());
+        let other_ns_id = format!("job-other-{}", uuid::Uuid::new_v4());
+
+        for (id, ns, status, blob_id, key) in [
+            (&pending_id, namespace, "pending", None, Some("k-pending")),
+            (&running_id, namespace, "running", None, Some("k-running")),
+            (
+                &uploaded_id,
+                namespace,
+                "uploaded",
+                Some("blob-up"),
+                Some("k-uploaded"),
+            ),
+            (
+                &done_id,
+                namespace,
+                "done",
+                Some("blob-done"),
+                Some("k-done"),
+            ),
+            (&other_ns_id, other_ns, "pending", None, Some("k-other")),
+        ] {
+            sqlx::query(
+                "INSERT INTO remember_jobs (
+                    id, owner, namespace, status, blob_id, idempotency_key,
+                    prepare_claimed_at, prepare_claim_token,
+                    recovery_claimed_at, recovery_claim_token
+                 ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), 'prep-tok', NOW(), 'rec-tok')",
+            )
+            .bind(id)
+            .bind(&owner)
+            .bind(ns)
+            .bind(status)
+            .bind(blob_id)
+            .bind(key)
+            .execute(&db.pool)
+            .await
+            .expect("seed remember_job");
+        }
+
+        // Reserve storage quota for the three in-flight jobs in `target-ns`.
+        let admission = db
+            .admit_storage_reservations(
+                &owner,
+                777_888_999,
+                1000,
+                &[
+                    StorageReservationRequest {
+                        id: pending_id.clone(),
+                        bytes: 300,
+                    },
+                    StorageReservationRequest {
+                        id: running_id.clone(),
+                        bytes: 300,
+                    },
+                    StorageReservationRequest {
+                        id: uploaded_id.clone(),
+                        bytes: 300,
+                    },
+                ],
+                Duration::from_secs(900),
+            )
+            .await
+            .expect("admit reservations");
+        assert_eq!(admission, StorageAdmission::Admitted);
+
+        db.delete_by_namespace(&owner, namespace)
+            .await
+            .expect("delete_by_namespace");
+
+        for fenced_id in [&pending_id, &running_id, &uploaded_id] {
+            let row: (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT status, error_msg, idempotency_key, prepare_claim_token, recovery_claim_token
+                 FROM remember_jobs WHERE id = $1",
+            )
+            .bind(fenced_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch fenced job");
+            assert_eq!(row.0, "failed", "in-flight job {fenced_id} must be failed");
+            assert_eq!(
+                row.1.as_deref(),
+                Some(FORGOTTEN_IN_FLIGHT_JOB_ERROR),
+                "in-flight job {fenced_id} must record forget cancellation reason"
+            );
+            assert!(row.2.is_none(), "idempotency_key must be cleared");
+            assert!(row.3.is_none(), "prepare_claim_token must be cleared");
+            assert!(row.4.is_none(), "recovery_claim_token must be cleared");
+
+            let tombstoned: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM memory_tombstones WHERE memory_id = $1")
+                    .bind(fenced_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("count tombstone for fenced job");
+            assert_eq!(
+                tombstoned, 1,
+                "fenced in-flight job {fenced_id} must have a tombstone"
+            );
+
+            // A late worker attempting to insert the vector for this fenced job
+            // must be blocked by the tombstone.
+            let vec_data = vec![0.1_f32; 1536];
+            db.insert_vector(
+                fenced_id,
+                &owner,
+                namespace,
+                "blob-from-late-worker",
+                &vec_data,
+                300,
+                0.5,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("late insert_vector for fenced job");
+
+            let live_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM vector_entries WHERE id = $1")
+                    .bind(fenced_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("count vector_entries for fenced job");
+            assert_eq!(
+                live_count, 0,
+                "fenced in-flight job {fenced_id} must not insert into vector_entries"
+            );
+        }
+
+        // Reserved storage quota for the fenced jobs must have been released.
+        let remaining_reservations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM storage_reservations WHERE owner = $1")
+                .bind(&owner)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count storage_reservations");
+        assert_eq!(
+            remaining_reservations, 0,
+            "storage_reservations for fenced jobs must be released by delete_by_namespace"
+        );
+
+        // Terminal `done` job in the forgotten namespace keeps status = `done`
+        // (with idempotency_key cleared), and the job in `other-ns` is untouched.
+        let done_row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, idempotency_key FROM remember_jobs WHERE id = $1")
+                .bind(&done_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("fetch done job");
+        assert_eq!(done_row.0, "done");
+        assert!(done_row.1.is_none());
+
+        let other_row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, idempotency_key, prepare_claim_token FROM remember_jobs WHERE id = $1",
+        )
+        .bind(&other_ns_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch other_ns job");
+        assert_eq!(other_row.0, "pending");
+        assert_eq!(other_row.1.as_deref(), Some("k-other"));
+        assert_eq!(other_row.2.as_deref(), Some("prep-tok"));
+
+        let _ = sqlx::query("DELETE FROM memory_tombstones WHERE owner = $1")
+            .bind(&owner)
+            .execute(&db.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&db.pool)
+            .await;
+    }
+
+    /// Regression test for PR #1330 review: once `delete_by_namespace` fences
+    /// in-flight or previously failed `remember_jobs` in the forgotten namespace,
+    /// every retry/error writer (`update_remember_job_after_wallet_error`,
+    /// `claim_remember_preparation`, `claim_paid_recovery`, and
+    /// `unpaid_analyze_retry_reset_sql`) must treat the forgotten state as
+    /// strictly terminal and never flip `status` back to `running`, `pending`,
+    /// or `uploaded` or overwrite `FORGOTTEN_IN_FLIGHT_JOB_ERROR`.
+    #[tokio::test]
+    async fn forgotten_in_flight_jobs_remain_terminal_across_wallet_error_and_retry_claims() {
+        let db = test_db().await;
+        let owner = format!("0xforget-terminal-{}", uuid::Uuid::new_v4());
+        let namespace = "forget-terminal-ns";
+
+        let unpaid_running_id = format!("job-unpaid-running-{}", uuid::Uuid::new_v4());
+        let unpaid_failed_id = format!("job-unpaid-failed-{}", uuid::Uuid::new_v4());
+        let paid_uploaded_id = format!("job-paid-uploaded-{}", uuid::Uuid::new_v4());
+        let tombstone_only_id = format!("job-tombstone-only-{}", uuid::Uuid::new_v4());
+
+        // 1. In-flight unpaid running job.
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, prepare_claimed_at, prepare_claim_token)
+             VALUES ($1, $2, $3, 'running', 'k-unpaid-running', NOW(), 'prep-tok-1')",
+        )
+        .bind(&unpaid_running_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&db.pool)
+        .await
+        .expect("insert unpaid_running job");
+
+        // 2. Previously failed unpaid job in the same namespace before forget.
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, idempotency_key, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'k-unpaid-failed', 'earlier transient failure')",
+        )
+        .bind(&unpaid_failed_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&db.pool)
+        .await
+        .expect("insert unpaid_failed job");
+
+        // 3. In-flight paid uploaded job.
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, idempotency_key, recovery_claimed_at, recovery_claim_token)
+             VALUES ($1, $2, $3, 'uploaded', 'blob-paid-1', '0xobj-paid-1', 'k-paid-uploaded', NOW(), 'rec-tok-1')",
+        )
+        .bind(&paid_uploaded_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&db.pool)
+        .await
+        .expect("insert paid_uploaded job");
+
+        // Run delete_by_namespace to fence all three jobs.
+        db.delete_by_namespace(&owner, namespace)
+            .await
+            .expect("delete_by_namespace");
+
+        // 4. Also insert a synthetic row whose error_msg was somehow non-marker
+        //    but whose id is present in `memory_tombstones` to verify the
+        //    tombstone-existence guard independently.
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'some other error')",
+        )
+        .bind(&tombstone_only_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&db.pool)
+        .await
+        .expect("insert tombstone_only job");
+        sqlx::query(
+            "INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
+             VALUES ($1, $2, $3, '')",
+        )
+        .bind(&tombstone_only_id)
+        .bind(&owner)
+        .bind(namespace)
+        .execute(&db.pool)
+        .await
+        .expect("insert tombstone for tombstone_only job");
+
+        // (a) Simulate an in-flight upload attempt erroring out (both retryable
+        //     and terminal) after `delete_by_namespace`.
+        let retryable_err = crate::jobs::WalletJobError::Transient("sidecar timeout".into());
+        crate::jobs::update_remember_job_after_wallet_error(
+            &db.pool,
+            Some(&unpaid_running_id),
+            &retryable_err,
+            "sidecar timeout on attempt 1",
+            None,
+        )
+        .await;
+        crate::jobs::update_remember_job_after_wallet_error(
+            &db.pool,
+            Some(&tombstone_only_id),
+            &retryable_err,
+            "sidecar timeout on tombstoned job",
+            None,
+        )
+        .await;
+
+        let terminal_err = crate::jobs::WalletJobError::Permanent("permanent sidecar error".into());
+        crate::jobs::update_remember_job_after_wallet_error(
+            &db.pool,
+            Some(&unpaid_running_id),
+            &terminal_err,
+            "permanent sidecar error",
+            None,
+        )
+        .await;
+
+        // (b) Verify every fenced job remains `failed` with its expected error_msg
+        //     and resolves to `UploadResume::Forgotten`.
+        for (jid, expected_err) in [
+            (&unpaid_running_id, FORGOTTEN_IN_FLIGHT_JOB_ERROR),
+            (&unpaid_failed_id, "earlier transient failure"),
+            (&paid_uploaded_id, FORGOTTEN_IN_FLIGHT_JOB_ERROR),
+        ] {
+            let (status, error_msg, prep_tok, rec_tok): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT status, error_msg, prepare_claim_token, recovery_claim_token
+                 FROM remember_jobs WHERE id = $1",
+            )
+            .bind(jid)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch fenced job after retry writers");
+
+            assert_eq!(status, "failed", "job {jid} must stay failed");
+            assert_eq!(
+                error_msg.as_deref(),
+                Some(expected_err),
+                "job {jid} must keep expected error_msg"
+            );
+            assert!(
+                prep_tok.is_none(),
+                "job {jid} prepare_claim_token must stay NULL"
+            );
+            assert!(
+                rec_tok.is_none(),
+                "job {jid} recovery_claim_token must stay NULL"
+            );
+            assert_eq!(
+                crate::jobs::upload_resume_disposition(&db.pool, jid).await,
+                crate::jobs::UploadResume::Forgotten,
+                "job {jid} must resolve to UploadResume::Forgotten"
+            );
+        }
+
+        let (tomb_status, tomb_err): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&tombstone_only_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("fetch tombstone_only job");
+        assert_eq!(tomb_status, "failed");
+        assert_eq!(tomb_err.as_deref(), Some("some other error"));
+        assert_eq!(
+            crate::jobs::upload_resume_disposition(&db.pool, &tombstone_only_id).await,
+            crate::jobs::UploadResume::Forgotten,
+            "tombstoned job must resolve to UploadResume::Forgotten even if error_msg differs"
+        );
+
+        let _ = sqlx::query("DELETE FROM memory_tombstones WHERE owner = $1")
+            .bind(&owner)
+            .execute(&db.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&db.pool)
+            .await;
     }
 }
