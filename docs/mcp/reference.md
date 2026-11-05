@@ -391,6 +391,9 @@ The hosted relayer (and any self-hosted relayer) exposes the same MCP routes:
 | `GET /api/mcp` | Streamable HTTP server-to-client stream |
 | `POST /api/mcp` | Streamable HTTP JSON-RPC messages |
 | `DELETE /api/mcp` | Close a Streamable HTTP session |
+| `GET /.well-known/mcp/server-card.json` | SEP-2127 MCP Server Card discovery metadata |
+| `GET /mcp/server-card` | SEP-2127 MCP Server Card discovery alias |
+| `GET /api/mcp/server-card` | SEP-2127 MCP Server Card discovery under the `/api/mcp` prefix |
 | `GET /.well-known/oauth-protected-resource` | OAuth resource metadata (RFC 9728, when configured) |
 | `GET /.well-known/oauth-authorization-server` | OAuth authorization-server metadata (RFC 8414) |
 | `POST /oauth/register` | Dynamic client registration (RFC 7591) |
