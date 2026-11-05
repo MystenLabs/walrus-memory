@@ -787,8 +787,9 @@ async fn admit_wallet_upload(
 
 /// The storage reservation is admitted at enqueue and expires after 15
 /// minutes. A congestion wait can outlive that. Refresh it so a burst cannot
-/// take the bytes this job is still going to write. If the row was already
-/// swept, admit it again; a rejection is logged and the upload still retries.
+/// take the bytes this job is still going to write. Only live (`expires_at > NOW()`)
+/// rows may be extended directly; an expired or swept row must re-enter
+/// `reserve_storage_quota_one` under the owner's quota lock.
 async fn keep_upload_storage_reservation(
     state: &AppState,
     job_id: &str,
@@ -805,7 +806,7 @@ async fn keep_upload_storage_reservation(
     let extended = sqlx::query(
         "UPDATE storage_reservations
          SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
-         WHERE id = $1",
+         WHERE id = $1 AND expires_at > NOW()",
     )
     .bind(job_id)
     .bind(ttl_secs)
@@ -837,6 +838,192 @@ async fn keep_upload_storage_reservation(
             e
         );
     }
+}
+
+/// Prove or renew a job's storage reservation under the owner's quota lock
+/// Try to extend an active (live) storage reservation for a job whose earlier
+/// allocation has not expired yet. Returns `Ok(true)` if `max_storage_bytes <= 0`
+/// or the row was still live (`expires_at > NOW()`) and was extended.
+pub(crate) async fn try_extend_live_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+) -> Result<bool, WalletJobError> {
+    if max_storage_bytes <= 0 {
+        return Ok(true);
+    }
+    let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
+    let extended = sqlx::query(
+        "UPDATE storage_reservations
+         SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
+         WHERE id = $1 AND expires_at > NOW()",
+    )
+    .bind(job_id)
+    .bind(ttl_secs)
+    .execute(db.pool())
+    .await
+    .map_err(|e| {
+        WalletJobError::Transient(format!(
+            "could not extend storage reservation for job {}: {}",
+            job_id, e
+        ))
+    })?;
+
+    Ok(extended.rows_affected() > 0)
+}
+
+/// Re-admit an expired or missing storage reservation against owner storage quota.
+pub(crate) async fn admit_expired_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if max_storage_bytes <= 0 {
+        return Ok(());
+    }
+    let lock_key = crate::rate_limit::stable_hash_i64(owner);
+    let reservations = [crate::storage::db::StorageReservationRequest {
+        id: job_id.to_string(),
+        bytes: bytes.max(1),
+    }];
+    match db
+        .admit_storage_reservations(
+            owner,
+            lock_key,
+            max_storage_bytes,
+            &reservations,
+            crate::rate_limit::STORAGE_RESERVATION_TTL,
+        )
+        .await
+    {
+        Ok(crate::storage::db::StorageAdmission::Admitted) => Ok(()),
+        Ok(crate::storage::db::StorageAdmission::Rejected { used }) => {
+            Err(WalletJobError::Permanent(format!(
+                "storage quota exceeded after reservation expired (used={} bytes, max={} bytes)",
+                used, max_storage_bytes
+            )))
+        }
+        Err(e) => Err(WalletJobError::Transient(format!(
+            "could not re-admit storage reservation for job {}: {}",
+            job_id, e
+        ))),
+    }
+}
+
+/// Ensure a live reservation exists for this job, renewing it if still active
+/// or re-evaluating owner quota if expired, without running a transaction
+/// before an unpaid upload step spends Walrus storage.
+#[allow(dead_code)]
+pub(crate) async fn ensure_upload_storage_reservation_with_db(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if try_extend_live_storage_reservation(db, max_storage_bytes, job_id).await? {
+        return Ok(());
+    }
+
+    admit_expired_upload_storage_reservation(db, max_storage_bytes, job_id, owner, bytes).await
+}
+
+/// Before enforcing expired-quota re-admission on a resumed `encoded` journal
+/// that already holds a saved `register_transaction`, reconcile that digest
+/// against the sidecar without permitting a new submission. If the prepared
+/// registration already landed on-chain before the crash, advance directly to
+/// `registered` so the paid blob is not stranded when quota has filled in the
+/// meantime; if the sidecar proves the digest is not on-chain (`Unpaid`),
+/// enforce `ensure_upload_storage_reservation_with_db` before execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_or_ensure_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    http_client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    max_storage_bytes: i64,
+    encrypted: &[u8],
+    epochs: u64,
+    owner: &str,
+    namespace: &str,
+    package_id: &str,
+    remember_job_id: &str,
+    journal: &UploadJournal,
+    needs_prepared_reconcile: bool,
+) -> Result<Option<DurableUploadAdvance>, WalletJobError> {
+    if upload_journal_signer_committed(journal) {
+        return Ok(None);
+    }
+
+    if try_extend_live_storage_reservation(db, max_storage_bytes, remember_job_id).await? {
+        return Ok(None);
+    }
+
+    if needs_prepared_reconcile && journal.register_transaction.is_some() {
+        let mut attaches = 0u32;
+        let reconciled = loop {
+            let _ = sqlx::query(
+                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+            )
+            .bind(remember_job_id)
+            .execute(db.pool())
+            .await;
+            match crate::storage::walrus::reconcile_durable_upload(
+                http_client,
+                sidecar_url,
+                sidecar_secret,
+                encrypted,
+                epochs,
+                owner,
+                namespace,
+                package_id,
+                remember_job_id,
+                journal.clone(),
+            )
+            .await
+            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
+            {
+                Ok(reconciled) => break reconciled,
+                Err(err)
+                    if attaches < SAME_JOURNAL_ATTACHES
+                        && matches!(
+                            &err,
+                            WalletJobError::UploadSlotCongestion(msg)
+                                if WalletJobError::is_sidecar_upload_transport_error(msg)
+                        ) =>
+                {
+                    attaches += 1;
+                    tracing::info!(
+                        "[wallet-job:upload] job_id={} dropped reconcile connection; reattaching same journal ({}/{})",
+                        remember_job_id,
+                        attaches,
+                        SAME_JOURNAL_ATTACHES,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        match reconciled {
+            crate::storage::walrus::PreparedRegisterReconciliation::Advanced(advanced) => {
+                return Ok(Some(advanced));
+            }
+            crate::storage::walrus::PreparedRegisterReconciliation::Unpaid => {}
+        }
+    }
+
+    admit_expired_upload_storage_reservation(
+        db,
+        max_storage_bytes,
+        remember_job_id,
+        owner,
+        encrypted.len() as i64,
+    )
+    .await?;
+    Ok(None)
 }
 
 /// Backoff before re-running a congestion-requeued upload: 30s, 60s, 120s,
@@ -1011,7 +1198,7 @@ fn wallet_index_for_upload_attempt(
 ///
 /// `encoded` is a local checkpoint, and a prepared register has not been
 /// submitted. `registered` and later refer to a blob object that signer owns.
-fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
+pub(crate) fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
     matches!(
         journal
             .resume_step
@@ -2182,49 +2369,88 @@ async fn execute_durable_upload(
     // Each sidecar call advances one checkpointable step. Persist the returned
     // checkpoint before asking the sidecar to perform the next side effect.
     let mut budget = DurableUploadBudget::new();
+    let mut needs_prepared_reconcile =
+        !upload_journal_signer_committed(&journal) && journal.register_transaction.is_some();
     while budget.take_step() {
-        let mut attaches = 0u32;
-        let advanced = loop {
-            let _ = sqlx::query(
-                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
-            )
-            .bind(remember_job_id)
-            .execute(state.db.pool())
-            .await;
-            match crate::storage::walrus::advance_durable_upload(
-                &state.http_client,
-                &state.config.sidecar_url,
-                state.config.sidecar_secret.as_deref(),
-                encrypted,
-                epochs as u64,
-                owner,
-                namespace,
-                package_id,
-                remember_job_id,
-                journal.clone(),
-            )
-            .await
-            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
-            {
-                Ok(advanced) => break advanced,
-                Err(err)
-                    if attaches < SAME_JOURNAL_ATTACHES
-                        && matches!(
-                            &err,
-                            WalletJobError::UploadSlotCongestion(msg)
-                                if WalletJobError::is_sidecar_upload_transport_error(msg)
-                        ) =>
-                {
-                    attaches += 1;
-                    tracing::info!(
-                        "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
-                        remember_job_id,
-                        attaches,
-                        SAME_JOURNAL_ATTACHES,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let reconciled_advance = reconcile_or_ensure_upload_storage_reservation(
+            &state.db,
+            &state.http_client,
+            &state.config.sidecar_url,
+            state.config.sidecar_secret.as_deref(),
+            state.config.rate_limit.max_storage_bytes,
+            encrypted,
+            epochs as u64,
+            owner,
+            namespace,
+            package_id,
+            remember_job_id,
+            &journal,
+            needs_prepared_reconcile,
+        )
+        .await?;
+        needs_prepared_reconcile = false;
+
+        let advanced = if let Some(advanced) = reconciled_advance {
+            advanced
+        } else {
+            let is_encoded = journal
+                .resume_step
+                .as_ref()
+                .and_then(|step| step.get("step"))
+                .and_then(serde_json::Value::as_str)
+                == Some("encoded");
+            if is_encoded {
+                if let Some(tx) = journal.register_transaction.as_mut() {
+                    if tx.execution_started != Some(true) {
+                        tx.execution_started = Some(true);
+                        persist_upload_journal(state.db.pool(), remember_job_id, &journal).await?;
+                    }
                 }
-                Err(err) => return Err(err),
+            }
+
+            let mut attaches = 0u32;
+            loop {
+                let _ = sqlx::query(
+                    "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+                )
+                .bind(remember_job_id)
+                .execute(state.db.pool())
+                .await;
+                match crate::storage::walrus::advance_durable_upload(
+                    &state.http_client,
+                    &state.config.sidecar_url,
+                    state.config.sidecar_secret.as_deref(),
+                    encrypted,
+                    epochs as u64,
+                    owner,
+                    namespace,
+                    package_id,
+                    remember_job_id,
+                    journal.clone(),
+                )
+                .await
+                .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
+                {
+                    Ok(advanced) => break advanced,
+                    Err(err)
+                        if attaches < SAME_JOURNAL_ATTACHES
+                            && matches!(
+                                &err,
+                                WalletJobError::UploadSlotCongestion(msg)
+                                    if WalletJobError::is_sidecar_upload_transport_error(msg)
+                            ) =>
+                    {
+                        attaches += 1;
+                        tracing::info!(
+                            "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
+                            remember_job_id,
+                            attaches,
+                            SAME_JOURNAL_ATTACHES,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
 
@@ -3669,7 +3895,7 @@ pub enum WalletJobError {
 }
 
 impl WalletJobError {
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             WalletJobError::Transient(msg)
             | WalletJobError::Permanent(msg)
@@ -4664,6 +4890,7 @@ the checkpoint it replied about",
                 signature: "bb".into(),
                 digest: "cc".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         assert!(pin_journal_wallet(&prepared, 1));
@@ -5166,6 +5393,7 @@ the checkpoint it replied about",
             signature: "bb".into(),
             digest: "cc".into(),
             sponsor_digest: None,
+            execution_started: None,
         }
     }
 
@@ -5845,6 +6073,7 @@ the checkpoint it replied about",
                 signature: "signature".into(),
                 digest: "digest-1".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
 

@@ -5403,6 +5403,294 @@ mod quota_admission_tests {
         cleanup(&db, &owner).await;
     }
 
+    #[tokio::test]
+    async fn expired_reservation_cannot_resurrect_or_upload_past_owner_quota() {
+        let db = test_db().await;
+        let owner = unique_owner("mw10-expired");
+        let max_bytes: i64 = 100;
+
+        // 1. Job 1 (60 bytes) is admitted with a 0-second TTL so it expires immediately.
+        assert_eq!(
+            db.admit_storage_reservations(
+                &owner,
+                lock_key(&owner),
+                max_bytes,
+                &[StorageReservationRequest {
+                    id: "mw10-job-1".into(),
+                    bytes: 60,
+                }],
+                Duration::from_secs(0),
+            )
+            .await
+            .unwrap(),
+            StorageAdmission::Admitted
+        );
+
+        // 2. Job 2 (60 bytes) arrives after Job 1 expired, sweeps Job 1, and takes 60 of 100 bytes.
+        assert_eq!(
+            db.admit_storage_reservations(
+                &owner,
+                lock_key(&owner),
+                max_bytes,
+                &[StorageReservationRequest {
+                    id: "mw10-job-2".into(),
+                    bytes: 60,
+                }],
+                TTL,
+            )
+            .await
+            .unwrap(),
+            StorageAdmission::Admitted
+        );
+
+        // 3. Job 1 wakes up for its unpaid upload step: renewal must be rejected because 60 + 60 > 100.
+        let err = crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-1",
+            &owner,
+            60,
+        )
+        .await
+        .expect_err("expired swept reservation must not proceed when owner quota is full");
+        assert!(
+            err.aborts_retries(),
+            "quota exhaustion on expired reservation must abort unpaid upload: {err}"
+        );
+        assert!(
+            err.message()
+                .contains("storage quota exceeded after reservation expired"),
+            "{err}"
+        );
+
+        // 4. Even if an expired row has NOT been swept yet, UPDATE must not resurrect it without re-checking quota.
+        sqlx::query(
+            "INSERT INTO storage_reservations (id, owner, bytes, expires_at)
+             VALUES ('mw10-job-unswept', $1, 60, NOW() - INTERVAL '10 seconds')",
+        )
+        .bind(&owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let unswept_err = crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-unswept",
+            &owner,
+            60,
+        )
+        .await
+        .expect_err("expired unswept reservation must not resurrect when owner quota is full");
+        assert!(unswept_err.aborts_retries(), "{unswept_err}");
+
+        // 4b. An expired reservation for a job whose owner still has sufficient quota re-admits cleanly.
+        sqlx::query(
+            "INSERT INTO storage_reservations (id, owner, bytes, expires_at)
+             VALUES ('mw10-job-within-quota', $1, 30, NOW() - INTERVAL '10 seconds')",
+        )
+        .bind(&owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-within-quota",
+            &owner,
+            30,
+        )
+        .await
+        .expect("within-quota expired reservation must re-admit cleanly");
+
+        let renewed_expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT expires_at FROM storage_reservations WHERE id = 'mw10-job-within-quota'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            renewed_expires_at > chrono::Utc::now(),
+            "re-admitted reservation must be renewed into the future"
+        );
+        sqlx::query("DELETE FROM storage_reservations WHERE id = 'mw10-job-within-quota'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // 5. Job 2 (whose reservation is still live) extends cleanly and can proceed.
+        crate::jobs::ensure_upload_storage_reservation_with_db(
+            &db,
+            max_bytes,
+            "mw10-job-2",
+            &owner,
+            60,
+        )
+        .await
+        .expect("live reservation must extend cleanly");
+
+        // 6. Restart after the prepared checkpoint: reconcile the prepared digest first.
+        // If the registration already landed on-chain before the crash, it advances to
+        // `registered` even when the reservation expired and quota filled; if the digest
+        // is not on-chain (`PREPARED_REGISTER_NOT_ON_CHAIN`), expired-quota re-admission rejects it.
+        let prepared_journal = crate::storage::walrus::UploadJournal {
+            wallet_index: 0,
+            wallet_address: Some("0xabc".into()),
+            execution_identity: None,
+            resume_step: Some(serde_json::json!({ "step": "encoded", "blobId": "blob-1" })),
+            register_transaction: Some(crate::storage::walrus::PreparedRegisterTransaction {
+                transaction_bytes: "aa".into(),
+                signature: "bb".into(),
+                digest: "cc".into(),
+                sponsor_digest: None,
+                execution_started: Some(true),
+            }),
+        };
+        assert!(
+            !crate::jobs::upload_journal_signer_committed(&prepared_journal),
+            "prepared journal is not signer committed before on-chain execution"
+        );
+
+        let landed_on_chain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen_reconcile = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/walrus/upload-step-v3",
+            axum::routing::post({
+                let landed_on_chain = std::sync::Arc::clone(&landed_on_chain);
+                let seen_reconcile = std::sync::Arc::clone(&seen_reconcile);
+                move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let landed_on_chain = std::sync::Arc::clone(&landed_on_chain);
+                    let seen_reconcile = std::sync::Arc::clone(&seen_reconcile);
+                    async move {
+                        seen_reconcile.lock().unwrap().push(req);
+                        if landed_on_chain.load(std::sync::atomic::Ordering::SeqCst) {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "step": {
+                                        "step": "registered",
+                                        "blobId": "blob-1",
+                                        "blobObjectId": "0xblob1",
+                                        "txDigest": "cc"
+                                    }
+                                })),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({
+                                    "code": "PREPARED_REGISTER_NOT_ON_CHAIN",
+                                    "error": "prepared register transaction cc is not on chain"
+                                })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sidecar_url = format!("http://{}", listener.local_addr().unwrap());
+        let sidecar_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // 5b. When a live reservation exists (`expires_at > NOW()`), reconcile_or_ensure_upload_storage_reservation
+        // extends the live row immediately without even calling the sidecar.
+        let live_reconciled = crate::jobs::reconcile_or_ensure_upload_storage_reservation(
+            &db,
+            &reqwest::Client::new(),
+            &sidecar_url,
+            None,
+            max_bytes,
+            &[0u8; 60],
+            1,
+            &owner,
+            "default",
+            "0xpkg",
+            "mw10-job-2",
+            &prepared_journal,
+            true,
+        )
+        .await
+        .expect("live reservation must extend cleanly without sidecar round-trip");
+        assert!(live_reconciled.is_none());
+        assert_eq!(
+            seen_reconcile.lock().unwrap().len(),
+            0,
+            "live reservation extension must make zero sidecar calls"
+        );
+
+        // 6a. Prepared digest already finalized on-chain: reconciles to `registered` without failing quota.
+        let reconciled = crate::jobs::reconcile_or_ensure_upload_storage_reservation(
+            &db,
+            &reqwest::Client::new(),
+            &sidecar_url,
+            None,
+            max_bytes,
+            &[0u8; 60],
+            1,
+            &owner,
+            "default",
+            "0xpkg",
+            "mw10-job-prepared-landed",
+            &prepared_journal,
+            true,
+        )
+        .await
+        .expect("already-registered prepared digest must reconcile even when expired reservation cannot re-admit");
+        match reconciled {
+            Some(crate::storage::walrus::DurableUploadAdvance::Step { step, .. }) => {
+                assert_eq!(step["step"], "registered");
+                assert_eq!(step["blobObjectId"], "0xblob1");
+            }
+            _ => panic!("expected reconciled registered step"),
+        }
+
+        // 6b. Prepared digest is NOT on-chain and was unsubmitted: falls through to quota re-admission and rejects permanently.
+        let mut unsubmitted_journal = prepared_journal.clone();
+        if let Some(tx) = unsubmitted_journal.register_transaction.as_mut() {
+            tx.execution_started = Some(false);
+        }
+        landed_on_chain.store(false, std::sync::atomic::Ordering::SeqCst);
+        let prepared_err = match crate::jobs::reconcile_or_ensure_upload_storage_reservation(
+            &db,
+            &reqwest::Client::new(),
+            &sidecar_url,
+            None,
+            max_bytes,
+            &[0u8; 60],
+            1,
+            &owner,
+            "default",
+            "0xpkg",
+            "mw10-job-prepared-unpaid",
+            &unsubmitted_journal,
+            true,
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("unpaid prepared digest with expired reservation must be rejected when owner quota is full"),
+        };
+        assert!(prepared_err.aborts_retries(), "{prepared_err}");
+        assert!(
+            prepared_err
+                .message()
+                .contains("storage quota exceeded after reservation expired"),
+            "{prepared_err}"
+        );
+
+        sidecar_server.abort();
+        {
+            let reqs = seen_reconcile.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            assert_eq!(reqs[0]["reconcileOnly"], true);
+            assert_eq!(reqs[1]["reconcileOnly"], true);
+            assert_eq!(reqs[1]["mayHaveBeenSubmitted"], false);
+        }
+
+        cleanup(&db, &owner).await;
+    }
+
     /// Bulk admission is all-or-nothing, which is what keeps the existing
     /// "reject the whole request" behaviour and the 402 shape intact.
     #[tokio::test]
