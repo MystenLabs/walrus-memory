@@ -449,7 +449,8 @@ async function handleLoginToolCall(
         log.error("memwal_login.tool.url_not_ready", { msg });
         const fallbackCmd = remoteLoginCommand({
             url: config.webUrl,
-            environment: config.relayerUrl.includes("dev.memwal.ai") ? "dev" : config.relayerUrl.includes("localhost") || config.relayerUrl.includes("127.0.0.1") ? "local" : undefined,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
         });
         return {
             isError: true,
@@ -475,7 +476,8 @@ async function handleLoginToolCall(
             credentialsPath: credsPath(),
             signedIn: loadCreds() !== null,
             discardedKey,
-            environment: config.relayerUrl.includes("dev.memwal.ai") ? "dev" : config.relayerUrl.includes("localhost") || config.relayerUrl.includes("127.0.0.1") ? "local" : undefined,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
         }),
     };
 }

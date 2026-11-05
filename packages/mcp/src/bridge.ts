@@ -1076,7 +1076,8 @@ async function handleLocalLogin(
             credentialsPath: credsPath(),
             signedIn: loadCreds() !== null,
             discardedKey,
-            environment: config.relayerUrl.includes("dev.memwal.ai") ? "dev" : config.relayerUrl.includes("localhost") || config.relayerUrl.includes("127.0.0.1") ? "local" : undefined,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
         }),
     };
 }

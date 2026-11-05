@@ -28,16 +28,53 @@ export interface LoginPromptInfo {
     /** Set when `freshKey` dropped a pending delegate key. The write-ahead
      * file no longer has it, so the prompt is the place that names it. */
     discardedKey?: { publicKey: string; address: string };
+    /** Configured relayer URL for the active MCP session. */
+    relayerUrl?: string;
+    /** Configured dashboard web URL for the active MCP session. */
+    webUrl?: string;
     /** Optional environment name or explicit CLI flag (e.g. 'dev', 'local', 'staging'). */
     environment?: string;
 }
 
+const PROD_RELAYER_URL = "https://relayer.memory.walrus.xyz";
+const PROD_WEB_URL = "https://memory.walrus.xyz";
+const DEV_RELAYER_URL = "https://relayer.dev.memwal.ai";
+const DEV_WEB_URL = "https://dev.memwal.ai";
+const LOCAL_RELAYER_URL = "http://127.0.0.1:8000";
+const LOCAL_WEB_URL = "http://localhost:5173";
+
+function normalizeCliUrl(raw: string | undefined | null): string | null {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed || /[\s\u0000-\u001f\u007f;|&$`\\"'<>(){}[\]*?~#!]/.test(trimmed)) {
+        return null;
+    }
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+        if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+        const path = parsed.pathname.replace(/\/+$/, "");
+        return `${parsed.origin}${path}`;
+    } catch {
+        return null;
+    }
+}
+
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 /** Resolves the CLI login command for remote or headless login fallback,
- * preserving explicit environment presets (`--dev`, `--local`, `--staging`)
- * and custom `--relayer` overrides. */
-export function remoteLoginCommand(info: LoginPromptInfo | { url: string; environment?: string }): string {
+ * preserving exact environment presets (`--dev`, `--local`) only when both
+ * relayer and web URLs match the preset pair, and otherwise emitting
+ * shell-quoted `--relayer` and `--web-url` overrides. */
+export function remoteLoginCommand(
+    info:
+        | LoginPromptInfo
+        | { url?: string; relayerUrl?: string; webUrl?: string; environment?: string },
+): string {
     const base = "npx -y @mysten-incubation/memwal-mcp login";
-    if (info.environment) {
+    if (info.environment && !info.relayerUrl && !info.webUrl) {
         const env = info.environment.trim().toLowerCase().replace(/^--/, "");
         if (env === "dev" || env === "staging" || env === "local") {
             return `${base} --${env}`;
@@ -45,32 +82,52 @@ export function remoteLoginCommand(info: LoginPromptInfo | { url: string; enviro
         if (env === "prod" || env === "production") {
             return base;
         }
-        return `${base} ${info.environment.startsWith("--") ? info.environment : `--${info.environment}`}`;
     }
-    try {
-        const u = new URL(info.url);
-        const relayerParam = u.searchParams.get("relayer");
-        const relayer = (relayerParam ?? "").trim().toLowerCase().replace(/\/+$/, "");
-        const host = u.hostname.toLowerCase();
-        if (relayer.includes("dev.memwal.ai") || host.includes("dev.memwal.ai")) {
-            return `${base} --dev`;
-        }
-        if (
-            relayer.includes("127.0.0.1:8000") ||
-            relayer.includes("localhost:8000") ||
-            host === "localhost" ||
-            host === "127.0.0.1"
-        ) {
-            return `${base} --local`;
-        }
-        if (relayer.includes("staging")) {
-            return `${base} --staging`;
-        }
-        if (relayerParam && !relayer.includes("relayer.memory.walrus.xyz")) {
-            return `${base} --relayer ${relayerParam}`;
-        }
-    } catch {}
-    return base;
+
+    let urlRelayer: string | null = null;
+    let urlWeb: string | null = null;
+    if (info.url) {
+        try {
+            const parsed = new URL(info.url);
+            urlRelayer = normalizeCliUrl(parsed.searchParams.get("relayer"));
+            const basePath = parsed.pathname.replace(/\/connect\/mcp\/?$/, "").replace(/\/+$/, "");
+            urlWeb = normalizeCliUrl(`${parsed.origin}${basePath}`);
+        } catch {}
+    }
+
+    const explicitRelayer = normalizeCliUrl(info.relayerUrl) ?? urlRelayer;
+    const explicitWeb = normalizeCliUrl(info.webUrl) ?? urlWeb;
+
+    const relayer = explicitRelayer ?? PROD_RELAYER_URL;
+    const defaultWebForRelayer =
+        !explicitWeb && relayer.toLowerCase() === DEV_RELAYER_URL
+            ? DEV_WEB_URL
+            : !explicitWeb && relayer.toLowerCase() === LOCAL_RELAYER_URL
+              ? LOCAL_WEB_URL
+              : PROD_WEB_URL;
+    const web = explicitWeb ?? defaultWebForRelayer;
+
+    const normRelayer = relayer.toLowerCase();
+    const normWeb = web.toLowerCase();
+
+    if (normRelayer === PROD_RELAYER_URL && normWeb === PROD_WEB_URL) {
+        return base;
+    }
+    if (normRelayer === DEV_RELAYER_URL && normWeb === DEV_WEB_URL) {
+        return `${base} --dev`;
+    }
+    if (normRelayer === LOCAL_RELAYER_URL && normWeb === LOCAL_WEB_URL) {
+        return `${base} --local`;
+    }
+
+    const args = [base];
+    if (normRelayer !== PROD_RELAYER_URL) {
+        args.push(`--relayer ${shellQuote(relayer)}`);
+    }
+    if (normWeb !== PROD_WEB_URL) {
+        args.push(`--web-url ${shellQuote(web)}`);
+    }
+    return args.join(" ");
 }
 
 /**

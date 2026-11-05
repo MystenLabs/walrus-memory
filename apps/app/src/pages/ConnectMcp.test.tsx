@@ -36,7 +36,7 @@ vi.mock('../utils/analytics', () => ({
     getAnalyticsErrorType: () => 'unknown',
 }))
 
-import ConnectMcp from './ConnectMcp'
+import ConnectMcp, { mcpCliLoginCommand } from './ConnectMcp'
 
 const PORT = '38291'
 const PUBLIC_KEY = 'a'.repeat(64)
@@ -266,6 +266,37 @@ describe('MCP sign-in hand-off', () => {
         )
 
         expect(await screen.findByText(/npx -y @mysten-incubation\/memwal-mcp login --dev/i)).toBeInTheDocument()
+    })
+
+    it('quotes custom relayer and web overrides and rejects shell metacharacters in the remote CLI command', async () => {
+        expect(mcpCliLoginCommand('https://staging.relayer.example')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://staging.relayer.example'",
+        )
+        expect(mcpCliLoginCommand('https://relayer.dev.memwal.ai', 'https://custom.dashboard.example')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://relayer.dev.memwal.ai' --web-url 'https://custom.dashboard.example'",
+        )
+        expect(mcpCliLoginCommand('https://relayer.example; echo SYNTHETIC_COMMAND')).toBe(
+            'npx -y @mysten-incubation/memwal-mcp login',
+        )
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                const url = String(input)
+                if (url.endsWith('/preflight')) throw new TypeError('Failed to fetch')
+                throw new Error(`unexpected fetch: ${url}`)
+            }),
+        )
+        const injectedRelayer = 'https://relayer.example; echo SYNTHETIC_COMMAND'
+        const query = `?port=${PORT}&publicKey=${PUBLIC_KEY}&relayer=${encodeURIComponent(injectedRelayer)}&connectState=${STATE}`
+        render(
+            <MemoryRouter initialEntries={[`/connect/mcp${query}`]}>
+                <ConnectMcp />
+            </MemoryRouter>,
+        )
+
+        expect(await screen.findByText(/npx -y @mysten-incubation\/memwal-mcp login/i)).toBeInTheDocument()
+        expect(screen.queryByText(/SYNTHETIC_COMMAND/)).not.toBeInTheDocument()
     })
 
     it('tells a refused hand-off apart from an absent one', async () => {

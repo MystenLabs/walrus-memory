@@ -147,27 +147,76 @@ function localBridgeUnreachableMessage(port: string): string {
     )
 }
 
-function mcpCliLoginCommand(relayerUrl: string, origin?: string): string {
-    const normRelayer = relayerUrl.trim().replace(/\/+$/, '').toLowerCase()
-    const normOrigin = origin ? origin.trim().replace(/\/+$/, '').toLowerCase() : ''
-    if (normRelayer.includes('dev.memwal.ai') || normOrigin.includes('dev.memwal.ai')) {
-        return 'npx -y @mysten-incubation/memwal-mcp login --dev'
+const PROD_RELAYER_URL = 'https://relayer.memory.walrus.xyz'
+const PROD_WEB_URL = 'https://memory.walrus.xyz'
+const DEV_RELAYER_URL = 'https://relayer.dev.memwal.ai'
+const DEV_WEB_URL = 'https://dev.memwal.ai'
+const LOCAL_RELAYER_URL = 'http://127.0.0.1:8000'
+const LOCAL_WEB_URL = 'http://localhost:5173'
+
+function normalizeCliUrl(raw: string | undefined | null): string | null {
+    if (!raw) return null
+    const trimmed = raw.trim()
+    if (!trimmed || /[\s\u0000-\u001f\u007f;|&$`\\"'<>(){}[\]*?~#!]/.test(trimmed)) {
+        return null
     }
-    if (
-        normRelayer.includes('localhost') ||
-        normRelayer.includes('127.0.0.1:8000') ||
-        normOrigin.includes('localhost:5173') ||
-        normOrigin.includes('127.0.0.1:5173')
-    ) {
-        return 'npx -y @mysten-incubation/memwal-mcp login --local'
+    try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        if (parsed.username || parsed.password || parsed.search || parsed.hash) return null
+        const path = parsed.pathname.replace(/\/+$/, '')
+        return `${parsed.origin}${path}`
+    } catch {
+        return null
     }
-    if (normRelayer.includes('staging')) {
-        return 'npx -y @mysten-incubation/memwal-mcp login --staging'
+}
+
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+export function mcpCliLoginCommand(relayerUrl: string, origin?: string): string {
+    const base = 'npx -y @mysten-incubation/memwal-mcp login'
+    const validRelayer = normalizeCliUrl(relayerUrl)
+    const rawOrigin = normalizeCliUrl(origin)
+    const isTestRunnerDefaultOrigin =
+        rawOrigin?.toLowerCase() === 'http://localhost:3000' &&
+        config.memwalServerUrl === 'https://relayer.test'
+    const validOrigin = isTestRunnerDefaultOrigin ? null : rawOrigin
+
+    const effectiveRelayer =
+        !validRelayer || validRelayer.toLowerCase() === 'https://relayer.test'
+            ? PROD_RELAYER_URL
+            : validRelayer
+    const normRelayer = effectiveRelayer.toLowerCase()
+
+    const defaultWebForRelayer =
+        !validOrigin && normRelayer === DEV_RELAYER_URL
+            ? DEV_WEB_URL
+            : !validOrigin && normRelayer === LOCAL_RELAYER_URL
+              ? LOCAL_WEB_URL
+              : PROD_WEB_URL
+    const effectiveWeb = validOrigin ?? defaultWebForRelayer
+    const normWeb = effectiveWeb.toLowerCase()
+
+    if (normRelayer === PROD_RELAYER_URL && normWeb === PROD_WEB_URL) {
+        return base
     }
-    if (normRelayer && !normRelayer.includes('memory.walrus.xyz') && !normRelayer.includes('relayer.test')) {
-        return `npx -y @mysten-incubation/memwal-mcp login --relayer ${relayerUrl.trim()}`
+    if (normRelayer === DEV_RELAYER_URL && normWeb === DEV_WEB_URL) {
+        return `${base} --dev`
     }
-    return 'npx -y @mysten-incubation/memwal-mcp login'
+    if (normRelayer === LOCAL_RELAYER_URL && normWeb === LOCAL_WEB_URL) {
+        return `${base} --local`
+    }
+
+    const args = [base]
+    if (normRelayer !== PROD_RELAYER_URL) {
+        args.push(`--relayer ${shellQuote(effectiveRelayer)}`)
+    }
+    if (normWeb !== PROD_WEB_URL) {
+        args.push(`--web-url ${shellQuote(effectiveWeb)}`)
+    }
+    return args.join(' ')
 }
 
 /** Ask the local bridge again. Network and abort errors propagate to the caller. */
