@@ -10,6 +10,12 @@ import type { db as dbClient } from "@/shared/lib/db";
 import type { User } from "@/shared/db/type";
 import { users, zkLoginSessions, walletSessions } from "@/shared/db/schema";
 import { eq, and } from "drizzle-orm";
+import {
+  DelegateKeyCryptoError,
+  encryptDelegatePrivateKey,
+  isLegacyPlaintextDelegateKey,
+  openOrMigrateDelegatePrivateKey,
+} from "../lib/delegate-key-crypto";
 
 type DbClient = typeof dbClient;
 
@@ -168,11 +174,15 @@ export async function upsertEnokiUser(
       throw new DelegateCredentialConflictError();
     }
 
+    const encryptedDelegateKey = encryptDelegatePrivateKey(
+      input.delegatePrivateKey
+    );
+
     const [user] = await db
       .update(users)
       .set({
         authMethod: "enoki",
-        delegatePrivateKey: input.delegatePrivateKey,
+        delegatePrivateKey: encryptedDelegateKey,
         delegateAccountId: input.delegateAccountId,
         lastSeenAt: new Date(),
       })
@@ -181,18 +191,158 @@ export async function upsertEnokiUser(
     return user;
   }
 
+  const encryptedDelegateKey = encryptDelegatePrivateKey(
+    input.delegatePrivateKey
+  );
+
   const [user] = await db
     .insert(users)
     .values({
       suiAddress: input.suiAddress,
       authMethod: "enoki",
-      delegatePrivateKey: input.delegatePrivateKey,
+      delegatePrivateKey: encryptedDelegateKey,
       delegateAccountId: input.delegateAccountId,
       name: "Enoki User",
       lastSeenAt: new Date(),
     })
     .returning();
   return user;
+}
+
+/**
+ * Decrypt an at-rest `v1.` delegate key envelope, or transparently encrypt and
+ * backfill a pre-upgrade 64-hex plaintext delegate key in PostgreSQL so the
+ * existing account and memory access survive the upgrade without generating a
+ * replacement account.
+ *
+ * Uses an atomic compare-and-swap on `delegatePrivateKey` to protect against
+ * concurrent credential rotations. If another session updated credentials
+ * between the initial read and migration, reloads the complete credential tuple
+ * (`delegatePrivateKey` and `delegateAccountId`) and propagates it back to
+ * `user` so callers never combine the new key with a stale account ID.
+ */
+export async function resolveAndMigrateUserDelegateKey(
+  db: DbClient,
+  user: Pick<User, "id" | "delegatePrivateKey"> & {
+    delegateAccountId?: string | null;
+  },
+  secretOverride?: string
+): Promise<{
+  plaintextKey: string;
+  encryptedEnvelope: string;
+  migrated: boolean;
+  delegateAccountId: string | null;
+}> {
+  if (!user.delegatePrivateKey) {
+    throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+  }
+  const originalPlaintext = user.delegatePrivateKey;
+  const resolved = openOrMigrateDelegatePrivateKey(
+    originalPlaintext,
+    secretOverride
+  );
+  if (resolved.migrated) {
+    const updated = await db
+      .update(users)
+      .set({
+        delegatePrivateKey: resolved.encryptedEnvelope,
+      })
+      .where(
+        and(
+          eq(users.id, user.id),
+          eq(users.delegatePrivateKey, originalPlaintext)
+        )
+      )
+      .returning();
+
+    if (updated.length > 0) {
+      user.delegatePrivateKey = resolved.encryptedEnvelope;
+      return {
+        ...resolved,
+        delegateAccountId: user.delegateAccountId ?? null,
+      };
+    }
+
+    // Lost race: a concurrent credential rotation modified delegatePrivateKey.
+    // Reload the complete credential tuple (delegatePrivateKey, delegateAccountId)
+    // rather than returning the stale key or leaving a stale delegateAccountId on user.
+    const [reloaded] = await db
+      .select({
+        delegatePrivateKey: users.delegatePrivateKey,
+        delegateAccountId: users.delegateAccountId,
+      })
+      .from(users)
+      .where(eq(users.id, user.id));
+
+    if (
+      !reloaded ||
+      !reloaded.delegatePrivateKey ||
+      !reloaded.delegateAccountId
+    ) {
+      throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+    }
+    user.delegatePrivateKey = reloaded.delegatePrivateKey;
+    user.delegateAccountId = reloaded.delegateAccountId;
+    const reloadedResolved = openOrMigrateDelegatePrivateKey(
+      reloaded.delegatePrivateKey,
+      secretOverride
+    );
+    return {
+      ...reloadedResolved,
+      delegateAccountId: reloaded.delegateAccountId,
+    };
+  }
+  return {
+    ...resolved,
+    delegateAccountId: user.delegateAccountId ?? null,
+  };
+}
+
+/**
+ * Batch-backfill any remaining pre-upgrade 64-hex plaintext delegate keys in
+ * `users` into AES-256-GCM `v1.` envelopes in place.
+ *
+ * Compares `users.delegatePrivateKey` with the read plaintext atomically to
+ * avoid clobbering concurrent credential updates.
+ */
+export async function backfillLegacyDelegateKeys(
+  db: DbClient,
+  secretOverride?: string
+): Promise<number> {
+  const rows = await db
+    .select({
+      id: users.id,
+      delegatePrivateKey: users.delegatePrivateKey,
+    })
+    .from(users);
+  let migratedCount = 0;
+  for (const row of rows) {
+    if (
+      row.delegatePrivateKey &&
+      isLegacyPlaintextDelegateKey(row.delegatePrivateKey)
+    ) {
+      const encryptedEnvelope = encryptDelegatePrivateKey(
+        row.delegatePrivateKey,
+        secretOverride
+      );
+      const updated = await db
+        .update(users)
+        .set({
+          delegatePrivateKey: encryptedEnvelope,
+        })
+        .where(
+          and(
+            eq(users.id, row.id),
+            eq(users.delegatePrivateKey, row.delegatePrivateKey)
+          )
+        )
+        .returning();
+      if (updated.length > 0) {
+        migratedCount += 1;
+      }
+    }
+  }
+  return migratedCount;
 }
 
 /** Look up Enoki user with stored credentials for returning-user fast path. */
@@ -206,7 +356,12 @@ export async function getEnokiUserBySuiAddress(db: DbClient, suiAddress: string)
     .limit(1);
 
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
-    return user;
+    try {
+      await resolveAndMigrateUserDelegateKey(db, user);
+      return user.delegateAccountId ? user : null;
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -227,9 +382,12 @@ export async function getDelegateKeyForOwner(
     .limit(1);
 
   if (user?.delegatePrivateKey && user?.delegateAccountId) {
+    const { plaintextKey, delegateAccountId } =
+      await resolveAndMigrateUserDelegateKey(db, user);
+    if (!delegateAccountId) return null;
     return {
-      delegatePrivateKey: user.delegatePrivateKey,
-      delegateAccountId: user.delegateAccountId,
+      delegatePrivateKey: plaintextKey,
+      delegateAccountId,
     };
   }
   return null;

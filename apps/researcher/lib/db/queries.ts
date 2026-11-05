@@ -15,6 +15,12 @@ import {
   type SQL,
 } from "drizzle-orm";
 import type { VisibilityType } from "@/components/chat/visibility-selector";
+import {
+  DelegateKeyCryptoError,
+  encryptDelegatePrivateKey,
+  isLegacyPlaintextDelegateKey,
+  openOrMigrateDelegatePrivateKey,
+} from "@/lib/auth/delegate-key-crypto";
 import type { Citation, SourceMeta } from "@/lib/sprint/types";
 import { ChatbotError } from "../errors";
 import {
@@ -83,12 +89,13 @@ export async function upsertDelegateCredentialsByPublicKey({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<User> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   const existing = await getUserByPublicKey(publicKey);
   try {
     if (existing) {
       const [updated] = await db
         .update(user)
-        .set({ delegatePrivateKey, accountId })
+        .set({ delegatePrivateKey: encryptedDelegateKey, accountId })
         .where(eq(user.id, existing.id))
         .returning();
       return updated;
@@ -97,7 +104,12 @@ export async function upsertDelegateCredentialsByPublicKey({
     const email = `key-${publicKey.slice(0, 8)}@ed25519`;
     const [created] = await db
       .insert(user)
-      .values({ email, publicKey, delegatePrivateKey, accountId })
+      .values({
+        email,
+        publicKey,
+        delegatePrivateKey: encryptedDelegateKey,
+        accountId,
+      })
       .returning();
     return created;
   } catch (_error) {
@@ -133,11 +145,18 @@ export async function createEnokiUser({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<User> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   const email = `enoki-${suiAddress.slice(0, 8)}@zklogin`;
   try {
     const [created] = await db
       .insert(user)
-      .values({ email, publicKey, suiAddress, delegatePrivateKey, accountId })
+      .values({
+        email,
+        publicKey,
+        suiAddress,
+        delegatePrivateKey: encryptedDelegateKey,
+        accountId,
+      })
       .returning();
     return created;
   } catch (_error) {
@@ -157,10 +176,11 @@ export async function updateEnokiUserCredentials({
   delegatePrivateKey: string;
   accountId: string;
 }): Promise<void> {
+  const encryptedDelegateKey = encryptDelegatePrivateKey(delegatePrivateKey);
   try {
     await db
       .update(user)
-      .set({ publicKey, delegatePrivateKey, accountId })
+      .set({ publicKey, delegatePrivateKey: encryptedDelegateKey, accountId })
       .where(eq(user.id, userId));
   } catch (_error) {
     throw new ChatbotError(
@@ -168,6 +188,139 @@ export async function updateEnokiUserCredentials({
       "Failed to update Enoki user credentials"
     );
   }
+}
+
+export type MigratedUserCredentials = {
+  id: string;
+  delegatePrivateKey: string | null;
+  publicKey?: string | null;
+  accountId?: string | null;
+};
+
+/**
+ * Decrypt an at-rest `v1.` delegate key envelope, or transparently encrypt and
+ * backfill a pre-upgrade 64-hex plaintext delegate key in PostgreSQL so
+ * existing accounts and memory access survive the upgrade without generating a
+ * replacement account.
+ *
+ * Uses an atomic compare-and-swap on `delegatePrivateKey` to protect against
+ * concurrent credential rotations. If another session updated credentials
+ * between the initial read and migration, reloads the complete credential tuple
+ * (`delegatePrivateKey`, `publicKey`, `accountId`) and propagates it back to
+ * `targetUser` so callers never pair the new key with stale account metadata.
+ */
+export async function resolveAndMigrateUserDelegateKey(
+  targetUser: MigratedUserCredentials,
+  secretOverride?: string
+): Promise<string> {
+  if (!targetUser.delegatePrivateKey) {
+    throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+  }
+  const originalPlaintext = targetUser.delegatePrivateKey;
+  const resolved = openOrMigrateDelegatePrivateKey(
+    originalPlaintext,
+    secretOverride
+  );
+  if (resolved.migrated) {
+    try {
+      const updatedRows = await db
+        .update(user)
+        .set({ delegatePrivateKey: resolved.encryptedEnvelope })
+        .where(
+          and(
+            eq(user.id, targetUser.id),
+            eq(user.delegatePrivateKey, originalPlaintext)
+          )
+        )
+        .returning({ delegatePrivateKey: user.delegatePrivateKey });
+
+      if (updatedRows.length > 0) {
+        targetUser.delegatePrivateKey = resolved.encryptedEnvelope;
+        return resolved.plaintextKey;
+      }
+
+      // Lost race: a concurrent credential rotation modified delegatePrivateKey.
+      // Reload the full credential tuple so callers receive the rotated publicKey and accountId too.
+      const [reloaded] = await db
+        .select({
+          delegatePrivateKey: user.delegatePrivateKey,
+          publicKey: user.publicKey,
+          accountId: user.accountId,
+        })
+        .from(user)
+        .where(eq(user.id, targetUser.id));
+
+      if (
+        !reloaded ||
+        !reloaded.delegatePrivateKey ||
+        !reloaded.publicKey ||
+        !reloaded.accountId
+      ) {
+        throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
+      }
+      targetUser.delegatePrivateKey = reloaded.delegatePrivateKey;
+      targetUser.publicKey = reloaded.publicKey;
+      targetUser.accountId = reloaded.accountId;
+      const reloadedResolved = openOrMigrateDelegatePrivateKey(
+        reloaded.delegatePrivateKey,
+        secretOverride
+      );
+      return reloadedResolved.plaintextKey;
+    } catch (error) {
+      if (error instanceof DelegateKeyCryptoError) {
+        throw error;
+      }
+      throw new ChatbotError(
+        "bad_request:database",
+        "Failed to migrate legacy delegate credentials"
+      );
+    }
+  }
+  return resolved.plaintextKey;
+}
+
+/**
+ * Batch-backfill any remaining pre-upgrade 64-hex plaintext delegate keys in
+ * `"User"` into AES-256-GCM `v1.` envelopes in place.
+ *
+ * Compares `user.delegatePrivateKey` with the read plaintext atomically to
+ * avoid clobbering concurrent credential updates.
+ */
+export async function backfillLegacyDelegateKeys(
+  secretOverride?: string
+): Promise<number> {
+  const rows = await db
+    .select({
+      id: user.id,
+      delegatePrivateKey: user.delegatePrivateKey,
+    })
+    .from(user);
+  let migratedCount = 0;
+  for (const row of rows) {
+    if (
+      row.delegatePrivateKey &&
+      isLegacyPlaintextDelegateKey(row.delegatePrivateKey)
+    ) {
+      const encryptedEnvelope = encryptDelegatePrivateKey(
+        row.delegatePrivateKey,
+        secretOverride
+      );
+      const updated = await db
+        .update(user)
+        .set({ delegatePrivateKey: encryptedEnvelope })
+        .where(
+          and(
+            eq(user.id, row.id),
+            eq(user.delegatePrivateKey, row.delegatePrivateKey)
+          )
+        )
+        .returning({ id: user.id });
+      if (updated.length > 0) {
+        migratedCount += 1;
+      }
+    }
+  }
+  return migratedCount;
 }
 
 // ============================================================
