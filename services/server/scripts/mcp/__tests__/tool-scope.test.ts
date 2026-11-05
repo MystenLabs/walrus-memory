@@ -12,7 +12,7 @@ const WRITE_TOOLS = [
     "memwal_analyze",
     "memwal_restore",
 ];
-const READ_TOOLS = ["memwal_recall", "memwal_health"];
+const READ_TOOLS = ["memwal_recall", "memwal_namespaces", "memwal_health"];
 
 async function toolNamesFor(oauthScope: string | undefined, t: TestContext): Promise<string[]> {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

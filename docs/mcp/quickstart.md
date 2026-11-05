@@ -114,6 +114,8 @@ Every client runs the same server and differs only in the file format. The serve
 
 Every recall runs inside one account and namespace. To keep a client's memories in their own space, set the `MEMWAL_NAMESPACE` environment variable in the server entry (`env` in JSON configs, `environment` in OpenCode), or pass `"--namespace", "<name>"` in `args`. Without it, memories go to the `default` namespace.
 
+Verify your namespace spelling carefully: a mistyped namespace reads as empty (0 memories) rather than raising an error. If `memwal_recall` or `memwal_restore` reports 0 memories in your namespace, check the close-match suggestions in its reply or call `memwal_namespaces` to list every populated namespace on the account.
+
 ## Verify
 
 1. Open your client's MCP status view (for example `/mcp` in Claude Code) and confirm the status view lists `memwal` as connected with its tools.
