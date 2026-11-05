@@ -28,6 +28,49 @@ export interface LoginPromptInfo {
     /** Set when `freshKey` dropped a pending delegate key. The write-ahead
      * file no longer has it, so the prompt is the place that names it. */
     discardedKey?: { publicKey: string; address: string };
+    /** Optional environment name or explicit CLI flag (e.g. 'dev', 'local', 'staging'). */
+    environment?: string;
+}
+
+/** Resolves the CLI login command for remote or headless login fallback,
+ * preserving explicit environment presets (`--dev`, `--local`, `--staging`)
+ * and custom `--relayer` overrides. */
+export function remoteLoginCommand(info: LoginPromptInfo | { url: string; environment?: string }): string {
+    const base = "npx -y @mysten-incubation/memwal-mcp login";
+    if (info.environment) {
+        const env = info.environment.trim().toLowerCase().replace(/^--/, "");
+        if (env === "dev" || env === "staging" || env === "local") {
+            return `${base} --${env}`;
+        }
+        if (env === "prod" || env === "production") {
+            return base;
+        }
+        return `${base} ${info.environment.startsWith("--") ? info.environment : `--${info.environment}`}`;
+    }
+    try {
+        const u = new URL(info.url);
+        const relayerParam = u.searchParams.get("relayer");
+        const relayer = (relayerParam ?? "").trim().toLowerCase().replace(/\/+$/, "");
+        const host = u.hostname.toLowerCase();
+        if (relayer.includes("dev.memwal.ai") || host.includes("dev.memwal.ai")) {
+            return `${base} --dev`;
+        }
+        if (
+            relayer.includes("127.0.0.1:8000") ||
+            relayer.includes("localhost:8000") ||
+            host === "localhost" ||
+            host === "127.0.0.1"
+        ) {
+            return `${base} --local`;
+        }
+        if (relayer.includes("staging")) {
+            return `${base} --staging`;
+        }
+        if (relayerParam && !relayer.includes("relayer.memory.walrus.xyz")) {
+            return `${base} --relayer ${relayerParam}`;
+        }
+    } catch {}
+    return base;
 }
 
 /**
@@ -74,7 +117,7 @@ export function loginPrompt(info: LoginPromptInfo): string {
               ]
             : []),
         ``,
-        `_The login link stays valid for 5 minutes and talks to localhost on the machine running this MCP server. If it expires, call \`memwal_login\` again to get a fresh URL. If this MCP server runs on a remote host or bot without a local browser, run \`npx -y @mysten-incubation/memwal-mcp login\` on the machine with your browser and copy the resulting credentials file to \`${info.credentialsPath}\` (mode \`0600\`) on the remote host._`,
+        `_The login link stays valid for 5 minutes and talks to localhost on the machine running this MCP server. If it expires, call \`memwal_login\` again to get a fresh URL. If this MCP server runs on a remote host or bot without a local browser, run \`${remoteLoginCommand(info)}\` on the machine with your browser and copy the resulting credentials file to \`${info.credentialsPath}\` (mode \`0600\`) on the remote host._`,
     ].join("\n");
 }
 

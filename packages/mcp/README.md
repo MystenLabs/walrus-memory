@@ -121,7 +121,7 @@ Browser sign-in verifies the request and delivers credentials to a loopback list
 
 To authenticate a remote or headless host without a local browser:
 
-1. On the computer that has your browser and Sui wallet, run:
+1. On the computer that has your browser and Sui wallet, run (adding `--dev` or `--local` for non-production environments):
    ```sh
    npx -y @mysten-incubation/memwal-mcp login
    ```
