@@ -2774,53 +2774,62 @@ async fn unlock_concurrent_index_lock(conn: &mut PgConnection) -> bool {
     )
 }
 
+type AdvisoryLockHolderRow = (
+    i32,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    bool,
+);
+
 /// Advisory locks are database-wide. If an earlier pooled backend or stalled
-/// session leaked `CONCURRENT_INDEX_LOCK_KEYS` and is now sitting idle,
-/// terminate that backend so the direct migration session can proceed without
-/// waiting out the 20-minute lock timeout. Active sessions (`state = 'active'`)
-/// are never terminated because a sibling replica may be actively building a
-/// concurrent index.
+/// session in the current database leaked `CONCURRENT_INDEX_LOCK_KEYS` and is
+/// now sitting idle, terminate that backend after atomically revalidating that
+/// its `state_change` has not advanced and it has no entry in
+/// `pg_stat_progress_create_index`. Active sessions (`state = 'active'`) or
+/// locks in other databases on the same cluster are never terminated.
 async fn release_orphaned_concurrent_index_lock(
     conn: &mut PgConnection,
     min_idle: std::time::Duration,
 ) -> usize {
     let min_idle_ms = i64::try_from(min_idle.as_millis()).unwrap_or(i64::MAX);
-    let holders: Vec<(i32, Option<String>, Option<String>, Option<String>, bool)> =
-        match sqlx::query_as(
-            "SELECT a.pid,
-                    a.application_name,
-                    a.state,
-                    left(a.query, 120),
-                    (a.application_name = 'pgbouncer'
-                     OR a.state_change IS NULL
-                     OR a.state_change <= NOW() - ($3::bigint * INTERVAL '1 millisecond'))
-             FROM pg_locks l
-             JOIN pg_stat_activity a ON a.pid = l.pid
-             WHERE l.locktype = 'advisory'
-               AND l.granted
-               AND l.objsubid = 2
-               AND l.classid::bigint = $1
-               AND l.objid::bigint = $2
-               AND l.pid <> pg_backend_pid()",
-        )
-        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.0))
-        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.1))
-        .bind(min_idle_ms)
-        .fetch_all(&mut *conn)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "vector db: could not inspect pg_locks for concurrent-index advisory lock"
-                );
-                return 0;
-            }
-        };
+    let holders: Vec<AdvisoryLockHolderRow> = match sqlx::query_as(
+        "SELECT a.pid,
+                a.application_name,
+                a.state,
+                left(a.query, 120),
+                a.state_change,
+                (a.application_name = 'pgbouncer'
+                 OR a.state_change <= NOW() - ($3::bigint * INTERVAL '1 millisecond'))
+         FROM pg_locks l
+         JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
+         WHERE l.locktype = 'advisory'
+           AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND l.objsubid = 2
+           AND l.classid::bigint = $1
+           AND l.objid::bigint = $2
+           AND l.pid <> pg_backend_pid()",
+    )
+    .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.0))
+    .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.1))
+    .bind(min_idle_ms)
+    .fetch_all(&mut *conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "vector db: could not inspect pg_locks for concurrent-index advisory lock"
+            );
+            return 0;
+        }
+    };
 
     let mut terminated = 0usize;
-    for (pid, application_name, state, query, eligible_by_age_or_pooler) in holders {
+    for (pid, application_name, state, query, state_change, eligible_by_age_or_pooler) in holders {
         tracing::warn!(
             pid,
             application_name = application_name.as_deref().unwrap_or(""),
@@ -2833,22 +2842,54 @@ async fn release_orphaned_concurrent_index_lock(
         {
             continue;
         }
-        match sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
-            .bind(pid)
-            .fetch_one(&mut *conn)
-            .await
+        let Some(observed_state_change) = state_change else {
+            continue;
+        };
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT pg_terminate_backend(a.pid)
+             FROM pg_locks l
+             JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
+             WHERE l.locktype = 'advisory'
+               AND l.granted
+               AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND l.objsubid = 2
+               AND l.classid::bigint = $1
+               AND l.objid::bigint = $2
+               AND a.pid = $3
+               AND a.pid <> pg_backend_pid()
+               AND a.state IN ('idle', 'idle in transaction')
+               AND a.state_change = $4
+               AND (a.application_name = 'pgbouncer'
+                    OR a.state_change <= NOW() - ($5::bigint * INTERVAL '1 millisecond'))
+               AND NOT EXISTS (
+                   SELECT 1 FROM pg_stat_progress_create_index p WHERE p.pid = a.pid
+               )",
+        )
+        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.0))
+        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.1))
+        .bind(pid)
+        .bind(observed_state_change)
+        .bind(min_idle_ms)
+        .fetch_optional(&mut *conn)
+        .await
         {
-            Ok(true) => {
+            Ok(Some(true)) => {
                 terminated += 1;
                 tracing::warn!(
                     pid,
                     "vector db: terminated idle backend holding leaked concurrent-index advisory lock"
                 );
             }
-            Ok(false) => {
+            Ok(Some(false)) => {
                 tracing::warn!(
                     pid,
                     "vector db: pg_terminate_backend returned false for concurrent-index lock holder"
+                );
+            }
+            Ok(None) => {
+                tracing::info!(
+                    pid,
+                    "vector db: skipped terminating lock holder after state changed since inspection"
                 );
             }
             Err(error) => {
