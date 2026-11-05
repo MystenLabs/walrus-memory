@@ -17,6 +17,7 @@
  */
 import { MemWal } from "@mysten-incubation/memwal";
 import { verifyInternalOrigin } from "./internal-auth.js";
+import { normalizeMcpNamespace } from "./tools/util.js";
 
 export interface MemWalSession {
     accountId: string;
@@ -150,7 +151,15 @@ export async function resolveAuth(
         );
     }
 
-    const namespace = headers.get("x-memwal-namespace") ?? undefined;
+    const rawNamespace = headers.get("x-memwal-namespace") ?? undefined;
+    let namespace: string | undefined;
+    if (rawNamespace !== undefined) {
+        try {
+            namespace = normalizeMcpNamespace(rawNamespace);
+        } catch (err) {
+            throw new McpAuthError((err as Error).message);
+        }
+    }
     const oauthScope = headers.get("x-memwal-internal-oauth-scope") ?? undefined;
     const delegatePubKeyHex = await publicKeyHex(delegateKeyHex);
 

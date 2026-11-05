@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
-import { wrapTool, explorerFooter } from "./util.js";
+import { wrapTool, explorerFooter, normalizeMcpNamespace } from "./util.js";
 import { SECRET_EXCLUSION_RULES, AUTO_SAVE_OPT_IN_RULE } from "./memory-policy.js";
 import {
     sanitizeFactBatch,
@@ -124,6 +124,7 @@ export function registerRememberBulkTool(
             inputSchema: REMEMBER_BULK_INPUT,
         },
         wrapTool<{ facts: string[]; namespace?: string; _idempotency_key?: string }>(session, "memwal_remember_bulk", async ({ facts, namespace, _idempotency_key }) => {
+            const cleanNamespace = normalizeMcpNamespace(namespace);
             // Every entry is sanitized BEFORE the batch is handed to the SDK.
             // Walrus is append-only, so a credential that lands cannot be
             // taken back (WALM-642). An entry that survives keeps its safe
@@ -179,7 +180,7 @@ export function registerRememberBulkTool(
             // The only texts anything below may echo or forward. The originals
             // still hold the secret and must not reach a result line.
             const safeFacts = kept.map((s) => s.result.text);
-            const items = safeFacts.map((text) => ({ text, namespace }));
+            const items = safeFacts.map((text) => ({ text, namespace: cleanNamespace }));
             // Two steps rather than `rememberBulkAndWait`, for the same reason
             // `memwal_remember` splits them: acceptance is the part that must
             // succeed, the wait is a courtesy we cut short.
@@ -215,7 +216,7 @@ export function registerRememberBulkTool(
                     },
                 );
             const accepted: BulkAccepted = _idempotency_key
-                ? await acceptOnce(session, `${namespace ?? ""}\0${_idempotency_key}`, accept)
+                ? await acceptOnce(session, `${cleanNamespace ?? ""}\0${_idempotency_key}`, accept)
                 : await accept();
 
             // Pair each job with its fact up front. Every later branch needs

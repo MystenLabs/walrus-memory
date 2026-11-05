@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
-import { wrapTool, walruscanBlobUrl } from "./util.js";
+import { wrapTool, walruscanBlobUrl, normalizeMcpNamespace } from "./util.js";
 import { SECRET_EXCLUSION_RULES, AUTO_SAVE_OPT_IN_RULE } from "./memory-policy.js";
 import { sanitizeFact, redactionNotice, refusalNotice } from "./redaction.js";
 import {
@@ -80,11 +80,12 @@ export function registerRememberTool(
             // Two steps rather than `rememberAndWait`, because the accept and
             // the wait need separate budgets: acceptance is the part that
             // must succeed, the wait is a courtesy we cut short.
-            const resolvedNamespace = namespace ?? session.namespace ?? "default";
+            const cleanNamespace = normalizeMcpNamespace(namespace);
+            const resolvedNamespace = cleanNamespace ?? session.namespace ?? "default";
             const accepted = await withAcceptDeadline(
                 withRelayerRetry(
                     () =>
-                        session.memwal.rememberAsync(safeText, namespace, {
+                        session.memwal.rememberAsync(safeText, cleanNamespace, {
                             // Ours, not the SDK's random one — see
                             // derivedIdempotencyKey. This is what makes the
                             // accept-timeout message's retry promise true.

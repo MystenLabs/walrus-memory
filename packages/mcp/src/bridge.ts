@@ -69,48 +69,94 @@ const NAMESPACE_TOOLS = new Set([
     "memwal_recall",
     "memwal_analyze",
     "memwal_restore",
+    "memwal_ask",
+    "memwal_stats",
+    "memwal_forget",
 ]);
 
 /**
- * Inject the configured default namespace into an outbound `tools/call`
- * message when the agent omitted one. Mutates `msg.params.arguments` in place
- * and returns `msg` (so it works inline before tracking/forwarding).
+ * Normalize a raw namespace value.
  *
- * No-op when:
- *   - no default namespace is configured (`namespace` falsy), or
- *   - the message is not a `tools/call` for a namespace-aware memory tool, or
- *   - the caller already supplied a non-empty `namespace` — an explicit
- *     per-call namespace always wins over the configured default.
+ * Returns undefined when raw is not a string or when trimmed length is 0.
+ * Rejects control characters ([\r\n\0]) with an Error.
+ * Rejects namespaces exceeding 255 bytes in UTF-8.
+ * Preserves internal casing without lowercasing.
  */
+export function normalizeNamespaceValue(raw: unknown): string | undefined {
+    if (typeof raw !== "string") {
+        return undefined;
+    }
+    if (/[\r\n\0]/.test(raw)) {
+        throw new Error("Namespace cannot contain control characters");
+    }
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+        return undefined;
+    }
+    if (Buffer.byteLength(trimmed, "utf8") > 255) {
+        throw new Error("Namespace cannot exceed 255 bytes");
+    }
+    return trimmed;
+}
+
+/**
+ * Normalize the namespace argument on outbound memory tool calls.
+ *
+ * Trims surrounding whitespace for explicit namespaces on namespace-aware tools.
+ * If args.namespace was whitespace-only, treats it as empty so the trimmed
+ * default namespace applies if configured, or deletes args.namespace if not.
+ * Injects the trimmed default namespace if args.namespace was omitted.
+ */
+export function normalizeToolNamespace(
+    msg: RpcMessage,
+    defaultNamespace?: string,
+): RpcMessage {
+    if (msg.method !== "tools/call") return msg;
+    const params = msg.params as
+        | { name?: string; arguments?: Record<string, unknown> }
+        | undefined;
+    if (!params || typeof params.name !== "string" || !NAMESPACE_TOOLS.has(params.name)) {
+        return msg;
+    }
+    const toolName = params.name;
+    const args = (params.arguments ??= {});
+    const normalizedDefault = normalizeNamespaceValue(defaultNamespace);
+
+    if ("namespace" in args) {
+        const raw = args.namespace;
+        if (typeof raw === "string") {
+            if (toolName === "memwal_restore" && raw.trim().length === 0) {
+                throw new Error("Namespace cannot be empty");
+            }
+            const normalized = normalizeNamespaceValue(raw);
+            if (normalized !== undefined) {
+                args.namespace = normalized;
+                return msg;
+            }
+            if (normalizedDefault !== undefined) {
+                args.namespace = normalizedDefault;
+            } else {
+                delete args.namespace;
+            }
+            return msg;
+        }
+    }
+
+    if (normalizedDefault !== undefined) {
+        args.namespace = normalizedDefault;
+    }
+    return msg;
+}
+
 /**
  * Name the destination this process is bound to in a `memwal_health` result:
  * the relayer it dialled, and the account it signs for.
- *
- * The relayer-side text can only report an origin its deployment published, and
- * stays silent on a self-hosted or local one, where the sidecar knows nothing
- * but the loopback address it dials. This side always knows the URL it
- * connected to — it is exactly what `--prod` / `--relayer` / `MEMWAL_SERVER_URL`
- * selected — so a client bound to the wrong network sees that here instead of
- * by noticing its memories are missing.
- *
- * Rewrites an existing `relayer=` field rather than appending a second one: when
- * both sides know the origin they describe the same session, and two
- * conflicting fields would be worse than neither.
- *
- * `account=` rides along for the same reason (WALM-639). A project-local
- * credentials file can point this process at a different account than the one
- * the user signed in with, and "which account am I writing to" was otherwise
- * only visible in stderr the MCP host usually hides — so the half of the
- * destination that decides WHOSE memory this is now shows up beside the half
- * that decides where it is stored.
  */
 export function annotateHealthResult(
     result: { content?: unknown; isError?: unknown },
     relayerUrl: string,
     accountId?: string,
 ): void {
-    // A failed health call has no session to describe; naming a relayer beside
-    // an error reads as though that relayer answered.
     if (result.isError) return;
     if (!Array.isArray(result.content)) return;
     const block = (result.content as { type?: string; text?: string }[]).find(
@@ -139,12 +185,8 @@ const IDEMPOTENT_WRITE_TOOLS = new Set([
 
 /**
  * Inject a stable idempotency key into an outbound `tools/call` for a write
- * tool. Mutates `msg.params.arguments` in place — call BEFORE the message
+ * tool. Mutates `msg.params.arguments` in place; call BEFORE the message
  * is stored in `inFlight` so reconnect replays carry the same key.
- *
- * No-op when:
- *   - the message is not a `tools/call` for a write tool, or
- *   - the caller already supplied a `_idempotency_key`.
  */
 export function applyIdempotencyKey(msg: RpcMessage): RpcMessage {
     if (msg.method !== "tools/call") return msg;
@@ -160,21 +202,11 @@ export function applyIdempotencyKey(msg: RpcMessage): RpcMessage {
     return msg;
 }
 
-export function applyDefaultNamespace(msg: RpcMessage, namespace?: string): RpcMessage {
-    if (!namespace) return msg;
-    if (msg.method !== "tools/call") return msg;
-    const params = msg.params as
-        | { name?: string; arguments?: Record<string, unknown> }
-        | undefined;
-    if (!params || typeof params.name !== "string" || !NAMESPACE_TOOLS.has(params.name)) {
-        return msg;
-    }
-    const args = (params.arguments ??= {});
-    const current = args.namespace;
-    // Explicit, non-empty per-call namespace wins.
-    if (typeof current === "string" && current.trim() !== "") return msg;
-    args.namespace = namespace;
-    return msg;
+export function applyDefaultNamespace(
+    msg: RpcMessage,
+    namespace?: string,
+): RpcMessage {
+    return normalizeToolNamespace(msg, namespace);
 }
 
 /** Tools we serve LOCALLY (not forwarded to the relayer) so the user can
@@ -2274,9 +2306,18 @@ export async function runBridge(
                 }
 
                 // Fill in the configured default namespace for memory tool
-                // calls that didn't pass one. Mutates msg in place so the
-                // forwarded — and any replayed-on-reconnect — copy carries it.
-                applyDefaultNamespace(msg, config.namespace);
+                // calls that didn't pass one, and normalize and trim namespaces.
+                // Mutates msg in place so the forwarded and any replayed copy carries it.
+                try {
+                    normalizeToolNamespace(msg, config.namespace);
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    failRequest(msg, "invalid namespace", {
+                        toolText: `❌ ${message}`,
+                        errorMessage: message,
+                    });
+                    return;
+                }
 
                 // Stamp write tools with a stable idempotency key, once per
                 // logical call, so a reconnect replay carries the same key as

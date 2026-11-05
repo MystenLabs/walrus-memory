@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
-import { wrapTool, explorerFooter } from "./util.js";
+import { wrapTool, explorerFooter, normalizeMcpNamespace } from "./util.js";
 import { SECRET_EXCLUSION_RULES, AUTO_SAVE_OPT_IN_RULE } from "./memory-policy.js";
 import {
     sanitizePassage,
@@ -86,6 +86,7 @@ export function registerAnalyzeTool(
             inputSchema: ANALYZE_INPUT,
         },
         wrapTool<{ text: string; namespace?: string }>(session, "memwal_analyze", async ({ text, namespace }) => {
+            const cleanNamespace = normalizeMcpNamespace(namespace);
             // Runs BEFORE the passage reaches the SDK, and therefore before it
             // reaches the extractor LLM. Everything this tool stores is derived
             // from this text, so a credential left in it can be copied into any
@@ -124,7 +125,7 @@ export function registerAnalyzeTool(
                 // that never reached the handler, so no job row can exist yet
                 // to duplicate.
                 withRelayerRetry(
-                    () => session.memwal.analyze(safeText, namespace),
+                    () => session.memwal.analyze(safeText, cleanNamespace),
                     "analyze this text",
                 ),
                 "memwal_analyze extraction",
@@ -186,7 +187,7 @@ export function registerAnalyzeTool(
 
             const startedAt = Date.now();
             const namespaces = entries.map(
-                () => namespace ?? session.namespace ?? "default"
+                () => cleanNamespace ?? session.namespace ?? "default"
             );
             // The wait is a courtesy; the accept above is the part that had to
             // succeed. If the relayer goes quiet mid-poll `withWaitDeadline`
