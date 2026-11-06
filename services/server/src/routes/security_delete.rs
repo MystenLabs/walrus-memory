@@ -2047,6 +2047,14 @@ mod tests {
         .execute(&legacy_pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id)
+             VALUES ('mem-legacy-1', $1, 'legacy-ns', 'legacy-blob')",
+        )
+        .bind(OWNER)
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "INSERT INTO vector_entries (id, owner, namespace, blob_id)
@@ -2198,6 +2206,48 @@ mod tests {
         assert_eq!(counts.deletable, 0);
         assert_eq!(counts.deleted, 1);
 
+        // Finalizing the legacy batch in its separate pool (which also has
+        // vector_entries.namespace and memory_tombstones) must remove the
+        // legacy vector_entries row and write a tombstone.
+        store::set_batch_prepared(
+            &legacy_pool,
+            legacy_batch_id,
+            "digest-legacy-1",
+            &[4, 5, 6],
+            &bcs::to_bytes(&vec!["legacy-blob".to_string()]).unwrap(),
+            1,
+            7,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store::begin_batch_execution(&legacy_pool, legacy_batch_id, &[vec![3], vec![4]])
+                .await
+                .unwrap()
+        );
+        let legacy_deleted =
+            store::finalize_batch_deleted(&legacy_pool, legacy_batch_id, store::BATCH_EXECUTING)
+                .await
+                .unwrap();
+        assert_eq!(legacy_deleted, Some(1));
+
+        let remaining_legacy_vectors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vector_entries WHERE owner = $1")
+                .bind(OWNER)
+                .fetch_one(&legacy_pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_legacy_vectors, 0);
+
+        let legacy_tombstone_ns: Option<String> = sqlx::query_scalar(
+            "SELECT namespace FROM memory_tombstones WHERE memory_id = 'mem-legacy-1'",
+        )
+        .fetch_optional(&legacy_pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_tombstone_ns.as_deref(), Some("legacy-ns"));
+
         drop(legacy_pool);
         drop(primary_pool);
         for schema in [&legacy_schema, &primary_schema] {
@@ -2281,7 +2331,7 @@ mod tests {
         .unwrap_err();
         assert!(
             check_err.to_string().contains(
-                "LEGACY_DB_URL points to the same PostgreSQL database and schema as DATABASE_URL"
+                "same PostgreSQL database and schema or resolves vector_entries to the primary table"
             ),
             "must reject shared database and schema: {check_err}"
         );

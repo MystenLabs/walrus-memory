@@ -934,7 +934,7 @@ pub async fn finalize_batch_deleted(
                 FROM delete_blobs_tracking t
                 INNER JOIN vector_entries v
                   ON v.owner = t.owner AND v.blob_id = t.blob_id
-                WHERE t.batch_id=$1 AND t.state='deleting' AND t.scope = 'current'
+                WHERE t.batch_id=$1 AND t.state='deleting'
              ),
              removed AS (
                 DELETE FROM vector_entries v
