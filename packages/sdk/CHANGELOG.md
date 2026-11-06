@@ -4,6 +4,7 @@
 
 ### Added
 
+- `forget(namespace?)` (and alias `forgetNamespace(namespace?)`) on `MemWal` and `MemWalManual` wraps `POST /api/forget` and returns `ForgetResult` (`deleted`, `namespace`, `owner`). It soft-deletes the owner's index rows for the namespace (without building a SEAL session) while leaving Walrus blobs in place. `MemWalMock` retains synchronous per-blob `forget(blobId): boolean` and adds `forgetNamespace(namespace?): ForgetResult`. (#1043)
 - `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results: []`, `degraded: true`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070)
 - `RecallOptions` accepts `onDropped?: "ignore" | "throw"` (defaulting to `"ignore"`). Passing `onDropped: "throw"` throws `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`, exposing `total`, `droppedCount`, and `namespace`) when every vector search match is dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
 

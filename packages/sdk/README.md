@@ -81,14 +81,14 @@ const result = await memwal.recall({ query: "display preference" });
 expect(result.results[0].text).toContain("dark mode");
 ```
 
-The mock supports remember/job polling, bulk remember, recall, analyze, embed, health, restore, `forget(blobId)`, and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
+The mock supports remember/job polling, bulk remember, recall, analyze, embed, health, restore, `forget(blobId)`, `forgetNamespace(namespace?)`, and `clear(namespace?)`. For deterministic behavior, `analyze` stores its full input as one fact instead of invoking an LLM extractor. Its simple relevance score is for application tests, not production search-quality evaluation.
 
 ## Exports
 
 | Entry | Description |
 |---|---|
-| `@mysten-incubation/memwal` | Default client (`MemWal`) and offline test client (`MemWalMock`). The production client delegates embedding, encryption, storage, retrieval, and restore to the relayer. |
-| `@mysten-incubation/memwal/manual` | Manual client flow (`MemWalManual`). You handle embedding calls and local SEAL operations. The relayer still handles upload relay, registration, search, and restore. |
+| `@mysten-incubation/memwal` | Default client (`MemWal`) and offline test client (`MemWalMock`). The production client delegates embedding, encryption, storage, retrieval, restore, and forget to the relayer. |
+| `@mysten-incubation/memwal/manual` | Manual client flow (`MemWalManual`). You handle embedding calls and local SEAL operations. The relayer still handles upload relay, registration, search, restore, and forget. |
 | `@mysten-incubation/memwal/ai` | Vercel AI SDK integration - wraps `MemWal` as middleware for use with `streamText`, `generateText`, etc. |
 
 ## How It Works
@@ -96,7 +96,7 @@ The mock supports remember/job polling, bulk remember, recall, analyze, embed, h
 1. **Scope** - Each memory operation runs inside an `owner + namespace` boundary
 2. **Store** - The relayer embeds, encrypts, uploads to Walrus, and stores vector metadata in PostgreSQL
 3. **Recall** - The relayer searches by owner plus namespace, resolves matching blobs, and returns plaintext results
-4. **Restore** - The relayer can incrementally rebuild missing indexed entries for one namespace
+4. **Restore / Forget** - The relayer can incrementally rebuild missing indexed entries (`restore`) or soft-delete indexed entries (`forget`) for one namespace
 
 ## License
 
