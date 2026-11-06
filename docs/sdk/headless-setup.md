@@ -90,7 +90,7 @@ Recall is scoped per **account plus namespace**. Never hardcode an account ID co
 
 ## When to use the manual client
 
-The default `MemWal` client lets the relayer handle embedding and Seal encryption on your behalf, which is the right choice for most runtimes. Use `MemWalManual` only when the runtime must hold its own keys and keep plaintext entirely client-side. With the manual client, the runtime embeds and Seal-encrypts locally, then the relayer uploads the resulting ciphertext to Walrus and stores the vector row, so the relayer never sees plaintext. It requires a few more fields, including a Sui key that authorizes Seal:
+The default `MemWal` client lets the relayer handle embedding and Seal encryption on your behalf, which is the right choice for most runtimes. Use `MemWalManual` only when the runtime must hold its own keys and keep plaintext entirely client-side. With the manual client, the runtime embeds and Seal-encrypts locally, then the relayer uploads the resulting ciphertext to Walrus and stores the vector row, so the relayer never sees plaintext. It requires a few more fields, including a Sui key that authorizes Seal decryption:
 
 ```ts
 import { MemWalManual } from "@mysten-incubation/memwal/manual";
@@ -100,8 +100,9 @@ const manual = MemWalManual.create({
   accountId: requireEnv("MEMWAL_ACCOUNT_ID"),
   packageId: requireEnv("MEMWAL_PACKAGE_ID"),
   serverUrl: "https://relayer.memory.walrus.xyz",
-  // The Sui key authorizes Seal encryption and decryption. The relayer still
-  // handles the Walrus upload, registration, search, and restore.
+  // Seal encryption needs no key. The Sui key signs the Seal session key that
+  // authorizes decryption during recall. The relayer still handles the Walrus
+  // upload, registration, search, and restore.
   suiPrivateKey: requireEnv("SUI_PRIVATE_KEY"),
   embeddingApiKey: requireEnv("OPENAI_API_KEY"),
   suiNetwork: "mainnet",
