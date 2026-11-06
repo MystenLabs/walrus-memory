@@ -894,7 +894,7 @@ mod mcp_rate_limit_tests {
     async fn signed_preauth_ipv4_mapped_ipv6_loopback_bypasses_ip_limiter() {
         let state = test_state(denying_redis().await).await;
         let app = Router::new()
-            .route("/test-preauth", axum::routing::get(|| async { StatusCode::OK }))
+            .route("/restricted", axum::routing::get(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
                 rate_limit::signed_preauth_rate_limit_middleware,
@@ -907,7 +907,7 @@ mod mcp_rate_limit_tests {
 
         for _ in 0..5 {
             let mut req = Request::builder()
-                .uri("/test-preauth")
+                .uri("/restricted")
                 .body(Body::empty())
                 .unwrap();
             req.extensions_mut()
@@ -924,7 +924,7 @@ mod mcp_rate_limit_tests {
         // An external IP on the same denying redis must be rejected with 429
         let external_peer: std::net::SocketAddr = "203.0.113.19:12345".parse().unwrap();
         let mut ext_req = Request::builder()
-            .uri("/test-preauth")
+            .uri("/restricted")
             .body(Body::empty())
             .unwrap();
         ext_req
@@ -939,7 +939,7 @@ mod mcp_rate_limit_tests {
     async fn signed_preauth_valid_console_bearer_bypasses_ip_limiter() {
         let state = test_state(denying_redis().await).await;
         let app = Router::new()
-            .route("/test-preauth", axum::routing::get(|| async { StatusCode::OK }))
+            .route("/restricted", axum::routing::get(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
                 rate_limit::signed_preauth_rate_limit_middleware,
@@ -959,7 +959,7 @@ mod mcp_rate_limit_tests {
 
         // Request with valid Bearer token bypasses signed preauth limiter
         let mut req = Request::builder()
-            .uri("/test-preauth")
+            .uri("/restricted")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -975,7 +975,7 @@ mod mcp_rate_limit_tests {
 
         // Invalid bearer token from same external IP is NOT exempted and gets 429
         let mut bad_req = Request::builder()
-            .uri("/test-preauth")
+            .uri("/restricted")
             .header(header::AUTHORIZATION, "Bearer invalid-garbage-token")
             .body(Body::empty())
             .unwrap();
