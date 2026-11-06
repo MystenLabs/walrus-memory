@@ -167,6 +167,7 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
     migration!("026_drop_owner_idempotency_key_index.sql"),
     migration!("027_owner_rate_limits.sql"),
+    migration!("028_memory_updated_xid.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -587,6 +588,7 @@ mod tests {
             migration_sql("018_memory_expiry_synced_at_index.sql"),
             migration_sql("019_memory_read_api_updated_at_set_not_null.sql"),
             migration_sql("020_read_api_followups.sql"),
+            migration_sql("028_memory_updated_xid.sql"),
         ] {
             execute_idempotent_migration(&pool, migration).await;
         }
@@ -3955,23 +3957,39 @@ impl VectorDb {
         end_epoch: i32,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            AppError::Internal(format!("Failed to begin set memory expiry tx: {}", e))
+        })?;
         sqlx::query(
-            "UPDATE vector_entries
+            "WITH target AS (
+                 SELECT id, owner
+                 FROM vector_entries
+                 WHERE id = $3
+             ),
+             _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext(owner))
+                 FROM target
+             )
+             UPDATE vector_entries
              SET end_epoch = $1,
                  expires_at = $2,
                  updated_at = CASE
-                     WHEN end_epoch IS DISTINCT FROM $1 OR expires_at IS NULL
+                     WHEN vector_entries.end_epoch IS DISTINCT FROM $1 OR vector_entries.expires_at IS NULL
                      THEN clock_timestamp()
-                     ELSE updated_at
+                     ELSE vector_entries.updated_at
                  END
-             WHERE id = $3",
+             FROM target, _sync_lock
+             WHERE vector_entries.id = target.id",
         )
         .bind(end_epoch)
         .bind(expires_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to set memory expiry: {}", e)))?;
+        tx.commit().await.map_err(|e| {
+            AppError::Internal(format!("Failed to commit set memory expiry tx: {}", e))
+        })?;
         Ok(())
     }
 

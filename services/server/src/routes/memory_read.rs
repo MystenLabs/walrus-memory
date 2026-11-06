@@ -680,9 +680,7 @@ async fn has_unavoidable_cursor_gap(
              FROM vector_entries
              WHERE owner = $1
                AND (updated_at, id) <= ($2, $3)
-               AND (expiry_synced_at IS NULL OR expiry_synced_at <= updated_at)
-               AND (metadata_synced_at IS NULL OR metadata_synced_at <= updated_at)
-               AND NOT pg_visible_in_snapshot(xmin::text::xid8, $4::pg_snapshot)
+               AND NOT pg_visible_in_snapshot(COALESCE(updated_xid, xmin::text::xid8), $4::pg_snapshot)
          ) OR (
              $5::timestamptz IS NOT NULL
              AND $6::text IS NOT NULL
@@ -1139,6 +1137,7 @@ mod tests {
                 include_str!("../../migrations/018_memory_expiry_synced_at_index.sql"),
                 include_str!("../../migrations/019_memory_read_api_updated_at_set_not_null.sql"),
                 include_str!("../../migrations/020_read_api_followups.sql"),
+                include_str!("../../migrations/028_memory_updated_xid.sql"),
             ] {
                 sqlx::raw_sql(migration).execute(&pool).await.unwrap();
             }
@@ -2882,6 +2881,150 @@ mod tests {
         );
         assert!(page2.memories.is_empty());
         assert!(page2.next_cursor.is_none());
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Regression test for PR #1349 review feedback from @ducnmm:
+    /// When an expiry update commits behind the cursor watermark and is subsequently
+    /// stamped by background housekeeping (mark_expiry_scheduled) before the next poll,
+    /// gap detection must not discard the row. The row retains its content write
+    /// transaction identity (updated_xid) so has_unavoidable_cursor_gap still signals
+    /// must_resync: true, rather than allowing expiry_synced_at > updated_at to mask
+    /// the late write.
+    #[tokio::test]
+    async fn incremental_sync_signals_must_resync_when_late_expiry_followed_by_mark_expiry_scheduled() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        // 1. Seed initial memories m1 at ts(100) and m2 at ts(200).
+        seed_entry(&pool, &owner, "m1", "default", 10, ts(100)).await;
+        seed_entry(&pool, &owner, "m2", "default", 10, ts(200)).await;
+
+        // 2. Poll 1 establishes watermark at (ts(200), m2) with a snapshot.
+        let poll1 = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(poll1.memories.len(), 2);
+        assert!(!poll1.must_resync);
+        let cursor1 = poll1.next_cursor.expect("cursor after initial poll");
+
+        // 3. Late transaction updates m1 expiry and bumps updated_at behind cursor (ts(150) < ts(200)).
+        let m1_id = format!("{owner}-m1");
+        sqlx::query(
+            "UPDATE vector_entries
+             SET end_epoch = 500,
+                 expires_at = clock_timestamp(),
+                 updated_at = $1
+             WHERE id = $2",
+        )
+        .bind(ts(150))
+        .bind(&m1_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 4. Background housekeeping runs mark_expiry_scheduled on m1 before the client polls again.
+        // This stamps expiry_synced_at = clock_timestamp() > updated_at and changes m1 tuple xmin.
+        sqlx::query("UPDATE vector_entries SET expiry_synced_at = clock_timestamp() WHERE id = $1")
+            .bind(&m1_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 5. Poll 2 using cursor1 must detect the late expiry commit behind the watermark
+        // even though mark_expiry_scheduled stamped the row afterwards.
+        let poll2 = query_owner_memories(&pool, &owner, Some(cursor1), 100)
+            .await
+            .unwrap();
+        assert!(
+            poll2.must_resync,
+            "housekeeping via mark_expiry_scheduled must not hide a late expiry change from gap detection"
+        );
+        assert!(poll2.memories.is_empty());
+        assert!(poll2.next_cursor.is_none());
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Pure housekeeping after snapshot (mark_expiry_scheduled stamping expiry_synced_at)
+    /// must not trigger false must_resync when content did not change after snapshot.
+    #[tokio::test]
+    async fn incremental_sync_does_not_resync_on_pure_housekeeping_after_snapshot() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        // 1. Seed initial memory m1 at ts(100) with resolved expiry.
+        seed_entry(&pool, &owner, "m1", "default", 10, ts(100)).await;
+        let m1_id = format!("{owner}-m1");
+        sqlx::query(
+            "UPDATE vector_entries
+             SET end_epoch = 500,
+                 expires_at = clock_timestamp(),
+                 updated_at = $1
+             WHERE id = $2",
+        )
+        .bind(ts(100))
+        .bind(&m1_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 2. Poll 1 establishes watermark after m1.
+        let poll1 = query_owner_memories(&pool, &owner, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(poll1.memories.len(), 1);
+        assert!(!poll1.must_resync);
+        let cursor1 = poll1.next_cursor.expect("cursor after initial poll");
+
+        // 3. Routine housekeeping runs mark_expiry_scheduled after poll1 snapshot.
+        sqlx::query("UPDATE vector_entries SET expiry_synced_at = clock_timestamp() WHERE id = $1")
+            .bind(&m1_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 4. Poll 2 using cursor1: no content changed since poll1, so no false resync.
+        let poll2 = query_owner_memories(&pool, &owner, Some(cursor1), 100)
+            .await
+            .unwrap();
+        assert!(
+            !poll2.must_resync,
+            "pure housekeeping after snapshot must not trigger false must_resync"
+        );
+
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Verify that query_owner_memories and set_memory_expiry participate in the
+    /// per-owner sync lock protocol: updating expiry inside a transaction acquires
+    /// pg_advisory_xact_lock_shared(20261029, hashtext(owner)) and bumps updated_at = clock_timestamp().
+    #[tokio::test]
+    async fn query_owner_memories_set_memory_expiry_participates_in_sync_lock_protocol() {
+        let pool = test_pool().await;
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+
+        seed_entry(&pool, &owner, "m1", "default", 10, ts(100)).await;
+        let m1_id = format!("{owner}-m1");
+
+        let db = crate::storage::db::VectorDb::from_pool(pool.clone());
+        let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
+
+        // Call production set_memory_expiry:
+        db.set_memory_expiry(&m1_id, 500, expires_at).await.unwrap();
+
+        let row: (i32, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT end_epoch, expires_at, updated_at FROM vector_entries WHERE id = $1",
+        )
+        .bind(&m1_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, 500);
+        assert!(row.1.is_some());
+        assert!(row.2 > ts(100), "updated_at must bump on real expiry change");
 
         cleanup(&pool, &owner).await;
     }
