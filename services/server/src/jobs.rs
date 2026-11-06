@@ -290,7 +290,6 @@ pub(crate) async fn update_remember_job_after_wallet_error(
                    SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
                )",
         )
-        )
         .bind(status)
         .bind(msg)
         .bind(jid)
@@ -6999,6 +6998,102 @@ the checkpoint it replied about",
         }
     }
 
+    #[tokio::test]
+    async fn upload_resume_returns_forgotten_after_delete_by_namespace_and_blocks_uploaded_transition(
+    ) {
+        let pool = test_pool().await;
+        let owner = format!("0xforget-owner-{}", uuid::Uuid::new_v4());
+        let namespace = "forgotten-ns";
+        let pending_id = format!("job-pending-{}", uuid::Uuid::new_v4());
+        let uploaded_id = format!("job-uploaded-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, error_msg)
+             VALUES ($1, $2, $3, 'failed', $4)",
+        )
+        .bind(&pending_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'blob-already-minted', '0xobj', $4)",
+        )
+        .bind(&uploaded_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending_disp = upload_resume_disposition(&pool, &pending_id).await;
+        let uploaded_disp = upload_resume_disposition(&pool, &uploaded_id).await;
+        assert_eq!(pending_disp, UploadResume::Forgotten);
+        assert_eq!(uploaded_disp, UploadResume::Forgotten);
+        assert!(!resume_needs_upload_slot(&pending_disp));
+
+        // Even if an in-flight upload finished minting right as forget ran,
+        // persist_uploaded_state must return false and must not flip a
+        // forgotten job back to 'uploaded'.
+        let transitioned =
+            persist_uploaded_state(&pool, &pending_id, "blob-late-mint", Some("0xlate"))
+                .await
+                .expect("persist_uploaded_state on forgotten job");
+        assert!(
+            !transitioned,
+            "persist_uploaded_state must report false when job was forgotten"
+        );
+
+        // An in-flight attempt erroring out after `delete_by_namespace` must
+        // not flip the forgotten row back to `running` or overwrite the
+        // cancellation error_msg (either retryable or terminal).
+        let retryable_err = WalletJobError::Transient("sidecar HTTP 502".into());
+        update_remember_job_after_wallet_error(
+            &pool,
+            Some(&pending_id),
+            &retryable_err,
+            "upload retryable error",
+            None,
+        )
+        .await;
+        let terminal_err = WalletJobError::Permanent("permanent upload failure".into());
+        update_remember_job_after_wallet_error(
+            &pool,
+            Some(&pending_id),
+            &terminal_err,
+            "upload terminal error",
+            None,
+        )
+        .await;
+
+        for jid in [&pending_id, &uploaded_id] {
+            let (status, error_msg): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                    .bind(jid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status, "failed",
+                "forgotten job {jid} must remain failed after wallet error writers"
+            );
+            assert_eq!(
+                error_msg.as_deref(),
+                Some(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR),
+                "forgotten job {jid} must preserve FORGOTTEN_IN_FLIGHT_JOB_ERROR"
+            );
+            assert_eq!(
+                upload_resume_disposition(&pool, jid).await,
+                UploadResume::Forgotten,
+                "forgotten job {jid} must still resolve to UploadResume::Forgotten"
+            );
+        }
+
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
             .bind(&owner)
             .execute(&pool)
@@ -7230,9 +7325,6 @@ the checkpoint it replied about",
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
             .bind(&job_id)
-            .execute(&pool)
-            .await;
-    }
             .execute(&pool)
             .await;
     }

@@ -429,7 +429,7 @@ where
 
 #[derive(Default)]
 struct FallbackOriginRegistry {
-    instances: std::collections::HashMap<u64, usize>,
+    instances: std::collections::HashMap<u64, std::sync::Weak<std::sync::Mutex<FallbackInner>>>,
     request_origins: std::collections::HashMap<(String, String), u64>,
 }
 
@@ -455,35 +455,160 @@ impl Drop for FallbackOriginGuard {
     }
 }
 
-pub struct InMemoryFallback {
+#[derive(Default)]
+pub struct FallbackInner {
     pub buckets: std::collections::HashMap<String, TokenBucket>,
+}
+
+impl FallbackInner {
+    pub fn can_consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.can_consume_at(weight, capacity, refill_rate, now)
+    }
+
+    pub fn consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        if let Some(bucket) = self.buckets.get_mut(key) {
+            bucket.consume_at(weight, capacity, refill_rate, now);
+        }
+    }
+
+    pub fn consume_tracked_at(
+        &mut self,
+        key: &str,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.consume_tracked_at(request_id, weight, capacity, refill_rate, now);
+    }
+
+    pub fn refund_tracked_local_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        let refill_rate = capacity / refill_duration_secs;
+        if let Some(bucket) = self.buckets.get_mut(key) {
+            bucket.refund_tracked_at(
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_rate,
+                now,
+            )
+        } else {
+            0.0
+        }
+    }
+
+    pub fn refund_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.refund_at(weight, capacity, refill_rate, now);
+    }
+
+    pub fn cleanup_stale(&mut self, now: std::time::Instant) {
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
+    }
+}
+
+#[derive(Clone)]
+pub struct FallbackBucketsRef {
+    inner: std::sync::Arc<std::sync::Mutex<FallbackInner>>,
+}
+
+impl FallbackBucketsRef {
+    pub fn get(&self, key: &str) -> Option<TokenBucket> {
+        self.inner.lock().unwrap().buckets.get(key).cloned()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.lock().unwrap().buckets.contains_key(key)
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().buckets.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().buckets.is_empty()
+    }
+}
+
+pub struct InMemoryFallback {
+    inner: std::sync::Arc<std::sync::Mutex<FallbackInner>>,
+    pub buckets: FallbackBucketsRef,
     pub cleanup_counter: usize,
     origin_guard: FallbackOriginGuard,
 }
 
 impl Default for InMemoryFallback {
     fn default() -> Self {
+        let instance_id =
+            NEXT_FALLBACK_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(FallbackInner::default()));
+        let buckets = FallbackBucketsRef {
+            inner: std::sync::Arc::clone(&inner),
+        };
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            reg.instances
+                .insert(instance_id, std::sync::Arc::downgrade(&inner));
+        }
         Self {
-            buckets: std::collections::HashMap::new(),
+            inner,
+            buckets,
             cleanup_counter: 0,
-            origin_guard: FallbackOriginGuard(
-                NEXT_FALLBACK_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            ),
+            origin_guard: FallbackOriginGuard(instance_id),
         }
     }
 }
 
 impl InMemoryFallback {
-    fn refresh_registry_ptr(&mut self) {
-        let instance_id = self.origin_guard.0;
-        if let Ok(mut reg) = fallback_origin_registry().lock() {
-            if reg.instances.contains_key(&instance_id) {
-                reg.instances
-                    .insert(instance_id, self as *mut InMemoryFallback as usize);
-            }
-        }
-    }
-
     pub fn can_consume(
         &mut self,
         key: &str,
@@ -508,13 +633,10 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) -> bool {
-        self.refresh_registry_ptr();
-        let refill_rate = capacity / refill_duration_secs;
-        let bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new_at(capacity, now));
-        bucket.can_consume_at(weight, capacity, refill_rate, now)
+        self.inner
+            .lock()
+            .unwrap()
+            .can_consume_at(key, weight, capacity, refill_duration_secs, now)
     }
 
     pub fn consume(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
@@ -535,17 +657,15 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) {
-        self.refresh_registry_ptr();
-        let refill_rate = capacity / refill_duration_secs;
-        if let Some(bucket) = self.buckets.get_mut(key) {
-            bucket.consume_at(weight, capacity, refill_rate, now);
-        }
+        self.inner
+            .lock()
+            .unwrap()
+            .consume_at(key, weight, capacity, refill_duration_secs, now);
 
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 1000 {
             self.cleanup_counter = 0;
-            self.buckets
-                .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
+            self.inner.lock().unwrap().cleanup_stale(now);
         }
     }
 
@@ -576,19 +696,19 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) {
-        let refill_rate = capacity / refill_duration_secs;
-        let bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new_at(capacity, now));
-        bucket.consume_tracked_at(request_id, weight, capacity, refill_rate, now);
+        self.inner.lock().unwrap().consume_tracked_at(
+            key,
+            request_id,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        );
 
         if let Some(req_id) = request_id {
             if weight > 0 {
                 let instance_id = self.origin_guard.0;
                 if let Ok(mut reg) = fallback_origin_registry().lock() {
-                    reg.instances
-                        .insert(instance_id, self as *mut InMemoryFallback as usize);
                     if reg.request_origins.len() >= 10_000 {
                         reg.request_origins.clear();
                     }
@@ -601,8 +721,7 @@ impl InMemoryFallback {
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 1000 {
             self.cleanup_counter = 0;
-            self.buckets
-                .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
+            self.inner.lock().unwrap().cleanup_stale(now);
         }
     }
 
@@ -636,19 +755,15 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) -> f64 {
-        let refill_rate = capacity / refill_duration_secs;
-        if let Some(bucket) = self.buckets.get_mut(key) {
-            bucket.refund_tracked_at(
-                request_id,
-                member_offset,
-                weight,
-                capacity,
-                refill_rate,
-                now,
-            )
-        } else {
-            0.0
-        }
+        self.inner.lock().unwrap().refund_tracked_local_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
     }
 
     pub fn refund_tracked_at(
@@ -661,13 +776,15 @@ impl InMemoryFallback {
         refill_duration_secs: f64,
         now: std::time::Instant,
     ) -> f64 {
-        self.refresh_registry_ptr();
-        let has_local_unit = self.buckets.get(key).is_some_and(|bucket| {
-            bucket
-                .outstanding_units
-                .iter()
-                .any(|u| u.request_id == request_id)
-        });
+        let has_local_unit = {
+            let inner = self.inner.lock().unwrap();
+            inner.buckets.get(key).is_some_and(|bucket| {
+                bucket
+                    .outstanding_units
+                    .iter()
+                    .any(|u| u.request_id == request_id)
+            })
+        };
         if has_local_unit {
             return self.refund_tracked_local_at(
                 key,
@@ -681,33 +798,36 @@ impl InMemoryFallback {
         }
 
         let instance_id = self.origin_guard.0;
-        if let Ok(reg) = fallback_origin_registry().lock() {
-            if let Some(&origin_id) = reg
-                .request_origins
-                .get(&(key.to_string(), request_id.to_string()))
-            {
-                if origin_id != instance_id {
-                    if let Some(&origin_ptr) = reg.instances.get(&origin_id) {
-                        if origin_ptr != 0 {
-                            // SAFETY: `origin_ptr` is registered by a live `InMemoryFallback`
-                            // instance, updated whenever that instance is accessed, and removed
-                            // in `Drop` while holding `FALLBACK_ORIGIN_REGISTRY`. Because
-                            // `origin_id != self.instance_id` and `reg` is held for the duration
-                            // of this call, `origin` does not alias `self`.
-                            let origin = unsafe { &mut *(origin_ptr as *mut InMemoryFallback) };
-                            return origin.refund_tracked_local_at(
-                                key,
-                                request_id,
-                                member_offset,
-                                weight,
-                                capacity,
-                                refill_duration_secs,
-                                now,
-                            );
-                        }
+        let origin_target = {
+            if let Ok(reg) = fallback_origin_registry().lock() {
+                if let Some(&origin_id) = reg
+                    .request_origins
+                    .get(&(key.to_string(), request_id.to_string()))
+                {
+                    if origin_id != instance_id {
+                        reg.instances.get(&origin_id).and_then(|weak| weak.upgrade())
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+
+        if let Some(origin_arc) = origin_target {
+            let mut origin = origin_arc.lock().unwrap();
+            return origin.refund_tracked_local_at(
+                key,
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_duration_secs,
+                now,
+            );
         }
 
         self.refund_tracked_local_at(
@@ -721,16 +841,150 @@ impl InMemoryFallback {
         )
     }
 
+    pub fn settle_fallback_job_quota_charge(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn settle_fallback_job_quota_charge_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.refund_tracked_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
+    pub fn refund_fallback_job_quota_charge(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn refund_fallback_job_quota_charge_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
     #[allow(dead_code)]
     pub fn refund(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
-        self.refresh_registry_ptr();
-        let refill_rate = capacity / refill_duration_secs;
-        let bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(capacity));
-        bucket.refund(weight, capacity, refill_rate);
+        self.refund_at(
+            key,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        );
     }
+
+    pub fn refund_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .refund_at(key, weight, capacity, refill_duration_secs, now);
+    }
+}
+
+pub fn settle_fallback_job_quota_charge(
+    fallback: &mut InMemoryFallback,
+    key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+    capacity: f64,
+    refill_duration_secs: f64,
+) -> f64 {
+    fallback.settle_fallback_job_quota_charge(
+        key,
+        request_id,
+        member_offset,
+        weight,
+        capacity,
+        refill_duration_secs,
+    )
+}
+
+pub fn refund_fallback_job_quota_charge(
+    fallback: &mut InMemoryFallback,
+    key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+    capacity: f64,
+    refill_duration_secs: f64,
+) -> f64 {
+    fallback.refund_fallback_job_quota_charge(
+        key,
+        request_id,
+        member_offset,
+        weight,
+        capacity,
+        refill_duration_secs,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -740,6 +994,7 @@ pub struct OutstandingFallbackUnit {
     pub unreplenished: f64,
 }
 
+#[derive(Clone, Debug)]
 pub struct TokenBucket {
     pub tokens: f64,
     pub capacity: f64,
@@ -939,16 +1194,23 @@ impl TokenBucket {
         now: std::time::Instant,
     ) -> f64 {
         let effective_capacity = if self.capacity > 0.0 {
-            self.capacity
+            self.capacity.max(capacity)
         } else {
             capacity
         };
         let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
-            self.refill_rate_per_sec
+            if effective_capacity > self.capacity {
+                effective_capacity / 60.0
+            } else {
+                self.refill_rate_per_sec
+            }
         } else {
             refill_rate_per_sec
         };
-        self.advance_to(now, effective_capacity, effective_refill_rate);
+        if effective_capacity > self.capacity {
+            self.apply_policy_capacity(effective_capacity, effective_refill_rate);
+        }
+        self.advance_to(now, self.capacity, self.refill_rate_per_sec);
         if weight <= 0 || member_offset < 0 {
             return 0.0;
         }
@@ -965,8 +1227,8 @@ impl TokenBucket {
                 true
             }
         });
-        if refundable > 0.0 && self.tokens < effective_capacity {
-            self.tokens = (self.tokens + refundable).min(effective_capacity);
+        if refundable > 0.0 && self.tokens < self.capacity {
+            self.tokens = (self.tokens + refundable).min(self.capacity);
         }
         refundable
     }
@@ -990,18 +1252,25 @@ impl TokenBucket {
         now: std::time::Instant,
     ) {
         let effective_capacity = if self.capacity > 0.0 {
-            self.capacity
+            self.capacity.max(capacity)
         } else {
             capacity
         };
         let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
-            self.refill_rate_per_sec
+            if effective_capacity > self.capacity {
+                effective_capacity / 60.0
+            } else {
+                self.refill_rate_per_sec
+            }
         } else {
             refill_rate_per_sec
         };
-        self.advance_to(now, effective_capacity, effective_refill_rate);
-        if self.tokens < effective_capacity {
-            self.tokens = (self.tokens + weight.max(0.0)).min(effective_capacity);
+        if effective_capacity > self.capacity {
+            self.apply_policy_capacity(effective_capacity, effective_refill_rate);
+        }
+        self.advance_to(now, self.capacity, self.refill_rate_per_sec);
+        if self.tokens < self.capacity {
+            self.tokens = (self.tokens + weight.max(0.0)).min(self.capacity);
         }
     }
 }
@@ -3660,6 +3929,125 @@ mod tests {
             (instance_a.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4,
             "Instance A must be restored to 30.0/30.0"
         );
+    }
+
+    #[test]
+    fn test_settle_fallback_job_quota_charge_older_charge_does_not_clobber_newer_window() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_settle_older";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Admit older charge (req-1) consuming 5 units at t0 -> 25.0/30.0
+        fallback.consume_tracked_at(key, Some("req-1"), 5, capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // 2. Window elapses to t0 + 65s: req-1 has replenished, bucket refills to 30.0
+        let t_new = t0 + std::time::Duration::from_secs(65);
+
+        // 3. Newer active request (req-2) consumes 10 units at t_new -> 20.0/30.0
+        fallback.consume_tracked_at(key, Some("req-2"), 10, capacity, refill_duration_secs, t_new);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 20.0).abs() < 1e-4);
+
+        // 4. Settle older charge (req-1) at t_new + 5s.
+        // It must NOT clobber the newer active bucket or grant extra tokens beyond 20.0.
+        let t_settle = t_new + std::time::Duration::from_secs(5);
+        let settled_old = fallback.settle_fallback_job_quota_charge_at(
+            key,
+            "req-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t_settle,
+        );
+        assert_eq!(settled_old, 0.0, "replenished older charge must yield 0.0 refund");
+        // Only 5 seconds elapsed since t_new, adding 5 * 0.5 = 2.5 tokens: tokens must be 22.5, NOT overwritten by req-1's 5.0
+        let tokens_after_old_settle = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_after_old_settle - 22.5).abs() < 1e-4);
+
+        // 5. Duplicate settlement of req-1 must also be a safe no-op
+        let duplicate_settle = settle_fallback_job_quota_charge(
+            &mut fallback,
+            key,
+            "req-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+        );
+        assert_eq!(duplicate_settle, 0.0, "duplicate settlement must yield 0.0");
+
+        // 6. Newer request (req-2) was not clobbered: settling req-2 properly refunds remaining unreplenished units
+        let refunded_new = refund_fallback_job_quota_charge(
+            &mut fallback,
+            key,
+            "req-2",
+            0,
+            10,
+            capacity,
+            refill_duration_secs,
+        );
+        assert!(refunded_new > 0.0, "req-2 unreplenished units must be refundable");
+        assert!((fallback.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_settle_fallback_job_quota_charge_preserves_and_adjusts_active_capacity() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_adjust_capacity";
+        let low_capacity = 10.0;
+        let high_capacity = 40.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Consume 5 units under temporary low capacity (10.0) -> 5.0/10.0
+        fallback.consume_tracked_at(key, Some("req-low"), 5, low_capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 5.0).abs() < 1e-4);
+
+        // 2. Settle the charge after policy expands to 40.0 without clamping
+        let refunded = fallback.settle_fallback_job_quota_charge_at(
+            key,
+            "req-low",
+            0,
+            5,
+            high_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        // Capacity adjusted to 40.0, so tokens restored to 40.0
+        assert!((fallback.buckets.get(key).unwrap().tokens - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_safe_fallback_registry_handles_dropped_origin_gracefully() {
+        let mut instance_b = InMemoryFallback::default();
+        let key = "rate:dk:pk_dropped_origin";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        {
+            let mut instance_a = InMemoryFallback::default();
+            instance_a.consume_tracked_at(key, Some("req-drop-1"), 5, capacity, refill_duration_secs, t0);
+            assert!((instance_a.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+            // instance_a is dropped at end of block
+        }
+
+        // Instance B attempts to settle request from dropped Instance A:
+        // Must safely return 0.0 with zero unsafe dereferences or panics
+        let refunded = instance_b.refund_tracked_at(
+            key,
+            "req-drop-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 0.0);
     }
 
     #[test]
