@@ -380,4 +380,59 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     2,
     "opt-out phrases after 'but' like 'but do not save this in memory' must suppress assistant echoes from reaching analyze()",
   );
+
+  // 9. Hook-level regression: secret-bearing user turns also suppress paraphrased assistant echoes until the next normal user turn.
+  const secretHistory = [
+    {
+      id: "u12",
+      role: "user",
+      content: "Staging test account uses password: hunter2 for integration runs",
+    },
+    {
+      id: "a12",
+      role: "assistant",
+      content: "For integration testing, your staging database password is hunter2.",
+    },
+  ];
+  await handler(
+    {
+      success: true,
+      messages: [...secretHistory],
+    },
+    { sessionKey: "agent:main:test-secret-echo-suppression" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    2,
+    "secret-bearing user turns must suppress paraphrased assistant echoes from reaching analyze()",
+  );
+
+  secretHistory.push(
+    {
+      id: "u13",
+      role: "user",
+      content: "We run integration suites in GitHub Actions against a disposable PostgreSQL container.",
+    },
+    {
+      id: "a13",
+      role: "assistant",
+      content: "Noted, integration suites run against disposable PostgreSQL containers in CI.",
+    },
+  );
+  await handler(
+    {
+      success: true,
+      messages: [...secretHistory],
+    },
+    { sessionKey: "agent:main:test-secret-echo-suppression" },
+  );
+  assert.equal(analyzedPayloads.length, 3);
+  assert.ok(
+    !analyzedPayloads[2].includes("hunter2"),
+    "earlier secret-bearing turn and its assistant echo must remain excluded on subsequent turns",
+  );
+  assert.ok(
+    analyzedPayloads[2].includes("disposable PostgreSQL container"),
+    "next normal user turn must still be captured",
+  );
 });

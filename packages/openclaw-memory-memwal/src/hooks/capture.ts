@@ -8,7 +8,7 @@
 
 import type { MemWal } from "@mysten-incubation/memwal";
 import { resolveAgent } from "../config.js";
-import { hasCaptureOptOut, shouldCapture } from "../capture.js";
+import { hasCaptureOptOut, looksLikeSecret, shouldCapture } from "../capture.js";
 import {
   extractMessages,
   parseMessageTimestamp,
@@ -79,7 +79,8 @@ function extractNonOptedOutMessages(messages: any[], maxCount: number): Extracte
     const msg = messages[i];
     if (!msg || typeof msg !== "object") continue;
     if (msg.role === "user") {
-      optOutActive = hasCaptureOptOut(rawMessageText(msg));
+      const text = rawMessageText(msg);
+      optOutActive = hasCaptureOptOut(text) || looksLikeSecret(text);
     }
     if (i >= windowStart && !optOutActive) {
       allowed.push(msg);
