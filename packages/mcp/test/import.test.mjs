@@ -767,3 +767,98 @@ test("saved credentials relayerUrl is preserved when CLI has no override, and ov
     assert.equal(overrideRequests[0].url, "/api/remember/bulk");
 });
 
+test("screens heading-labelled private keys across Markdown line breaks and conversational body opt-outs across child headings before built-in signed client upload", async (t) => {
+    const projectDir = mkdtempSync(join(tmpdir(), "memwal-proj-multiline-test-"));
+
+    const capturedPayloads = [];
+    const server = createServer((req, res) => {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+            if (req.url === "/api/remember/bulk") {
+                capturedPayloads.push(JSON.parse(body));
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ job_ids: ["job-safe-1"] }));
+            } else if (req.url === "/api/remember/bulk/status") {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ results: [{ job_id: "job-safe-1", status: "done" }] }));
+            } else {
+                res.writeHead(404);
+                res.end();
+            }
+        });
+    });
+
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const port = server.address().port;
+    const relayerUrl = `http://127.0.0.1:${port}`;
+
+    t.after(() => {
+        server.close();
+        rmSync(projectDir, { recursive: true, force: true });
+    });
+
+    const syntheticHexKey = "a".repeat(64);
+    const syntheticSeed = "abandon ability able about above absent absorb abstract absurd abuse access accident";
+
+    writeFileSync(
+        join(projectDir, "MEMORY.md"),
+        [
+            "# Delegate private key",
+            syntheticHexKey,
+            "",
+            "# Seed phrase",
+            syntheticSeed,
+            "",
+            "# Personal notes",
+            "Do not store this.",
+            "",
+            "## Medical detail",
+            "Sensitive medical history paragraph that must remain excluded under parent opt-out scope.",
+            "",
+            "### Prescription schedule",
+            "Nested level three detail that must also remain excluded under parent opt-out scope.",
+            "",
+            "# Off the record section",
+            "This note is off the record for the team.",
+            "",
+            "## Internal compensation notes",
+            "Private compensation details that must remain excluded under off-the-record parent scope.",
+            "",
+            "# Build conventions",
+            "Pin deterministic workspace builds and verify all unit tests before opening a pull request.",
+        ].join("\n"),
+    );
+
+    const directScreen = screenContentForSafety(`# Delegate private key\n${syntheticHexKey}`);
+    assert.equal(directScreen.safe, false);
+    assert.equal(directScreen.reason, "secret_detected");
+
+    const result = await importProjectMemories({
+        targetDir: projectDir,
+        yes: true,
+        namespace: "ns-multiline-guard",
+        relayerUrl,
+        key: "11".repeat(32),
+        accountId: "0x" + "22".repeat(32),
+        print: () => {},
+    });
+
+    assert.equal(result.mode, "uploaded");
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].section, "Build conventions");
+    assert.equal(result.completed, 1);
+
+    assert.equal(capturedPayloads.length, 1);
+    const uploadedItems = capturedPayloads[0].items;
+    assert.equal(uploadedItems.length, 1);
+    const outgoingText = JSON.stringify(uploadedItems);
+    assert.ok(!outgoingText.includes(syntheticHexKey), "Heading-labelled hex key must never reach outgoing upload");
+    assert.ok(!outgoingText.includes("abandon ability"), "Heading-labelled seed phrase must never reach outgoing upload");
+    assert.ok(!outgoingText.includes("Medical detail"), "Child section under Do not store this must never reach outgoing upload");
+    assert.ok(!outgoingText.includes("Prescription schedule"), "Grandchild section under Do not store this must never reach outgoing upload");
+    assert.ok(!outgoingText.includes("Internal compensation"), "Child section under off the record must never reach outgoing upload");
+    assert.ok(outgoingText.includes("Build conventions"), "Sibling safe section after opted-out parent must still upload");
+});
+
+

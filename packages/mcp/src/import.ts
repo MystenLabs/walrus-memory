@@ -154,19 +154,86 @@ const SECRET_PATTERNS: RegExp[] = [
     /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
     // Plainly labelled private keys and delegate keys
     /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\s*[:=]\s*\S+/i,
-    /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{32,}\b/i,
-    /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
+    /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.]{0,48}\b(?:0x)?[0-9a-fA-F]{32,}\b/i,
+    /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9]{0,8}(?:is|was)?[^A-Za-z0-9]{0,8}(?:my|the|our)?[^A-Za-z0-9]{0,8}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
     /\bsui[\s._-]*keystore\b/i,
     // Credential assignments
     /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
     // Auth, bearer, and cookie headers
     /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
     /\b(?:set-)?cookie\s*[:=]\s*[^\s;]+(?:\s*;\s*[^\s;]+)*/i,
-    // Seed phrases
-    /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4}(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}\b/i,
+    // Seed phrases (including across line breaks after heading or label)
+    /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9]{0,12}(?:is|are)?[^A-Za-z0-9]{0,12}(?:[a-z]{3,8}[\s]+){11,23}[a-z]{3,8}\b/i,
     // .env style secret assignments
     /(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*\S+/i,
 ];
+
+const HEX_RUN = /\b(?:0x)?[0-9a-fA-F]{32,}\b/g;
+const OPAQUE_RUN = /[A-Za-z0-9+/_=-]{20,}/g;
+const HIGH_ENTROPY_CANDIDATE = /\b[A-Za-z0-9+/_-]{64,}={0,2}/g;
+const HEX_LABEL_WINDOW = 64;
+
+const HEX_CREDENTIAL_LABEL =
+    /private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*key|delegate[\s_-]*private|signing[\s_-]*key|priv[\s_-]*key|encryption[\s_-]*keys?(?![A-Za-z0-9])|enc[\s_-]*keys?(?![A-Za-z0-9])|api[\s_-]*key|access[\s_-]*key|auth[\s_-]*key|db[\s_-]*pass(?:word)?s?(?![A-Za-z0-9])|secret|seed|mnemonic|passphrase/i;
+
+const HEX_LABEL_AFTER =
+    /^[^A-Za-z0-9]{0,8}(?:is|was)?[^A-Za-z0-9]{0,8}(?:my|the|our|his|her|their)?[^A-Za-z0-9]{0,8}(?:delegate[\s_-]*)?(?:private[\s_-]*key|secret[\s_-]*key|signing[\s_-]*key|priv[\s_-]*key|encryption[\s_-]*keys?(?![A-Za-z0-9])|enc[\s_-]*keys?(?![A-Za-z0-9])|seed|mnemonic|passphrase|api[\s_-]*key|db[\s_-]*pass(?:word)?s?(?![A-Za-z0-9]))/i;
+
+function hasAdjacentCredentialLabel(
+    text: string,
+    start: number,
+    end: number,
+    window: number = HEX_LABEL_WINDOW,
+): boolean {
+    const before = text.slice(Math.max(0, start - window), start);
+    if (HEX_CREDENTIAL_LABEL.test(before)) return true;
+    const after = text.slice(end, end + window);
+    return HEX_LABEL_AFTER.test(after);
+}
+
+function looksLikeOpaqueToken(token: string): boolean {
+    if (token.length < 20) return false;
+    const hasLower = /[a-z]/.test(token);
+    const hasUpper = /[A-Z]/.test(token);
+    const hasDigit = /[0-9]/.test(token);
+    const hasSymbol = /[+/=]/.test(token);
+    return (hasLower && hasUpper) || hasDigit || hasSymbol;
+}
+
+function looksLikeSecretBlob(token: string): boolean {
+    const body = token.replace(/=+$/, "");
+    if (body.length < 64) return false;
+    if (!/[a-z]/.test(body)) return false;
+    if (!/[A-Z]/.test(body)) return false;
+    if (!/[0-9]/.test(body)) return false;
+    if (/^[0-9a-fA-F]+$/.test(body)) return false;
+    return true;
+}
+
+function hasLabelledOrHighEntropySecret(text: string): boolean {
+    for (const match of text.matchAll(HEX_RUN)) {
+        const start = match.index ?? 0;
+        const end = start + match[0].length;
+        if (hasAdjacentCredentialLabel(text, start, end)) {
+            return true;
+        }
+    }
+    for (const match of text.matchAll(OPAQUE_RUN)) {
+        const token = match[0];
+        if (!looksLikeOpaqueToken(token)) continue;
+        const start = match.index ?? 0;
+        const end = start + token.length;
+        if (hasAdjacentCredentialLabel(text, start, end)) {
+            return true;
+        }
+    }
+    for (const match of text.matchAll(HIGH_ENTROPY_CANDIDATE)) {
+        if (looksLikeSecretBlob(match[0])) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /** Screen text for secrets or opt-out markers. */
 export function screenContentForSafety(text: string): {
@@ -182,6 +249,9 @@ export function screenContentForSafety(text: string): {
         if (pattern.test(text)) {
             return { safe: false, reason: "secret_detected" };
         }
+    }
+    if (hasLabelledOrHighEntropySecret(text)) {
+        return { safe: false, reason: "secret_detected" };
     }
     return { safe: true };
 }
@@ -330,9 +400,9 @@ export function parseSections(content: string, relPath: string): RawSection[] {
         const headingMatch = line.match(headingRegex);
         if (headingMatch) {
             // Before flushing previous section on a new heading:
-            // if previous section's accumulated lines contain [no-memory] or MEMWAL_IGNORE,
+            // if previous section's accumulated lines contain any opt-out marker,
             // mark the top entry of headingStack (if any) as optedOut = true!
-            if (sectionHasBodyOptOut) {
+            if (sectionHasBodyOptOut || hasOptOutMarker(currentLines.join("\n"))) {
                 if (headingStack.length > 0) {
                     headingStack[headingStack.length - 1].optedOut = true;
                 }
@@ -420,7 +490,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
             if (privateDepth > 0) {
                 sectionInPrivate = true;
             }
-            if (/\[no-memory\]/i.test(line) || /\bMEMWAL_IGNORE\b/.test(line)) {
+            if (hasOptOutMarker(line)) {
                 sectionHasBodyOptOut = true;
             }
             currentLines.push(line);
@@ -428,7 +498,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
     }
 
     // EOF: check body opt-out on final section
-    if (sectionHasBodyOptOut) {
+    if (sectionHasBodyOptOut || hasOptOutMarker(currentLines.join("\n"))) {
         if (headingStack.length > 0) {
             headingStack[headingStack.length - 1].optedOut = true;
         }
@@ -537,6 +607,17 @@ export function extractCandidateChunks(
             continue;
         }
 
+        const combinedSectionSafety = screenContentForSafety(`${section.heading}\n${section.content}`);
+        if (!combinedSectionSafety.safe) {
+            skipped.push({
+                file: relPath,
+                section: section.heading,
+                reason: combinedSectionSafety.reason!,
+                snippet: makeSnippet(section.content),
+            });
+            continue;
+        }
+
         const subChunks = splitIntoParagraphs(section.content, 1500);
         for (const sub of subChunks) {
             const trimmed = sub.trim();
@@ -549,6 +630,17 @@ export function extractCandidateChunks(
                     file: relPath,
                     section: section.heading,
                     reason: subSafety.reason!,
+                    snippet: makeSnippet(trimmed),
+                });
+                continue;
+            }
+
+            const combinedSubSafety = screenContentForSafety(`${section.heading}\n${trimmed}`);
+            if (!combinedSubSafety.safe) {
+                skipped.push({
+                    file: relPath,
+                    section: section.heading,
+                    reason: combinedSubSafety.reason!,
                     snippet: makeSnippet(trimmed),
                 });
                 continue;
