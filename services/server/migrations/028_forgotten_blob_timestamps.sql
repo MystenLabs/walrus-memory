@@ -3,6 +3,12 @@
 -- duplicate blob rows, and preserved across memory_tombstones sweeping so
 -- subsequent /api/restore calls restore the exact original vector_entries.created_at
 -- instead of substituting job enqueue time or NOW().
+--
+-- Retention and Deletion Lifecycle:
+-- 1. Retention period: Records persist indefinitely across multiple forget/restore
+--    cycles and tombstone cleanups, ensuring temporal recency ordering remains true.
+-- 2. Account wipe / purge: Completely deleted upon account cleanup or unblock requests
+--    via DELETE FROM forgotten_blob_timestamps WHERE owner = $1.
 CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
     owner TEXT NOT NULL,
     namespace TEXT NOT NULL,
@@ -10,3 +16,6 @@ CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
     created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (owner, namespace, blob_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_forgotten_blob_timestamps_owner
+    ON forgotten_blob_timestamps(owner);
