@@ -844,6 +844,32 @@ test("redactSecrets redacts labelled private keys, delegate keys, and mnemonic s
 
     const benign = "This project uses Sui TypeScript SDK version 1.2.0 with PostgreSQL storage.";
     assert.equal(redactSecrets(benign), benign);
+
+    // Markdown line breaks and heading labels
+    const multilineHeading = "### Private Key\n0x" + rawKey;
+    const redactedHeading = redactSecrets(multilineHeading);
+    assert.doesNotMatch(redactedHeading, new RegExp(rawKey));
+    assert.match(redactedHeading, /\[redacted:private-key\]/);
+
+    const multilineBold = "**Private Key:**\n0x" + rawKey;
+    const redactedBold = redactSecrets(multilineBold);
+    assert.doesNotMatch(redactedBold, new RegExp(rawKey));
+    assert.match(redactedBold, /\[redacted:private-key\]/);
+
+    const multilineDelegate = "# Delegate private key\n" + rawKey;
+    const redactedDelegate = redactSecrets(multilineDelegate);
+    assert.doesNotMatch(redactedDelegate, new RegExp(rawKey));
+    assert.match(redactedDelegate, /\[redacted:private-key\]/);
+
+    const multilineLabelAfter = "0x" + rawKey + "\nis my private key";
+    const redactedAfter = redactSecrets(multilineLabelAfter);
+    assert.doesNotMatch(redactedAfter, new RegExp(rawKey));
+    assert.match(redactedAfter, /\[redacted:private-key\]/);
+
+    const multilineSeed = "# Seed phrase\n" + mnemonic;
+    const redactedSeed = redactSecrets(multilineSeed);
+    assert.doesNotMatch(redactedSeed, new RegExp(mnemonic));
+    assert.match(redactedSeed, /\[redacted:seed-phrase\]/);
 });
 
 test("runPreCompactSave screens Cookie and Set-Cookie headers from outgoing /api/analyze payload", async () => {
@@ -908,6 +934,72 @@ test("runPreCompactSave screens Cookie and Set-Cookie headers from outgoing /api
         assert.equal(resOnly.status, 0);
         await waitForRequests(mock, 1, 100);
         assert.equal(mock.requests.length, 1, "Standalone cookie-only transcript must not trigger a new /api/analyze request");
+    } finally {
+        await mock.close();
+        rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test("runPreCompactSave screens labelled private keys across Markdown line breaks from outgoing /api/analyze payload", async () => {
+    const tempDir = freshTempDir();
+    const mock = await startWorkerMockRelayer({ statusCode: 200 });
+
+    try {
+        writeSettings(tempDir, { autoSave: true });
+        await writeTestCreds(tempDir, { relayerUrl: mock.url });
+
+        const syntheticPrivKey = "44".repeat(32);
+        const transcriptPath = join(tempDir, "markdown-key-transcript.jsonl");
+        const lines = [
+            JSON.stringify({
+                role: "user",
+                content: "We use PostgreSQL with pgvector for durable indexing. Pin workspace packages to version 1.2.0.\n\n### Private Key\n0x" + syntheticPrivKey + "\n\nPlease make sure database migrations are run cleanly.",
+            }),
+        ];
+        writeFileSync(transcriptPath, lines.join("\n") + "\n");
+
+        const res = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-markdown-key",
+                transcript_path: transcriptPath,
+            }
+        );
+
+        assert.equal(res.status, 0, res.stderr);
+        await waitForRequests(mock, 1);
+        assert.equal(mock.requests.length, 1);
+        const body = JSON.parse(mock.requests[0].body);
+        assert.doesNotMatch(body.text, new RegExp(syntheticPrivKey));
+        assert.match(body.text, /\[redacted:private-key\]/);
+
+        // Standalone markdown heading private key only -> dropped completely (0 new requests)
+        const keyOnlyPath = join(tempDir, "key-only.jsonl");
+        writeFileSync(
+            keyOnlyPath,
+            JSON.stringify({
+                role: "user",
+                content: "### Private Key\n0x" + syntheticPrivKey,
+            }) + "\n"
+        );
+        const resOnly = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-markdown-key-only",
+                transcript_path: keyOnlyPath,
+            }
+        );
+        assert.equal(resOnly.status, 0);
+        await waitForRequests(mock, 1, 100);
+        assert.equal(mock.requests.length, 1, "Standalone heading-labelled key turn must be dropped without calling /api/analyze");
     } finally {
         await mock.close();
         rmSync(tempDir, { recursive: true, force: true });

@@ -337,23 +337,29 @@ export function redactSecrets(input: string): string {
         "$1$2[redacted:credential]"
     );
 
-    // 8. Plainly labelled private keys, delegate keys, or hex keys in prose
-    s = s.replace(
-        /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our|his|her|their)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/gi,
-        "[redacted:private-key]"
-    );
-    s = s.replace(
-        /(?:(?:my|the|our|his|her|their)\s+)?(?:delegate[\s_-]*)?(?:private[\s_-]*key|secret[\s_-]*key|signing[\s_-]*key|priv[\s_-]*key)\s*(?:is|was|[:=])\s*(?:0x)?[0-9a-fA-F]{32,}\b/gi,
-        "[redacted:private-key]"
-    );
-    s = s.replace(
-        /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|priv[\s_-]*key)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{32,}\b/gi,
-        "[redacted:private-key]"
-    );
+    // 8. Plainly labelled private keys, delegate keys, or hex keys in prose / markdown
+    const HEX_CREDENTIAL_LABEL_BEFORE =
+        /(?:(?:#+\s*|\b|(?<=[_*`]))(?:(?:my|the|our|his|her|their)\s+)?(?:(?:delegate[\s_-]*)?(?:private|secret|signing|priv|encryption|enc)[\s_-]*key|delegate[\s_-]*key)(?:s)?(?![A-Za-z0-9])|sui[\s._-]*keystore)/i;
+    const HEX_CREDENTIAL_LABEL_AFTER =
+        /^[^A-Za-z0-9]{0,16}(?:is|was)?[^A-Za-z0-9]{0,16}(?:my|the|our|his|her|their)?[^A-Za-z0-9]{0,16}(?:(?:delegate[\s_-]*)?(?:private|secret|signing|priv|encryption)[\s_-]*key|delegate[\s_-]*key|seed|mnemonic|passphrase)/i;
 
-    // 9. Labelled seed / recovery mnemonic phrases
+    const HEX_CANDIDATE = /(?:`|'|")?\b(?:0x)?[0-9a-fA-F]{32,}\b(?:`|'|")?/g;
+    s = s.replace(HEX_CANDIDATE, (match, offset, fullStr) => {
+        const windowSize = 80;
+        const before = fullStr.slice(Math.max(0, offset - windowSize), offset);
+        if (HEX_CREDENTIAL_LABEL_BEFORE.test(before)) {
+            return "[redacted:private-key]";
+        }
+        const after = fullStr.slice(offset + match.length, offset + match.length + windowSize);
+        if (HEX_CREDENTIAL_LABEL_AFTER.test(after)) {
+            return "[redacted:private-key]";
+        }
+        return match;
+    });
+
+    // 9. Labelled seed / recovery mnemonic phrases (including across line breaks / headings)
     s = s.replace(
-        /(?:\b|(?<=[a-z]))((?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)([^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4})((?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8})\b/gi,
+        /(?:\b|(?<=[a-z#*_`]))((?:(?:#+\s*)?(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic))([^A-Za-z0-9]{0,16}(?:is|are)?[^A-Za-z0-9]{0,16})((?:[a-z]{3,8}[ \t\r\n]+){11,23}[a-z]{3,8})\b/gi,
         "$1$2[redacted:seed-phrase]"
     );
 
