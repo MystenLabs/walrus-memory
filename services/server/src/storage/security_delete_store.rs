@@ -674,19 +674,37 @@ pub async fn finalize_batch_deleted(
         .begin()
         .await
         .map_err(|error| storage("begin finalize", error))?;
+    let Some(rows) = finalize_batch_deleted_in_tx(&mut tx, batch_id, expected_batch_state).await?
+    else {
+        tx.rollback()
+            .await
+            .map_err(|error| storage("finalize lost race", error))?;
+        return Ok(None);
+    };
+    tx.commit()
+        .await
+        .map_err(|error| storage("commit finalize", error))?;
+    Ok(Some(rows))
+}
+
+pub(crate) async fn finalize_batch_deleted_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    batch_id: Uuid,
+    expected_batch_state: &str,
+) -> Result<Option<u64>, AppError> {
+    if expected_batch_state != BATCH_EXECUTING {
+        return Err(AppError::BadRequest("invalid finalize state".into()));
+    }
     let updated = sqlx::query(
         "UPDATE deletion_batches SET state='completed', resolved_at=NOW(), signatures=NULL
          WHERE id=$1 AND state=$2",
     )
     .bind(batch_id)
     .bind(expected_batch_state)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|error| storage("CAS finalize batch", error))?;
     if updated.rows_affected() == 0 {
-        tx.rollback()
-            .await
-            .map_err(|error| storage("finalize lost race", error))?;
         return Ok(None);
     }
     // Security-delete erases the Walrus blob, so every memory row pointing at
@@ -694,7 +712,10 @@ pub async fn finalize_batch_deleted(
     // (owner, blob_id) delete) so each tombstone carries the row's own
     // namespace. Tracking has no namespace column — PK is (owner, blob_id) —
     // and a shared blob_id across namespaces is unreadable after the blob is
-    // gone, so every matching row is purged.
+    // gone, so every matching row is purged. Acquire the shared per-owner sync
+    // advisory lock (classid 20261029) for every affected owner so concurrent
+    // incremental sync polls hold their watermark horizon until this delete
+    // transaction finishes.
     sqlx::query(
         "WITH tracked AS (
             SELECT v.id, v.owner, v.namespace, v.blob_id
@@ -703,18 +724,31 @@ pub async fn finalize_batch_deleted(
               ON v.owner = t.owner AND v.blob_id = t.blob_id
             WHERE t.batch_id=$1 AND t.state='deleting'
          ),
+         affected_owners AS (
+            SELECT DISTINCT owner FROM tracked
+            UNION
+            SELECT DISTINCT owner FROM delete_blobs_tracking WHERE batch_id=$1 AND state='deleting'
+            UNION
+            SELECT owner FROM deletion_batches WHERE id=$1
+         ),
+         owner_locks AS (
+            SELECT pg_advisory_xact_lock_shared(20261029, hashtext(owner))
+            FROM affected_owners
+            WHERE owner IS NOT NULL AND owner <> ''
+         ),
          removed AS (
             DELETE FROM vector_entries v
             USING tracked t
             WHERE v.id = t.id
+              AND (SELECT COUNT(*) FROM owner_locks) >= 0
             RETURNING v.id, v.owner, v.namespace, v.blob_id
          )
-         INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-         SELECT id, owner, namespace, blob_id FROM removed
-         ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+         INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+         SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+         ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
     )
     .bind(batch_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|error| storage("tombstone security-delete rows", error))?;
     let rows = sqlx::query(
@@ -722,7 +756,7 @@ pub async fn finalize_batch_deleted(
          WHERE batch_id=$1 AND state='deleting'",
     )
     .bind(batch_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|error| storage("finalize blobs", error))?
     .rows_affected();
@@ -741,12 +775,9 @@ pub async fn finalize_batch_deleted(
     .bind(batch_id)
     .bind(BLOB_DELETED)
     .bind(MEMBER_CLAIMED)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|error| storage("finalize batch members", error))?;
-    tx.commit()
-        .await
-        .map_err(|error| storage("commit finalize", error))?;
     Ok(Some(rows))
 }
 

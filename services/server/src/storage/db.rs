@@ -167,6 +167,7 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
     migration!("026_drop_owner_idempotency_key_index.sql"),
     migration!("027_owner_rate_limits.sql"),
+    migration!("028_memory_updated_xid.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -587,6 +588,7 @@ mod tests {
             migration_sql("018_memory_expiry_synced_at_index.sql"),
             migration_sql("019_memory_read_api_updated_at_set_not_null.sql"),
             migration_sql("020_read_api_followups.sql"),
+            migration_sql("028_memory_updated_xid.sql"),
         ] {
             execute_idempotent_migration(&pool, migration).await;
         }
@@ -3028,8 +3030,12 @@ impl VectorDb {
                 AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
             })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp()
+             FROM _sync_lock
              WHERE NOT EXISTS (
                  SELECT 1 FROM memory_tombstones WHERE memory_id = $1
              )
@@ -3043,7 +3049,7 @@ impl VectorDb {
                 agent_id = EXCLUDED.agent_id,
                 package_id = EXCLUDED.package_id,
                 end_epoch = EXCLUDED.end_epoch,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(row.id)
         .bind(row.owner)
@@ -3122,8 +3128,12 @@ impl VectorDb {
                 AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
             })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp()
+             FROM _sync_lock
              WHERE NOT EXISTS (
                  SELECT 1 FROM memory_tombstones WHERE memory_id = $1
              )
@@ -3135,7 +3145,7 @@ impl VectorDb {
                 blob_size_bytes = EXCLUDED.blob_size_bytes,
                 plaintext = EXCLUDED.plaintext,
                 importance = EXCLUDED.importance,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(id)
         .bind(owner)
@@ -3457,14 +3467,18 @@ impl VectorDb {
             )));
         }
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($1))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE owner = $1 AND namespace = $2
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(owner)
         .bind(namespace)
@@ -3581,8 +3595,12 @@ impl VectorDb {
     ) -> Result<bool, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "UPDATE vector_entries
-             SET importance = $4, updated_at = NOW()
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             UPDATE vector_entries
+             SET importance = $4, updated_at = clock_timestamp()
+             FROM _sync_lock
              WHERE id = $1 AND owner = $2 AND namespace = $3",
         )
         .bind(id)
@@ -3612,14 +3630,18 @@ impl VectorDb {
     ) -> Result<u64, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE blob_id = $1 AND owner = $2 AND namespace = $3
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(blob_id)
         .bind(owner)
@@ -3935,23 +3957,39 @@ impl VectorDb {
         end_epoch: i32,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            AppError::Internal(format!("Failed to begin set memory expiry tx: {}", e))
+        })?;
         sqlx::query(
-            "UPDATE vector_entries
+            "WITH target AS (
+                 SELECT id, owner
+                 FROM vector_entries
+                 WHERE id = $3
+             ),
+             _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext(owner))
+                 FROM target
+             )
+             UPDATE vector_entries
              SET end_epoch = $1,
                  expires_at = $2,
                  updated_at = CASE
-                     WHEN end_epoch IS DISTINCT FROM $1 OR expires_at IS NULL
-                     THEN NOW()
-                     ELSE updated_at
+                     WHEN vector_entries.end_epoch IS DISTINCT FROM $1 OR vector_entries.expires_at IS NULL
+                     THEN clock_timestamp()
+                     ELSE vector_entries.updated_at
                  END
-             WHERE id = $3",
+             FROM target, _sync_lock
+             WHERE vector_entries.id = target.id",
         )
         .bind(end_epoch)
         .bind(expires_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to set memory expiry: {}", e)))?;
+        tx.commit().await.map_err(|e| {
+            AppError::Internal(format!("Failed to commit set memory expiry tx: {}", e))
+        })?;
         Ok(())
     }
 
