@@ -127,6 +127,18 @@ export function hasOptOutMarker(text: string): boolean {
     return OPT_OUT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+const WHOLE_SECTION_OPT_OUT_PATTERNS: RegExp[] = [
+    /\[no-memory\]/i,
+    /\bMEMWAL_IGNORE\b/,
+    /\b(?:do\s+not|don'?t|dont|never|please\s+do\s+not|please\s+don'?t)\s+(?:save|store|remember|record|keep|persist|log)\s+(?:this|that|it|these|those|any\s+of\s+(?:this|that|it))\b/i,
+    /\boff[-\s]the[-\s]record\b/i,
+];
+
+/** Check whether text contains whole-section / conversational opt-out markers that propagate to child sections. */
+export function hasWholeSectionOptOut(text: string): boolean {
+    return WHOLE_SECTION_OPT_OUT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 const SECRET_PATTERNS: RegExp[] = [
     // Sui private key (suiprivkey1...)
     /suiprivkey1[0-9a-zA-Z]+/,
@@ -171,7 +183,7 @@ const SECRET_PATTERNS: RegExp[] = [
 const HEX_RUN = /\b(?:0x)?[0-9a-fA-F]{32,}\b/g;
 const OPAQUE_RUN = /[A-Za-z0-9+/_=-]{20,}/g;
 const HIGH_ENTROPY_CANDIDATE = /\b[A-Za-z0-9+/_-]{64,}={0,2}/g;
-const HEX_LABEL_WINDOW = 64;
+const HEX_LABEL_WINDOW = 128;
 
 const HEX_CREDENTIAL_LABEL =
     /private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*key|delegate[\s_-]*private|signing[\s_-]*key|priv[\s_-]*key|encryption[\s_-]*keys?(?![A-Za-z0-9])|enc[\s_-]*keys?(?![A-Za-z0-9])|api[\s_-]*key|access[\s_-]*key|auth[\s_-]*key|db[\s_-]*pass(?:word)?s?(?![A-Za-z0-9])|secret|seed|mnemonic|passphrase/i;
@@ -312,6 +324,7 @@ export interface RawSection {
     content: string;
     inheritedOptOut?: boolean;
     optOutSource?: string;
+    ancestors?: string[];
 }
 
 function countPrivateTags(text: string): { openings: number; closings: number } {
@@ -343,6 +356,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
     let sectionInPrivate = false;
     let sectionHasBodyOptOut = false;
     let sectionStartedInPrivate = false;
+    let currentAncestors: string[] = [];
 
     // Heading ancestor stack: levels 1 through 6
     const headingStack: Array<{ level: number; heading: string; optedOut: boolean }> = [];
@@ -360,11 +374,12 @@ export function parseSections(content: string, relPath: string): RawSection[] {
         if (currentLines.length > 0 || currentHeading) {
             const text = currentLines.join("\n").trim();
             if (text) {
-                const isOptedOut = currentOptedOut || sectionInPrivate;
+                const isOptedOut = currentOptedOut || (privateDepth > 0 && sectionStartedInPrivate);
                 sections.push({
                     heading: currentHeading || fallbackHeading,
                     content: text,
                     inheritedOptOut: isOptedOut,
+                    ancestors: [...currentAncestors],
                 });
             }
         }
@@ -400,9 +415,9 @@ export function parseSections(content: string, relPath: string): RawSection[] {
         const headingMatch = line.match(headingRegex);
         if (headingMatch) {
             // Before flushing previous section on a new heading:
-            // if previous section's accumulated lines contain any opt-out marker,
+            // if previous section's accumulated lines contain a whole-section opt-out marker,
             // mark the top entry of headingStack (if any) as optedOut = true!
-            if (sectionHasBodyOptOut || hasOptOutMarker(currentLines.join("\n"))) {
+            if (sectionHasBodyOptOut || hasWholeSectionOptOut(currentLines.join("\n"))) {
                 if (headingStack.length > 0) {
                     headingStack[headingStack.length - 1].optedOut = true;
                 }
@@ -450,8 +465,11 @@ export function parseSections(content: string, relPath: string): RawSection[] {
                 headingStack.pop();
             }
 
+            // Current ancestors are the surviving headings in stack:
+            currentAncestors = headingStack.map((h) => h.heading);
+
             // Check self and parent opt-out
-            const selfOptOut = hasOptOutMarker(headingText) || privateDepth > 0;
+            const selfOptOut = hasWholeSectionOptOut(headingText) || hasOptOutMarker(headingText) || privateDepth > 0;
             const parentOptOut = headingStack.some((h) => h.optedOut);
             const headingOptedOut = selfOptOut || parentOptOut;
 
@@ -490,7 +508,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
             if (privateDepth > 0) {
                 sectionInPrivate = true;
             }
-            if (hasOptOutMarker(line)) {
+            if (hasWholeSectionOptOut(line)) {
                 sectionHasBodyOptOut = true;
             }
             currentLines.push(line);
@@ -498,7 +516,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
     }
 
     // EOF: check body opt-out on final section
-    if (sectionHasBodyOptOut || hasOptOutMarker(currentLines.join("\n"))) {
+    if (sectionHasBodyOptOut || hasWholeSectionOptOut(currentLines.join("\n"))) {
         if (headingStack.length > 0) {
             headingStack[headingStack.length - 1].optedOut = true;
         }
@@ -514,6 +532,7 @@ export function parseSections(content: string, relPath: string): RawSection[] {
             heading: fallbackHeading,
             content: content.trim(),
             inheritedOptOut: isOptedOut,
+            ancestors: [],
         });
     }
 
@@ -585,6 +604,27 @@ export function extractCandidateChunks(
             continue;
         }
 
+        // 1. Screen all ancestor headings
+        let ancestorFailed = false;
+        if (section.ancestors && section.ancestors.length > 0) {
+            for (const anc of section.ancestors) {
+                const ancSafety = screenContentForSafety(anc);
+                if (!ancSafety.safe) {
+                    skipped.push({
+                        file: relPath,
+                        section: section.heading,
+                        reason: ancSafety.reason!,
+                        snippet: makeSnippet(anc),
+                    });
+                    ancestorFailed = true;
+                    break;
+                }
+            }
+        }
+        if (ancestorFailed) {
+            continue;
+        }
+
         const headingSafety = screenContentForSafety(section.heading);
         if (!headingSafety.safe) {
             skipped.push({
@@ -596,29 +636,69 @@ export function extractCandidateChunks(
             continue;
         }
 
-        const safety = screenContentForSafety(section.content);
+        // Strip scoped <private>...</private> blocks from content
+        let contentToProcess = section.content;
+        if (/<\s*private[\s>]/i.test(contentToProcess)) {
+            contentToProcess = contentToProcess.replace(/<\s*private[\s>][\s\S]*?<\s*\/\s*private\s*>/gi, "").trim();
+        }
+        if (!contentToProcess) {
+            skipped.push({
+                file: relPath,
+                section: section.heading,
+                reason: "opt_out_marker",
+                snippet: makeSnippet(section.content),
+            });
+            continue;
+        }
+
+        const safety = screenContentForSafety(contentToProcess);
         if (!safety.safe) {
             skipped.push({
                 file: relPath,
                 section: section.heading,
                 reason: safety.reason!,
-                snippet: makeSnippet(section.content),
+                snippet: makeSnippet(contentToProcess),
             });
             continue;
         }
 
-        const combinedSectionSafety = screenContentForSafety(`${section.heading}\n${section.content}`);
+        const fullHierarchyHeading = section.ancestors && section.ancestors.length > 0
+            ? [...section.ancestors, section.heading].join("\n")
+            : section.heading;
+
+        const combinedSectionSafety = screenContentForSafety(`${fullHierarchyHeading}\n${contentToProcess}`);
         if (!combinedSectionSafety.safe) {
             skipped.push({
                 file: relPath,
                 section: section.heading,
                 reason: combinedSectionSafety.reason!,
-                snippet: makeSnippet(section.content),
+                snippet: makeSnippet(contentToProcess),
             });
             continue;
         }
 
-        const subChunks = splitIntoParagraphs(section.content, 1500);
+        // Check if any ancestor heading contains a credential label
+        const ancestorHasCredentialLabel = section.ancestors?.some((anc) =>
+            HEX_CREDENTIAL_LABEL.test(anc) || /(?:private|secret|signing|priv|delegate)[\s_-]*key/i.test(anc)
+        );
+        if (ancestorHasCredentialLabel) {
+            let foundSecretInChild = false;
+            for (const match of contentToProcess.matchAll(HEX_RUN)) {
+                skipped.push({
+                    file: relPath,
+                    section: section.heading,
+                    reason: "secret_detected",
+                    snippet: makeSnippet(contentToProcess),
+                });
+                foundSecretInChild = true;
+                break;
+            }
+            if (foundSecretInChild) {
+                continue;
+            }
+        }
+
+        const subChunks = splitIntoParagraphs(contentToProcess, 1500);
         for (const sub of subChunks) {
             const trimmed = sub.trim();
             if (trimmed.length < 20) {
@@ -635,7 +715,7 @@ export function extractCandidateChunks(
                 continue;
             }
 
-            const combinedSubSafety = screenContentForSafety(`${section.heading}\n${trimmed}`);
+            const combinedSubSafety = screenContentForSafety(`${fullHierarchyHeading}\n${trimmed}`);
             if (!combinedSubSafety.safe) {
                 skipped.push({
                     file: relPath,
@@ -644,6 +724,23 @@ export function extractCandidateChunks(
                     snippet: makeSnippet(trimmed),
                 });
                 continue;
+            }
+
+            if (ancestorHasCredentialLabel) {
+                let foundSecretInSub = false;
+                for (const match of trimmed.matchAll(HEX_RUN)) {
+                    skipped.push({
+                        file: relPath,
+                        section: section.heading,
+                        reason: "secret_detected",
+                        snippet: makeSnippet(trimmed),
+                    });
+                    foundSecretInSub = true;
+                    break;
+                }
+                if (foundSecretInSub) {
+                    continue;
+                }
             }
 
             const provenanceText = `[source: ${relPath} | section: ${section.heading}]\n${trimmed}`;

@@ -861,4 +861,41 @@ test("screens heading-labelled private keys across Markdown line breaks and conv
     assert.ok(outgoingText.includes("Build conventions"), "Sibling safe section after opted-out parent must still upload");
 });
 
+test("screens ancestor-heading labelled private keys and preserves public content outside scoped private block", () => {
+    // 1. Ancestor heading with credential label screens child hex key
+    const ancestorKeyContent = [
+        "# Delegate private keys",
+        "## Staging cluster credentials",
+        "### Primary worker",
+        "0x" + "aa".repeat(32),
+        "",
+        "# Safe guidelines",
+        "Follow workspace build guidelines and ensure all tests pass before review.",
+    ].join("\n");
 
+    const res1 = extractCandidateChunks(ancestorKeyContent, "MEMORY.md");
+    assert.equal(res1.candidates.length, 1);
+    assert.equal(res1.candidates[0].section, "Safe guidelines");
+    const skippedSecrets = res1.skipped.filter((s) => s.reason === "secret_detected");
+    assert.equal(skippedSecrets.length, 1);
+    assert.equal(skippedSecrets[0].section, "Primary worker");
+
+    // 2. Scoped private block preserves public content outside the block
+    const scopedPrivateContent = [
+        "# Project configuration",
+        "<private>",
+        "Internal staging credentials and private tokens that must not be saved.",
+        "</private>",
+        "",
+        "## Coding conventions",
+        "Public coding standards and conventions for the engineering team.",
+    ].join("\n");
+
+    const res2 = extractCandidateChunks(scopedPrivateContent, "CLAUDE.md");
+    assert.equal(res2.candidates.length, 1);
+    assert.equal(res2.candidates[0].section, "Coding conventions");
+    assert.ok(res2.candidates[0].text.includes("Public coding standards"));
+    const skippedOptOut = res2.skipped.filter((s) => s.reason === "opt_out_marker");
+    assert.equal(skippedOptOut.length, 1);
+    assert.equal(skippedOptOut[0].section, "Project configuration");
+});
