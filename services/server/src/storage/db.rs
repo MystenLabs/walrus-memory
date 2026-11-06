@@ -589,6 +589,7 @@ mod tests {
             migration_sql("018_memory_expiry_synced_at_index.sql"),
             migration_sql("019_memory_read_api_updated_at_set_not_null.sql"),
             migration_sql("020_read_api_followups.sql"),
+            migration_sql("028_forgotten_blob_timestamps.sql"),
         ] {
             execute_idempotent_migration(&pool, migration).await;
         }
@@ -3210,52 +3211,6 @@ pub async fn release_storage_reservations_with_pool(pool: &PgPool, ids: &[String
     }
 }
 
-pub(crate) async fn ensure_forgotten_blob_timestamps_table_on_pool(
-    pool: &PgPool,
-) -> Result<(), AppError> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
-            owner TEXT NOT NULL,
-            namespace TEXT NOT NULL,
-            blob_id TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (owner, namespace, blob_id)
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "Failed to ensure forgotten_blob_timestamps table on pool: {}",
-            e
-        ))
-    })?;
-    Ok(())
-}
-
-async fn ensure_forgotten_blob_timestamps_table_tx(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<(), AppError> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
-            owner TEXT NOT NULL,
-            namespace TEXT NOT NULL,
-            blob_id TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (owner, namespace, blob_id)
-        )",
-    )
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "Failed to ensure forgotten_blob_timestamps table in tx: {}",
-            e
-        ))
-    })?;
-    Ok(())
-}
-
 /// Look up the original write timestamps for `blob_ids` belonging to `owner` (#1060).
 ///
 /// Priority order:
@@ -3276,8 +3231,6 @@ pub(crate) async fn lookup_original_blob_created_at_on_pool(
     if blob_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-
-    let _ = ensure_forgotten_blob_timestamps_table_on_pool(pool).await;
 
     let started = std::time::Instant::now();
     let result: Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, AppError> = sqlx::query_as(
@@ -4018,7 +3971,6 @@ impl VectorDb {
             .begin()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to begin forget tx: {}", e)))?;
-        ensure_forgotten_blob_timestamps_table_tx(&mut tx).await?;
         if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
             .bind(owner)
             .bind(namespace)

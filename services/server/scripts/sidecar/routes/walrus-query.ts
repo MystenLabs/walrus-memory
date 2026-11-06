@@ -133,9 +133,14 @@ type RawBlobObj = {
     timestampMs?: string | null;
 };
 
+export type BlobCreationInfo = {
+    digest: string;
+    createdAt?: string | null;
+};
+
 type BlobHistoryClient = {
     getTransaction(digest: string): Promise<any>;
-    getCreationTransaction(objectId: string): Promise<string | null>;
+    getCreationTransaction(objectId: string): Promise<string | BlobCreationInfo | null>;
 };
 
 function finalizedTransaction(response: any): any | null {
@@ -165,22 +170,27 @@ export async function findBlobCreationProvenance(
     blob: Pick<RawBlobObj, "objectId" | "previousTransaction">,
     client: BlobHistoryClient
 ): Promise<BlobProvenanceRecord> {
-    const digest = await client.getCreationTransaction(blob.objectId);
-    if (!digest) return { sender: null, createdAt: null };
+    const creationResult = await client.getCreationTransaction(blob.objectId);
+    if (!creationResult) return { sender: null, createdAt: null };
+    const digest = typeof creationResult === "string" ? creationResult : creationResult.digest;
+    const initialCreatedAt =
+        typeof creationResult === "string" ? null : creationResult.createdAt ?? null;
+    if (!digest) return { sender: null, createdAt: initialCreatedAt };
+
     const transaction = finalizedTransaction(await client.getTransaction(digest));
-    if (!transaction?.status?.success) return { sender: null, createdAt: null };
+    if (!transaction?.status?.success) return { sender: null, createdAt: initialCreatedAt };
     const created = transaction.effects?.changedObjects?.find(
         (object: any) =>
             normalizedSuiAddressOrNull(object?.objectId) === normalizedSuiAddressOrNull(blob.objectId) &&
             object?.idOperation === "Created"
     );
-    if (!created) return { sender: null, createdAt: null };
+    if (!created) return { sender: null, createdAt: initialCreatedAt };
     const createdAt =
         typeof transaction.effects?.timestamp === "string" && transaction.effects.timestamp.length > 0
             ? transaction.effects.timestamp
             : typeof transaction.timestamp === "string" && transaction.timestamp.length > 0
               ? transaction.timestamp
-              : getCachedBlobCreationTimestamp(blob.objectId);
+              : initialCreatedAt ?? getCachedBlobCreationTimestamp(blob.objectId);
     const sender = normalizedSuiAddressOrNull(transaction.transaction?.sender);
     if (sender) {
         cacheBlobProvenance(blob.objectId, { sender, createdAt });
@@ -246,9 +256,9 @@ const blobHistoryClient: BlobHistoryClient = {
         if (createdAt) {
             cacheBlobProvenance(objectId, { createdAt });
         }
-        return typeof previousTx?.digest === "string"
-            ? previousTx.digest
-            : null;
+        const digest = typeof previousTx?.digest === "string" ? previousTx.digest : null;
+        if (!digest) return null;
+        return { digest, createdAt };
     },
 };
 

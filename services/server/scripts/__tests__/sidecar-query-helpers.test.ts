@@ -1182,6 +1182,41 @@ test("findBlobCreationProvenance extracts timestamp from transaction root when e
     assert.equal(getCachedBlobCreationTimestamp(objectId), createdTimestamp);
 });
 
+test("findBlobCreationProvenance preserves createdAt when cache is evicted during getTransaction", async () => {
+    clearBlobProvenanceCacheForTests();
+    const objectId = `0x${"e".repeat(64)}`;
+    const trusted = `0x${"f".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T09:15:00.000Z";
+    const client = {
+        async getCreationTransaction() {
+            return {
+                digest: "eviction-test-tx",
+                createdAt: createdTimestamp,
+            };
+        },
+        async getTransaction(digest: string) {
+            assert.equal(digest, "eviction-test-tx");
+            // Simulate 10,001 other blobs processed during async getTransaction,
+            // completely evicting objectId from the LRU cache.
+            for (let i = 0; i < 10_001; i++) {
+                cacheBlobProvenance(`evict-tx-${i}`, { sender: `s-${i}`, createdAt: `ts-${i}` });
+            }
+            assert.equal(getCachedBlobCreationTimestamp(objectId), null);
+            return {
+                status: { success: true },
+                transaction: { sender: trusted },
+                effects: {
+                    changedObjects: [{ objectId, idOperation: "Created" }],
+                },
+            };
+        },
+    };
+
+    const prov = await findBlobCreationProvenance({ objectId, previousTransaction: "any-tx" }, client);
+    assert.equal(prov.sender, trusted);
+    assert.equal(prov.createdAt, createdTimestamp);
+});
+
 test("blob provenance excludes external creators and fails closed on incomplete history", async () => {
     const objectId = `0x${"1".repeat(64)}`;
     const recipient = `0x${"2".repeat(64)}`;
