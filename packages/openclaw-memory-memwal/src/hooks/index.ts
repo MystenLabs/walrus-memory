@@ -1,8 +1,8 @@
 /**
- * Lifecycle hooks — the invisible memory layer.
+ * Lifecycle hooks: the invisible memory layer.
  *
  * Each agent gets its own namespace derived from ctx.sessionKey.
- * Same key, same account — isolation via server-side namespace scoping.
+ * Same key, same account: isolation via server-side namespace scoping.
  */
 
 import type { MemWal } from "@mysten-incubation/memwal";

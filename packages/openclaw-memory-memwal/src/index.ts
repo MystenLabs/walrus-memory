@@ -1,20 +1,20 @@
 /**
- * OpenClaw Memory Plugin — Walrus Memory
+ * OpenClaw Memory Plugin: Walrus Memory
  *
  * Encrypted, decentralized long-term memory via Walrus Memory.
  *
  * Components:
- *   hooks/     — before_prompt_build (auto-recall), agent_end (auto-capture)
- *   tools/     — memory_search, memory_store
- *   cli/       — openclaw memwal search/stats
- *   config.ts  — Config parsing, namespace resolution
- *   format.ts  — Memory formatting, tag injection/stripping, prompt safety
- *   capture.ts — Capture filtering, injection detection
- *   types.ts   — Shared TypeScript types
+ *   hooks/: before_prompt_build (auto-recall), agent_end (auto-capture)
+ *   tools/: memory_search, memory_store
+ *   cli/: openclaw memwal search and stats
+ *   config.ts: Config parsing, namespace resolution, sender isolation
+ *   format.ts: Memory formatting, tag injection and stripping, prompt safety
+ *   capture.ts: Capture filtering, injection detection
+ *   types.ts: Shared TypeScript types
  *
- * Per-agent isolation via namespaces:
- *   Each OpenClaw agent gets its own namespace derived from ctx.sessionKey.
- *   Same key, same account — isolation scoped at the server level.
+ * Per-agent and per-sender isolation via namespaces:
+ *   Each OpenClaw agent and sender gets its own namespace.
+ *   Same key, same account: isolation scoped at the server level.
  */
 
 import { MemWal } from "@mysten-incubation/memwal";
