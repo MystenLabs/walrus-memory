@@ -161,6 +161,14 @@ test("remote fallback retains environment presets and explicit relayer flags", (
         }),
         "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://relayer.dev.memwal.ai' --web-url 'https://custom.dashboard.example'",
     );
+    // Valid bracketed IPv6 relayer and web URLs are preserved and shell-quoted
+    assert.equal(
+        remoteLoginCommand({
+            relayerUrl: "http://[::1]:8000",
+            webUrl: "http://[::1]:5173",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'http://[::1]:8000' --web-url 'http://[::1]:5173'",
+    );
     // Unverified relayer with shell metacharacters is rejected
     assert.equal(
         remoteLoginCommand({
