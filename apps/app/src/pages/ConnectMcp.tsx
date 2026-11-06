@@ -159,7 +159,7 @@ const LOCAL_WEB_URL = 'http://localhost:5173'
 function normalizeCliUrl(raw: string | undefined | null): string | null {
     if (!raw) return null
     const trimmed = raw.trim()
-    if (!trimmed || /[\s\u0000-\u001f\u007f;|&$`\\"'<>(){}[\]*?~#!]/.test(trimmed)) {
+    if (!trimmed || /[\s\u0000-\u001f\u007f;|&$`\\"'<>(){}*?~#!]/.test(trimmed)) {
         return null
     }
     try {
@@ -167,6 +167,7 @@ function normalizeCliUrl(raw: string | undefined | null): string | null {
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
         if (parsed.username || parsed.password || parsed.search || parsed.hash) return null
         const path = parsed.pathname.replace(/\/+$/, '')
+        if (/[\[\]]/.test(path)) return null
         return `${parsed.origin}${path}`
     } catch {
         return null

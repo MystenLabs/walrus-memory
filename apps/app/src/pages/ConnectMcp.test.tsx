@@ -275,6 +275,9 @@ describe('MCP sign-in hand-off', () => {
         expect(mcpCliLoginCommand('https://relayer.dev.memwal.ai', 'https://custom.dashboard.example')).toBe(
             "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://relayer.dev.memwal.ai' --web-url 'https://custom.dashboard.example'",
         )
+        expect(mcpCliLoginCommand('http://[::1]:8000', 'http://[::1]:5173')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'http://[::1]:8000' --web-url 'http://[::1]:5173'",
+        )
         expect(mcpCliLoginCommand('https://relayer.example; echo SYNTHETIC_COMMAND')).toBe(
             'npx -y @mysten-incubation/memwal-mcp login',
         )
