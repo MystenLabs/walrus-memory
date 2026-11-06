@@ -950,14 +950,12 @@ mod mcp_rate_limit_tests {
         let external_peer: std::net::SocketAddr = "203.0.113.20:12345".parse().unwrap();
 
         // Mint a valid owner token with memories.read permission
-        let token = owner_token_auth::issue_token(
+        let token = owner_token_auth::mint_token(
             state.config.owner_token_secret.as_bytes(),
             "0x1111111111111111111111111111111111111111111111111111111111111111",
-            &[owner_token_auth::PERMISSION_MEMORIES_READ.to_string()],
-            chrono::Utc::now().timestamp(),
             300,
-        )
-        .unwrap();
+            chrono::Utc::now().timestamp(),
+        );
 
         // Request with valid Bearer token bypasses signed preauth limiter
         let mut req = Request::builder()

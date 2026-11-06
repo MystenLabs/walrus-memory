@@ -505,7 +505,7 @@ pub struct DelegateVerifyCacheState {
     /// the revoke wins and the next caller reads the chain again.
     pub evictions: std::sync::atomic::AtomicU64,
     /// Bounds concurrent cold on-chain delegate verification RPC calls.
-    pub rpc_semaphore: tokio::sync::Semaphore,
+    pub rpc_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     pub semaphore_wait: std::time::Duration,
 }
 
@@ -529,7 +529,7 @@ pub fn new_delegate_verify_cache_with_concurrency_and_wait(
     std::sync::Arc::new(DelegateVerifyCacheState {
         entries: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         evictions: std::sync::atomic::AtomicU64::new(0),
-        rpc_semaphore: tokio::sync::Semaphore::new(max_inflight.max(1)),
+        rpc_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
         semaphore_wait,
     })
 }

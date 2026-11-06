@@ -3644,7 +3644,6 @@ mod tests {
                 &mut redis_signed,
                 &signed_cfg,
                 Some(attacker_ip),
-                (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
             )
             .await
             .unwrap()
@@ -3664,7 +3663,6 @@ mod tests {
                     &mut redis_signed,
                     &signed_cfg,
                     Some(legit_ip),
-                    (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
                 )
                 .await
                 .unwrap(),
@@ -3676,30 +3674,22 @@ mod tests {
         // 4. Internal loopback MCP callers (`ip: None`):
         // Bypass external source IP burst windows so distinct accounts served by a local sidecar
         // are not capped at `per_minute` (4 requests).
-        // They remain subject to deployment-wide global ceiling windows (`global_per_minute` = 10).
+        // Since global pre-auth windows were removed in favor of rpc_semaphore concurrency bounding,
+        // callers with `ip: None` immediately return Ok(None) without consuming Redis admission slots.
         let mut loopback_redis = SlidingWindowMockRedis::default();
-        let mut loopback_admitted = 0;
-        let mut loopback_denied = 0;
         for _ in 0..15 {
-            match check_signed_preauth_windows(
-                &mut loopback_redis,
-                &signed_cfg,
+            assert_eq!(
+                check_signed_preauth_windows(
+                    &mut loopback_redis,
+                    &signed_cfg,
+                    None,
+                )
+                .await
+                .unwrap(),
                 None,
-                (SIGNED_PREAUTH_GLOBAL_MIN_KEY, SIGNED_PREAUTH_GLOBAL_HR_KEY),
-            )
-            .await
-            .unwrap()
-            {
-                None => loopback_admitted += 1,
-                Some(SignedPreauthDenial::GlobalBurst) => loopback_denied += 1,
-                Some(other) => panic!("unexpected denial for loopback sidecar caller: {other:?}"),
-            }
+                "loopback caller without source IP must be admitted immediately (Ok(None))"
+            );
         }
-        assert_eq!(
-            loopback_admitted, 10,
-            "loopback sidecar caller reaches global ceiling without hitting source IP burst"
-        );
-        assert_eq!(loopback_denied, 5);
     }
 
     #[tokio::test]
