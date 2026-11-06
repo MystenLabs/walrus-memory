@@ -1076,6 +1076,8 @@ async function handleLocalLogin(
             credentialsPath: credsPath(),
             signedIn: loadCreds() !== null,
             discardedKey,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
         }),
     };
 }

@@ -113,7 +113,25 @@ Run the login flow manually:
 npx -y @mysten-incubation/memwal-mcp login
 ```
 
-The command opens your browser, asks you to connect your Sui wallet, and saves credentials locally.
+The command opens your browser, asks you to connect your Sui wallet, and saves credentials locally at `~/.memwal/credentials.json` (mode `0600`).
+
+### Remote hosts, containers, and bots
+
+Browser sign-in verifies the request and delivers credentials to a loopback listener (`http://127.0.0.1:<port>`) on the machine running `memwal-mcp`. Because `127.0.0.1` always resolves to the device where the browser is open, clicking a `memwal_login` URL generated on a remote server, SSH box, container, or hosted bot (such as Grok Bot) from your laptop browser cannot reach the remote listener.
+
+To authenticate a remote or headless host without a local browser:
+
+1. On the computer that has your browser and Sui wallet, run (adding `--dev` or `--local` for non-production environments):
+   ```sh
+   npx -y @mysten-incubation/memwal-mcp login
+   ```
+2. Copy the generated `~/.memwal/credentials.json` file to `~/.memwal/credentials.json` (or `$MEMWAL_CREDS_DIR/credentials.json`) on the remote host and restrict its permissions:
+   ```sh
+   ssh user@remote-host 'mkdir -p ~/.memwal && chmod 700 ~/.memwal'
+   scp ~/.memwal/credentials.json user@remote-host:~/.memwal/credentials.json
+   ssh user@remote-host 'chmod 600 ~/.memwal/credentials.json'
+   ```
+3. Restart the MCP server or bot on the remote host so it loads the credentials file on startup.
 
 ## Commands
 

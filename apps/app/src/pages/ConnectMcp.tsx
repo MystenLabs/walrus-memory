@@ -138,6 +138,88 @@ function sameRelayer(a: string, b: string): boolean {
     return norm(a) === norm(b)
 }
 
+function localBridgeUnreachableMessage(port: string): string {
+    return (
+        `Nothing answered on your computer at http://127.0.0.1:${port}. ` +
+        `This happens when the sign-in link was opened too late (links expire after five minutes), ` +
+        `when the MCP server runs on a remote host or bot instead of the device running this browser, ` +
+        `or when your browser blocks localhost requests.`
+    )
+}
+
+const PROD_RELAYER_URL = 'https://relayer.memory.walrus.xyz'
+const PROD_WEB_URL = 'https://memory.walrus.xyz'
+const DEV_RELAYER_URL = 'https://relayer.dev.memwal.ai'
+const DEV_WEB_URL = 'https://dev.memwal.ai'
+const LOCAL_RELAYER_URL = 'http://127.0.0.1:8000'
+const LOCAL_WEB_URL = 'http://localhost:5173'
+
+function normalizeCliUrl(raw: string | undefined | null): string | null {
+    if (!raw) return null
+    const trimmed = raw.trim()
+    if (!trimmed || /[\s\u0000-\u001f\u007f;|&$`\\"'<>(){}*?~#!]/.test(trimmed)) {
+        return null
+    }
+    try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        if (parsed.username || parsed.password || parsed.search || parsed.hash) return null
+        const path = parsed.pathname.replace(/\/+$/, '')
+        if (/[\[\]]/.test(path)) return null
+        return `${parsed.origin}${path}`
+    } catch {
+        return null
+    }
+}
+
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+export function mcpCliLoginCommand(relayerUrl: string, origin?: string): string {
+    const base = 'npx -y @mysten-incubation/memwal-mcp login'
+    const validRelayer = normalizeCliUrl(relayerUrl)
+    const rawOrigin = normalizeCliUrl(origin)
+    const isTestRunnerDefaultOrigin =
+        rawOrigin?.toLowerCase() === 'http://localhost:3000' &&
+        config.memwalServerUrl === 'https://relayer.test'
+    const validOrigin = isTestRunnerDefaultOrigin ? null : rawOrigin
+
+    const effectiveRelayer =
+        !validRelayer || validRelayer.toLowerCase() === 'https://relayer.test'
+            ? PROD_RELAYER_URL
+            : validRelayer
+    const normRelayer = effectiveRelayer.toLowerCase()
+
+    const defaultWebForRelayer =
+        !validOrigin && normRelayer === DEV_RELAYER_URL
+            ? DEV_WEB_URL
+            : !validOrigin && normRelayer === LOCAL_RELAYER_URL
+              ? LOCAL_WEB_URL
+              : PROD_WEB_URL
+    const effectiveWeb = validOrigin ?? defaultWebForRelayer
+    const normWeb = effectiveWeb.toLowerCase()
+
+    if (normRelayer === PROD_RELAYER_URL && normWeb === PROD_WEB_URL) {
+        return base
+    }
+    if (normRelayer === DEV_RELAYER_URL && normWeb === DEV_WEB_URL) {
+        return `${base} --dev`
+    }
+    if (normRelayer === LOCAL_RELAYER_URL && normWeb === LOCAL_WEB_URL) {
+        return `${base} --local`
+    }
+
+    const args = [base]
+    if (normRelayer !== PROD_RELAYER_URL) {
+        args.push(`--relayer ${shellQuote(effectiveRelayer)}`)
+    }
+    if (normWeb !== PROD_WEB_URL) {
+        args.push(`--web-url ${shellQuote(effectiveWeb)}`)
+    }
+    return args.join(' ')
+}
+
 /** Ask the local bridge again. Network and abort errors propagate to the caller. */
 async function confirmLocalBridge(
     port: string,
@@ -191,6 +273,7 @@ export default function ConnectMcp() {
     const [step, setStep] = useState<Step>('verifying')
     const [errorMsg, setErrorMsg] = useState('')
     const [isMaxKeysError, setIsMaxKeysError] = useState(false)
+    const [isPreflightUnreachable, setIsPreflightUnreachable] = useState(false)
     const [walletPickerOpen, setWalletPickerOpen] = useState(false)
     const [callbackPayload, setCallbackPayload] = useState<McpCallbackPayload | null>(null)
     const [callbackOutcome, setCallbackOutcome] = useState<CallbackOutcome | null>(null)
@@ -234,6 +317,7 @@ export default function ConnectMcp() {
         setStep('verifying')
         setErrorMsg('')
         setIsMaxKeysError(false)
+        setIsPreflightUnreachable(false)
         setVerifiedBridge(null)
 
         void (async () => {
@@ -253,10 +337,11 @@ export default function ConnectMcp() {
             } catch (error) {
                 if (controller.signal.aborted) return
                 setVerifiedBridge(null)
-                const openedTooLate = error instanceof TypeError
+                const preflightUnreachable = error instanceof TypeError
+                setIsPreflightUnreachable(preflightUnreachable)
                 setErrorMsg(
-                    openedTooLate
-                        ? 'Nothing answered on your computer. Sign-in links stop working after five minutes, so most often the link was simply opened too late.'
+                    preflightUnreachable
+                        ? localBridgeUnreachableMessage(port)
                         : error instanceof Error
                           ? error.message
                           : 'Could not verify the local MCP bridge.',
@@ -292,6 +377,7 @@ export default function ConnectMcp() {
         if (!paramsValid || !verifiedBridge) {
             trackEvent('mcp_connect_failed', { error_type: 'invalid_request' })
             setIsMaxKeysError(false)
+            setIsPreflightUnreachable(false)
             setErrorMsg('This request was not verified by the local MCP client.')
             setStep('error')
             return
@@ -314,10 +400,12 @@ export default function ConnectMcp() {
             if (error instanceof DOMException && error.name === 'AbortError') return
             trackEvent('mcp_connect_failed', { error_type: 'bridge_preflight_failed' })
             setVerifiedBridge(null)
+            const preflightUnreachable = error instanceof TypeError
+            setIsPreflightUnreachable(preflightUnreachable)
             setIsMaxKeysError(false)
             setErrorMsg(
-                error instanceof TypeError
-                    ? 'Nothing answered on your computer. Sign-in links stop working after five minutes, so most often the link was simply opened too late.'
+                preflightUnreachable
+                    ? localBridgeUnreachableMessage(port)
                     : error instanceof Error
                       ? error.message
                       : 'Could not verify the local MCP bridge.',
@@ -325,6 +413,7 @@ export default function ConnectMcp() {
             setStep('error')
             return
         }
+        setIsPreflightUnreachable(false)
         setVerifiedBridge(bridge)
         setStep('signing')
         try {
@@ -565,6 +654,35 @@ export default function ConnectMcp() {
                         <div className="setup-classic-intro">
                             <h2 className="setup-classic-title">Something went wrong</h2>
                             <p className="setup-classic-description mcp-error">{errorMsg}</p>
+                            {isPreflightUnreachable && (
+                                <p className="setup-classic-description">
+                                    If your MCP client runs on this computer, run{' '}
+                                    <code className="mcp-code">memwal_login</code> again and open the
+                                    new link right away. If it runs on a remote host, container, or
+                                    bot without a local browser, run{' '}
+                                    <code className="mcp-code">
+                                        {mcpCliLoginCommand(relayer, typeof window !== 'undefined' ? window.location.origin : '')}
+                                    </code>{' '}
+                                    on the machine with your browser and copy{' '}
+                                    <code className="mcp-code">~/.memwal/credentials.json</code> (mode{' '}
+                                    <code className="mcp-code">0600</code>) to the remote host.{' '}
+                                    {config.docsUrl && (
+                                        <a
+                                            href={`${config.docsUrl}/troubleshooting/overview#sign-in-page-says-nothing-answered-on-your-computer`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={() =>
+                                                trackEvent('outbound_link_click', {
+                                                    link: 'docs',
+                                                    location: 'connect_mcp_preflight_failed',
+                                                })
+                                            }
+                                        >
+                                            See remote setup and troubleshooting.
+                                        </a>
+                                    )}
+                                </p>
+                            )}
                             <div className="setup-classic-actions">
                                 {isMaxKeysError && (
                                     <Link
@@ -581,6 +699,7 @@ export default function ConnectMcp() {
                                         trackEvent('cta_click', { cta: 'mcp_retry', location: 'connect_mcp' })
                                         setErrorMsg('')
                                         setIsMaxKeysError(false)
+                                        setIsPreflightUnreachable(false)
                                         if (verifiedBridge) {
                                             setStep('consent')
                                         } else {
