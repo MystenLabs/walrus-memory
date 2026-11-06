@@ -28,7 +28,8 @@ questions:
   - What changed in the MemWal OpenClaw plugin changelog?
   - When was the MemWal OpenClaw plugin first released?
 answer: >-
-  Version 0.0.9 prevents sub-agent namespaces and legacy aliases from colliding with the main agent's defaultNamespace, rejects sub-agent memory_search and memory_store requests for the main namespace, and updates the MemWal SDK dependency to 0.1.13. Version 0.0.8 bounds and expires idle capture-session state, watermarks auto-capture per session and preserves message timestamps for occurredAt, aborts timed-out analyze requests without blind retries, distinguishes accepted async remember jobs from completed storage in memory_store, updates the MemWal SDK dependency to 0.1.10, and detects letter-spaced prompt injection keywords.
+  answer: >-
+    Version 0.0.9 prevents sub-agent namespaces and legacy aliases from colliding with the main agent's defaultNamespace, rejects sub-agent memory_search and memory_store requests for the main namespace, skips automatic capture on conversational opt-out turns (including trailing assistant replies) and inline credentials while preserving ordinary developer statements, and updates the MemWal SDK dependency to 0.1.13. Version 0.0.8 bounds and expires idle capture-session state, watermarks auto-capture per session and preserves message timestamps for occurredAt, aborts timed-out analyze requests without blind retries, distinguishes accepted async remember jobs from completed storage in memory_store, updates the MemWal SDK dependency to 0.1.10, and detects letter-spaced prompt injection keywords.
 ---
 
 ## 0.0.9
@@ -37,6 +38,8 @@ answer: >-
 
 - Keep sub-agent memory separate from the main agent when the derived namespace or legacy alias would collide with `defaultNamespace`. Colliding derived namespaces use a deterministic hashed namespace, and `memory_search` and `memory_store` reject explicit requests for the main namespace from sub-agent sessions.
 - When a sub-agent's derived namespace previously equaled `defaultNamespace`, it now uses the hashed namespace. Memories already stored under `defaultNamespace` remain there and are no longer automatically recalled by that sub-agent.
+- Skip automatic capture for conversational opt-out directives (`do not remember`, `don't save`, `off the record`, `forget this`, `[no-save]`, `#nosave`) and suppress trailing assistant replies on opted-out user turns so echoed topics never reach `analyze()`.
+- Exclude turns containing inline credentials, vendor API keys, PEM private keys, labelled 64-hex keys, seed phrases, and `key=value` or `key: value` secret assignments from automatic capture while keeping ordinary developer prose (`We never log request bodies in production`, `Our api_key is configured via Railway`) capturable.
 
 ### Changed
 
