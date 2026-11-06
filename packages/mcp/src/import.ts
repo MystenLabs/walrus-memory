@@ -170,14 +170,16 @@ const SECRET_PATTERNS: RegExp[] = [
     /\b(?:0x)?[0-9a-fA-F]{32,}\b[^A-Za-z0-9]{0,8}(?:is|was)?[^A-Za-z0-9]{0,8}(?:my|the|our)?[^A-Za-z0-9]{0,8}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
     /\bsui[\s._-]*keystore\b/i,
     // Credential assignments
-    /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
+    /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|tokens?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{4,})/i,
+    /\btokens?["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{4,})/i,
     // Auth, bearer, and cookie headers
     /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
     /\b(?:set-)?cookie\s*[:=]\s*[^\s;]+(?:\s*;\s*[^\s;]+)*/i,
     // Seed phrases (including across line breaks after heading or label)
     /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9]{0,12}(?:is|are)?[^A-Za-z0-9]{0,12}(?:[a-z]{3,8}[\s]+){11,23}[a-z]{3,8}\b/i,
-    // .env style secret assignments
-    /(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*\S+/i,
+    // .env style secret assignments and plain token assignments
+    /\b(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY|AUTH_TOKEN|SESSION_TOKEN|ACCESS_TOKEN)\s*[:=]\s*\S+/i,
+    /\b(?:api_key|secret|token|password|private_key|auth_token|session_token|access_token)\s*[:=]\s*\S+/i,
 ];
 
 const HEX_RUN = /\b(?:0x)?[0-9a-fA-F]{32,}\b/g;

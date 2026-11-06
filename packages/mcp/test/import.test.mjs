@@ -180,6 +180,18 @@ test("secret screening identifies private keys, tokens, and env assignments", ()
     );
     assert.equal(setCookieHeader.safe, false);
     assert.equal(setCookieHeader.reason, "secret_detected");
+
+    const plainTokenEquals = screenContentForSafety('token = "synthetic_plain_token_secret_value"');
+    assert.equal(plainTokenEquals.safe, false);
+    assert.equal(plainTokenEquals.reason, "secret_detected");
+
+    const plainTokenColon = screenContentForSafety('token: "synthetic_plain_token_secret_value"');
+    assert.equal(plainTokenColon.safe, false);
+    assert.equal(plainTokenColon.reason, "secret_detected");
+
+    const plainTokenUnquoted = screenContentForSafety("token = synthetic_plain_token_12345");
+    assert.equal(plainTokenUnquoted.safe, false);
+    assert.equal(plainTokenUnquoted.reason, "secret_detected");
 });
 
 test("opt-out markers are detected and recorded with opt_out_marker reason", () => {
@@ -898,4 +910,21 @@ test("screens ancestor-heading labelled private keys and preserves public conten
     const skippedOptOut = res2.skipped.filter((s) => s.reason === "opt_out_marker");
     assert.equal(skippedOptOut.length, 1);
     assert.equal(skippedOptOut[0].section, "Project configuration");
+
+    // 3. Plain token assignment in section content is excluded from direct bulk-upload payload
+    const plainTokenContent = [
+        "# Staging deployment",
+        "For the staging CLI use token: synthetic-rest-token-value before running integration tests.",
+        "",
+        "# Production architecture",
+        "We deploy stateless services to ECS with PostgreSQL managed by Aurora.",
+    ].join("\n");
+
+    const res3 = extractCandidateChunks(plainTokenContent, "AGENTS.md");
+    assert.equal(res3.candidates.length, 1);
+    assert.equal(res3.candidates[0].section, "Production architecture");
+    assert.ok(res3.candidates[0].text.includes("Aurora"));
+    const tokenSkip = res3.skipped.filter((s) => s.reason === "secret_detected");
+    assert.equal(tokenSkip.length, 1);
+    assert.equal(tokenSkip[0].section, "Staging deployment");
 });
