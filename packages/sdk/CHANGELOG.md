@@ -10,6 +10,7 @@
 ### Fixed
 
 - `MemWal` and `MemWalMock` share input validation on `remember*`, `rememberBulk*`, `analyze*`, `embed`, `recall`, `restore`, and `listNamespaces`, rejecting invalid `idempotencyKey` values before signing and rejecting `limit: 0` consistently. On read paths (`recall`, `recallManual`, `restore`, and `listMemories`), empty string `""` is rejected while whitespace namespaces remain readable to match the server's namespace validation. (Refs #978)
+- `withMemWal` accepts `maxTokens` in `WithMemWalOptions` and forwards it to `recall({ maxTokens })` before calling the underlying language model, capping the token budget of recalled memories injected into each prompt.
 
 ## 0.1.12
 
