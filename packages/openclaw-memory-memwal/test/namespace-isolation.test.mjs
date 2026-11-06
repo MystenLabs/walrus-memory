@@ -624,3 +624,62 @@ test("memory_search and memory_store require identity when sender isolation is e
   assert.equal(storeRes.details.error, "sender_identity_required");
   assert.equal(storeRes.error, "sender_identity_required");
 });
+
+test("registerTools isolates distinct requesterSenderId callers sharing the same group sessionKey", async () => {
+  const storedByNs = new Map();
+  const client = {
+    analyze: async (text, opts) => {
+      const list = storedByNs.get(opts.namespace) ?? [];
+      list.push({ id: `f-${list.length + 1}`, text });
+      storedByNs.set(opts.namespace, list);
+      return { facts: [{ id: `f-${list.length}`, text }] };
+    },
+    recall: async (_query, _limit, ns) => {
+      const list = storedByNs.get(ns) ?? [];
+      return { results: list.map((f) => ({ text: f.text, distance: 0.1 })) };
+    },
+  };
+
+  const config = {
+    ...BASE_CONFIG,
+    isolateBySender: true,
+    includeSharedNamespaceOnRecall: false,
+  };
+
+  const sharedSessionKey = "agent:main:discord:channel:999";
+  const aliceNs = `default:sender:${sanitizeNamespaceSegment("alice_user")}`;
+  const bobNs = `default:sender:${sanitizeNamespaceSegment("bob_user")}`;
+
+  const aliceTools = makeApi({
+    sessionKey: sharedSessionKey,
+    requesterSenderId: "alice_user",
+  });
+  registerTools(aliceTools.api, client, config);
+
+  const bobTools = makeApi({
+    sessionKey: sharedSessionKey,
+    requesterSenderId: "bob_user",
+  });
+  registerTools(bobTools.api, client, config);
+
+  // Alice stores a fact via memory_store using OpenClaw's ctx.requesterSenderId
+  const storeRes = await aliceTools.tools.memory_store.execute("st-alice", {
+    text: "Alice staging deploy key alias is alice-eu-west",
+  });
+  assert.equal(storeRes.details.namespace, aliceNs);
+
+  // Bob searches in the same group session via ctx.requesterSenderId and cannot see Alice's fact
+  const bobSearch = await bobTools.tools.memory_search.execute("sr-bob", {
+    query: "deploy key alias",
+  });
+  assert.equal(bobSearch.details.namespace, bobNs);
+  assert.equal(bobSearch.details.count, 0);
+
+  // Alice searches in the same group session via ctx.requesterSenderId and retrieves her own fact
+  const aliceSearch = await aliceTools.tools.memory_search.execute("sr-alice", {
+    query: "deploy key alias",
+  });
+  assert.equal(aliceSearch.details.namespace, aliceNs);
+  assert.equal(aliceSearch.details.count, 1);
+  assert.match(aliceSearch.content[0].text, /alice-eu-west/);
+});

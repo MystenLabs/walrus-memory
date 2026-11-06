@@ -169,13 +169,15 @@ export function extractMessages(
       const senderId =
         typeof msg.senderId === "string" && msg.senderId.trim().length > 0
           ? msg.senderId.trim()
-          : typeof msg.authorId === "string" && msg.authorId.trim().length > 0
-            ? msg.authorId.trim()
-            : typeof msg.author === "string" && msg.author.trim().length > 0
-              ? msg.author.trim()
-              : typeof msg.from === "string" && msg.from.trim().length > 0
-                ? msg.from.trim()
-                : undefined;
+          : typeof msg.requesterSenderId === "string" && msg.requesterSenderId.trim().length > 0
+            ? msg.requesterSenderId.trim()
+            : typeof msg.authorId === "string" && msg.authorId.trim().length > 0
+              ? msg.authorId.trim()
+              : typeof msg.author === "string" && msg.author.trim().length > 0
+                ? msg.author.trim()
+                : typeof msg.from === "string" && msg.from.trim().length > 0
+                  ? msg.from.trim()
+                  : undefined;
       const userId =
         typeof msg.userId === "string" && msg.userId.trim().length > 0
           ? msg.userId.trim()

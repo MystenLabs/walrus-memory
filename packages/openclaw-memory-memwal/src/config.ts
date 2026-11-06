@@ -205,21 +205,31 @@ export function sanitizeNamespaceSegment(raw: string): string {
 
 /**
  * Extract sender identifier from hook context or event.
- * Checks event.senderId, ctx.senderId, event.userId, ctx.userId, ctx.from,
- * and metadata fields in order, ignoring placeholder and whitespace values.
+ * Checks event.senderId, ctx.senderId, ctx.requesterSenderId, event.userId,
+ * ctx.userId, ctx.from, and metadata fields in order, ignoring placeholder
+ * and whitespace values.
  */
 export function extractSenderId(
   ctx?: PluginHookContext,
-  event?: { senderId?: string; userId?: string; metadata?: Record<string, unknown> },
+  event?: {
+    senderId?: string;
+    requesterSenderId?: string;
+    userId?: string;
+    metadata?: Record<string, unknown>;
+  },
 ): string | undefined {
   const candidates: unknown[] = [
     event?.senderId,
     ctx?.senderId,
+    event?.requesterSenderId,
+    ctx?.requesterSenderId,
     event?.userId,
     ctx?.userId,
     ctx?.from,
     event?.metadata?.senderId,
     ctx?.metadata?.senderId,
+    event?.metadata?.requesterSenderId,
+    ctx?.metadata?.requesterSenderId,
     event?.metadata?.userId,
     ctx?.metadata?.userId,
   ];

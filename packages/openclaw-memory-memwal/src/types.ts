@@ -32,6 +32,7 @@ export interface PluginConfig {
 export interface PluginHookContext {
   sessionKey?: string;
   senderId?: string;
+  requesterSenderId?: string;
   userId?: string;
   from?: string;
   sessionId?: string;
@@ -42,6 +43,7 @@ export interface PluginHookContext {
 export interface AgentStartEvent {
   prompt?: string;
   senderId?: string;
+  requesterSenderId?: string;
   userId?: string;
   sessionId?: string;
   metadata?: Record<string, unknown>;
@@ -52,6 +54,7 @@ export interface AgentEndEvent {
   success?: boolean;
   messages?: unknown[];
   senderId?: string;
+  requesterSenderId?: string;
   userId?: string;
   sessionId?: string;
   metadata?: Record<string, unknown>;
