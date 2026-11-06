@@ -70,6 +70,9 @@ import {
     normalizePrivateKey,
     normalizeServerUrl,
     assertNonBlankText,
+    assertReadableNamespace,
+    assertPositiveIntegerLimit,
+    validateIdempotencyKey,
     sanitizeServerError,
     redactInternalUrls,
     clockDriftErrorFromResponse,
@@ -93,6 +96,7 @@ import { pollingDelayMs } from "./polling-delay.js";
 import { resolveRecallCall } from "./recall-args.js";
 import {
     MemWalRateLimitedError,
+    MemWalRecallAllDroppedError,
     MemWalRememberJobFailedError,
     MemWalRememberJobNotFoundError,
     MemWalRememberJobTimeoutError,
@@ -343,17 +347,6 @@ function isTransientPollingStatus(status: number): boolean {
     return status === 0 || status === 429 || status >= 500;
 }
 
-/**
- * A list `limit` goes into the signed query string, so check it first.
- * `String(NaN)`, `-1` or `2.5` were signed and sent verbatim (#1213). The
- * message matches the recall/recallManual limit guards.
- */
-function assertPositiveIntegerLimit(limit: unknown): void {
-    if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-        throw new TypeError(`limit must be a positive integer, got ${limit}`);
-    }
-}
-
 function jsonBodyError(status: number, message: string): Error {
     return Object.assign(new Error(message), { status });
 }
@@ -553,8 +546,8 @@ export class MemWal {
         // warns (does not throw) if a user passes plain http:// for a
         // non-localhost host.
         this.serverUrl = normalizeServerUrl(config.serverUrl ?? "https://relayer.memory.walrus.xyz");
-        if (config.namespace !== undefined && !config.namespace) {
-            throw new Error("namespace cannot be empty");
+        if (config.namespace !== undefined) {
+            assertNonBlankText(config.namespace, "namespace cannot be empty");
         }
         this.namespace = config.namespace ?? "default";
         // A non-positive or non-finite override would disable the backstop
@@ -618,9 +611,11 @@ export class MemWal {
         options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         requireRememberText(text);
-        assertNonBlankText(text);
+        assertNonBlankText(text, "text cannot be empty");
         const split = splitRememberArgs(namespaceOrOptions, options);
         const resolvedNamespace = split.namespace ?? this.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        validateIdempotencyKey(split.options.idempotencyKey);
         const dedupe = split.options.dedupe === true;
         const requestIdentity = `${resolvedNamespace}\0${text}`;
         const pendingIdentity = dedupe ? `dedupe\0${requestIdentity}` : requestIdentity;
@@ -795,8 +790,11 @@ export class MemWal {
         opts?: RememberCallOptions,
     ): Promise<RememberResult> {
         requireRememberText(text);
+        assertNonBlankText(text, "text cannot be empty");
         const split = splitRememberArgs(namespaceOrOptions, opts);
         const resolvedNamespace = split.namespace ?? this.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
+        validateIdempotencyKey(split.options.idempotencyKey);
         const dedupe = split.options.dedupe === true;
         const requestIdentity = `${resolvedNamespace}\0${text}`;
         const pendingIdentity = dedupe ? `dedupe\0${requestIdentity}` : requestIdentity;
@@ -874,7 +872,11 @@ export class MemWal {
         }
         items.forEach((item, i) => {
             assertNonBlankText(item?.text, `items[${i}].text cannot be empty`);
+            if (item?.namespace !== undefined) {
+                assertNonBlankText(item.namespace, `items[${i}].namespace cannot be empty`);
+            }
         });
+        validateIdempotencyKey(options.idempotencyKey);
 
         const normalised = items.map((item) => ({
             text: item.text,
@@ -1125,7 +1127,11 @@ export class MemWal {
         }
         items.forEach((item, i) => {
             assertNonBlankText(item?.text, `items[${i}].text cannot be empty`);
+            if (item?.namespace !== undefined) {
+                assertNonBlankText(item.namespace, `items[${i}].namespace cannot be empty`);
+            }
         });
+        validateIdempotencyKey(opts.idempotencyKey);
 
         const normalised = items.map((item) => ({
             text: item.text,
@@ -1235,11 +1241,7 @@ export class MemWal {
         assertNonBlankText(query, "query cannot be empty");
         const rawLimit = options.topK !== undefined ? options.topK : options.limit;
         const limit = rawLimit !== undefined ? rawLimit : 10;
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(options.scoringWeights);
         if (
             options.maxDistance !== undefined
@@ -1249,7 +1251,18 @@ export class MemWal {
         ) {
             throw new Error("maxDistance must be a non-negative finite number");
         }
+        if (
+            options.onDropped !== undefined
+            && options.onDropped !== "throw"
+            && options.onDropped !== "ignore"
+        ) {
+            throw new TypeError(
+                `onDropped must be "throw" or "ignore", got ${String(options.onDropped)}`,
+            );
+        }
+        const onDropped = options.onDropped ?? "ignore";
         const resolvedNamespace = options.namespace ?? this.namespace;
+        assertReadableNamespace(resolvedNamespace);
 
 
         {
@@ -1279,7 +1292,37 @@ export class MemWal {
             }, { timeoutMs });
             requireArrayField(result, "results", "POST /api/recall");
 
-            let processed = result;
+            const droppedCount =
+                typeof result.dropped_count === "number" && result.dropped_count > 0
+                    ? result.dropped_count
+                    : 0;
+            const degraded = result.degraded === true || droppedCount > 0;
+            const rawTotal =
+                typeof result.total === "number" && Number.isFinite(result.total)
+                    ? result.total
+                    : result.results.length;
+
+            let processed: RecallResult = degraded
+                ? {
+                    ...result,
+                    total: rawTotal,
+                    dropped_count: droppedCount > 0 ? droppedCount : (result.results.length === 0 ? Math.max(1, rawTotal) : undefined),
+                    degraded: true,
+                }
+                : result;
+
+            if (result.results.length === 0 && degraded && onDropped === "throw") {
+                const effectiveDropped =
+                    typeof processed.dropped_count === "number" && processed.dropped_count > 0
+                        ? processed.dropped_count
+                        : Math.max(1, rawTotal);
+                throw new MemWalRecallAllDroppedError(
+                    effectiveDropped,
+                    effectiveDropped,
+                    resolvedNamespace,
+                );
+            }
+
             if (typeof options.maxDistance === "number") {
                 const filtered = result.results.filter(
                     (memory) =>
@@ -1346,13 +1389,15 @@ export class MemWal {
     async rememberManual(opts: RememberManualOptions): Promise<RememberManualResult> {
         assertNonEmptyEncryptedData(opts.encryptedData);
         assertFiniteVector(opts.vector);
+        const resolvedNamespace = opts.namespace ?? this.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         return this.signedRequest<RememberManualResult>(
             "POST",
             "/api/remember/manual",
             {
                 encrypted_data: opts.encryptedData,
                 vector: opts.vector,
-                namespace: opts.namespace ?? this.namespace,
+                namespace: resolvedNamespace,
             },
             { includeDelegateKey: false },
         );
@@ -1391,19 +1436,17 @@ export class MemWal {
     async recallManual(opts: RecallManualOptions): Promise<RecallManualHitResult> {
         assertFiniteVector(opts.vector);
         const limit = opts.limit !== undefined ? opts.limit : 10;
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertPositiveIntegerLimit(limit);
         assertFiniteScoringWeights(opts.scoringWeights);
+        const resolvedNamespace = opts.namespace ?? this.namespace;
+        assertReadableNamespace(resolvedNamespace);
         return this.signedRequest<RecallManualHitResult>(
             "POST",
             "/api/recall/manual",
             {
                 vector: opts.vector,
                 limit,
-                namespace: opts.namespace ?? this.namespace,
+                namespace: resolvedNamespace,
                 scoring_weights: scoringWeightsToWire(opts.scoringWeights),
             },
             { includeDelegateKey: false },
@@ -1445,11 +1488,13 @@ export class MemWal {
         text: string,
         namespaceOrOptions?: string | AnalyzeOptions,
     ): Promise<AnalyzeResult> {
-        assertNonBlankText(text);
+        assertNonBlankText(text, "text cannot be empty");
         const options = normalizeAnalyzeOptions(namespaceOrOptions);
+        const resolvedNamespace = options.namespace ?? this.namespace;
+        assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         const body: Record<string, unknown> = {
             text,
-            namespace: options.namespace ?? this.namespace,
+            namespace: resolvedNamespace,
         };
         const wireOccurredAt = occurredAtToWire(options.occurredAt);
         if (wireOccurredAt !== undefined) body.occurred_at = wireOccurredAt;
@@ -1526,11 +1571,8 @@ export class MemWal {
      * ```
      */
     async restore(namespace: string, limit: number = 10): Promise<RestoreResult> {
-        if (typeof limit !== "number" || !Number.isInteger(limit) || limit <= 0) {
-            throw new TypeError(
-                `limit must be a positive integer, got ${limit}`,
-            );
-        }
+        assertReadableNamespace(namespace);
+        assertPositiveIntegerLimit(limit);
         const result = await this.signedRequest<RestoreResult>(
             "POST",
             "/api/restore",
@@ -1572,14 +1614,13 @@ export class MemWal {
      * ```
      */
     async listNamespaces(options: ListNamespacesOptions = {}): Promise<NamespacesResult> {
-        const owner = await this.resolveOwner();
-
         const params = new URLSearchParams();
         if (options.cursor !== undefined) params.set("updated_after", options.cursor);
         if (options.limit !== undefined) {
             assertPositiveIntegerLimit(options.limit);
             params.set("limit", String(options.limit));
         }
+        const owner = await this.resolveOwner();
         const query = params.toString();
 
         // Query string must be part of the signed path: the server verifies
@@ -1618,14 +1659,16 @@ export class MemWal {
      * ```
      */
     async listMemories(options: ListMemoriesOptions = {}): Promise<MemoriesResult> {
-        const owner = await this.resolveOwner();
-
+        if (options.namespace !== undefined) {
+            assertReadableNamespace(options.namespace);
+        }
         const params = new URLSearchParams();
         if (options.cursor !== undefined) params.set("updated_after", options.cursor);
         if (options.limit !== undefined) {
             assertPositiveIntegerLimit(options.limit);
             params.set("limit", String(options.limit));
         }
+        const owner = await this.resolveOwner();
         const query = params.toString();
 
         // Query string must be part of the signed path (see listNamespaces).

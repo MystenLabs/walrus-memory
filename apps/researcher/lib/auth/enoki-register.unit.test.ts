@@ -38,14 +38,28 @@ const PUBLIC_KEY = Buffer.from(
 type ChainObject = { type?: string; json?: unknown } | undefined;
 let chain: { object: ChainObject; throws: boolean; reads: string[] };
 let persisted: Array<{ op: string; accountId: string }>;
-let sessions: Array<{ accountId: string }>;
-let existingUser: { id: string } | null;
+let sessions: Array<{ publicKey?: string; accountId: string }>;
+let existingUser: {
+  id: string;
+  delegatePrivateKey?: string | null;
+  publicKey?: string | null;
+  accountId?: string | null;
+} | null;
+let resolveAndMigrateOverride:
+  | ((targetUser: {
+      id: string;
+      delegatePrivateKey?: string | null;
+      publicKey?: string | null;
+      accountId?: string | null;
+    }) => Promise<string>)
+  | null;
 
 beforeEach(() => {
   chain = { object: undefined, throws: false, reads: [] };
   persisted = [];
   sessions = [];
   existingUser = null;
+  resolveAndMigrateOverride = null;
 });
 
 mock.module("@mysten/sui/grpc", {
@@ -61,14 +75,25 @@ mock.module("@mysten/sui/grpc", {
 });
 mock.module("@/lib/auth/session", {
   namedExports: {
-    createSession: async (_id: string, _pk: string, accountId: string) => {
-      sessions.push({ accountId });
+    createSession: async (_id: string, publicKey: string, accountId: string) => {
+      sessions.push({ publicKey, accountId });
     },
   },
 });
 mock.module("@/lib/db/queries", {
   namedExports: {
     getUserBySuiAddress: async () => existingUser,
+    resolveAndMigrateUserDelegateKey: async (targetUser: {
+      id: string;
+      delegatePrivateKey?: string | null;
+      publicKey?: string | null;
+      accountId?: string | null;
+    }) => {
+      if (resolveAndMigrateOverride) {
+        return resolveAndMigrateOverride(targetUser);
+      }
+      return targetUser.delegatePrivateKey ?? "";
+    },
     createEnokiUser: async (input: { accountId: string }) => {
       persisted.push({ op: "create", accountId: input.accountId });
       return { id: "user-new" };
@@ -187,7 +212,7 @@ test("accepts a key registered on an active account owned by the wallet", async 
   const result = await register();
   assert.equal(result.status, 200, JSON.stringify(result.body));
   assert.deepEqual(persisted, [{ op: "create", accountId: ACCOUNT_ID }]);
-  assert.deepEqual(sessions, [{ accountId: ACCOUNT_ID }]);
+  assert.deepEqual(sessions, [{ publicKey: PUBLIC_KEY, accountId: ACCOUNT_ID }]);
 });
 
 test("accepts an on-chain owner in a different but equivalent address form", async () => {
@@ -196,4 +221,42 @@ test("accepts an on-chain owner in a different but equivalent address form", asy
   const result = await register();
   assert.equal(result.status, 200, JSON.stringify(result.body));
   assert.deepEqual(persisted, [{ op: "update", accountId: ACCOUNT_ID }]);
+  assert.deepEqual(sessions, [{ publicKey: PUBLIC_KEY, accountId: ACCOUNT_ID }]);
+});
+
+test("Phase 1 returning Enoki login propagates the reloaded publicKey and accountId when migration loses a CAS race", async () => {
+  existingUser = {
+    id: "user-legacy",
+    delegatePrivateKey: "a".repeat(64),
+    publicKey: "pk-stale",
+    accountId: `0x${"1".repeat(64)}`,
+  };
+  const rotatedKey = "b".repeat(64);
+  const rotatedPublicKey = "pk-rotated";
+  const rotatedAccountId = `0x${"2".repeat(64)}`;
+
+  resolveAndMigrateOverride = async (targetUser) => {
+    targetUser.delegatePrivateKey = `v1.rotated.envelope`;
+    targetUser.publicKey = rotatedPublicKey;
+    targetUser.accountId = rotatedAccountId;
+    return rotatedKey;
+  };
+
+  const res = await POST(
+    new Request("http://researcher.local/api/auth/enoki", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        suiAddress: WALLET,
+        signature: "sig",
+      }),
+    })
+  );
+  const body = (await res.json()) as { success?: boolean; needsSetup?: boolean };
+  assert.equal(res.status, 200);
+  assert.equal(body.success, true);
+  assert.equal(body.needsSetup, false);
+  assert.deepEqual(sessions, [
+    { publicKey: rotatedPublicKey, accountId: rotatedAccountId },
+  ]);
 });

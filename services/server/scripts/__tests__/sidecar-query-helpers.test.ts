@@ -34,6 +34,7 @@ import {
     createdBlobObjectIdFromTransaction,
     durableRegisterDirectSigningAllowed,
     executePreparedRegisterTransaction,
+    PreparedRegisterNotOnChainError,
     readUploadBlobObject,
     waitForCertifiedStep,
     certifiedStep,
@@ -686,6 +687,159 @@ test("an expired prepared registration absent from chain is safe to rebuild", as
         code: "SHARED_SERVICE_UNAVAILABLE",
     });
     assert.equal(executeCalls, 0);
+
+    await assert.rejects(
+        executePreparedRegisterTransaction(
+            validated,
+            client,
+            () => {},
+            async () => 1n,
+            false,
+            async () => {
+                throw new Error("reconcile-only lookup must not submit sponsored transactions");
+            },
+            1,
+            false,
+        ),
+        (error: unknown) =>
+            error instanceof PreparedRegisterNotOnChainError
+            && error.code === "PREPARED_REGISTER_NOT_ON_CHAIN",
+    );
+    assert.equal(executeCalls, 0);
+});
+
+test("reconcile-only prepared registration retries replica lag and returns on-chain transaction", async () => {
+    const { signer, prepared } = await preparedRegisterFixture();
+    const validated = await validatePreparedRegisterTransaction(prepared, signer.toSuiAddress());
+    let getCalls = 0;
+    const client = {
+        async getTransaction() {
+            getCalls += 1;
+            if (getCalls === 1) {
+                throw Object.assign(new Error("transaction not found"), {
+                    code: "NOT_FOUND",
+                });
+            }
+            return {
+                Transaction: { digest: validated.digest },
+            };
+        },
+        async executeTransaction() {
+            throw new Error("reconcile-only lookup must never execute transactions");
+        },
+    };
+    let observed = false;
+    const result = await executePreparedRegisterTransaction(
+        validated,
+        client,
+        () => {
+            observed = true;
+        },
+        async () => 1n,
+        true,
+        async () => {
+            throw new Error("reconcile-only lookup must not submit sponsored transactions");
+        },
+        2,
+        false,
+    );
+    assert.deepEqual(result, { Transaction: { digest: validated.digest } });
+    assert.equal(getCalls, 2);
+    assert.equal(observed, true);
+});
+
+test("reconcile-only lookup classifies absence as ambiguous when mayHaveBeenSubmitted is true", async () => {
+    const { signer, prepared } = await preparedRegisterFixture();
+    const validated = await validatePreparedRegisterTransaction(prepared, signer.toSuiAddress());
+    assert.ok(validated.maxEpoch !== undefined);
+    const expiredEpoch = validated.maxEpoch + 1n;
+    const client = {
+        async getTransaction() {
+            throw Object.assign(new Error("transaction not found"), {
+                code: "NOT_FOUND",
+            });
+        },
+        async executeTransaction() {
+            throw new Error("reconcile-only lookup must never execute transactions");
+        },
+    };
+
+    // Before maxEpoch:
+    const ambiguousBeforeExpiry = await executePreparedRegisterTransaction(
+        validated,
+        client,
+        () => {},
+        async () => 1n,
+        true,
+        async () => {
+            throw new Error("must not submit");
+        },
+        2,
+        false,
+    ).then(
+        () => null,
+        (error) => error,
+    );
+    assert.match(ambiguousBeforeExpiry?.message, /not visible on chain yet and remains ambiguous/);
+    assert.equal(ambiguousBeforeExpiry?.code, "UNAVAILABLE");
+    assert.deepEqual(classifyDurableSideEffectError(ambiguousBeforeExpiry, false, true), {
+        code: "SHARED_SERVICE_UNAVAILABLE",
+    });
+
+    // After maxEpoch:
+    const ambiguousAfterExpiry = await executePreparedRegisterTransaction(
+        validated,
+        client,
+        () => {},
+        async () => expiredEpoch,
+        true,
+        async () => {
+            throw new Error("must not submit");
+        },
+        2,
+        false,
+    ).then(
+        () => null,
+        (error) => error,
+    );
+    assert.match(ambiguousAfterExpiry?.message, /expired .* but remains ambiguous/);
+    assert.equal(ambiguousAfterExpiry?.code, "UNAVAILABLE");
+    assert.deepEqual(classifyDurableSideEffectError(ambiguousAfterExpiry, false, true), {
+        code: "SHARED_SERVICE_UNAVAILABLE",
+    });
+});
+
+test("reconcile-only lookup returns PREPARED_REGISTER_NOT_ON_CHAIN when mayHaveBeenSubmitted is false", async () => {
+    const { signer, prepared } = await preparedRegisterFixture();
+    const validated = await validatePreparedRegisterTransaction(prepared, signer.toSuiAddress());
+    const client = {
+        async getTransaction() {
+            throw Object.assign(new Error("transaction not found"), {
+                code: "NOT_FOUND",
+            });
+        },
+        async executeTransaction() {
+            throw new Error("reconcile-only lookup must never execute transactions");
+        },
+    };
+
+    await assert.rejects(
+        executePreparedRegisterTransaction(
+            validated,
+            client,
+            () => {},
+            async () => 1n,
+            false,
+            async () => {
+                throw new Error("reconcile-only lookup must not submit sponsored transactions");
+            },
+            1,
+            false,
+        ),
+        (error: unknown) =>
+            error instanceof PreparedRegisterNotOnChainError
+            && error.code === "PREPARED_REGISTER_NOT_ON_CHAIN",
+    );
 });
 
 test("a newly created Blob missing from an RPC replica remains replayable", async () => {

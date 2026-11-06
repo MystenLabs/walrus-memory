@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
     address: '0xowner',
     accountId: '0xaccount',
+    accountObjectJson: null as Record<string, unknown> | null,
     signAndExecute: vi.fn(),
 }))
 
@@ -28,6 +29,7 @@ vi.mock('../hooks/useSponsoredTransaction', () => ({
 }))
 vi.mock('../utils/suiClientCompat', () => ({
     fetchAccountIdForOwner: vi.fn().mockResolvedValue(mocks.accountId),
+    fetchObjectJson: vi.fn(async () => mocks.accountObjectJson),
 }))
 vi.mock('../utils/analytics', () => ({
     trackEvent: vi.fn(),
@@ -73,6 +75,7 @@ async function signIn() {
 
 beforeEach(() => {
     vi.clearAllMocks()
+    mocks.accountObjectJson = null
     mocks.signAndExecute.mockResolvedValue({ digest: '0xdigest' })
 })
 
@@ -101,24 +104,96 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.getByText(/handed off to your MCP client/i)).toBeInTheDocument()
     })
 
-    it('offers the starter system prompt once the client is connected', async () => {
+    it('offers the one-time setup once the client is connected', async () => {
         stubListener(async () => new Response('{}', { status: 200 }))
         await signIn()
 
         expect(await screen.findByText(/MCP client connected/i)).toBeInTheDocument()
-        expect(screen.getByText(/most agents only write when told to/i)).toBeInTheDocument()
-        expect(screen.getByText(/call memwal_remember in that same turn/i)).toBeInTheDocument()
-        expect(screen.getByRole('button', { name: /copy prompt/i })).toBeInTheDocument()
+        expect(screen.getByText(/Required: one-time setup/i)).toBeInTheDocument()
+        expect(screen.getByText(/without asking for confirmation/i)).toBeInTheDocument()
+        expect(screen.getByText(/Instructions for Claude/i)).toBeInTheDocument()
+        expect(screen.getByText(/CLAUDE.md/)).toBeInTheDocument()
+        expect(screen.getByText(/AGENTS.md/)).toBeInTheDocument()
+        expect(screen.getByText(/\.cursor\/rules/)).toBeInTheDocument()
+        expect(screen.getByText(/does not delete existing native memories/i)).toBeInTheDocument()
+        expect(screen.queryByText(/ChatGPT/i)).not.toBeInTheDocument()
+        expect(screen.getAllByText(/Always allow/i).length).toBeGreaterThanOrEqual(1)
+        expect(screen.getByRole('link', { name: /memory\.walrus\.xyz/i })).toHaveAttribute(
+            'href',
+            'https://memory.walrus.xyz',
+        )
+        expect(screen.getByRole('button', { name: /copy instruction/i })).toBeInTheDocument()
+        expect(screen.getByText(/other clients use the same three steps/i)).toBeInTheDocument()
     })
 
-    it('withholds the starter prompt when the hand-off never landed', async () => {
+    it('defaults to proactive mode, rendering and copying the proactive instruction', async () => {
+        const user = userEvent.setup()
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined)
+        stubListener(async () => new Response('{}', { status: 200 }))
+        await signIn()
+
+        const proactiveBtn = await screen.findByRole('button', {
+            name: /portable across apps/i,
+        })
+        const explicitBtn = screen.getByRole('button', {
+            name: /keep native memory/i,
+        })
+
+        expect(proactiveBtn).toHaveAttribute('aria-pressed', 'true')
+        expect(explicitBtn).toHaveAttribute('aria-pressed', 'false')
+        expect(
+            screen.getByText(/Save durable facts to the user's Walrus Memory proactively/i),
+        ).toBeInTheDocument()
+
+        await user.click(screen.getByRole('button', { name: /copy instruction/i }))
+        expect(writeText).toHaveBeenCalledTimes(1)
+        expect(writeText.mock.calls[0]?.[0]).toContain(
+            "Save durable facts to the user's Walrus Memory proactively",
+        )
+    })
+
+    it('switches to explicit mode when toggled, updating the instruction and copy handler', async () => {
+        const user = userEvent.setup()
+        const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined)
+        stubListener(async () => new Response('{}', { status: 200 }))
+        await signIn()
+
+        const explicitBtn = await screen.findByRole('button', {
+            name: /keep native memory/i,
+        })
+        const proactiveBtn = screen.getByRole('button', {
+            name: /portable across apps/i,
+        })
+
+        await user.click(explicitBtn)
+        expect(explicitBtn).toHaveAttribute('aria-pressed', 'true')
+        expect(proactiveBtn).toHaveAttribute('aria-pressed', 'false')
+
+        expect(
+            screen.getByText(/Keep using the client's built-in memory by default/i),
+        ).toBeInTheDocument()
+        expect(
+            screen.queryByText(/Save durable facts to the user's Walrus Memory proactively/i),
+        ).not.toBeInTheDocument()
+        expect(
+            screen.getByText(/Write tools run only when you explicitly ask for Walrus Memory/i),
+        ).toBeInTheDocument()
+
+        await user.click(screen.getByRole('button', { name: /copy instruction/i }))
+        expect(writeText).toHaveBeenCalledTimes(1)
+        expect(writeText.mock.calls[0]?.[0]).toContain(
+            "Keep using the client's built-in memory by default",
+        )
+    })
+
+    it('withholds the one-time setup when the hand-off never landed', async () => {
         stubListener(async () => {
             throw new TypeError('Failed to fetch')
         })
         await signIn()
 
         expect(await screen.findByText(/Almost there/i)).toBeInTheDocument()
-        expect(screen.queryByRole('button', { name: /copy prompt/i })).not.toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: /copy instruction/i })).not.toBeInTheDocument()
     })
 
     it('does not claim success when nothing answers on localhost', async () => {
@@ -186,5 +261,50 @@ describe('MCP sign-in hand-off', () => {
             'href',
             'https://docs.test/troubleshooting/overview#sign-in-succeeds-but-credentials-are-not-saved',
         )
+    })
+
+    it('fails fast on preflight when the account already holds 20 delegate keys', async () => {
+        stubListener(async () => new Response('{}', { status: 200 }))
+        mocks.accountObjectJson = {
+            delegate_keys: Array.from({ length: 20 }, (_, idx) => ({ public_key: `key_${idx}` })),
+        }
+        await signIn()
+
+        expect(
+            await screen.findByText(
+                /already has the maximum number of delegate keys \(20\)\. Go to \/dashboard and revoke an unused key/i,
+            ),
+        ).toBeInTheDocument()
+        expect(screen.getByRole('link', { name: /go to dashboard/i })).toHaveAttribute('href', '/dashboard')
+        expect(mocks.signAndExecute).not.toHaveBeenCalled()
+    })
+
+    it('surfaces the 20 delegate-key limit when sponsor rejects with max_delegate_keys', async () => {
+        const { SponsorHttpError, sponsorFailureMessage } = await vi.importActual<
+            typeof import('../hooks/useSponsoredTransaction')
+        >('../hooks/useSponsoredTransaction')
+        stubListener(async () => new Response('{}', { status: 200 }))
+        mocks.signAndExecute.mockRejectedValue(
+            new Error(
+                sponsorFailureMessage(
+                    new SponsorHttpError(
+                        'sponsor',
+                        409,
+                        JSON.stringify({
+                            error: 'This Walrus Memory account already has the maximum number of delegate keys (20). Go to /dashboard and revoke an unused key, then try again.',
+                            code: 'max_delegate_keys',
+                            traceId: 'tr_limit_1',
+                        }),
+                    ),
+                ),
+            ),
+        )
+        await signIn()
+
+        expect(
+            await screen.findByText(/already has the maximum number of delegate keys \(20\)/i),
+        ).toBeInTheDocument()
+        expect(screen.getByText(/traceId: tr_limit_1/i)).toBeInTheDocument()
+        expect(screen.getByRole('link', { name: /go to dashboard/i })).toHaveAttribute('href', '/dashboard')
     })
 })

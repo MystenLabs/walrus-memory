@@ -301,15 +301,15 @@ test("MemWalMock.listNamespaces rejects a non-positive limit instead of paging f
 
     await assert.rejects(
         () => mock.listNamespaces({ limit: 0 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
     await assert.rejects(
         () => mock.listNamespaces({ limit: -1 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
     await assert.rejects(
         () => mock.listNamespaces({ limit: 1.5 }),
-        /limit must be positive/,
+        /limit must be a positive integer/,
     );
 
     const page = await mock.listNamespaces({ limit: 1 });
@@ -670,5 +670,26 @@ test("MemWalMock.remember with dedupe: true does not collapse onto a prior norma
     assert.equal(secondDedupe.id, firstDedupe.id);
     assert.equal(secondDedupe.blob_id, firstDedupe.blob_id);
 });
+
+test("MemWalMock.recall accepts omitted, ignore, and throw onDropped policies and rejects invalid values", async () => {
+    const mock = MemWalMock.create({
+        initialMemories: [{ text: "Morning coffee routine", namespace: "ns", blobId: "b1" }],
+    });
+
+    const omitted = await mock.recall({ query: "coffee", namespace: "ns" });
+    assert.equal(omitted.results.length, 1);
+
+    const ignored = await mock.recall({ query: "coffee", namespace: "ns", onDropped: "ignore" });
+    assert.equal(ignored.results.length, 1);
+
+    const strict = await mock.recall({ query: "coffee", namespace: "ns", onDropped: "throw" });
+    assert.equal(strict.results.length, 1);
+
+    await assert.rejects(
+        () => mock.recall({ query: "coffee", namespace: "ns", onDropped: /** @type {any} */ ("warn") }),
+        TypeError,
+    );
+});
+
 
 

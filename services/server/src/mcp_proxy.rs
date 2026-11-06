@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     body::Body,
@@ -35,6 +35,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use sha2::{Digest, Sha256};
 
 use crate::{client_ip::canonical_client_ip, types::AppState};
 
@@ -558,6 +559,228 @@ fn oauth_unauthorized_response(
     resp
 }
 
+pub const MCP_SERVER_CARD_SCHEMA: &str =
+    "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json";
+pub const MCP_SERVER_CARD_NAME: &str = "xyz.walrus.memory/memwal";
+pub const MCP_SERVER_CARD_TITLE: &str = "Walrus Memory MCP Server";
+pub const MCP_SERVER_CARD_DESCRIPTION: &str =
+    "Portable, SEAL-encrypted long-term memory for AI agents on Walrus and Sui.";
+pub const MCP_SERVER_CARD_WEBSITE_URL: &str = "https://memory.walrus.xyz";
+pub const MCP_SERVER_CARD_REPO_URL: &str = "https://github.com/MystenLabs/walrus-memory";
+
+pub fn compute_server_card_etag(json_bytes: &[u8]) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(json_bytes);
+    let hash = hex::encode(hasher.finalize());
+    let short_hash = &hash[..32];
+    (format!("\"{short_hash}\""), short_hash.to_string())
+}
+
+pub fn build_mcp_server_card(origin: Option<&str>, oauth_enabled: bool) -> serde_json::Value {
+    let clean_origin = origin
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty());
+
+    let (streamable_url, sse_url, remote_variables) = match clean_origin {
+        Some(base) => (
+            format!("{base}/api/mcp"),
+            format!("{base}/api/mcp/sse"),
+            None,
+        ),
+        None => (
+            "{relayer_url}/api/mcp".to_string(),
+            "{relayer_url}/api/mcp/sse".to_string(),
+            Some(serde_json::json!({
+                "relayer_url": {
+                    "description": "Walrus Memory relayer base URL.",
+                    "isRequired": true,
+                    "default": "https://relayer.memory.walrus.xyz"
+                }
+            })),
+        ),
+    };
+
+    let headers = serde_json::json!([
+        {
+            "name": "Authorization",
+            "description": "Bearer token: either a 64-hex Ed25519 delegate private key (with X-MemWal-Account-Id) or an OAuth 2.0 access token.",
+            "isRequired": true,
+            "isSecret": true,
+            "value": "Bearer {bearer_token}",
+            "variables": {
+                "bearer_token": {
+                    "description": "Walrus Memory delegate private key (64 hex characters) or OAuth 2.0 access token.",
+                    "isRequired": true,
+                    "isSecret": true
+                }
+            }
+        },
+        {
+            "name": "X-MemWal-Account-Id",
+            "description": "0x-prefixed 64-hex Walrus Memory Sui account object ID (required when bearer_token is a delegate key; omit for OAuth access tokens).",
+            "isRequired": false,
+            "placeholder": "0x..."
+        },
+        {
+            "name": "X-MemWal-Namespace",
+            "description": "Optional default memory namespace used when tool calls omit namespace.",
+            "isRequired": false,
+            "default": "default"
+        }
+    ]);
+
+    let supported_protocol_versions = serde_json::json!(["2025-03-26", "2024-11-05"]);
+
+    let mut streamable_remote = serde_json::json!({
+        "type": "streamable-http",
+        "url": streamable_url,
+        "headers": headers,
+        "supportedProtocolVersions": supported_protocol_versions,
+    });
+    let mut sse_remote = serde_json::json!({
+        "type": "sse",
+        "url": sse_url,
+        "headers": headers,
+        "supportedProtocolVersions": supported_protocol_versions,
+    });
+
+    if let Some(vars) = remote_variables {
+        streamable_remote["variables"] = vars.clone();
+        sse_remote["variables"] = vars;
+    }
+
+    let oauth_meta = if oauth_enabled {
+        let (protected_resource_url, auth_server_url) = match clean_origin {
+            Some(base) => (
+                format!("{base}/.well-known/oauth-protected-resource"),
+                format!("{base}/.well-known/oauth-authorization-server"),
+            ),
+            None => (
+                "{relayer_url}/.well-known/oauth-protected-resource".to_string(),
+                "{relayer_url}/.well-known/oauth-authorization-server".to_string(),
+            ),
+        };
+        serde_json::json!({
+            "enabled": true,
+            "protectedResourceMetadata": protected_resource_url,
+            "authorizationServerMetadata": auth_server_url,
+        })
+    } else {
+        serde_json::json!({
+            "enabled": false
+        })
+    };
+
+    let meta = serde_json::json!({
+        "xyz.walrus.memory/auth": {
+            "delegateBearer": {
+                "authorizationHeader": "Authorization",
+                "scheme": "Bearer",
+                "accountHeader": "X-MemWal-Account-Id",
+                "namespaceHeader": "X-MemWal-Namespace"
+            },
+            "oauth2": oauth_meta
+        }
+    });
+
+    serde_json::json!({
+        "$schema": MCP_SERVER_CARD_SCHEMA,
+        "name": MCP_SERVER_CARD_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "title": MCP_SERVER_CARD_TITLE,
+        "description": MCP_SERVER_CARD_DESCRIPTION,
+        "websiteUrl": MCP_SERVER_CARD_WEBSITE_URL,
+        "repository": {
+            "url": MCP_SERVER_CARD_REPO_URL,
+            "source": "github"
+        },
+        "remotes": [
+            streamable_remote,
+            sse_remote
+        ],
+        "_meta": meta
+    })
+}
+
+pub fn current_origin_and_oauth() -> (Option<String>, bool) {
+    let origin = std::env::var("MEMWAL_PUBLIC_RELAYER_URL")
+        .or_else(|_| std::env::var("MEMWAL_RELAYER_URL"))
+        .ok()
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    let oauth_enabled = crate::oauth::McpOAuthConfig::from_env().is_some();
+    (origin, oauth_enabled)
+}
+
+pub static DEFAULT_MCP_SERVER_CARD: LazyLock<serde_json::Value> =
+    LazyLock::new(|| build_mcp_server_card(None, false));
+
+pub static MCP_SERVER_CARD_JSON: LazyLock<String> = LazyLock::new(|| {
+    serde_json::to_string(&*DEFAULT_MCP_SERVER_CARD).expect("mcp server card json must serialize")
+});
+
+pub static MCP_SERVER_CARD_ETAG: LazyLock<String> =
+    LazyLock::new(|| compute_server_card_etag(MCP_SERVER_CARD_JSON.as_bytes()).0);
+
+pub static MCP_SERVER_CARD_RAW_ETAG: LazyLock<String> =
+    LazyLock::new(|| compute_server_card_etag(MCP_SERVER_CARD_JSON.as_bytes()).1);
+
+fn matches_if_none_match(header_val: &str, quoted_etag: &str, raw_etag: &str) -> bool {
+    header_val.split(',').any(|item| {
+        let trimmed = item.trim();
+        if trimmed == "*" || trimmed == quoted_etag || trimmed == raw_etag {
+            return true;
+        }
+        let stripped = trimmed.strip_prefix("W/").unwrap_or(trimmed).trim();
+        stripped == quoted_etag || stripped.trim_matches('"') == raw_etag
+    })
+}
+
+/// MCP Server Card discovery endpoint following SEP-2127 conventions.
+///
+/// Returns metadata describing this MCP server, transport endpoints,
+/// authentication schemes, and capability metadata.
+pub async fn mcp_server_card(headers: HeaderMap) -> Response {
+    let (origin, oauth_enabled) = current_origin_and_oauth();
+    let (card_json, quoted_etag, raw_etag) = match (origin.as_deref(), oauth_enabled) {
+        (None, false) => (
+            MCP_SERVER_CARD_JSON.clone(),
+            MCP_SERVER_CARD_ETAG.clone(),
+            MCP_SERVER_CARD_RAW_ETAG.clone(),
+        ),
+        (origin, oauth_enabled) => {
+            let card = build_mcp_server_card(origin, oauth_enabled);
+            let json_str = serde_json::to_string(&card).expect("server card must serialize");
+            let (q, r) = compute_server_card_etag(json_str.as_bytes());
+            (json_str, q, r)
+        }
+    };
+
+    if let Some(inm) = headers.get(axum::http::header::IF_NONE_MATCH) {
+        if let Ok(val) = inm.to_str() {
+            if matches_if_none_match(val, &quoted_etag, &raw_etag) {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(axum::http::header::CACHE_CONTROL, "public, max-age=300")
+                    .header(axum::http::header::ETAG, quoted_etag)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| StatusCode::NOT_MODIFIED.into_response());
+            }
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/mcp-server-card+json; charset=utf-8",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=300")
+        .header(axum::http::header::ETAG, quoted_etag)
+        .body(Body::from(card_json))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// `GET /api/mcp/sse` — open the SSE stream to the sidecar and stream the
 /// response body back to the client without buffering. The sidecar emits an
 /// `event: endpoint` line carrying `/api/mcp/messages?sessionId=…`; the
@@ -593,7 +816,7 @@ pub async fn sse_proxy(
             Some(identity)
         }
         McpAuthOutcome::Unauthorized(err) => {
-            return oauth_unauthorized_response(&state, err.as_ref())
+            return oauth_unauthorized_response(&state, err.as_ref());
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
@@ -722,7 +945,7 @@ pub async fn messages_proxy(
             Some(identity)
         }
         McpAuthOutcome::Unauthorized(err) => {
-            return oauth_unauthorized_response(&state, err.as_ref())
+            return oauth_unauthorized_response(&state, err.as_ref());
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
@@ -866,7 +1089,7 @@ pub async fn streamable_proxy(
             Some(identity)
         }
         McpAuthOutcome::Unauthorized(err) => {
-            return oauth_unauthorized_response(&state, err.as_ref())
+            return oauth_unauthorized_response(&state, err.as_ref());
         }
         McpAuthOutcome::Unavailable => return crate::auth::upstream_unavailable(),
     };
@@ -1371,5 +1594,504 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("0xrealaccount")
         );
+    }
+
+    // MCP Server Card (SEP-2127) discovery tests
+
+    fn validate_sep2127_server_card_schema(card: &serde_json::Value) {
+        let schema_str = include_str!("../tests/fixtures/sep2127-server-card.schema.json");
+        let schema_json: serde_json::Value =
+            serde_json::from_str(schema_str).expect("sep2127 fixture must parse as json");
+        let defs = schema_json.get("$defs").expect("$defs must exist");
+
+        let card_obj = card.as_object().expect("server card must be a JSON object");
+        let server_card_def = defs.get("ServerCard").expect("ServerCard def must exist");
+        let allowed_root_props: std::collections::HashSet<&str> = server_card_def
+            .get("properties")
+            .expect("ServerCard properties must exist")
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        // Strict: assert zero undeclared properties on root
+        for key in card_obj.keys() {
+            assert!(
+                allowed_root_props.contains(key.as_str()),
+                "unexpected undeclared property on ServerCard: {key}"
+            );
+        }
+
+        // Required root properties
+        for req in ["$schema", "description", "name", "version"] {
+            assert!(
+                card_obj.contains_key(req),
+                "missing required ServerCard property: {req}"
+            );
+        }
+
+        // $schema pattern
+        let schema_val = card["$schema"].as_str().expect("$schema must be string");
+        assert_eq!(
+            schema_val, "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
+            "$schema must match upstream SEP-2127 URI"
+        );
+
+        // name pattern: reverse-DNS with single '/'
+        let name_val = card["name"].as_str().expect("name must be string");
+        assert!(
+            name_val.len() >= 3 && name_val.len() <= 200,
+            "name length out of range: {}",
+            name_val.len()
+        );
+        let name_parts: Vec<&str> = name_val.split('/').collect();
+        assert_eq!(
+            name_parts.len(),
+            2,
+            "name must contain exactly one '/' separator: {name_val}"
+        );
+        assert!(
+            !name_parts[0].is_empty()
+                && name_parts[0]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+            "invalid namespace in name: {}",
+            name_parts[0]
+        );
+        assert!(
+            !name_parts[1].is_empty()
+                && name_parts[1]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+            "invalid server identifier in name: {}",
+            name_parts[1]
+        );
+
+        // version <= 255
+        let version_val = card["version"].as_str().expect("version must be string");
+        assert!(
+            !version_val.is_empty() && version_val.len() <= 255,
+            "version length out of range"
+        );
+
+        // description maxLength: 100
+        let desc_val = card["description"]
+            .as_str()
+            .expect("description must be string");
+        assert!(
+            !desc_val.is_empty() && desc_val.len() <= 100,
+            "description length {} exceeds SEP-2127 maxLength 100: {desc_val}",
+            desc_val.len()
+        );
+
+        // title (optional, maxLength: 100)
+        if let Some(title) = card.get("title") {
+            let title_val = title.as_str().expect("title must be string");
+            assert!(
+                !title_val.is_empty() && title_val.len() <= 100,
+                "title length exceeds 100"
+            );
+        }
+
+        // websiteUrl (optional URI)
+        if let Some(website) = card.get("websiteUrl") {
+            let website_val = website.as_str().expect("websiteUrl must be string");
+            assert!(
+                website_val.starts_with("http://") || website_val.starts_with("https://"),
+                "websiteUrl must be valid http(s) URI: {website_val}"
+            );
+        }
+
+        // repository
+        if let Some(repo) = card.get("repository") {
+            let repo_obj = repo.as_object().expect("repository must be object");
+            let repo_def = defs.get("Repository").expect("Repository def must exist");
+            let allowed_repo_props: std::collections::HashSet<&str> = repo_def
+                .get("properties")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            for key in repo_obj.keys() {
+                assert!(
+                    allowed_repo_props.contains(key.as_str()),
+                    "unexpected property on Repository: {key}"
+                );
+            }
+            assert!(repo_obj.contains_key("source"), "repository missing source");
+            assert!(repo_obj.contains_key("url"), "repository missing url");
+        }
+
+        // remotes
+        let remotes = card["remotes"].as_array().expect("remotes must be array");
+        assert!(!remotes.is_empty(), "remotes array must not be empty");
+
+        let remote_def = defs.get("Remote").expect("Remote def must exist");
+        let allowed_remote_props: std::collections::HashSet<&str> = remote_def
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        let key_value_def = defs
+            .get("KeyValueInput")
+            .expect("KeyValueInput def must exist");
+        let allowed_key_value_props: std::collections::HashSet<&str> = key_value_def
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        let input_def = defs.get("Input").expect("Input def must exist");
+        let allowed_input_props: std::collections::HashSet<&str> = input_def
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        for remote in remotes {
+            let remote_obj = remote.as_object().expect("remote must be object");
+            for key in remote_obj.keys() {
+                assert!(
+                    allowed_remote_props.contains(key.as_str()),
+                    "unexpected property on Remote: {key}"
+                );
+            }
+            assert!(remote_obj.contains_key("type"), "remote missing type");
+            assert!(remote_obj.contains_key("url"), "remote missing url");
+
+            let type_val = remote["type"].as_str().expect("type must be string");
+            assert!(
+                type_val == "sse" || type_val == "streamable-http",
+                "invalid remote transport type: {type_val}"
+            );
+
+            let url_val = remote["url"].as_str().expect("url must be string");
+            assert!(
+                !url_val.chars().any(char::is_whitespace),
+                "url must not contain whitespace: {url_val}"
+            );
+            assert!(
+                url_val.starts_with("http://")
+                    || url_val.starts_with("https://")
+                    || (url_val.starts_with('{') && url_val.contains('}')),
+                "url must start with http://, https://, or {{var}}: {url_val}"
+            );
+
+            if let Some(headers) = remote.get("headers") {
+                let headers_arr = headers.as_array().expect("headers must be array");
+                for header in headers_arr {
+                    let header_obj = header.as_object().expect("header must be object");
+                    for key in header_obj.keys() {
+                        assert!(
+                            allowed_key_value_props.contains(key.as_str()),
+                            "unexpected property on KeyValueInput: {key}"
+                        );
+                    }
+                    assert!(header_obj.contains_key("name"), "header missing name");
+
+                    if let Some(vars) = header.get("variables") {
+                        let vars_obj = vars.as_object().expect("variables must be object");
+                        for (var_name, var_def) in vars_obj {
+                            let var_obj = var_def.as_object().expect("input must be object");
+                            for key in var_obj.keys() {
+                                assert!(
+                                    allowed_input_props.contains(key.as_str()),
+                                    "unexpected property on Input {var_name}: {key}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(vars) = remote.get("variables") {
+                let vars_obj = vars.as_object().expect("variables must be object");
+                for (var_name, var_def) in vars_obj {
+                    let var_obj = var_def.as_object().expect("input must be object");
+                    for key in var_obj.keys() {
+                        assert!(
+                            allowed_input_props.contains(key.as_str()),
+                            "unexpected property on Input {var_name}: {key}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // _meta check
+        if let Some(meta) = card.get("_meta") {
+            let meta_obj = meta.as_object().expect("_meta must be object");
+            for key in meta_obj.keys() {
+                assert!(
+                    !key.contains("modelcontextprotocol") && !key.contains("mcp"),
+                    "reserved prefix in _meta key: {key}"
+                );
+                assert!(
+                    key.contains('/'),
+                    "_meta key must contain reverse-DNS slash: {key}"
+                );
+            }
+        }
+
+        // Anti-regression: ensure old non-standard properties are never present
+        for forbidden in [
+            "schemaVersion",
+            "vendor",
+            "documentationUrl",
+            "endpoints",
+            "authentication",
+            "capabilities",
+            "tools",
+        ] {
+            assert!(
+                !card_obj.contains_key(forbidden),
+                "non-standard legacy property must not be present: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_mcp_server_card_templated_conforms_to_sep2127() {
+        let card = build_mcp_server_card(None, false);
+        validate_sep2127_server_card_schema(&card);
+
+        let remotes = card["remotes"].as_array().unwrap();
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0]["url"], "{relayer_url}/api/mcp");
+        assert_eq!(remotes[1]["url"], "{relayer_url}/api/mcp/sse");
+        assert!(remotes[0]["variables"]["relayer_url"].is_object());
+
+        let auth_meta = &card["_meta"]["xyz.walrus.memory/auth"];
+        assert_eq!(auth_meta["oauth2"]["enabled"], false);
+    }
+
+    #[test]
+    fn build_mcp_server_card_with_origin_and_oauth_conforms_to_sep2127() {
+        let card = build_mcp_server_card(Some("https://relayer.memory.walrus.xyz/"), true);
+        validate_sep2127_server_card_schema(&card);
+
+        let remotes = card["remotes"].as_array().unwrap();
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(
+            remotes[0]["url"],
+            "https://relayer.memory.walrus.xyz/api/mcp"
+        );
+        assert_eq!(
+            remotes[1]["url"],
+            "https://relayer.memory.walrus.xyz/api/mcp/sse"
+        );
+        assert!(remotes[0].get("variables").is_none());
+
+        let auth_meta = &card["_meta"]["xyz.walrus.memory/auth"];
+        assert_eq!(auth_meta["oauth2"]["enabled"], true);
+        assert_eq!(
+            auth_meta["oauth2"]["protectedResourceMetadata"],
+            "https://relayer.memory.walrus.xyz/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            auth_meta["oauth2"]["authorizationServerMetadata"],
+            "https://relayer.memory.walrus.xyz/.well-known/oauth-authorization-server"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_200_with_expected_headers_and_body() {
+        let response = mcp_server_card(HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/mcp-server-card+json; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=300")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some(MCP_SERVER_CARD_ETAG.as_str())
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        validate_sep2127_server_card_schema(&json);
+
+        assert_eq!(
+            json["$schema"],
+            "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+        );
+        assert_eq!(json["name"], "xyz.walrus.memory/memwal");
+        assert_eq!(json["title"], "Walrus Memory MCP Server");
+        assert_eq!(
+            json["description"],
+            "Portable, SEAL-encrypted long-term memory for AI agents on Walrus and Sui."
+        );
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["websiteUrl"], "https://memory.walrus.xyz");
+        assert_eq!(
+            json["repository"]["url"],
+            "https://github.com/MystenLabs/walrus-memory"
+        );
+        assert_eq!(json["repository"]["source"], "github");
+
+        let remotes = json["remotes"]
+            .as_array()
+            .expect("remotes array must exist");
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0]["type"], "streamable-http");
+        assert_eq!(remotes[1]["type"], "sse");
+
+        // Verify headers advertise exact accepted transport headers
+        let headers = remotes[0]["headers"].as_array().unwrap();
+        let auth_header = headers
+            .iter()
+            .find(|h| h["name"] == "Authorization")
+            .expect("Authorization header must be advertised");
+        assert_eq!(auth_header["isRequired"], true);
+        assert_eq!(auth_header["isSecret"], true);
+        assert_eq!(auth_header["value"], "Bearer {bearer_token}");
+        assert_eq!(auth_header["variables"]["bearer_token"]["isRequired"], true);
+        assert_eq!(auth_header["variables"]["bearer_token"]["isSecret"], true);
+
+        let account_header = headers
+            .iter()
+            .find(|h| h["name"] == "X-MemWal-Account-Id")
+            .expect("X-MemWal-Account-Id header must be advertised");
+        assert_eq!(account_header["isRequired"], false);
+        assert_eq!(account_header["placeholder"], "0x...");
+
+        let ns_header = headers
+            .iter()
+            .find(|h| h["name"] == "X-MemWal-Namespace")
+            .expect("X-MemWal-Namespace header must be advertised");
+        assert_eq!(ns_header["isRequired"], false);
+        assert_eq!(ns_header["default"], "default");
+
+        // Verify _meta auth metadata
+        let auth_meta = &json["_meta"]["xyz.walrus.memory/auth"];
+        assert_eq!(
+            auth_meta["delegateBearer"]["authorizationHeader"],
+            "Authorization"
+        );
+        assert_eq!(auth_meta["delegateBearer"]["scheme"], "Bearer");
+        assert_eq!(
+            auth_meta["delegateBearer"]["accountHeader"],
+            "X-MemWal-Account-Id"
+        );
+        assert_eq!(
+            auth_meta["delegateBearer"]["namespaceHeader"],
+            "X-MemWal-Namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_304_when_if_none_match_matches() {
+        let etag = MCP_SERVER_CARD_ETAG.as_str();
+        let raw_etag = MCP_SERVER_CARD_RAW_ETAG.as_str();
+
+        for header_val in [
+            etag,
+            raw_etag,
+            "*",
+            &format!("W/{etag}"),
+            &format!("\"random-etag\", {etag}"),
+        ] {
+            let headers = axum_headers(&[("if-none-match", header_val)]);
+            let response = mcp_server_card(headers).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "failed for If-None-Match: {header_val}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ETAG)
+                    .and_then(|v| v.to_str().ok()),
+                Some(etag)
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("public, max-age=300")
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(bytes.is_empty(), "304 body must be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_returns_200_when_if_none_match_differs() {
+        let headers = axum_headers(&[("if-none-match", "\"outdated-version\"")]);
+        let response = mcp_server_card(headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_card_router_endpoints_respond_without_auth() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/.well-known/mcp/server-card.json", get(mcp_server_card))
+            .route("/mcp/server-card", get(mcp_server_card))
+            .route("/api/mcp/server-card", get(mcp_server_card));
+
+        for path in [
+            "/.well-known/mcp/server-card.json",
+            "/mcp/server-card",
+            "/api/mcp/server-card",
+        ] {
+            let req = axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "path {path} must return 200 without auth"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/mcp-server-card+json; charset=utf-8")
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            validate_sep2127_server_card_schema(&json);
+        }
     }
 }

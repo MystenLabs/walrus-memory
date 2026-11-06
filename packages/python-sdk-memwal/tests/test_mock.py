@@ -8,6 +8,7 @@ import re
 import pytest
 
 from memwal import (
+    MemWal,
     MemWalMock,
     MemWalMockSeed,
     MemWalMockSync,
@@ -202,6 +203,7 @@ def test_sync_mock_polling_and_analyze_signatures_match_production():
         "remember_and_wait",
         "wait_for_remember_jobs",
         "remember_bulk_and_wait",
+        "recall",
         "analyze",
         "analyze_and_wait",
         "forget_namespace",
@@ -217,6 +219,20 @@ def test_sync_mock_polling_and_analyze_signatures_match_production():
         assert parameter_contract(getattr(MemWalMockSync, method_name)) == parameter_contract(
             getattr(MemWalSync, method_name)
         )
+    assert parameter_contract(MemWalMock.recall) == parameter_contract(MemWal.recall)
+    assert inspect.signature(MemWalMock.recall).parameters["on_dropped"].default == "ignore"
+    assert RecallParams(query="x").on_dropped == "ignore"
+
+    async_mock = MemWalMock.create(
+        namespace="sync",
+        initial_memories=[MemWalMockSeed(text="coffee preference", namespace="sync")],
+    )
+    sync_mock = MemWalMockSync(async_mock)
+    assert sync_mock.recall("coffee").total == 1
+    assert sync_mock.recall("coffee", on_dropped="ignore").total == 1
+    assert sync_mock.recall("coffee", on_dropped="throw").total == 1
+    with pytest.raises(ValueError, match="on_dropped"):
+        sync_mock.recall("coffee", on_dropped="warn")
 
 
 @pytest.mark.asyncio

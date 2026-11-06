@@ -196,7 +196,7 @@ pub(crate) async fn warm_blob_cache_after_upload(
     }
 }
 
-async fn update_remember_job_after_wallet_error(
+pub(crate) async fn update_remember_job_after_wallet_error(
     pool: &sqlx::PgPool,
     remember_job_id: Option<&str>,
     error: &WalletJobError,
@@ -234,7 +234,8 @@ async fn update_remember_job_after_wallet_error(
         crate::storage::db::release_storage_reservations_with_pool(pool, &[jid.to_string()]).await;
     }
 
-    // Guard against downgrading a row a concurrent attempt already finished.
+    // Guard against downgrading a row a concurrent attempt already finished or
+    // that `delete_by_namespace` already fenced as forgotten.
     // Every pre-existing caller only runs while holding the per-job upload
     // lock (JobUploadLock), so it was never the current status writer's own
     // race to lose — but LockOutcome::Defer calls this specifically when it
@@ -247,18 +248,34 @@ async fn update_remember_job_after_wallet_error(
     // blob_object_id are untouched, so no data loss, but a client polling
     // GET /api/remember/:job_id (routes/remember.rs) would see a
     // misleadingly stuck row until the unrelated staleness sweep.
+    // Likewise, once `delete_by_namespace` marks an in-flight job failed with
+    // `FORGOTTEN_IN_FLIGHT_JOB_ERROR` (or records its tombstone), that state
+    // is terminal: an in-flight attempt erroring out must never flip `status`
+    // back to `running` or overwrite the cancellation marker, which would let
+    // the next Apalis retry see `UploadResume::Upload` and re-upload/index into
+    // the forgotten namespace.
     let _ = sqlx::query(
-        "UPDATE remember_jobs SET status = $1, error_msg = $2, updated_at = NOW() WHERE id = $3 AND status NOT IN ('uploaded', 'done')",
+        "UPDATE remember_jobs
+         SET status = $1,
+             error_msg = $2,
+             updated_at = NOW()
+         WHERE id = $3
+           AND status NOT IN ('uploaded', 'done')
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(status)
     .bind(msg)
     .bind(jid)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await;
 }
 
 /// Record a metadata failure only while `status = 'uploaded'`, so the other
-/// helper still cannot clobber a winner.
+/// helper still cannot clobber a winner or a forgotten job.
 async fn record_uploaded_metadata_error(
     pool: &sqlx::PgPool,
     remember_job_id: Option<&str>,
@@ -275,10 +292,20 @@ async fn record_uploaded_metadata_error(
         // A concurrent winner may already have moved it to `done`, and a
         // `running` row is the other helper's job.
         let updated = sqlx::query(
-            "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2 AND status = 'uploaded'",
+            "UPDATE remember_jobs
+             SET status = 'failed',
+                 error_msg = $1,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND status = 'uploaded'
+               AND COALESCE(error_msg, '') <> $3
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )",
         )
         .bind(msg)
         .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(pool)
         .await
         .map(|result| result.rows_affected())
@@ -290,10 +317,19 @@ async fn record_uploaded_metadata_error(
         return;
     }
     let _ = sqlx::query(
-        "UPDATE remember_jobs SET error_msg = $1, updated_at = NOW() WHERE id = $2 AND status = 'uploaded'",
+        "UPDATE remember_jobs
+         SET error_msg = $1,
+             updated_at = NOW()
+         WHERE id = $2
+           AND status = 'uploaded'
+           AND COALESCE(error_msg, '') <> $3
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(msg)
     .bind(jid)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await;
 }
@@ -522,10 +558,22 @@ async fn mark_remember_job_failed(
     };
 
     let result = sqlx::query(
-        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2",
+        "UPDATE remember_jobs
+         SET status = 'failed',
+             error_msg = CASE
+                 WHEN COALESCE(error_msg, '') = $3
+                   OR EXISTS (
+                       SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+                   )
+                 THEN $3
+                 ELSE $1
+             END,
+             updated_at = NOW()
+         WHERE id = $2",
     )
     .bind(msg)
     .bind(jid)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await?;
 
@@ -738,19 +786,26 @@ async fn admit_wallet_upload(
 
 /// The storage reservation is admitted at enqueue and expires after 15
 /// minutes. A congestion wait can outlive that. Refresh it so a burst cannot
-/// take the bytes this job is still going to write. If the row was already
-/// swept, admit it again; a rejection is logged and the upload still retries.
+/// take the bytes this job is still going to write. Only live (`expires_at > NOW()`)
+/// rows may be extended directly; an expired or swept row must re-enter
+/// `reserve_storage_quota_one` under the owner's quota lock.
 async fn keep_upload_storage_reservation(
     state: &AppState,
     job_id: &str,
     owner: &str,
     encrypted_b64: &str,
 ) {
+    if matches!(
+        upload_resume_disposition(state.db.pool(), job_id).await,
+        UploadResume::Forgotten | UploadResume::AlreadyDone { .. }
+    ) {
+        return;
+    }
     let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
     let extended = sqlx::query(
         "UPDATE storage_reservations
          SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
-         WHERE id = $1",
+         WHERE id = $1 AND expires_at > NOW()",
     )
     .bind(job_id)
     .bind(ttl_secs)
@@ -782,6 +837,192 @@ async fn keep_upload_storage_reservation(
             e
         );
     }
+}
+
+/// Prove or renew a job's storage reservation under the owner's quota lock
+/// Try to extend an active (live) storage reservation for a job whose earlier
+/// allocation has not expired yet. Returns `Ok(true)` if `max_storage_bytes <= 0`
+/// or the row was still live (`expires_at > NOW()`) and was extended.
+pub(crate) async fn try_extend_live_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+) -> Result<bool, WalletJobError> {
+    if max_storage_bytes <= 0 {
+        return Ok(true);
+    }
+    let ttl_secs = crate::rate_limit::STORAGE_RESERVATION_TTL.as_secs() as i64;
+    let extended = sqlx::query(
+        "UPDATE storage_reservations
+         SET expires_at = GREATEST(expires_at, NOW() + ($2 * INTERVAL '1 second'))
+         WHERE id = $1 AND expires_at > NOW()",
+    )
+    .bind(job_id)
+    .bind(ttl_secs)
+    .execute(db.pool())
+    .await
+    .map_err(|e| {
+        WalletJobError::Transient(format!(
+            "could not extend storage reservation for job {}: {}",
+            job_id, e
+        ))
+    })?;
+
+    Ok(extended.rows_affected() > 0)
+}
+
+/// Re-admit an expired or missing storage reservation against owner storage quota.
+pub(crate) async fn admit_expired_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if max_storage_bytes <= 0 {
+        return Ok(());
+    }
+    let lock_key = crate::rate_limit::stable_hash_i64(owner);
+    let reservations = [crate::storage::db::StorageReservationRequest {
+        id: job_id.to_string(),
+        bytes: bytes.max(1),
+    }];
+    match db
+        .admit_storage_reservations(
+            owner,
+            lock_key,
+            max_storage_bytes,
+            &reservations,
+            crate::rate_limit::STORAGE_RESERVATION_TTL,
+        )
+        .await
+    {
+        Ok(crate::storage::db::StorageAdmission::Admitted) => Ok(()),
+        Ok(crate::storage::db::StorageAdmission::Rejected { used }) => {
+            Err(WalletJobError::Permanent(format!(
+                "storage quota exceeded after reservation expired (used={} bytes, max={} bytes)",
+                used, max_storage_bytes
+            )))
+        }
+        Err(e) => Err(WalletJobError::Transient(format!(
+            "could not re-admit storage reservation for job {}: {}",
+            job_id, e
+        ))),
+    }
+}
+
+/// Ensure a live reservation exists for this job, renewing it if still active
+/// or re-evaluating owner quota if expired, without running a transaction
+/// before an unpaid upload step spends Walrus storage.
+#[allow(dead_code)]
+pub(crate) async fn ensure_upload_storage_reservation_with_db(
+    db: &crate::storage::db::VectorDb,
+    max_storage_bytes: i64,
+    job_id: &str,
+    owner: &str,
+    bytes: i64,
+) -> Result<(), WalletJobError> {
+    if try_extend_live_storage_reservation(db, max_storage_bytes, job_id).await? {
+        return Ok(());
+    }
+
+    admit_expired_upload_storage_reservation(db, max_storage_bytes, job_id, owner, bytes).await
+}
+
+/// Before enforcing expired-quota re-admission on a resumed `encoded` journal
+/// that already holds a saved `register_transaction`, reconcile that digest
+/// against the sidecar without permitting a new submission. If the prepared
+/// registration already landed on-chain before the crash, advance directly to
+/// `registered` so the paid blob is not stranded when quota has filled in the
+/// meantime; if the sidecar proves the digest is not on-chain (`Unpaid`),
+/// enforce `ensure_upload_storage_reservation_with_db` before execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_or_ensure_upload_storage_reservation(
+    db: &crate::storage::db::VectorDb,
+    http_client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    max_storage_bytes: i64,
+    encrypted: &[u8],
+    epochs: u64,
+    owner: &str,
+    namespace: &str,
+    package_id: &str,
+    remember_job_id: &str,
+    journal: &UploadJournal,
+    needs_prepared_reconcile: bool,
+) -> Result<Option<DurableUploadAdvance>, WalletJobError> {
+    if upload_journal_signer_committed(journal) {
+        return Ok(None);
+    }
+
+    if try_extend_live_storage_reservation(db, max_storage_bytes, remember_job_id).await? {
+        return Ok(None);
+    }
+
+    if needs_prepared_reconcile && journal.register_transaction.is_some() {
+        let mut attaches = 0u32;
+        let reconciled = loop {
+            let _ = sqlx::query(
+                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+            )
+            .bind(remember_job_id)
+            .execute(db.pool())
+            .await;
+            match crate::storage::walrus::reconcile_durable_upload(
+                http_client,
+                sidecar_url,
+                sidecar_secret,
+                encrypted,
+                epochs,
+                owner,
+                namespace,
+                package_id,
+                remember_job_id,
+                journal.clone(),
+            )
+            .await
+            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
+            {
+                Ok(reconciled) => break reconciled,
+                Err(err)
+                    if attaches < SAME_JOURNAL_ATTACHES
+                        && matches!(
+                            &err,
+                            WalletJobError::UploadSlotCongestion(msg)
+                                if WalletJobError::is_sidecar_upload_transport_error(msg)
+                        ) =>
+                {
+                    attaches += 1;
+                    tracing::info!(
+                        "[wallet-job:upload] job_id={} dropped reconcile connection; reattaching same journal ({}/{})",
+                        remember_job_id,
+                        attaches,
+                        SAME_JOURNAL_ATTACHES,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        match reconciled {
+            crate::storage::walrus::PreparedRegisterReconciliation::Advanced(advanced) => {
+                return Ok(Some(advanced));
+            }
+            crate::storage::walrus::PreparedRegisterReconciliation::Unpaid => {}
+        }
+    }
+
+    admit_expired_upload_storage_reservation(
+        db,
+        max_storage_bytes,
+        remember_job_id,
+        owner,
+        encrypted.len() as i64,
+    )
+    .await?;
+    Ok(None)
 }
 
 /// Backoff before re-running a congestion-requeued upload: 30s, 60s, 120s,
@@ -956,7 +1197,7 @@ fn wallet_index_for_upload_attempt(
 ///
 /// `encoded` is a local checkpoint, and a prepared register has not been
 /// submitted. `registered` and later refer to a blob object that signer owns.
-fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
+pub(crate) fn upload_journal_signer_committed(journal: &UploadJournal) -> bool {
     matches!(
         journal
             .resume_step
@@ -1181,6 +1422,20 @@ pub(crate) async fn execute_wallet_job(
             // permit. A worker that already took this key's next upload can
             // register while the metadata transaction is in flight. Priority
             // still prefers this job over an upload that has not been prefetched.
+            if let Some(ref jid) = remember_job_id {
+                if matches!(
+                    upload_resume_disposition(state.db.pool(), jid).await,
+                    UploadResume::Forgotten
+                ) {
+                    tracing::info!(
+                        "[wallet-job:set-metadata] job_id={} namespace forgotten while in flight — skipping metadata/transfer",
+                        jid
+                    );
+                    crate::rate_limit::release_storage_quota_one(state, jid).await;
+                    return Ok(());
+                }
+            }
+
             let _wallet_slot = state.key_pool.begin_attempt(enqueued_wallet_index);
 
             touch_uploaded_remember_job(state.db.pool(), remember_job_id.as_deref()).await;
@@ -1488,17 +1743,32 @@ async fn insert_vector_and_mark_remember_done(
 
     if let Some(jid) = remember_job_id {
         let _ = sqlx::query(
-            "UPDATE remember_jobs SET status = 'done', blob_id = $1, prepare_claimed_at = NULL, prepare_claim_token = NULL, recovery_claimed_at = NULL, recovery_claim_token = NULL, error_msg = NULL, updated_at = NOW() WHERE id = $2",
+            "UPDATE remember_jobs
+             SET status = 'done',
+                 blob_id = $1,
+                 prepare_claimed_at = NULL,
+                 prepare_claim_token = NULL,
+                 recovery_claimed_at = NULL,
+                 recovery_claim_token = NULL,
+                 error_msg = NULL,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND COALESCE(error_msg, '') <> $3
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )",
         )
         .bind(blob_id)
         .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(state.db.pool())
         .await;
 
-        // Release only now that the vector row is committed. The row carries
-        // the bytes from here on, so holding the reservation would double count
-        // them; releasing before the insert would instead open a window where
-        // neither counts and a concurrent burst could slip past the quota.
+        // Release only now that the vector row is committed (or fenced by
+        // forget). The row carries the bytes from here on, so holding the
+        // reservation would double count them; releasing before the insert
+        // would instead open a window where neither counts and a concurrent
+        // burst could slip past the quota.
         crate::rate_limit::release_storage_quota_one(state, jid).await;
     }
 
@@ -1566,9 +1836,12 @@ async fn enqueue_finalize_uploaded_blob(
 /// state — the idempotency decision, split out so it can be unit-tested against
 /// the real `remember_jobs` table without a live Walrus sidecar.
 #[derive(Debug, PartialEq, Eq)]
-enum UploadResume {
+pub(crate) enum UploadResume {
     /// Job already reached its terminal `done` state — nothing to redo.
     AlreadyDone { blob_id: String },
+    /// Namespace was forgotten while this job was in flight — do not mint,
+    /// transfer, or index into the forgotten namespace.
+    Forgotten,
     /// Paid blob already minted AND its object id is known, but metadata/transfer
     /// (and indexing) may not have finished. Resume via the metadata/transfer
     /// recovery path with the stored object id — never re-mint, never prematurely
@@ -1603,12 +1876,27 @@ enum UploadResume {
 /// A lookup **error** returns `Indeterminate` (fail closed): after a possible
 /// mint we must not re-upload on a transient read failure, so the caller retries
 /// without uploading rather than risking a duplicate paid blob.
-async fn upload_resume_disposition(pool: &sqlx::PgPool, job_id: &str) -> UploadResume {
-    let looked_up: Result<Option<(String, Option<String>, Option<String>)>, sqlx::Error> =
-        sqlx::query_as("SELECT status, blob_id, blob_object_id FROM remember_jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_optional(pool)
-            .await;
+type UploadResumeRow = (String, Option<String>, Option<String>, bool);
+
+pub(crate) async fn upload_resume_disposition(pool: &sqlx::PgPool, job_id: &str) -> UploadResume {
+    let looked_up: Result<Option<UploadResumeRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT
+            status,
+            blob_id,
+            blob_object_id,
+            (
+                COALESCE(error_msg, '') = $2
+                OR EXISTS (
+                    SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+                )
+            ) AS forgotten
+         FROM remember_jobs
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+    .fetch_optional(pool)
+    .await;
 
     let existing = match looked_up {
         Ok(row) => row,
@@ -1616,15 +1904,16 @@ async fn upload_resume_disposition(pool: &sqlx::PgPool, job_id: &str) -> UploadR
     };
 
     match existing {
+        Some((_, _, _, true)) => UploadResume::Forgotten,
         // Any recorded blob_id means the paid mint already happened → never upload.
-        Some((status, Some(blob_id), _)) if status == "done" => {
+        Some((status, Some(blob_id), _, false)) if status == "done" => {
             UploadResume::AlreadyDone { blob_id }
         }
-        Some((_, Some(blob_id), Some(blob_object_id))) => UploadResume::ResumeTransfer {
+        Some((_, Some(blob_id), Some(blob_object_id), false)) => UploadResume::ResumeTransfer {
             blob_id,
             blob_object_id,
         },
-        Some((_, Some(blob_id), None)) => UploadResume::ResumeIndex { blob_id },
+        Some((_, Some(blob_id), None, false)) => UploadResume::ResumeIndex { blob_id },
         // No durable blob record means there is nothing to resume. Trust the DB;
         // scanning every historical server-wallet Blob is both redundant and too
         // slow for the sidecar read deadline.
@@ -1784,7 +2073,18 @@ async fn persist_upload_journal(
             WalletJobError::Permanent(format!("failed to encode register journal: {}", e))
         })?;
     sqlx::query(
-        "UPDATE remember_jobs SET upload_wallet_index = $1, upload_wallet_address = $2, upload_execution_identity = $3, upload_resume_step = $4, upload_register_transaction = $5, updated_at = NOW() WHERE id = $6",
+        "UPDATE remember_jobs
+         SET upload_wallet_index = $1,
+             upload_wallet_address = $2,
+             upload_execution_identity = $3,
+             upload_resume_step = $4,
+             upload_register_transaction = $5,
+             updated_at = NOW()
+         WHERE id = $6
+           AND COALESCE(error_msg, '') <> $7
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(wallet_index)
     .bind(&journal.wallet_address)
@@ -1792,6 +2092,7 @@ async fn persist_upload_journal(
     .bind(&journal.resume_step)
     .bind(register)
     .bind(job_id)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await
     .map_err(|e| WalletJobError::Transient(format!("failed to persist upload journal: {}", e)))?;
@@ -1804,13 +2105,27 @@ async fn consume_preparation_claim(
     token: &str,
 ) -> Result<bool, WalletJobError> {
     let consumed = sqlx::query(
-        "UPDATE remember_jobs SET status = 'running', prepare_claimed_at = NULL, updated_at = NOW() WHERE id = $1 AND prepare_claim_token = $2 AND blob_id IS NULL AND status IN ('pending', 'running')",
+        "UPDATE remember_jobs
+         SET status = 'running',
+             prepare_claimed_at = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND prepare_claim_token = $2
+           AND blob_id IS NULL
+           AND status IN ('pending', 'running')
+           AND COALESCE(error_msg, '') <> $3
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(job_id)
     .bind(token)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await
-    .map_err(|e| WalletJobError::Transient(format!("failed to consume preparation claim: {}", e)))?;
+    .map_err(|e| {
+        WalletJobError::Transient(format!("failed to consume preparation claim: {}", e))
+    })?;
     Ok(consumed.rows_affected() == 1)
 }
 
@@ -1819,13 +2134,26 @@ async fn persist_uploaded_state(
     remember_job_id: &str,
     blob_id: &str,
     blob_object_id: Option<&str>,
-) -> Result<(), WalletJobError> {
-    sqlx::query(
-        "UPDATE remember_jobs SET status = 'uploaded', blob_id = $1, blob_object_id = $2, prepare_claimed_at = NULL, prepare_claim_token = NULL, error_msg = NULL, updated_at = NOW() WHERE id = $3",
+) -> Result<bool, WalletJobError> {
+    let updated = sqlx::query(
+        "UPDATE remember_jobs
+         SET status = 'uploaded',
+             blob_id = $1,
+             blob_object_id = $2,
+             prepare_claimed_at = NULL,
+             prepare_claim_token = NULL,
+             error_msg = NULL,
+             updated_at = NOW()
+         WHERE id = $3
+           AND COALESCE(error_msg, '') <> $4
+           AND NOT EXISTS (
+               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+           )",
     )
     .bind(blob_id)
     .bind(blob_object_id)
     .bind(remember_job_id)
+    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await
     .map_err(|e| {
@@ -1834,7 +2162,7 @@ async fn persist_uploaded_state(
             remember_job_id, e
         ))
     })?;
-    Ok(())
+    Ok(updated.rows_affected() > 0)
 }
 
 /// Resume an `uploaded`-but-not-`done` job by re-enqueuing the metadata/transfer
@@ -2040,49 +2368,88 @@ async fn execute_durable_upload(
     // Each sidecar call advances one checkpointable step. Persist the returned
     // checkpoint before asking the sidecar to perform the next side effect.
     let mut budget = DurableUploadBudget::new();
+    let mut needs_prepared_reconcile =
+        !upload_journal_signer_committed(&journal) && journal.register_transaction.is_some();
     while budget.take_step() {
-        let mut attaches = 0u32;
-        let advanced = loop {
-            let _ = sqlx::query(
-                "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
-            )
-            .bind(remember_job_id)
-            .execute(state.db.pool())
-            .await;
-            match crate::storage::walrus::advance_durable_upload(
-                &state.http_client,
-                &state.config.sidecar_url,
-                state.config.sidecar_secret.as_deref(),
-                encrypted,
-                epochs as u64,
-                owner,
-                namespace,
-                package_id,
-                remember_job_id,
-                journal.clone(),
-            )
-            .await
-            .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
-            {
-                Ok(advanced) => break advanced,
-                Err(err)
-                    if attaches < SAME_JOURNAL_ATTACHES
-                        && matches!(
-                            &err,
-                            WalletJobError::UploadSlotCongestion(msg)
-                                if WalletJobError::is_sidecar_upload_transport_error(msg)
-                        ) =>
-                {
-                    attaches += 1;
-                    tracing::info!(
-                        "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
-                        remember_job_id,
-                        attaches,
-                        SAME_JOURNAL_ATTACHES,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let reconciled_advance = reconcile_or_ensure_upload_storage_reservation(
+            &state.db,
+            &state.http_client,
+            &state.config.sidecar_url,
+            state.config.sidecar_secret.as_deref(),
+            state.config.rate_limit.max_storage_bytes,
+            encrypted,
+            epochs as u64,
+            owner,
+            namespace,
+            package_id,
+            remember_job_id,
+            &journal,
+            needs_prepared_reconcile,
+        )
+        .await?;
+        needs_prepared_reconcile = false;
+
+        let advanced = if let Some(advanced) = reconciled_advance {
+            advanced
+        } else {
+            let is_encoded = journal
+                .resume_step
+                .as_ref()
+                .and_then(|step| step.get("step"))
+                .and_then(serde_json::Value::as_str)
+                == Some("encoded");
+            if is_encoded {
+                if let Some(tx) = journal.register_transaction.as_mut() {
+                    if tx.execution_started != Some(true) {
+                        tx.execution_started = Some(true);
+                        persist_upload_journal(state.db.pool(), remember_job_id, &journal).await?;
+                    }
                 }
-                Err(err) => return Err(err),
+            }
+
+            let mut attaches = 0u32;
+            loop {
+                let _ = sqlx::query(
+                    "UPDATE remember_jobs SET updated_at = NOW() WHERE id = $1 AND status = 'running'",
+                )
+                .bind(remember_job_id)
+                .execute(state.db.pool())
+                .await;
+                match crate::storage::walrus::advance_durable_upload(
+                    &state.http_client,
+                    &state.config.sidecar_url,
+                    state.config.sidecar_secret.as_deref(),
+                    encrypted,
+                    epochs as u64,
+                    owner,
+                    namespace,
+                    package_id,
+                    remember_job_id,
+                    journal.clone(),
+                )
+                .await
+                .map_err(|e| WalletJobError::classify_sidecar_error(&e.to_string()))
+                {
+                    Ok(advanced) => break advanced,
+                    Err(err)
+                        if attaches < SAME_JOURNAL_ATTACHES
+                            && matches!(
+                                &err,
+                                WalletJobError::UploadSlotCongestion(msg)
+                                    if WalletJobError::is_sidecar_upload_transport_error(msg)
+                            ) =>
+                    {
+                        attaches += 1;
+                        tracing::info!(
+                            "[wallet-job:upload] job_id={} dropped upload connection; reattaching same journal ({}/{})",
+                            remember_job_id,
+                            attaches,
+                            SAME_JOURNAL_ATTACHES,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
 
@@ -2127,13 +2494,21 @@ async fn execute_durable_upload(
 
                 let blob_id = durable_step_field(&step, "blobId")?;
                 let object_id = durable_step_field(&step, "blobObjectId")?;
-                persist_uploaded_state(
+                if !persist_uploaded_state(
                     state.db.pool(),
                     remember_job_id,
                     &blob_id,
                     Some(&object_id),
                 )
-                .await?;
+                .await?
+                {
+                    tracing::info!(
+                        "[wallet-job:upload] job_id={} namespace forgotten before uploaded state persisted; skipping transfer and indexing",
+                        remember_job_id,
+                    );
+                    crate::rate_limit::release_storage_quota_one(state, remember_job_id).await;
+                    return Ok(());
+                }
                 warm_blob_cache_after_upload(state, &blob_id, encrypted).await;
                 return resume_metadata_and_transfer(
                     state,
@@ -2507,6 +2882,14 @@ async fn execute_upload_and_transfer_locked(
                 );
                 return Ok(());
             }
+            UploadResume::Forgotten => {
+                tracing::info!(
+                    "[wallet-job:upload] job_id={} namespace forgotten while in flight — skipping upload",
+                    jid,
+                );
+                crate::rate_limit::release_storage_quota_one(state, jid).await;
+                return Ok(());
+            }
             UploadResume::ResumeTransfer {
                 blob_id,
                 blob_object_id,
@@ -2601,12 +2984,34 @@ async fn execute_upload_and_transfer_locked(
 
     // ── Mark running ───────────────────────────────────────────
     if let Some(ref jid) = remember_job_id {
-        let _ = sqlx::query(
-            "UPDATE remember_jobs SET status = 'running', error_msg = NULL, updated_at = NOW() WHERE id = $1",
+        let marked = sqlx::query(
+            "UPDATE remember_jobs
+             SET status = 'running',
+                 error_msg = NULL,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status NOT IN ('uploaded', 'done')
+               AND COALESCE(error_msg, '') <> $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )",
         )
         .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
         .execute(state.db.pool())
         .await;
+        if let Ok(result) = marked {
+            if result.rows_affected() == 0 {
+                tracing::info!(
+                    "[wallet-job:upload] job_id={} owner={} ns={} was fenced/completed before upload start — skipping",
+                    jid,
+                    &owner[..10.min(owner.len())],
+                    namespace,
+                );
+                crate::rate_limit::release_storage_quota_one(state, jid).await;
+                return Ok(());
+            }
+        }
     }
 
     // ── Decode encrypted bytes ─────────────────────────────────
@@ -2828,7 +3233,11 @@ async fn execute_upload_and_transfer_locked(
             // the recovery job (see persist_uploaded_state). A retry that lands
             // here reads this to resume the transfer instead of re-minting.
             if let Some(ref jid) = remember_job_id {
-                persist_uploaded_state(state.db.pool(), jid, &blob_id, Some(&object_id)).await?;
+                if !persist_uploaded_state(state.db.pool(), jid, &blob_id, Some(&object_id)).await?
+                {
+                    crate::rate_limit::release_storage_quota_one(state, jid).await;
+                    return Ok(());
+                }
             }
 
             let job_id_for_log = remember_job_id.as_deref().unwrap_or("-").to_string();
@@ -3063,7 +3472,12 @@ async fn execute_upload_and_transfer_locked(
     // the old fire-and-forget `let _ =`. Also stores blob_object_id so an
     // uploaded-but-not-done retry can resume the transfer without re-minting.
     if let Some(ref jid) = remember_job_id {
-        persist_uploaded_state(state.db.pool(), jid, &blob_id, upload.object_id.as_deref()).await?;
+        if !persist_uploaded_state(state.db.pool(), jid, &blob_id, upload.object_id.as_deref())
+            .await?
+        {
+            crate::rate_limit::release_storage_quota_one(state, jid).await;
+            return Ok(());
+        }
     }
 
     // The sidecar's `/walrus/upload` endpoint already performs metadata+transfer
@@ -3480,7 +3894,7 @@ pub enum WalletJobError {
 }
 
 impl WalletJobError {
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             WalletJobError::Transient(msg)
             | WalletJobError::Permanent(msg)
@@ -4306,6 +4720,20 @@ the checkpoint it replied about",
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(
+            "SELECT pg_advisory_lock(72819041);
+             CREATE TABLE IF NOT EXISTS memory_tombstones (
+                 memory_id  TEXT PRIMARY KEY,
+                 owner      TEXT NOT NULL,
+                 namespace  TEXT NOT NULL,
+                 blob_id    TEXT NOT NULL,
+                 deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             SELECT pg_advisory_unlock(72819041);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         pool
     }
@@ -4461,6 +4889,7 @@ the checkpoint it replied about",
                 signature: "bb".into(),
                 digest: "cc".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         assert!(pin_journal_wallet(&prepared, 1));
@@ -4963,6 +5392,7 @@ the checkpoint it replied about",
             signature: "bb".into(),
             digest: "cc".into(),
             sponsor_digest: None,
+            execution_started: None,
         }
     }
 
@@ -5642,6 +6072,7 @@ the checkpoint it replied about",
                 signature: "signature".into(),
                 digest: "digest-1".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
 
@@ -6379,5 +6810,107 @@ the checkpoint it replied about",
             }
             other => panic!("expected transient handoff error, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn upload_resume_returns_forgotten_after_delete_by_namespace_and_blocks_uploaded_transition(
+    ) {
+        let pool = test_pool().await;
+        let owner = format!("0xforget-owner-{}", uuid::Uuid::new_v4());
+        let namespace = "forgotten-ns";
+        let pending_id = format!("job-pending-{}", uuid::Uuid::new_v4());
+        let uploaded_id = format!("job-uploaded-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, error_msg)
+             VALUES ($1, $2, $3, 'failed', $4)",
+        )
+        .bind(&pending_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status, blob_id, blob_object_id, error_msg)
+             VALUES ($1, $2, $3, 'failed', 'blob-already-minted', '0xobj', $4)",
+        )
+        .bind(&uploaded_id)
+        .bind(&owner)
+        .bind(namespace)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending_disp = upload_resume_disposition(&pool, &pending_id).await;
+        let uploaded_disp = upload_resume_disposition(&pool, &uploaded_id).await;
+        assert_eq!(pending_disp, UploadResume::Forgotten);
+        assert_eq!(uploaded_disp, UploadResume::Forgotten);
+        assert!(!resume_needs_upload_slot(&pending_disp));
+
+        // Even if an in-flight upload finished minting right as forget ran,
+        // persist_uploaded_state must return false and must not flip a
+        // forgotten job back to 'uploaded'.
+        let transitioned =
+            persist_uploaded_state(&pool, &pending_id, "blob-late-mint", Some("0xlate"))
+                .await
+                .expect("persist_uploaded_state on forgotten job");
+        assert!(
+            !transitioned,
+            "persist_uploaded_state must report false when job was forgotten"
+        );
+
+        // An in-flight attempt erroring out after `delete_by_namespace` must
+        // not flip the forgotten row back to `running` or overwrite the
+        // cancellation error_msg (either retryable or terminal).
+        let retryable_err = WalletJobError::Transient("sidecar HTTP 502".into());
+        update_remember_job_after_wallet_error(
+            &pool,
+            Some(&pending_id),
+            &retryable_err,
+            "upload retryable error",
+            None,
+        )
+        .await;
+        let terminal_err = WalletJobError::Permanent("permanent upload failure".into());
+        update_remember_job_after_wallet_error(
+            &pool,
+            Some(&pending_id),
+            &terminal_err,
+            "upload terminal error",
+            None,
+        )
+        .await;
+
+        for jid in [&pending_id, &uploaded_id] {
+            let (status, error_msg): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                    .bind(jid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status, "failed",
+                "forgotten job {jid} must remain failed after wallet error writers"
+            );
+            assert_eq!(
+                error_msg.as_deref(),
+                Some(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR),
+                "forgotten job {jid} must preserve FORGOTTEN_IN_FLIGHT_JOB_ERROR"
+            );
+            assert_eq!(
+                upload_resume_disposition(&pool, jid).await,
+                UploadResume::Forgotten,
+                "forgotten job {jid} must still resolve to UploadResume::Forgotten"
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await;
     }
 }

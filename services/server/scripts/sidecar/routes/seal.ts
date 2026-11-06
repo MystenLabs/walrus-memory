@@ -195,6 +195,29 @@ export async function retryTransientSealRpc<T>(
   }
 }
 
+const DECRYPT_FETCH_KEYS_ATTEMPTS = 2;
+const DECRYPT_FETCH_KEYS_BACKOFF_MS = 250;
+
+/**
+ * Bounded single retry for SEAL decrypt key fetches so transient key-server
+ * socket drops ("fetch failed"), 429s, or 5xx blips recover inline without
+ * blowing past interactive recall deadlines or retrying permanent auth errors.
+ */
+export async function retryTransientSealDecryptRpc<T>(
+  op: () => Promise<T>,
+  sleep: (ms: number) => Promise<unknown> = delay,
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      const transient = isRetryableRpcError(err) || errorMessage(err).toLowerCase().includes("fetch failed");
+      if (!transient || attempt >= DECRYPT_FETCH_KEYS_ATTEMPTS) throw err;
+      await sleep(DECRYPT_FETCH_KEYS_BACKOFF_MS);
+    }
+  }
+}
+
 const accountReader = {
   async getObject(input: { objectId: string; include: { json: true } }) {
     return await retryTransientSealRpc(() => suiClient.getObject(input));
@@ -357,13 +380,16 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
             ]);
 
         phase = "fetch_keys";
-            const sealClient = await createDecryptSealClient();
-        // Fetch keys from key servers
-        await sealClient.fetchKeys({
-          ids: [fullId],
-          txBytes,
-          sessionKey,
-          threshold: SEAL_THRESHOLD,
+        // Fetch keys from key servers with one bounded retry on transient RPC drops
+        const sealClient = await retryTransientSealDecryptRpc(async () => {
+          const client = await createDecryptSealClient();
+          await client.fetchKeys({
+            ids: [fullId],
+            txBytes,
+            sessionKey,
+            threshold: SEAL_THRESHOLD,
+          });
+          return client;
         });
 
         phase = "decrypt";
@@ -446,14 +472,18 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         );
 
         phase = "fetch_keys";
-            const sealClient = await createDecryptSealClient();
-        // ONE fetchKeys call for ALL IDs
+        // ONE fetchKeys call for ALL IDs, retrying once on transient RPC failure
+        let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
         try {
-          await sealClient.fetchKeys({
-            ids: allIds,
-            txBytes,
-            sessionKey,
-            threshold: SEAL_THRESHOLD,
+          sealClient = await retryTransientSealDecryptRpc(async () => {
+            const client = await createDecryptSealClient();
+            await client.fetchKeys({
+              ids: allIds,
+              txBytes,
+              sessionKey,
+              threshold: SEAL_THRESHOLD,
+            });
+            return client;
           });
         } catch (err: any) {
           const traceId = randomUUID();

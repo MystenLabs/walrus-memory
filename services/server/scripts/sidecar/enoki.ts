@@ -102,6 +102,31 @@ export function reactivateRejectionCode(
 }
 
 /**
+ * `account::add_delegate_key` aborts the sponsor dry-run with
+ * `ETooManyDelegateKeys` (abort code 2) once the account holds 20 delegate
+ * keys. Callers map this to `max_delegate_keys` so the UI directs the user to
+ * revoke an unused key on `/dashboard` instead of reporting a sponsor outage.
+ */
+export function addDelegateKeyRejectionCode(
+    message: string,
+): "max_delegate_keys" | null {
+    if (!/moveabort/i.test(message)) return null;
+    const namesThisFunction =
+        /::account::add_delegate_key\b/.test(message) ||
+        /"functionName"\s*:\s*"add_delegate_key"/.test(message) ||
+        /function_name:\s*Some\(\\?"add_delegate_key\\?"\)/.test(message);
+    if (!namesThisFunction) return null;
+    const abort =
+        message.match(/abort code:\s*(\d+)\b/i)?.[1] ??
+        message.match(/'ETooManyDelegateKeys':\s*(\d+)\b/)?.[1] ??
+        message.match(/\\"abortCode\\"\s*:\s*\\?"(\d+)\\?"/)?.[1] ??
+        message.match(/"abortCode"\s*:\s*"?(\d+)"?/)?.[1] ??
+        message.match(/function_name:\s*Some\(\\?"add_delegate_key\\?"\)\s*\},\s*(\d+)\)/)?.[1];
+    if (abort === "2") return "max_delegate_keys";
+    return null;
+}
+
+/**
  * Detect the `0x2::coin::destroy_zero` abort (ENonZero, abort code 0) that the
  * Walrus register PTB raises when the WAL payment coin still holds a non-zero
  * remainder. The `@mysten/walrus` `#withWal` helper pre-funds an *exact* WAL

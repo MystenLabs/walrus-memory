@@ -26,6 +26,7 @@ import { getAnalyticsErrorType, trackEvent } from '../utils/analytics'
 import { useCopyFeedback } from '../hooks/useCopyFeedback'
 import { apiGet } from '../utils/api'
 import { assertDelegateKeyRegistered, deriveDelegatePublicKeyHex, normalizeDelegatePrivateKey } from '../utils/delegateKeyImport'
+import { MAX_DELEGATE_KEYS } from '../utils/delegateKeys'
 import { fetchAccountIdForOwner, fetchObjectJson, publicKeyToHex } from '../utils/suiClientCompat'
 import ConnectWalrusMemory, { type ConnectPath } from './ConnectWalrusMemory'
 
@@ -40,7 +41,6 @@ interface OnChainDelegateKey {
     createdAt: number
 }
 
-const MAX_DELEGATE_KEYS = 20
 const MAX_DELEGATE_KEYS_MESSAGE = 'This wallet already has 20 delegate keys. Remove an old key before creating a new delegate key.'
 const DELEGATE_KEYS_SECTION_ID = 'delegate-keys'
 // Relayer clamps `limit` (default 100, max 500); these stay well inside that.
@@ -104,7 +104,7 @@ function DelegateKeySkeletonList() {
                     <tr>
                         <th scope="col" className="dashboard-key-table-select">Select</th>
                         <th scope="col">Key name</th>
-                        <th scope="col">Public key</th>
+                        <th scope="col">Public key (Agent ID)</th>
                         <th scope="col">Created</th>
                         <th scope="col" className="dashboard-key-table-actions">Actions</th>
                     </tr>
@@ -1206,7 +1206,7 @@ asyncio.run(main())`
 
                         <div className="dashboard-credential-row">
                             <div className="dashboard-credential-main">
-                                <div className="dashboard-credential-label">Delegate public key</div>
+                                <div className="dashboard-credential-label">Delegate public key (Agent ID)</div>
                                 <code className="dashboard-credential-value">{delegatePublicKey}</code>
                             </div>
                             <div className="dashboard-credential-actions">
@@ -1214,8 +1214,8 @@ asyncio.run(main())`
                                     type="button"
                                     className={`dashboard-credential-icon-button copy-status-button${copyStatusOf('pub') === 'copied' ? ' dashboard-credential-icon-button--copied' : ''}`}
                                     onClick={() => copyToClipboard(delegatePublicKey!, 'pub')}
-                                    aria-label="Copy delegate public key"
-                                    title="Copy public key"
+                                    aria-label="Copy Agent ID (public key)"
+                                    title="Copy Agent ID (public key)"
                                 >
                                     <CopyStatusIcon status={copyStatusOf('pub')} />
                                 </button>
@@ -1571,7 +1571,7 @@ asyncio.run(main())`
                                     <tr>
                                         <th scope="col" className="dashboard-key-table-select">Select</th>
                                         <th scope="col">Key name</th>
-                                        <th scope="col">Public key</th>
+                                        <th scope="col">Public key (Agent ID)</th>
                                         <th scope="col">Created</th>
                                         <th scope="col" className="dashboard-key-table-actions">Actions</th>
                                     </tr>
@@ -1614,7 +1614,7 @@ asyncio.run(main())`
                                                         )}
                                                     </div>
                                                 </td>
-                                                <td data-label="Public key">
+                                                <td data-label="Public key (Agent ID)">
                                                     <code className="dashboard-key-public" title={k.publicKey}>
                                                         {compactPublicKey(k.publicKey)}
                                                     </code>
@@ -1627,8 +1627,8 @@ asyncio.run(main())`
                                                         <button
                                                             className={`btn btn-secondary btn-sm dashboard-key-icon-action copy-status-button${copyStatusOf(copyPublicKeyLabel) === 'copied' ? ' dashboard-key-icon-action--copied' : ''}`}
                                                             onClick={() => copyToClipboard(k.publicKey, copyPublicKeyLabel)}
-                                                            aria-label="Copy public key"
-                                                            title="Copy public key"
+                                                            aria-label="Copy Agent ID (public key)"
+                                                            title="Copy Agent ID (public key)"
                                                         >
                                                             <CopyStatusIcon status={copyStatusOf(copyPublicKeyLabel)} />
                                                         </button>

@@ -65,12 +65,14 @@ fn importance_changed(existing: f32, incoming: f32) -> bool {
 /// it in place makes the sidecar reject the retry with `Resume blobId mismatch`
 /// and burn the attempt budget. A registered-or-later resume, or any recorded
 /// blob, is left untouched: those bytes may already have been submitted.
-fn unpaid_analyze_retry_reset_sql() -> &'static str {
+pub(crate) fn unpaid_analyze_retry_reset_sql() -> &'static str {
     "UPDATE remember_jobs SET status = 'pending', error_msg = NULL, \
      upload_wallet_index = NULL, upload_wallet_address = NULL, \
      upload_execution_identity = NULL, upload_resume_step = NULL, \
      upload_register_transaction = NULL, updated_at = NOW() \
      WHERE id = $1 AND status = 'failed' AND blob_id IS NULL AND blob_object_id IS NULL \
+     AND COALESCE(error_msg, '') <> $2 \
+     AND NOT EXISTS (SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text) \
      AND (upload_resume_step IS NULL OR upload_resume_step->>'step' = 'encoded')"
 }
 
@@ -875,6 +877,7 @@ pub async fn analyze(
                     } else {
                         let reset = match sqlx::query(unpaid_analyze_retry_reset_sql())
                             .bind(&existing_id)
+                            .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
                             .execute(state.db.pool())
                             .await
                         {
@@ -946,11 +949,20 @@ pub async fn analyze(
         .await
         {
             let _ = sqlx::query(
-                "UPDATE remember_jobs SET status = 'failed', error_msg = $2, updated_at = NOW()
-                 WHERE id = $1 AND blob_id IS NULL",
+                "UPDATE remember_jobs
+                 SET status = 'failed',
+                     error_msg = $2,
+                     updated_at = NOW()
+                 WHERE id = $1
+                   AND blob_id IS NULL
+                   AND COALESCE(error_msg, '') <> $3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+                   )",
             )
             .bind(&upload_job_id)
             .bind(e.to_string())
+            .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
             .execute(state.db.pool())
             .await;
             rate_limit::release_storage_quota(&state, std::slice::from_ref(&upload_job_id)).await;

@@ -2,7 +2,7 @@
 title: Reference
 description: >-
   Complete reference for Walrus Memory MCP tools, CLI flags, environment presets, transport routes, and self-hosting.
-  Covers all eight tools, credential management, stdio and HTTP transports, and runtime safety details.
+  Covers all tools, credential management, stdio and HTTP transports, and runtime safety details.
 keywords:
   - MCP
   - Walrus Memory
@@ -30,14 +30,14 @@ questions:
   - How do I configure the MemWal MCP CLI flags and environment variables?
   - How do I set up Streamable HTTP transport for Walrus Memory MCP?
 answer: >-
-  The MemWal MCP reference documents eight tools (memwal_remember, memwal_remember_bulk, memwal_recall, memwal_analyze, memwal_restore, memwal_health, memwal_login, memwal_logout) with full parameter details. It covers CLI flags such as --relayer, --namespace, and --label, environment presets (prod, staging, local), two transport modes (stdio and Streamable HTTP), credential file format, default namespace precedence, self-hosting configuration, and runtime safety notes for 401 handling and relayer overrides.
+  The MemWal MCP reference documents the MCP tools (memwal_remember, memwal_remember_bulk, memwal_remember_status, memwal_recall, memwal_namespaces, memwal_analyze, memwal_restore, memwal_health, memwal_login, memwal_logout) with full parameter details. It covers CLI flags such as --relayer, --namespace, and --label, environment presets (prod, staging, local), two transport modes (stdio and Streamable HTTP), credential file format, default namespace precedence, self-hosting configuration, and runtime safety notes for 401 handling and relayer overrides.
 ---
 
 The Walrus Memory MCP package exposes the tools, flags, environment variables, and transport routes below. For per-client setup, start with the [MCP overview](/mcp/overview).
 
 ## Tools
 
-The MCP server exposes **eight tools**: six **relayer tools** (memory operations plus a health check) and two **session tools** served locally by the stdio package. For the lifecycle hooks that drive these tools automatically, see [Claude Code](/mcp/claude-code) or [Codex](/mcp/codex).
+The MCP server exposes **relayer tools** (memory operations, namespace discovery, and a health check) plus two **session tools** served locally by the stdio package (`memwal_login` and `memwal_logout`). For the lifecycle hooks that drive these tools automatically, see [Claude Code](/mcp/claude-code) or [Codex](/mcp/codex).
 
 ## First-run behavior
 
@@ -79,12 +79,23 @@ Each result line includes `score` and `distance`. `distance` is cosine distance 
 
 The cutoff is applied to the `limit` nearest matches, not before them, so a tight `maxDistance` returns fewer than `limit` results — that is the cutoff biting, not an empty namespace. Raise `limit` to widen the candidate pool the cutoff sees.
 
+When `memwal_recall` returns 0 matches, it checks the account's namespaces and distinguishes an empty or misspelled namespace (`namespace "<name>" currently holds 0 memories`, plus close-match suggestions) from a query that had 0 semantic matches in a populated namespace.
+
 | **Parameter** | **Type** | **Required** | **Description** |
 | --- | --- | --- | --- |
 | `query` | string | yes | Natural-language query to match against stored memories. |
 | `limit` | integer (1–100) | no | Max memories to return. Default `10`. |
 | `namespace` | string | no | Namespace bucket to search. |
 | `maxDistance` | number (>= 0) | no | Cosine-distance cutoff (low = similar). Hits with `distance >= maxDistance` are dropped. Omit for no cutoff. |
+
+### memwal_namespaces
+
+List the namespaces that hold memories in the user's Walrus Memory account, with each namespace's `memory_count`, `storage_used`, and last `updated` date (metadata only, no decryption). Use this to discover existing namespaces on an account or verify namespace spelling when `memwal_recall` or `memwal_restore` reports 0 memories.
+
+| **Parameter** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `limit` | integer (1–500) | no | Max namespaces to return per page. Default `100`. |
+| `cursor` | string | no | Pagination cursor (`next_cursor` from a previous call). |
 
 ### memwal_analyze
 
@@ -214,6 +225,7 @@ The stdio package accepts CLI flags and environment variables. **CLI takes prece
 | `--label <text>` | `MEMWAL_CLIENT_LABEL` | Friendly delegate-key label shown in the Walrus Memory dashboard. |
 | `--namespace <name>` (alias `--ns`) | `MEMWAL_NAMESPACE` | Default memory namespace injected into memory tool calls that omit one. See [Default namespace](#default-namespace). |
 | `--login` (or `login` subcommand) | Not applicable | Force a re-login even when credentials exist. The existing file is kept until the new sign-in succeeds. |
+| `status` (alias `whoami`, `--status`, `--whoami`) | Not applicable | Print the active account ID, delegate address, key label, effective relayer URL, resolved namespace, and credentials path, then exit. Works without a TTY and exits `1` when not logged in. |
 | `--logout` | Not applicable | Delete the credentials file currently in use and exit. |
 | `approve-project` | Not applicable | Approve the project-local `.memwal/credentials.json` found from the current directory, so it is the file used here. Requires an interactive terminal. See [Approving a project file](#approving-a-project-file). |
 | `revoke-project` | Not applicable | Withdraw that approval. Requires an interactive terminal. |
@@ -233,6 +245,10 @@ Precedence, highest first:
 4. **Unset**. The package forwards the call without a `namespace`, and the relayer applies its own `"default"` namespace.
 
 CLI wins over the environment variable when you set both, which matches every other flag in the table above.
+
+<Warning>
+A mistyped namespace reads as empty (0 memories) on read and silently writes new memories into a separate bucket on write. Double-check your `--namespace` or `MEMWAL_NAMESPACE` spelling in your client config. When `memwal_recall` or `memwal_restore` sees 0 memories in the target namespace, it automatically checks your account's existing namespaces and suggests close matches; you can also call `memwal_namespaces` directly to list every populated namespace and its memory count.
+</Warning>
 
 <Note>
 `memwal_restore` still lists `namespace` as **required** in its tool schema, so agents normally pass one explicitly. The configured default only acts as a fallback when the agent calls `memwal_restore` without a namespace.
@@ -375,6 +391,9 @@ The hosted relayer (and any self-hosted relayer) exposes the same MCP routes:
 | `GET /api/mcp` | Streamable HTTP server-to-client stream |
 | `POST /api/mcp` | Streamable HTTP JSON-RPC messages |
 | `DELETE /api/mcp` | Close a Streamable HTTP session |
+| `GET /.well-known/mcp/server-card.json` | SEP-2127 MCP Server Card discovery metadata |
+| `GET /mcp/server-card` | SEP-2127 MCP Server Card discovery alias |
+| `GET /api/mcp/server-card` | SEP-2127 MCP Server Card discovery under the `/api/mcp` prefix |
 | `GET /.well-known/oauth-protected-resource` | OAuth resource metadata (RFC 9728, when configured) |
 | `GET /.well-known/oauth-authorization-server` | OAuth authorization-server metadata (RFC 8414) |
 | `POST /oauth/register` | Dynamic client registration (RFC 7591) |

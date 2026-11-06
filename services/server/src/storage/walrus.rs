@@ -47,6 +47,8 @@ pub struct PreparedRegisterTransaction {
     /// Enoki sponsorship handle. Absent for legacy/direct-signed journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -79,6 +81,14 @@ pub enum DurableUploadAdvance {
         journal: UploadJournal,
         step: serde_json::Value,
     },
+}
+
+pub enum PreparedRegisterReconciliation {
+    /// Sidecar proved the journaled registration digest is not on chain yet.
+    Unpaid,
+    /// Sidecar either reconciled the digest to `registered` (or later) or
+    /// proved the prepared transaction is reset-safe.
+    Advanced(DurableUploadAdvance),
 }
 
 #[derive(Debug)]
@@ -273,6 +283,10 @@ struct DurableUploadRequest<'a> {
     resume_step: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     register_transaction: Option<&'a PreparedRegisterTransaction>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reconcile_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    may_have_been_submitted: Option<bool>,
     epochs: u64,
 }
 
@@ -646,7 +660,7 @@ pub async fn advance_durable_upload(
     namespace: &str,
     package_id: &str,
     job_id: &str,
-    mut journal: UploadJournal,
+    journal: UploadJournal,
 ) -> Result<DurableUploadAdvance, AppError> {
     if crate::storage::walrus_native::is_in_process_sidecar_enabled(sidecar_url) {
         return crate::storage::walrus_native::advance_durable_upload_in_process(
@@ -655,7 +669,82 @@ pub async fn advance_durable_upload(
         .await;
     }
 
+    match send_durable_upload_step(
+        client,
+        sidecar_url,
+        sidecar_secret,
+        data,
+        epochs,
+        owner,
+        namespace,
+        package_id,
+        job_id,
+        journal,
+        false,
+    )
+    .await?
+    {
+        PreparedRegisterReconciliation::Advanced(advanced) => Ok(advanced),
+        PreparedRegisterReconciliation::Unpaid => Err(AppError::Internal(
+            "durable Walrus upload returned PREPARED_REGISTER_NOT_ON_CHAIN on execute path".into(),
+        )),
+    }
+}
+
+/// Reconcile a journaled `register_transaction` against on-chain finality
+/// without permitting the sidecar to submit a new registration transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile_durable_upload(
+    client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    data: &[u8],
+    epochs: u64,
+    owner: &str,
+    namespace: &str,
+    package_id: &str,
+    job_id: &str,
+    journal: UploadJournal,
+) -> Result<PreparedRegisterReconciliation, AppError> {
+    send_durable_upload_step(
+        client,
+        sidecar_url,
+        sidecar_secret,
+        data,
+        epochs,
+        owner,
+        namespace,
+        package_id,
+        job_id,
+        journal,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_durable_upload_step(
+    client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    data: &[u8],
+    epochs: u64,
+    owner: &str,
+    namespace: &str,
+    package_id: &str,
+    job_id: &str,
+    mut journal: UploadJournal,
+    reconcile_only: bool,
+) -> Result<PreparedRegisterReconciliation, AppError> {
     let url = format!("{}/walrus/upload-step-v3", sidecar_url);
+    let may_have_been_submitted = if reconcile_only {
+        journal
+            .register_transaction
+            .as_ref()
+            .map(|tx| tx.execution_started.unwrap_or(true))
+    } else {
+        None
+    };
     let mut req = client.post(&url).json(&DurableUploadRequest {
         data: BASE64.encode(data),
         key_index: journal.wallet_index,
@@ -671,6 +760,8 @@ pub async fn advance_durable_upload(
             journal.resume_step.as_ref(),
             journal.register_transaction.as_ref(),
         ),
+        reconcile_only,
+        may_have_been_submitted,
         epochs,
     });
     if let Some(secret) = sidecar_secret {
@@ -700,6 +791,14 @@ pub async fn advance_durable_upload(
         let error_code = serde_json::from_str::<DurableUploadErrorResponse>(&body)
             .ok()
             .and_then(|error| error.code);
+        if reconcile_only
+            && matches!(
+                error_code.as_deref(),
+                Some("PREPARED_REGISTER_NOT_ON_CHAIN")
+            )
+        {
+            return Ok(PreparedRegisterReconciliation::Unpaid);
+        }
         if should_drop_stale_encoded_resume(
             &body,
             error_code.as_deref(),
@@ -711,10 +810,12 @@ pub async fn advance_durable_upload(
             // belongs to the old blob id.
             journal.resume_step = None;
             journal.register_transaction = None;
-            return Ok(DurableUploadAdvance::Reset {
-                journal,
-                reason: format!("durable Walrus upload reset ({}): {}", status, body),
-            });
+            return Ok(PreparedRegisterReconciliation::Advanced(
+                DurableUploadAdvance::Reset {
+                    journal,
+                    reason: format!("durable Walrus upload reset ({}): {}", status, body),
+                },
+            ));
         }
         let reset_safe = should_reset_prepared_register(
             error_code.as_deref(),
@@ -737,10 +838,12 @@ pub async fn advance_durable_upload(
             } else {
                 journal.register_transaction = None;
             }
-            return Ok(DurableUploadAdvance::Reset {
-                journal,
-                reason: format!("durable Walrus upload reset ({}): {}", status, body),
-            });
+            return Ok(PreparedRegisterReconciliation::Advanced(
+                DurableUploadAdvance::Reset {
+                    journal,
+                    reason: format!("durable Walrus upload reset ({}): {}", status, body),
+                },
+            ));
         }
         return Err(AppError::Internal(format!(
             "durable Walrus upload failed ({}): {}",
@@ -752,13 +855,18 @@ pub async fn advance_durable_upload(
     })?;
     let returned_step = parsed.step.as_ref();
     let next_resume_step = parsed.resume_step.or(journal.resume_step);
-    let next_register_transaction = if returned_step.is_some() {
+    let mut next_register_transaction = if returned_step.is_some() {
         // A returned checkpoint consumed any prepared transaction. The only
         // returned step before preparation is `encoded`, when none exists yet.
         parsed.register_transaction
     } else {
         parsed.register_transaction.or(journal.register_transaction)
     };
+    if let Some(tx) = next_register_transaction.as_mut() {
+        if tx.execution_started.is_none() {
+            tx.execution_started = Some(false);
+        }
+    }
     let next = UploadJournal {
         wallet_index: journal.wallet_index,
         wallet_address: parsed.wallet_address.or(journal.wallet_address),
@@ -769,12 +877,16 @@ pub async fn advance_durable_upload(
         register_transaction: next_register_transaction,
     };
     if let Some(step) = parsed.step {
-        Ok(DurableUploadAdvance::Step {
-            journal: next,
-            step,
-        })
+        Ok(PreparedRegisterReconciliation::Advanced(
+            DurableUploadAdvance::Step {
+                journal: next,
+                step,
+            },
+        ))
     } else if next.register_transaction.is_some() {
-        Ok(DurableUploadAdvance::Prepared(next))
+        Ok(PreparedRegisterReconciliation::Advanced(
+            DurableUploadAdvance::Prepared(next),
+        ))
     } else {
         Err(AppError::Internal(
             "durable Walrus upload response contained neither step nor prepared transaction".into(),
@@ -1492,6 +1604,7 @@ mod tests {
             signature: "signature".into(),
             digest: "digest".into(),
             sponsor_digest: None,
+            execution_started: None,
         };
         let encoded = serde_json::json!({ "step": "encoded" });
         let registered = serde_json::json!({ "step": "registered" });
@@ -1508,6 +1621,7 @@ mod tests {
             signature: "signature".into(),
             digest: "digest".into(),
             sponsor_digest: None,
+            execution_started: None,
         };
         let sponsored = PreparedRegisterTransaction {
             sponsor_digest: Some("sponsor".into()),
@@ -1543,6 +1657,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "cancelled-digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         discard_cancelled_register(&mut journal);
@@ -1798,6 +1913,7 @@ mod tests {
                     signature: "signature".into(),
                     digest: "digest".into(),
                     sponsor_digest: Some("sponsor".into()),
+                    execution_started: None,
                 }),
             };
             let result = super::advance_durable_upload(
@@ -1889,6 +2005,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "cancelled-digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         let reset = super::advance_durable_upload(
@@ -1972,6 +2089,7 @@ mod tests {
                 signature: "signature".into(),
                 digest: "digest".into(),
                 sponsor_digest: None,
+                execution_started: None,
             }),
         };
         for _ in 0..2 {

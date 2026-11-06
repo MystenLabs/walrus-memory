@@ -2,6 +2,11 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
+import {
+    formatNamespaceSuggestionHint,
+    tryListNamespaces,
+    type NamespaceEntry,
+} from "./namespaces.js";
 import { wrapTool } from "./util.js";
 
 const RECALL_INPUT = {
@@ -41,6 +46,17 @@ function dedupeKey(text: string): string {
     return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+export interface CollapsedDuplicate {
+    /** 1-based line number in the deduplicated `unique` list. */
+    index: number;
+    /** Number of additional copies collapsed into this survivor. */
+    collapsed: number;
+    /** Total number of matching rows for this fact (`1 + collapsed`). */
+    total: number;
+    /** Distinct non-empty `blob_id`s across all copies of this fact. */
+    blobIds: string[];
+}
+
 /**
  * Collapse results carrying identical text, keeping the first occurrence.
  *
@@ -55,16 +71,89 @@ function dedupeKey(text: string): string {
  * budget on one fact and crowds out everything else it asked for, which is a
  * read-side problem worth fixing on the read side.
  */
-export function collapseDuplicates<T extends { text: string }>(
+export function collapseDuplicates<T extends { text: string; blob_id?: unknown }>(
     results: T[],
-): { unique: T[]; collapsed: number } {
-    const seen = new Map<string, T>();
+): { unique: T[]; collapsed: number; duplicates: CollapsedDuplicate[] } {
+    const seen = new Map<
+        string,
+        { survivor: T; index: number; total: number; blobIds: Set<string> }
+    >();
     for (const item of results) {
-        const key = dedupeKey(item.text);
-        if (!seen.has(key)) seen.set(key, item);
+        const blobId =
+            typeof item.blob_id === "string" && item.blob_id.trim().length > 0
+                ? item.blob_id.trim()
+                : null;
+        const key = blobId ? `blob:${blobId}` : `text:${dedupeKey(item.text)}`;
+        const existing = seen.get(key);
+        if (!existing) {
+            const blobIds = new Set<string>();
+            if (blobId) blobIds.add(blobId);
+            seen.set(key, {
+                survivor: item,
+                index: seen.size + 1,
+                total: 1,
+                blobIds,
+            });
+        } else {
+            existing.total += 1;
+            if (blobId) existing.blobIds.add(blobId);
+        }
     }
-    const unique = [...seen.values()];
-    return { unique, collapsed: results.length - unique.length };
+    const unique: T[] = [];
+    const duplicates: CollapsedDuplicate[] = [];
+    for (const entry of seen.values()) {
+        unique.push(entry.survivor);
+        if (entry.total > 1) {
+            duplicates.push({
+                index: entry.index,
+                collapsed: entry.total - 1,
+                total: entry.total,
+                blobIds: [...entry.blobIds],
+            });
+        }
+    }
+    return { unique, collapsed: results.length - unique.length, duplicates };
+}
+
+/**
+ * Render the footer note explaining which result row(s) had duplicate copies
+ * collapsed and how many blobs/copies sit behind each.
+ *
+ * Naming the 1-based row number (`#3`) prevents the trailing note from reading
+ * as if it refers to the final row (`#5`), and naming the distinct blob count
+ * when multiple blobs hold the same fact surfaces that separate Walrus blobs
+ * were written rather than one blob being returned twice.
+ */
+export function formatCollapsedDuplicatesNote(
+    duplicates: CollapsedDuplicate[],
+): string | null {
+    if (duplicates.length === 0) return null;
+    if (duplicates.length === 1) {
+        const d = duplicates[0]!;
+        const copyWord = d.collapsed === 1 ? "copy" : "copies";
+        const backing =
+            d.blobIds.length > 1
+                ? `#${d.index} is stored across ${d.blobIds.length} blobs`
+                : d.blobIds.length === 1
+                  ? `#${d.index} shares 1 blob across ${d.total} copies`
+                  : `${d.total} copies total`;
+        return `\n(${d.collapsed} duplicate ${copyWord} of #${d.index} collapsed: ${backing}; the same fact is stored more than once.)`;
+    }
+    const totalCollapsed = duplicates.reduce((sum, d) => sum + d.collapsed, 0);
+    const copyWord = totalCollapsed === 1 ? "copy" : "copies";
+    const details = duplicates
+        .map((d) => {
+            const dupWord = d.collapsed === 1 ? "duplicate" : "duplicates";
+            const backing =
+                d.blobIds.length > 1
+                    ? `${d.blobIds.length} blobs`
+                    : d.blobIds.length === 1
+                      ? `1 blob, ${d.total} copies`
+                      : `${d.total} copies`;
+            return `#${d.index} (${d.collapsed} ${dupWord}, ${backing})`;
+        })
+        .join(", ");
+    return `\n(${totalCollapsed} duplicate ${copyWord} collapsed: ${details}; the same fact is stored more than once.)`;
 }
 
 /**
@@ -85,6 +174,27 @@ export function filterByMaxDistance<T extends { distance: number }>(
     return results.filter((memory) => memory.distance < maxDistance);
 }
 
+/** Extract `droppedCount` when the SDK throws `MemWalRecallAllDroppedError`. */
+export function allDroppedCountFromError(err: unknown): number | null {
+    if (err == null || typeof err !== "object") return null;
+    const e = err as {
+        code?: unknown;
+        name?: unknown;
+        droppedCount?: unknown;
+        dropped_count?: unknown;
+    };
+    if (e.code !== "RECALL_ALL_DROPPED" && e.name !== "MemWalRecallAllDropped") {
+        return null;
+    }
+    if (typeof e.droppedCount === "number" && e.droppedCount > 0) {
+        return e.droppedCount;
+    }
+    if (typeof e.dropped_count === "number" && e.dropped_count > 0) {
+        return e.dropped_count;
+    }
+    return 1;
+}
+
 /**
  * Empty-result copy after the maxDistance filter.
  *
@@ -94,7 +204,15 @@ export function filterByMaxDistance<T extends { distance: number }>(
  * speak for it either: when both counts are non-zero, say both rather than
  * letting "outside maxDistance" imply the namespace held nothing relevant.
  */
-export function emptyRecallText(resultCount: number, dropped: number): string {
+export function emptyRecallText(
+    resultCount: number,
+    dropped: number,
+    namespaceContext?: {
+        activeNamespace: string;
+        namespaces: readonly NamespaceEntry[];
+        has_more?: boolean;
+    },
+): string {
     if (resultCount > 0) {
         const unchecked =
             dropped > 0
@@ -104,6 +222,22 @@ export function emptyRecallText(resultCount: number, dropped: number): string {
     }
     if (dropped > 0) {
         return `No matching memories could be returned (${dropped} matched but failed to download or decrypt). This is not an empty namespace.`;
+    }
+    if (namespaceContext) {
+        const { activeNamespace, namespaces, has_more } = namespaceContext;
+        const activeEntry = namespaces.find((ns) => ns.name === activeNamespace);
+        if (activeEntry) {
+            if (activeEntry.memory_count === 0) {
+                const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+                return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
+            }
+            return `No matching memories found in namespace "${activeNamespace}" (0 matches among ${activeEntry.memory_count} ${activeEntry.memory_count === 1 ? "memory" : "memories"}).`;
+        }
+        if (has_more) {
+            return `No matching memories found in namespace "${activeNamespace}".`;
+        }
+        const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+        return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
     }
     return "No matching memories found.";
 }
@@ -168,29 +302,63 @@ export function registerRecallTool(
             inputSchema: RECALL_INPUT,
         },
         wrapTool<{ query: string; limit: number; namespace?: string; maxDistance?: number }>(session, "memwal_recall", async ({ query, limit, namespace, maxDistance }) => {
-            const result = await session.memwal.recall(query, limit, namespace);
+            let result: Awaited<ReturnType<typeof session.memwal.recall>>;
+            try {
+                result = await session.memwal.recall(query, limit, namespace);
+            } catch (err) {
+                const allDropped = allDroppedCountFromError(err);
+                if (allDropped !== null) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: emptyRecallText(0, allDropped),
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                throw err;
+            }
             const droppedRaw = (result as { dropped_count?: unknown }).dropped_count;
             const dropped = typeof droppedRaw === "number" ? droppedRaw : 0;
             const filtered = filterByMaxDistance(result.results, maxDistance);
             if (filtered.length === 0) {
+                const activeNamespace =
+                    namespace?.trim() || session.namespace?.trim() || "default";
+                const discovery =
+                    result.results.length === 0 && dropped === 0
+                        ? await tryListNamespaces(session, activeNamespace, 50)
+                        : null;
+                const allDropped = result.results.length === 0 && dropped > 0;
                 return {
                     content: [
                         {
                             type: "text",
-                            text: emptyRecallText(result.results.length, dropped),
+                            text: emptyRecallText(
+                                result.results.length,
+                                dropped,
+                                discovery
+                                    ? {
+                                          activeNamespace,
+                                          namespaces: discovery.namespaces,
+                                          has_more: discovery.has_more,
+                                      }
+                                    : undefined,
+                            ),
                         },
                     ],
+                    ...(allDropped ? { isError: true } : {}),
                 };
             }
-            const { unique, collapsed } = collapseDuplicates(filtered);
+            const { unique, duplicates } = collapseDuplicates(filtered);
             const lines = unique.map((m, i) => formatRecallLine(m, i));
             // Say what was folded away rather than quietly returning fewer rows
-            // than the caller asked for. It also surfaces that the same fact was
-            // stored repeatedly, which is usually worth knowing.
-            if (collapsed > 0) {
-                lines.push(
-                    `\n(${collapsed} duplicate ${collapsed === 1 ? "copy" : "copies"} of the above collapsed; the same fact is stored more than once.)`
-                );
+            // than the caller asked for. Naming the affected line number(s) and
+            // blob/copy count avoids implying the final line was the duplicated one.
+            const duplicateNote = formatCollapsedDuplicatesNote(duplicates);
+            if (duplicateNote) {
+                lines.push(duplicateNote);
             }
             if (dropped > 0) {
                 lines.push(
