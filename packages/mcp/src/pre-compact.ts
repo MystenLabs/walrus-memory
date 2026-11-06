@@ -366,6 +366,39 @@ export function redactSecrets(input: string): string {
     return s;
 }
 
+const CLAUSE_IMPERATIVE_PREFIX =
+    "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:please|just)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
+const IMPERATIVE_NEGATION_PREFIX =
+    "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:and|but|please|just)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
+/** Conversational opt-out patterns that instruct the assistant not to persist the turn. */
+export const CONVERSATIONAL_OPT_OUT_PATTERNS: RegExp[] = [
+    new RegExp(
+        `${CLAUSE_IMPERATIVE_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep|persist))?\\b`,
+        "i"
+    ),
+    new RegExp(
+        `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep|persist)\\b|\\s+(?:any(?:\\s+of)?(?:\\s+(?:this|that|these|those|it))?|anything(?:\\s+(?:here|from\\s+this))?|this|that|these|those|it|the\\s+following\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b)`,
+        "i"
+    ),
+    new RegExp(
+        `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:save|store|record|capture|keep|persist)(?:\\s+or\\s+(?:remember|memorize|save|store|record|capture|keep|persist))?(?:\\s+(?:any(?:\\s+of)?(?:\\s+(?:this|that|these|those|it))?|anything(?:\\s+(?:here|from\\s+this))?|this|that|these|those|it|what\\s+i|where\\s+i|who\\s+i|how\\s+i|my\\b|our\\b|the\\s+following\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b|(?=\\s*(?:$|[.!?:;,)\\]])))`,
+        "i"
+    ),
+    new RegExp(
+        `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?log\\s+(?:this(?:\\s+(?:conversation|message|chat|turn|session))?|anything\\s+(?:here|from\\s+this)|our\\s+(?:conversation|chat))\\b`,
+        "i"
+    ),
+    /\b(?:off\s+the\s+record|(?:do\s+not|don['\u2019]?t|never)\s+keep\s+(?:this\s+|that\s+|it\s+)?in\s+memory|(?:please\s+)?forget\s+(?:this(?:\s+(?:conversation|message|chat|turn))?|what\s+i\s+just\s+said))\b/i,
+    /(?:^|\s)(?:\[\s*no[-_\s]?save\s*\]|#no[-_]?save\b|\[\s*no[-_\s]?memory\s*\]|#no[-_]?memory\b|\bMEMWAL_IGNORE\b)/i,
+];
+
+export function hasConversationalOptOut(text: string): boolean {
+    if (!text) return false;
+    return CONVERSATIONAL_OPT_OUT_PATTERNS.some((pat) => pat.test(text));
+}
+
 function hasSalvageableContent(text: string): boolean {
     const withoutPlaceholders = text.replace(/\[redacted:[a-z-]+\]/g, " ");
     const words = withoutPlaceholders.match(/[\p{L}\p{N}]{2,}/gu) ?? [];
@@ -377,7 +410,7 @@ export function cleanAndFilterTurn(turn: TranscriptTurn): string | null {
     let text = turn.text;
 
     // Screen each message/block for opt-out markers:
-    if (/\[no-memory\]/i.test(text) || /MEMWAL_IGNORE/i.test(text)) {
+    if (/\[no-memory\]/i.test(text) || /MEMWAL_IGNORE/i.test(text) || hasConversationalOptOut(text)) {
         return null;
     }
 
@@ -505,10 +538,20 @@ export async function runPreCompactSave(input: PreCompactInput): Promise<PreComp
     // 5. Parse turns and filter
     const lines = rawChunk.split("\n");
     const formattedTurns: string[] = [];
+    let userTurnOptedOut = false;
 
     for (const line of lines) {
         const turn = parseTranscriptLine(line);
         if (!turn) continue;
+
+        if (turn.role === "user") {
+            userTurnOptedOut = hasConversationalOptOut(turn.text);
+        }
+
+        if (userTurnOptedOut) {
+            continue;
+        }
+
         const cleaned = cleanAndFilterTurn(turn);
         if (cleaned) {
             formattedTurns.push(cleaned);

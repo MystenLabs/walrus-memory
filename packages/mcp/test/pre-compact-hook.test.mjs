@@ -15,6 +15,7 @@ import {
 } from "../dist/auto-save.js";
 import {
     redactSecrets,
+    hasConversationalOptOut,
 } from "../dist/pre-compact.js";
 import {
     SECRET_EXCLUSION_RULES,
@@ -1000,6 +1001,71 @@ test("runPreCompactSave screens labelled private keys across Markdown line break
         assert.equal(resOnly.status, 0);
         await waitForRequests(mock, 1, 100);
         assert.equal(mock.requests.length, 1, "Standalone heading-labelled key turn must be dropped without calling /api/analyze");
+    } finally {
+        await mock.close();
+        rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test("conversational opt-out instructions and trailing assistant echoes are excluded from pre-compaction analyze", async () => {
+    assert.equal(hasConversationalOptOut("do not save this turn"), true);
+    assert.equal(hasConversationalOptOut("Please don't remember this: temporary work"), true);
+    assert.equal(hasConversationalOptOut("keep this off the record"), true);
+    assert.equal(hasConversationalOptOut("never store this in memory"), true);
+    assert.equal(hasConversationalOptOut("We prefer using TypeScript for MCP tools"), false);
+
+    const tempDir = freshTempDir();
+    const mock = await startWorkerMockRelayer({ statusCode: 200 });
+
+    try {
+        writeSettings(tempDir, { autoSave: true });
+        await writeTestCreds(tempDir, { relayerUrl: mock.url });
+
+        const transcriptPath = join(tempDir, "conversational-optout.jsonl");
+        const lines = [
+            // 1. Opted out turn
+            JSON.stringify({
+                role: "user",
+                content: "Please do not save this: I am debugging a confidential project codenamed Alpha.",
+            }),
+            // 2. Trailing assistant echo
+            JSON.stringify({
+                role: "assistant",
+                content: "Understood, project Alpha will stay strictly off the record.",
+            }),
+            // 3. Normal durable turn
+            JSON.stringify({
+                role: "user",
+                content: "Architectural decision: We enforce ESM modules across all packages in this repo.",
+            }),
+            // 4. Assistant acknowledgment of normal turn
+            JSON.stringify({
+                role: "assistant",
+                content: "Noted, ESM modules are enforced.",
+            }),
+        ];
+        writeFileSync(transcriptPath, lines.join("\n") + "\n");
+
+        const result = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-conversational-optout",
+                transcript_path: transcriptPath,
+            }
+        );
+
+        assert.equal(result.status, 0);
+        await waitForRequests(mock, 1);
+        assert.equal(mock.requests.length, 1);
+        const analyzedText = JSON.parse(mock.requests[0].body).text;
+
+        assert.ok(analyzedText.includes("Architectural decision: We enforce ESM modules across all packages in this repo."));
+        assert.ok(!analyzedText.includes("confidential project codenamed Alpha"));
+        assert.ok(!analyzedText.includes("project Alpha will stay strictly off the record"));
     } finally {
         await mock.close();
         rmSync(tempDir, { recursive: true, force: true });
