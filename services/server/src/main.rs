@@ -866,6 +866,55 @@ mod mcp_rate_limit_tests {
     }
 
     #[tokio::test]
+    async fn cross_process_fallback_refund_routes_via_postgres_when_isolated_from_process_registry()
+    {
+        let state_a = test_state(denying_redis().await).await;
+        let state_b = test_state(denying_redis().await).await;
+
+        let pk = format!("0xpk_cross_proc_{}", uuid::Uuid::new_v4());
+        let owner = "0xowner_cross_proc";
+        let dk_key = format!("rate:dk:{}", pk);
+        let req_id = format!("req-cross-proc-{}", uuid::Uuid::new_v4());
+
+        // Process A admits a 5-unit fallback request, then detaches from the
+        // process-local static registry so Process B shares only PostgreSQL.
+        {
+            let mut fb_a = state_a.fallback_rate_limit.lock().await;
+            fb_a.consume_tracked(&dk_key, Some(&req_id), 5, 30.0, 60.0);
+            fb_a.detach_from_process_registry();
+            assert!((fb_a.buckets.get(&dk_key).unwrap().tokens - 25.0).abs() < 0.2);
+        }
+
+        // Process B settles the failed job via refund_delegate_key_rate_limit,
+        // writing the cross-process refund claim to PostgreSQL.
+        let charge = rate_limit::RateLimitCharge {
+            request_id: req_id,
+            public_key: pk.clone(),
+            owner: owner.to_string(),
+            weight: 5,
+            member_offset: 0,
+            backend: rate_limit::RateLimitBackend::Fallback,
+            delegate_key_capacity: 30,
+        };
+        rate_limit::refund_delegate_key_rate_limit(&state_b, &charge).await;
+
+        // Process A drains cross-process fallback refunds from PostgreSQL (as
+        // rate_limit_middleware does before checking fallback capacity).
+        let refunded = rate_limit::sync_fallback_rate_limit_refunds(&state_a, &pk, owner).await;
+        assert!(
+            refunded >= 4.9,
+            "expected ~5.0 refunded via PostgreSQL cross-process routing, got {refunded}"
+        );
+
+        let fb_a = state_a.fallback_rate_limit.lock().await;
+        let tokens_after = fb_a.buckets.get(&dk_key).unwrap().tokens;
+        assert!(
+            (tokens_after - 30.0).abs() < 1e-4,
+            "Process A fallback bucket must be restored to 30.0, got {tokens_after}"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_rate_limit_routes_use_their_own_ip_bucket() {
         let state = test_state(denying_redis().await).await;
         // Merged the same way `main` merges `mcp_routes` into `public_routes`.
