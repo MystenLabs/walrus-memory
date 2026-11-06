@@ -106,6 +106,8 @@ const SECRET_PATTERNS = [
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
   /[A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/[^\s/@:?=&]+:[^\s/@?=&]+@/,
   /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+  /\b(?:set-)?cookie\s*[:=]\s*\S+/i,
+  /(?:\b|(?<=[a-z0-9_-]))(?:session[_-]?cookies?|session[_-]?ids?|connect\.sid)\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false)\b)[^\s'",;}{)\]]{6,})/i,
   /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
   /\btoken["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{8,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{12,})/i,
   /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|api[\s_-]*key|seed)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{64}\b/i,

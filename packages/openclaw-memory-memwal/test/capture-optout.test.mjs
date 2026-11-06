@@ -60,6 +60,9 @@ test("shouldCapture rejects turns containing inline secrets and credentials", ()
     'Service webhook uses secret="my_super_secret_123" for local verification',
     "Remember that api_key: superSecretProductionTokenValue12345",
     "My seed phrase is witch collapse practice feed shame open despair creek road again ice least",
+    "The dashboard needs Cookie: session=9f8e7d6c5b4a3 to load my profile",
+    "Response header includes Set-Cookie: connect.sid=s%3A23490812345; Path=/; HttpOnly",
+    "Use cookie: session_id=abc123def456 for authentication",
   ];
 
   for (const turn of secretTurns) {
@@ -435,4 +438,60 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     analyzedPayloads[2].includes("disposable PostgreSQL container"),
     "next normal user turn must still be captured",
   );
+
+  // 10. Hook-level regression: session-cookie headers also suppress assistant echoes until the next normal user turn.
+  const cookieHistory = [
+    {
+      id: "u14",
+      role: "user",
+      content: "The dashboard needs Cookie: session=9f8e7d6c5b4a3 to load my profile",
+    },
+    {
+      id: "a14",
+      role: "assistant",
+      content: "Noted, the dashboard uses Cookie: session=9f8e7d6c5b4a3 for profile requests.",
+    },
+  ];
+  await handler(
+    {
+      success: true,
+      messages: [...cookieHistory],
+    },
+    { sessionKey: "agent:main:test-cookie-echo-suppression" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    3,
+    "session-cookie bearing user turns must suppress paraphrased assistant echoes from reaching analyze()",
+  );
+
+  cookieHistory.push(
+    {
+      id: "u15",
+      role: "user",
+      content: "We use Redis for session caching across our API instances.",
+    },
+    {
+      id: "a15",
+      role: "assistant",
+      content: "Got it, Redis is used for session caching across API instances.",
+    },
+  );
+  await handler(
+    {
+      success: true,
+      messages: [...cookieHistory],
+    },
+    { sessionKey: "agent:main:test-cookie-echo-suppression" },
+  );
+  assert.equal(analyzedPayloads.length, 4);
+  assert.ok(
+    !analyzedPayloads[3].includes("session=9f8e7d6c5b4a3"),
+    "cookie-bearing turn and its assistant echo must remain excluded on subsequent turns",
+  );
+  assert.ok(
+    analyzedPayloads[3].includes("Redis for session caching"),
+    "next normal user turn after cookie turn must be captured",
+  );
 });
+
