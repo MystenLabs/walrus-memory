@@ -1033,8 +1033,11 @@ impl Config {
             );
         }
 
-        let sidecar_url =
-            std::env::var("SIDECAR_URL").unwrap_or_else(|_| "http://localhost:9000".to_string());
+        let sidecar_url = if env_bool("SIDECAR_USE_IN_PROCESS_RUST") {
+            crate::storage::walrus_native::IN_PROCESS_SIDECAR_URL.to_string()
+        } else {
+            std::env::var("SIDECAR_URL").unwrap_or_else(|_| "http://localhost:9000".to_string())
+        };
         let seal_sidecar_url = plan_seal_deployment_from_env(&sidecar_url).dial_url;
 
         Self {

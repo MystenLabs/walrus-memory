@@ -5,6 +5,7 @@
 
 pub mod classify;
 mod client;
+pub mod enoki;
 pub mod input_freshness;
 pub mod tx_build;
 pub mod verifier;

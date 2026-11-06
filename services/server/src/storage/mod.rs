@@ -20,6 +20,8 @@ pub mod db;
 pub mod legacy_db;
 pub mod postgres_url;
 pub mod seal;
+pub mod seal_native;
 pub mod security_delete_store;
 pub mod sui;
 pub mod walrus;
+pub mod walrus_native;
