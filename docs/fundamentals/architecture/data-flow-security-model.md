@@ -87,6 +87,10 @@ You have options depending on your trust requirements:
 - **Run the relayer in a TEE**: move plaintext processing into an attested enclave. This reduces trust in the host operator, but clients or gateway policy must verify the enclave identity before treating it as a TEE-backed deployment.
 - **Manual client flow**: use `MemWalManual` to handle encryption and embedding entirely on the client side. The relayer only sees encrypted payloads and vectors, never plaintext. This flow suits Web3-native users who want full control over their data and are comfortable managing keys, signing, and Seal operations directly.
 
+<Warning>
+**Do not pass client-encrypted ciphertext to the default `MemWal.remember(text)` flow.** In the default flow, the relayer embeds `text` directly; passing ciphertext causes the relayer to embed ciphertext bytes, which silently breaks semantic `recall()`. When encrypting on the client, always use [`MemWalManual`](/sdk/usage/memwal-manual) (`rememberManual` / `recallManual`) so you compute the embedding from plaintext on the client and send `{ encryptedData, vector }` to the relayer.
+</Warning>
+
 ## What lives where
 
 ```mermaid

@@ -50,7 +50,7 @@ inside Claude Desktop uses the [Claude Code plugin guide](/mcp/claude-code).
 
 - You need Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x), because the server runs through `npx` with no install step.
 - `npx` resolves the package name against the directory your client starts the server in, which is usually the project you have open. A project that contains an installed `@mysten-incubation/memwal-mcp` of its own would be run instead of the published package, and pinning a version in the command does not prevent it. The [plugin](/mcp/claude-code) avoids this by installing the pinned version into `~/.memwal/runtime` and launching that absolute path; to get the same property without the plugin, install the version yourself outside any project and point `command`/`args` at the absolute entry point (see the [package README](https://github.com/MystenLabs/MemWal/blob/dev/packages/mcp/README.md#how-the-plugin-launches-the-server)).
-- You need a [Walrus Memory account](/fundamentals/concepts/ownership-and-access). An unauthenticated memory-tool call returns sign-in instructions rather than signing you in, so ask the agent to run `memwal_login` and follow the URL it returns to connect your wallet. Config files carry no keys.
+- You need a [Walrus Memory account](/fundamentals/concepts/ownership-and-access). An unauthenticated memory-tool call returns sign-in instructions rather than signing you in, so ask the agent to run `memwal_login` and follow the URL it returns to connect your wallet. Config files carry no keys. If you use a **Slush Google zkLogin** wallet, unlock and sign in with Google in the Slush extension first before opening the `/connect/mcp` sign-in URL so the approval popup does not hang.
 
 ## Set up your client
 
