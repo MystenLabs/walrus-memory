@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       relayer_url:
-        description: Relayer base URL for GET /config when SUI_RPC_URL / MEMWAL_PACKAGE_ID are unset
+        description: Relayer base URL for GET /config when SUI_GRPC_URL / MEMWAL_PACKAGE_ID are unset
         required: false
         type: string
         default: ""
@@ -31,6 +31,8 @@ jobs:
       SEAL_CROSS_ACCOUNT_B_ID: ${{ secrets.SEAL_CROSS_ACCOUNT_B_ID }}
       SEAL_CROSS_ACCOUNT_A_KEY: ${{ secrets.SEAL_CROSS_ACCOUNT_A_KEY }}
       SEAL_CROSS_ACCOUNT_B_KEY: ${{ secrets.SEAL_CROSS_ACCOUNT_B_KEY }}
+      SUI_GRPC_URL: ${{ vars.SUI_GRPC_URL }}
+      # Legacy fallback for SUI_GRPC_URL; must be a fullnode that serves gRPC.
       SUI_RPC_URL: ${{ vars.SUI_RPC_URL }}
       SUI_NETWORK: ${{ vars.SUI_NETWORK }}
       MEMWAL_PACKAGE_ID: ${{ vars.MEMWAL_PACKAGE_ID }}
