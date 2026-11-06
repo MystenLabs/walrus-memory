@@ -834,6 +834,82 @@ test("redactSecrets redacts labelled private keys, delegate keys, and mnemonic s
     assert.doesNotMatch(redacted2, new RegExp(mnemonic));
     assert.match(redacted2, /\[redacted:seed-phrase\]/);
 
+    const cookieSample = "Debug header Cookie: session=synthetic-session-cookie-value-for-tests; other=synthetic-two and Set-Cookie: auth_sid=secret-cookie-token; HttpOnly in request.";
+    const redactedCookie = redactSecrets(cookieSample);
+    assert.doesNotMatch(redactedCookie, /synthetic-session-cookie-value-for-tests/);
+    assert.doesNotMatch(redactedCookie, / synthetic-two|other=synthetic-two/);
+    assert.doesNotMatch(redactedCookie, /secret-cookie-token/);
+    assert.match(redactedCookie, /Cookie: \[redacted:auth-header\]/);
+    assert.match(redactedCookie, /Set-Cookie: \[redacted:auth-header\]/);
+
     const benign = "This project uses Sui TypeScript SDK version 1.2.0 with PostgreSQL storage.";
     assert.equal(redactSecrets(benign), benign);
+});
+
+test("runPreCompactSave screens Cookie and Set-Cookie headers from outgoing /api/analyze payload", async () => {
+    const tempDir = freshTempDir();
+    const mock = await startWorkerMockRelayer({ statusCode: 200 });
+
+    try {
+        writeSettings(tempDir, { autoSave: true });
+        await writeTestCreds(tempDir, { relayerUrl: mock.url });
+
+        const transcriptPath = join(tempDir, "cookie-transcript.jsonl");
+        const lines = [
+            JSON.stringify({
+                role: "user",
+                content: "We use PostgreSQL with pgvector for durable indexing. Never forward Cookie: session=synthetic-session-cookie-value-for-tests; other=synthetic-two or Set-Cookie: sid=top-secret-session-id; Path=/ in logs.",
+            }),
+        ];
+        writeFileSync(transcriptPath, lines.join("\n") + "\n");
+
+        const res = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-cookie-redaction",
+                transcript_path: transcriptPath,
+            }
+        );
+
+        assert.equal(res.status, 0, res.stderr);
+        await waitForRequests(mock, 1);
+        assert.equal(mock.requests.length, 1);
+        const body = JSON.parse(mock.requests[0].body);
+        assert.doesNotMatch(body.text, /synthetic-session-cookie-value-for-tests/);
+        assert.doesNotMatch(body.text, /other=synthetic-two/);
+        assert.doesNotMatch(body.text, /top-secret-session-id/);
+        assert.match(body.text, /Cookie: \[redacted:auth-header\]/);
+        assert.match(body.text, /Set-Cookie: \[redacted:auth-header\]/);
+
+        // Also verify a standalone cookie-only transcript is dropped completely without calling /api/analyze
+        const cookieOnlyPath = join(tempDir, "cookie-only.jsonl");
+        writeFileSync(
+            cookieOnlyPath,
+            JSON.stringify({
+                role: "user",
+                content: "Cookie: session=synthetic-session-cookie-value-for-tests; other=synthetic-two",
+            }) + "\n"
+        );
+        const resOnly = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-cookie-only",
+                transcript_path: cookieOnlyPath,
+            }
+        );
+        assert.equal(resOnly.status, 0);
+        await waitForRequests(mock, 1, 100);
+        assert.equal(mock.requests.length, 1, "Standalone cookie-only transcript must not trigger a new /api/analyze request");
+    } finally {
+        await mock.close();
+        rmSync(tempDir, { recursive: true, force: true });
+    }
 });

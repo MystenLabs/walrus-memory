@@ -292,6 +292,10 @@ export function redactSecrets(input: string): string {
         "$1$2[redacted:auth-header]"
     );
     s = s.replace(
+        /\b((?:set-)?cookie)(\s*[:=]\s*)[^\s;]+(?:\s*;\s*[^\s;]+)*/gi,
+        "$1$2[redacted:auth-header]"
+    );
+    s = s.replace(
         /\bBearer\s+[A-Za-z0-9_\-\.]{16,}\b/gi,
         "Bearer [redacted:token]"
     );
@@ -356,6 +360,12 @@ export function redactSecrets(input: string): string {
     return s;
 }
 
+function hasSalvageableContent(text: string): boolean {
+    const withoutPlaceholders = text.replace(/\[redacted:[a-z-]+\]/g, " ");
+    const words = withoutPlaceholders.match(/[\p{L}\p{N}]{2,}/gu) ?? [];
+    return words.length >= 3;
+}
+
 /** Clean, filter opt-out markers, and format a turn. Returns null if skipped. */
 export function cleanAndFilterTurn(turn: TranscriptTurn): string | null {
     let text = turn.text;
@@ -384,7 +394,11 @@ export function cleanAndFilterTurn(turn: TranscriptTurn): string | null {
     }
 
     // Redact secrets
+    const beforeRedact = text;
     text = redactSecrets(text);
+    if (text !== beforeRedact && !hasSalvageableContent(text)) {
+        return null;
+    }
 
     text = text.trim();
     if (!text) return null;
