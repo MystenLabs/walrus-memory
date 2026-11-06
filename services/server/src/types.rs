@@ -1341,9 +1341,6 @@ pub fn validate_security_delete_config(config: &Config) -> Result<(), String> {
     }
 
     let mut missing = Vec::new();
-    if config.legacy_db_url.is_none() {
-        missing.push("LEGACY_DB_URL");
-    }
     if config.sui_grpc_url.is_none() {
         missing.push("SUI_GRPC_URL");
     }
@@ -1368,6 +1365,14 @@ pub fn validate_security_delete_config(config: &Config) -> Result<(), String> {
             missing.join(", ")
         ))
     } else {
+        if let Some(ref legacy_url) = config.legacy_db_url {
+            if crate::storage::postgres_url::postgres_urls_share_target(
+                legacy_url,
+                &config.database_url,
+            ) {
+                return Err("LEGACY_DB_URL must reference a dedicated pre-migration database distinct from DATABASE_URL; shared single-database deletion is not supported because pre-existing vector_entries rows lack unambiguous scope provenance".into());
+            }
+        }
         config
             .walrus_package_id
             .parse::<sui_sdk_types::Address>()
@@ -3415,6 +3420,18 @@ mod tests {
     }
 
     #[test]
+    fn security_delete_boot_guard_allows_post_migration_without_legacy_db() {
+        let mut config = security_delete_test_config();
+        config.enable_memory_deletion = true;
+        config.enable_security_delete = true;
+        config.legacy_db_url = None;
+        config.deletion_token_secret = Some("secret".into());
+        config.sponsor_private_key =
+            Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32]));
+        assert!(validate_security_delete_config(&config).is_ok());
+    }
+
+    #[test]
     fn security_delete_boot_guard_reconciler_requires_sponsor() {
         let mut config = security_delete_test_config();
         config.deletion_reconciler_enabled = true;
@@ -3428,6 +3445,39 @@ mod tests {
     #[test]
     fn security_delete_boot_guard_all_off_needs_nothing() {
         let config = security_delete_test_config();
+        assert!(validate_security_delete_config(&config).is_ok());
+    }
+
+    #[test]
+    fn security_delete_boot_guard_rejects_shared_database_urls() {
+        let mut config = security_delete_test_config();
+        config.enable_memory_deletion = true;
+        config.enable_security_delete = true;
+        config.deletion_token_secret = Some("secret".into());
+        config.sponsor_private_key =
+            Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32]));
+
+        // 1. Exact same URL is rejected
+        config.database_url = "postgresql://memwal:secret@localhost:5432/memwal".into();
+        config.legacy_db_url = Some("postgresql://memwal:secret@localhost:5432/memwal".into());
+        let err = validate_security_delete_config(&config).unwrap_err();
+        assert!(err.contains("LEGACY_DB_URL must reference a dedicated pre-migration database distinct from DATABASE_URL"));
+
+        // 2. Neon pooler vs direct hostname on same database is rejected
+        config.database_url =
+            "postgresql://memwal:secret@ep-foo.us-east-2.aws.neon.tech/neondb".into();
+        config.legacy_db_url = Some("postgresql://memwal:secret@ep-foo-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require".into());
+        let err = validate_security_delete_config(&config).unwrap_err();
+        assert!(err.contains("LEGACY_DB_URL must reference a dedicated pre-migration database distinct from DATABASE_URL"));
+
+        // 3. Distinct database names succeed
+        config.database_url = "postgresql://memwal:secret@localhost:5432/memwal".into();
+        config.legacy_db_url =
+            Some("postgresql://memwal:secret@localhost:5432/memwal_legacy".into());
+        assert!(validate_security_delete_config(&config).is_ok());
+
+        // 4. Unset LEGACY_DB_URL succeeds
+        config.legacy_db_url = None;
         assert!(validate_security_delete_config(&config).is_ok());
     }
 
