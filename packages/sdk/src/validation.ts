@@ -308,6 +308,15 @@ export function assertValidRememberText(
     field = "text",
 ): RememberValidationResult {
     const result = validateRemember(text, options);
+    const emptyIssue = result.issues.find((i) => i.code === "empty_text");
+    if (emptyIssue) {
+        throw new MemWalValidationError(
+            `${field} cannot be empty`,
+            "empty_text",
+            result.issues,
+            result.kinds,
+        );
+    }
     const lengthIssue = result.issues.find((i) => i.code === "text_too_long");
     if (lengthIssue) {
         throw new MemWalValidationError(

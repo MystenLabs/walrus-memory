@@ -579,11 +579,33 @@ export class MemWalMock {
         namespaceOrOptions?: string | AnalyzeOptions,
         opts: RememberBulkOptions = {}
     ): Promise<AnalyzeWaitResult> {
-        const analyzed = await this.analyze(text, namespaceOrOptions);
         const namespace =
             typeof namespaceOrOptions === "string"
                 ? namespaceOrOptions
                 : namespaceOrOptions?.namespace;
+        if (opts.dryRun === true) {
+            validateText(text);
+            assertNonBlankText(namespace ?? this.namespace, "namespace cannot be empty");
+            validateIdempotencyKey(opts.idempotencyKey);
+            const occurredAt =
+                typeof namespaceOrOptions === "string"
+                    ? undefined
+                    : namespaceOrOptions?.occurredAt;
+            assertOccurredAt(occurredAt);
+            if (typeof namespaceOrOptions === "object" && namespaceOrOptions?.signal) {
+                namespaceOrOptions.signal.throwIfAborted();
+            }
+            assertValidRememberText(text, opts, "text");
+            return {
+                results: [],
+                total: 0,
+                succeeded: 0,
+                failed: 0,
+                facts: [],
+                owner: this.owner,
+            };
+        }
+        const analyzed = await this.analyze(text, namespaceOrOptions);
         const settled = await this.waitForRememberJobs(
             analyzed.job_ids,
             analyzed.job_ids.map(() => namespace ?? this.namespace),

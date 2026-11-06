@@ -1572,6 +1572,23 @@ export class MemWal {
     ): Promise<AnalyzeWaitResult> {
         const options = normalizeAnalyzeOptions(namespaceOrOptions);
         const namespace = options.namespace ?? this.namespace;
+        if (opts.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            assertNonBlankText(text, "text cannot be empty");
+            assertNonBlankText(namespace, "namespace cannot be empty");
+            validateIdempotencyKey(opts.idempotencyKey);
+            occurredAtToWire(options.occurredAt);
+            options.signal?.throwIfAborted();
+            assertValidRememberText(text, opts, "text");
+            return {
+                results: [],
+                total: 0,
+                succeeded: 0,
+                failed: 0,
+                facts: [],
+                owner: this.ownerAddress ?? this.accountId,
+            };
+        }
         const accepted = await this.analyze(text, options);
         requireArrayField(accepted, "job_ids", "POST /api/analyze");
         const namespaces = accepted.job_ids.map(() => namespace);

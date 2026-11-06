@@ -17,6 +17,7 @@ import {
     MemWalMock,
     MemWalValidationError,
     MAX_REMEMBER_TEXT_BYTES,
+    assertValidRememberText,
     validateRemember,
 } from "../dist/index.js";
 import { sanitizeFact } from "../../../services/server/scripts/mcp/tools/redaction.ts";
@@ -250,7 +251,39 @@ test("MemWal and MemWalMock reject secrets and >1 MiB inputs before any network 
         );
         assert.equal(dryBulk.status, "dry_run");
         assert.equal(dryBulk.total, 2);
+
+        const dryAnalyzeClient = await client.analyzeAndWait("User lives in Tokyo", "default", {
+            dryRun: true,
+        });
+        assert.deepEqual(dryAnalyzeClient, {
+            results: [],
+            total: 0,
+            succeeded: 0,
+            failed: 0,
+            facts: [],
+            owner: TEST_ACCOUNT_ID,
+        });
         assert.equal(fetchCalls, 0, "dryRun must not trigger any HTTP request");
+
+        const dryAnalyzeMock = await mock.analyzeAndWait("User lives in Tokyo", "default", {
+            dryRun: true,
+        });
+        assert.equal(dryAnalyzeMock.total, 0);
+        assert.deepEqual(dryAnalyzeMock.facts, []);
+        const recalledAfterDryAnalyze = await mock.recall("Tokyo");
+        assert.equal(recalledAfterDryAnalyze.results.length, 0);
+
+        for (const blank of ["", "   \n\t  "]) {
+            assert.throws(
+                () => assertValidRememberText(blank, {}, "payload"),
+                (err) => {
+                    assert.ok(err instanceof MemWalValidationError);
+                    assert.equal(err.code, "empty_text");
+                    assert.match(err.message, /payload cannot be empty/);
+                    return true;
+                },
+            );
+        }
 
         // 4. allowSecrets / skipValidation permits intentional storage in MemWalMock.
         const allowed = await mock.remember(`Test fixture key ${REPRO_SUIPRIVKEY}`, {
