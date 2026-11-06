@@ -101,6 +101,12 @@ import {
     MemWalRememberJobNotFoundError,
     MemWalRememberJobTimeoutError,
 } from "./errors.js";
+import {
+    assertValidRememberText,
+    validateRemember,
+    type RememberValidationResult,
+    type ValidateRememberOptions,
+} from "./validation.js";
 
 // ============================================================
 // Ed25519 Signing (lazy-loaded)
@@ -603,6 +609,16 @@ export class MemWal {
     // ============================================================
 
     /**
+     * Validate memory text locally without opening a socket or contacting the relayer (#435).
+     */
+    validateRemember(
+        text: string,
+        options?: ValidateRememberOptions,
+    ): RememberValidationResult {
+        return validateRemember(text, options);
+    }
+
+    /**
      * Submit a remember request and return as soon as the server accepts the job.
      */
     async rememberAsync(
@@ -613,6 +629,11 @@ export class MemWal {
         requireRememberText(text);
         assertNonBlankText(text, "text cannot be empty");
         const split = splitRememberArgs(namespaceOrOptions, options);
+        assertValidRememberText(text, split.options);
+        if (split.options.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            return { job_id: "dry-run", status: "dry_run" };
+        }
         const resolvedNamespace = split.namespace ?? this.namespace;
         assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         validateIdempotencyKey(split.options.idempotencyKey);
@@ -792,9 +813,20 @@ export class MemWal {
         requireRememberText(text);
         assertNonBlankText(text, "text cannot be empty");
         const split = splitRememberArgs(namespaceOrOptions, opts);
+        assertValidRememberText(text, split.options);
         const resolvedNamespace = split.namespace ?? this.namespace;
         assertNonBlankText(resolvedNamespace, "namespace cannot be empty");
         validateIdempotencyKey(split.options.idempotencyKey);
+        if (split.options.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            return {
+                id: "dry-run",
+                job_id: "dry-run",
+                blob_id: "",
+                owner: this.ownerAddress ?? "",
+                namespace: resolvedNamespace,
+            };
+        }
         const dedupe = split.options.dedupe === true;
         const requestIdentity = `${resolvedNamespace}\0${text}`;
         const pendingIdentity = dedupe ? `dedupe\0${requestIdentity}` : requestIdentity;
@@ -811,6 +843,8 @@ export class MemWal {
         const accepted = await this.rememberAsync(text, resolvedNamespace, {
             idempotencyKey,
             ...(dedupe ? { dedupe: true } : {}),
+            ...(split.options.allowSecrets ? { allowSecrets: true } : {}),
+            ...(split.options.skipValidation ? { skipValidation: true } : {}),
         });
         const completed = await this.waitForRememberJob(accepted.job_id, split.options);
         // Clear only after terminal success. A polling timeout/transport failure
@@ -875,8 +909,17 @@ export class MemWal {
             if (item?.namespace !== undefined) {
                 assertNonBlankText(item.namespace, `items[${i}].namespace cannot be empty`);
             }
+            assertValidRememberText(item.text, options, `items[${i}].text`);
         });
         validateIdempotencyKey(options.idempotencyKey);
+        if (options.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            return {
+                job_ids: items.map((_, i) => `dry-run-${i + 1}`),
+                total: items.length,
+                status: "dry_run",
+            };
+        }
 
         const normalised = items.map((item) => ({
             text: item.text,
@@ -1130,6 +1173,7 @@ export class MemWal {
             if (item?.namespace !== undefined) {
                 assertNonBlankText(item.namespace, `items[${i}].namespace cannot be empty`);
             }
+            assertValidRememberText(item.text, opts, `items[${i}].text`);
         });
         validateIdempotencyKey(opts.idempotencyKey);
 
@@ -1137,6 +1181,20 @@ export class MemWal {
             text: item.text,
             namespace: item.namespace ?? this.namespace,
         }));
+        if (opts.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            return {
+                results: normalised.map((item, i) => ({
+                    id: `dry-run-${i + 1}`,
+                    blob_id: "",
+                    status: "done",
+                    namespace: item.namespace,
+                })),
+                total: normalised.length,
+                succeeded: normalised.length,
+                failed: 0,
+            };
+        }
         const requestIdentity = `bulk\0${normalised.map((item) => `${item.namespace}\0${item.text}`).join("\0\0")}`;
         const generatedKey = opts.idempotencyKey === undefined;
         const idempotencyKey = opts.idempotencyKey
@@ -1514,6 +1572,23 @@ export class MemWal {
     ): Promise<AnalyzeWaitResult> {
         const options = normalizeAnalyzeOptions(namespaceOrOptions);
         const namespace = options.namespace ?? this.namespace;
+        if (opts.dryRun === true) {
+            if (this.destroyed) throw destroyedClientError();
+            assertNonBlankText(text, "text cannot be empty");
+            assertNonBlankText(namespace, "namespace cannot be empty");
+            validateIdempotencyKey(opts.idempotencyKey);
+            occurredAtToWire(options.occurredAt);
+            options.signal?.throwIfAborted();
+            assertValidRememberText(text, opts, "text");
+            return {
+                results: [],
+                total: 0,
+                succeeded: 0,
+                failed: 0,
+                facts: [],
+                owner: this.ownerAddress ?? this.accountId,
+            };
+        }
         const accepted = await this.analyze(text, options);
         requireArrayField(accepted, "job_ids", "POST /api/analyze");
         const namespaces = accepted.job_ids.map(() => namespace);

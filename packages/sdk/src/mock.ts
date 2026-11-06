@@ -35,6 +35,12 @@ import {
     validateIdempotencyKey,
 } from "./utils.js";
 import { MemWalRememberJobNotFoundError } from "./errors.js";
+import {
+    assertValidRememberText,
+    validateRemember,
+    type RememberValidationResult,
+    type ValidateRememberOptions,
+} from "./validation.js";
 
 /** Matches the relayer's `MAX_BULK_ITEMS`. */
 const MAX_BULK_ITEMS = 20;
@@ -223,13 +229,25 @@ export class MemWalMock {
         this.dedupe.clear();
     }
 
+    validateRemember(
+        text: string,
+        options?: ValidateRememberOptions,
+    ): RememberValidationResult {
+        return validateRemember(text, options);
+    }
+
     async rememberAsync(
         text: string,
         namespaceOrOptions?: string | RememberOptions,
         options?: RememberOptions,
     ): Promise<RememberAcceptedResult> {
         requireRememberText(text);
+        validateText(text);
         const split = splitRememberArgs(namespaceOrOptions, options);
+        assertValidRememberText(text, split.options);
+        if (split.options.dryRun === true) {
+            return { job_id: "dry-run", status: "dry_run" };
+        }
         const memory = this.store(
             text,
             split.namespace,
@@ -279,7 +297,19 @@ export class MemWalMock {
         const accepted = await this.rememberAsync(text, split.namespace, {
             idempotencyKey: split.options.idempotencyKey,
             dedupe: split.options.dedupe,
+            allowSecrets: split.options.allowSecrets,
+            skipValidation: split.options.skipValidation,
+            dryRun: split.options.dryRun,
         });
+        if (split.options.dryRun === true) {
+            return {
+                id: "dry-run",
+                job_id: "dry-run",
+                blob_id: "",
+                owner: this.owner,
+                namespace: split.namespace ?? this.namespace,
+            };
+        }
         return this.waitForRememberJob(accepted.job_id, split.options);
     }
 
@@ -300,9 +330,17 @@ export class MemWalMock {
             if (item?.namespace !== undefined) {
                 validateText(item.namespace, `items[${i}].namespace`);
             }
+            assertValidRememberText(item.text, options, `items[${i}].text`);
         });
 
         validateIdempotencyKey(options.idempotencyKey);
+        if (options.dryRun === true) {
+            return {
+                job_ids: items.map((_, i) => `dry-run-${i + 1}`),
+                total: items.length,
+                status: "dry_run",
+            };
+        }
         const normalised = items.map((item) => ({
             text: item.text,
             namespace: item.namespace ?? this.namespace,
@@ -385,6 +423,19 @@ export class MemWalMock {
         const namespaces = items.map(
             (item) => item.namespace ?? this.namespace
         );
+        if (opts.dryRun === true) {
+            return {
+                results: accepted.job_ids.map((id, i) => ({
+                    id,
+                    blob_id: "",
+                    status: "done",
+                    namespace: namespaces[i],
+                })),
+                total: accepted.job_ids.length,
+                succeeded: accepted.job_ids.length,
+                failed: 0,
+            };
+        }
         return this.waitForRememberJobs(accepted.job_ids, namespaces, opts);
     }
 
@@ -528,11 +579,33 @@ export class MemWalMock {
         namespaceOrOptions?: string | AnalyzeOptions,
         opts: RememberBulkOptions = {}
     ): Promise<AnalyzeWaitResult> {
-        const analyzed = await this.analyze(text, namespaceOrOptions);
         const namespace =
             typeof namespaceOrOptions === "string"
                 ? namespaceOrOptions
                 : namespaceOrOptions?.namespace;
+        if (opts.dryRun === true) {
+            validateText(text);
+            assertNonBlankText(namespace ?? this.namespace, "namespace cannot be empty");
+            validateIdempotencyKey(opts.idempotencyKey);
+            const occurredAt =
+                typeof namespaceOrOptions === "string"
+                    ? undefined
+                    : namespaceOrOptions?.occurredAt;
+            assertOccurredAt(occurredAt);
+            if (typeof namespaceOrOptions === "object" && namespaceOrOptions?.signal) {
+                namespaceOrOptions.signal.throwIfAborted();
+            }
+            assertValidRememberText(text, opts, "text");
+            return {
+                results: [],
+                total: 0,
+                succeeded: 0,
+                failed: 0,
+                facts: [],
+                owner: this.owner,
+            };
+        }
+        const analyzed = await this.analyze(text, namespaceOrOptions);
         const settled = await this.waitForRememberJobs(
             analyzed.job_ids,
             analyzed.job_ids.map(() => namespace ?? this.namespace),
