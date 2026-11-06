@@ -715,9 +715,10 @@ mod mcp_rate_limit_tests {
         }
     }
 
-    async fn test_state(redis: redis::aio::ConnectionManager) -> Arc<AppState> {
-        let pool = sqlx::postgres::PgPool::connect_lazy("postgres://memwal@127.0.0.1/memwal")
-            .expect("lazy pool");
+    async fn test_state_with_pool(
+        redis: redis::aio::ConnectionManager,
+        pool: sqlx::postgres::PgPool,
+    ) -> Arc<AppState> {
         let db = Arc::new(VectorDb::from_pool(pool.clone()));
         let http_client = reqwest::Client::new();
         let config = Arc::new(rate_limit_test_config());
@@ -769,6 +770,14 @@ mod mcp_rate_limit_tests {
             blob_cache_max_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
             embedding_cache_ttl: std::time::Duration::from_secs(DEFAULT_EMBEDDING_CACHE_TTL_SECS),
         })
+    }
+
+    async fn test_state(redis: redis::aio::ConnectionManager) -> Arc<AppState> {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://memwal@127.0.0.1/memwal".to_string());
+        let pool = sqlx::postgres::PgPool::connect_lazy(&database_url)
+            .expect("lazy pool");
+        test_state_with_pool(redis, pool).await
     }
 
     async fn expect_mcp_ip_burst(app: &Router, method: Method, uri: &str, bearer: bool) {
@@ -868,8 +877,29 @@ mod mcp_rate_limit_tests {
     #[tokio::test]
     async fn cross_process_fallback_refund_routes_via_postgres_when_isolated_from_process_registry()
     {
-        let state_a = test_state(denying_redis().await).await;
-        let state_b = test_state(denying_redis().await).await;
+        let Some(database_url) = std::env::var("DATABASE_URL").ok() else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping DB integration test: could not connect to DATABASE_URL: {e}");
+                return;
+            }
+        };
+
+        let _ = sqlx::raw_sql(include_str!("../migrations/028_rate_limit_fallback_refunds.sql"))
+            .execute(&pool)
+            .await;
+
+        let state_a = test_state_with_pool(denying_redis().await, pool.clone()).await;
+        let state_b = test_state_with_pool(denying_redis().await, pool.clone()).await;
 
         let pk = format!("0xpk_cross_proc_{}", uuid::Uuid::new_v4());
         let owner = "0xowner_cross_proc";
@@ -911,6 +941,62 @@ mod mcp_rate_limit_tests {
         assert!(
             (tokens_after - 30.0).abs() < 1e-4,
             "Process A fallback bucket must be restored to 30.0, got {tokens_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_drain_avoids_mutex_contention_and_handles_unavailable_db() {
+        let fallback_mutex = tokio::sync::Mutex::new(rate_limit::InMemoryFallback::default());
+        let dk_key = "rate:dk:0xcontention_test";
+        let req_id = "req-contention-1";
+
+        {
+            let mut fb = fallback_mutex.lock().await;
+            fb.consume_tracked(dk_key, Some(req_id), 5, 30.0, 60.0);
+            assert_eq!(fb.outstanding_request_ids(dk_key).len(), 1);
+        }
+
+        // Connect to a lazy pool pointing at an unreachable host to simulate delayed/unavailable PostgreSQL
+        let dead_pool = sqlx::postgres::PgPool::connect_lazy("postgres://memwal@127.0.0.1:65534/memwal")
+            .expect("lazy dead pool");
+
+        // Concurrent task tries to consume tokens while drain is in-flight against unavailable DB
+        let fallback_ref = std::sync::Arc::new(fallback_mutex);
+        let fb_clone = std::sync::Arc::clone(&fallback_ref);
+
+        let drain_task = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let refunded = rate_limit::drain_cross_process_fallback_refunds(
+                &dead_pool,
+                &fb_clone,
+                dk_key,
+                30.0,
+                60.0,
+            )
+            .await;
+            (refunded, start.elapsed())
+        });
+
+        // The mutex is dropped immediately before DB I/O, so concurrent requests are NOT blocked
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let concurrent_acquire_start = std::time::Instant::now();
+        {
+            let fb = fallback_ref.lock().await;
+            assert!(fb.buckets.contains_key(dk_key));
+        }
+        let lock_wait = concurrent_acquire_start.elapsed();
+        assert!(
+            lock_wait < std::time::Duration::from_millis(50),
+            "fallback mutex must not be held across DB I/O; acquire took {:?}",
+            lock_wait
+        );
+
+        let (refunded, drain_elapsed) = drain_task.await.unwrap();
+        assert_eq!(refunded, 0.0);
+        assert!(
+            drain_elapsed < std::time::Duration::from_millis(800),
+            "drain must bound DB timeout on unavailable postgres; took {:?}",
+            drain_elapsed
         );
     }
 

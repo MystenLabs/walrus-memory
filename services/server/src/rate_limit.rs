@@ -1696,15 +1696,16 @@ pub async fn rate_limit_middleware(
     if redis_down {
         tracing::warn!("rate limit: Redis is unreachable, using in-memory fallback");
         crate::observability::record_rate_limit_fallback("authenticated");
-        let mut fallback = state.fallback_rate_limit.lock().await;
         drain_cross_process_fallback_refunds(
             state.db.pool(),
-            &mut fallback,
+            &state.fallback_rate_limit,
             &dk_key,
             config.max_requests_per_delegate_key as f64,
             60.0,
         )
         .await;
+
+        let mut fallback = state.fallback_rate_limit.lock().await;
 
         if !fallback.can_consume(
             &dk_key,
@@ -1791,31 +1792,6 @@ pub async fn rate_limit_middleware(
     next.run(request).await
 }
 
-static FALLBACK_REFUNDS_TABLE_READY: std::sync::OnceLock<tokio::sync::Mutex<bool>> =
-    std::sync::OnceLock::new();
-
-async fn ensure_fallback_refunds_table(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    let lock = FALLBACK_REFUNDS_TABLE_READY.get_or_init(|| tokio::sync::Mutex::new(false));
-    let mut ready = lock.lock().await;
-    if *ready {
-        return Ok(());
-    }
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS rate_limit_fallback_refunds (
-            rate_key TEXT NOT NULL,
-            request_id TEXT NOT NULL,
-            member_offset BIGINT NOT NULL,
-            weight BIGINT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (rate_key, request_id, member_offset)
-        )",
-    )
-    .execute(pool)
-    .await?;
-    *ready = true;
-    Ok(())
-}
-
 pub async fn enqueue_cross_process_fallback_refund(
     pool: &sqlx::PgPool,
     dk_key: &str,
@@ -1826,19 +1802,13 @@ pub async fn enqueue_cross_process_fallback_refund(
     if weight <= 0 || dk_key.is_empty() || request_id.is_empty() {
         return;
     }
-    if let Err(e) = ensure_fallback_refunds_table(pool).await {
-        tracing::warn!(
-            "rate limit: failed to ensure rate_limit_fallback_refunds table: {}",
-            e
-        );
-        return;
-    }
-    let _ = sqlx::query(
+    let cleanup = sqlx::query(
         "DELETE FROM rate_limit_fallback_refunds WHERE created_at < NOW() - INTERVAL '5 minutes'",
     )
-    .execute(pool)
-    .await;
-    if let Err(e) = sqlx::query(
+    .execute(pool);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cleanup).await;
+
+    let insert = sqlx::query(
         "INSERT INTO rate_limit_fallback_refunds (rate_key, request_id, member_offset, weight)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (rate_key, request_id, member_offset) DO NOTHING",
@@ -1847,49 +1817,79 @@ pub async fn enqueue_cross_process_fallback_refund(
     .bind(request_id)
     .bind(member_offset)
     .bind(weight)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(
-            "rate limit: failed to enqueue cross-process fallback refund: {}",
-            e
-        );
+    .execute(pool);
+
+    match tokio::time::timeout(std::time::Duration::from_millis(500), insert).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "rate limit: failed to enqueue cross-process fallback refund: {}",
+                e
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                "rate limit: timed out enqueuing cross-process fallback refund after 500ms"
+            );
+        }
     }
 }
 
 pub async fn drain_cross_process_fallback_refunds(
     pool: &sqlx::PgPool,
-    fallback: &mut InMemoryFallback,
+    fallback_mutex: &tokio::sync::Mutex<InMemoryFallback>,
     dk_key: &str,
     capacity: f64,
     refill_duration_secs: f64,
 ) -> f64 {
-    let pending_req_ids = fallback.outstanding_request_ids(dk_key);
+    // 1. Acquire fallback mutex only long enough to extract pending request IDs, then drop it
+    // before any DB I/O so other requests never suffer latency spikes or lock contention.
+    let pending_req_ids = {
+        let fallback = fallback_mutex.lock().await;
+        fallback.outstanding_request_ids(dk_key)
+    };
     if pending_req_ids.is_empty() {
         return 0.0;
     }
-    if ensure_fallback_refunds_table(pool).await.is_err() {
-        return 0.0;
-    }
-    let rows: Vec<(String, i64, i64)> = match sqlx::query_as(
+
+    // 2. Perform DB deletion outside the lock with a bounded timeout for delayed/unavailable DB
+    let delete_fut = sqlx::query_as::<_, (String, i64, i64)>(
         "DELETE FROM rate_limit_fallback_refunds
          WHERE rate_key = $1 AND request_id = ANY($2)
          RETURNING request_id, member_offset, weight",
     )
     .bind(dk_key)
     .bind(&pending_req_ids)
-    .fetch_all(pool)
+    .fetch_all(pool);
+
+    let rows: Vec<(String, i64, i64)> = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        delete_fut,
+    )
     .await
     {
-        Ok(rows) => rows,
-        Err(e) => {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
             tracing::warn!(
                 "rate limit: failed to drain cross-process fallback refunds: {}",
                 e
             );
             return 0.0;
         }
+        Err(_) => {
+            tracing::warn!(
+                "rate limit: timed out draining cross-process fallback refunds after 500ms"
+            );
+            return 0.0;
+        }
     };
+
+    if rows.is_empty() {
+        return 0.0;
+    }
+
+    // 3. Re-acquire fallback mutex briefly only to credit the returned rows
+    let mut fallback = fallback_mutex.lock().await;
     let now = std::time::Instant::now();
     let mut total_refunded = 0.0;
     for (req_id, member_offset, weight) in rows {
@@ -1919,8 +1919,14 @@ pub async fn sync_fallback_rate_limit_refunds(
     let policy = state.owner_policies.policy_for(owner).ok().flatten();
     let capacity = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now)
         .max_requests_per_delegate_key;
-    let mut fallback = state.fallback_rate_limit.lock().await;
-    drain_cross_process_fallback_refunds(state.db.pool(), &mut fallback, &dk_key, capacity as f64, 60.0).await
+    drain_cross_process_fallback_refunds(
+        state.db.pool(),
+        &state.fallback_rate_limit,
+        &dk_key,
+        capacity as f64,
+        60.0,
+    )
+    .await
 }
 
 /// Refund delegate key rate limit charge after an infrastructure failure.
