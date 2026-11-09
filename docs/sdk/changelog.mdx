@@ -35,8 +35,8 @@ answer: >-
 
 ### Added
 
-- `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results: []`, `degraded: true`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070)
-- `RecallOptions` accepts `onDropped?: "ignore" | "throw"` (defaulting to `"ignore"`). Passing `onDropped: "throw"` throws `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`, exposing `total`, `droppedCount`, and `namespace`) when every vector search match is dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
+- `RecallResult` includes an optional `degraded?: boolean` flag set to `true` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results: []`, `degraded: true`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070, #1362)
+- `RecallOptions` accepts `onDropped?: "ignore" | "throw"` (defaulting to `"ignore"`). Passing `onDropped: "throw"` throws `MemWalRecallAllDroppedError` (`name = "MemWalRecallAllDropped"`, `code = "RECALL_ALL_DROPPED"`, exposing `total`, `droppedCount`, and `namespace`) when every vector search match is dropped during Walrus blob download or SEAL decryption. (#1036, #1070, #1362)
 
 ## 0.1.13
 
