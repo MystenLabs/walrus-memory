@@ -196,7 +196,7 @@ export async function tryListNamespaces(
         for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
             const remainingMs = deadline - Date.now();
             if (remainingMs <= 0) return null;
-            const page = await withDeadline(
+            const page = await withDeadline<NamespacesPage>(
                 fn.call(session!.memwal, { limit: pageSize, cursor }),
                 remainingMs,
                 "Namespace discovery timed out",
