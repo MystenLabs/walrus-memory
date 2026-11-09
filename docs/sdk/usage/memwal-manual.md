@@ -136,7 +136,7 @@ const manual = MemWalManual.create({
 
 Every blob on Walrus is public, so you must encrypt private agent state before storing it. For an autonomous agent that has no human to approve a wallet popup, `MemWalManual` is the path that keeps the agent in control of its own key material: encryption happens client-side, and the relayer never receives plaintext.
 
-A headless agent signs Seal and Walrus operations with its own Sui key rather than a connected wallet. Provide `suiPrivateKey` instead of `walletSigner`, set `suiNetwork` for your environment, and load every secret from the environment:
+A headless agent signs the Seal session key used for decryption with its own Sui key rather than a connected wallet. Provide `suiPrivateKey` instead of `walletSigner`, set `suiNetwork` for your environment, and load every secret from the environment:
 
 ```ts
 import { MemWalManual } from "@mysten-incubation/memwal/manual";
@@ -166,7 +166,7 @@ for (const memory of hits.results) {
 The agent holds two distinct secrets:
 
 - The **delegate key** (`key`) authenticates the agent to the relayer.
-- The **Sui key** (`suiPrivateKey`) signs the Seal and Walrus operations that encrypt and store the data.
+- The **Sui key** (`suiPrivateKey`) signs the Seal session key that authorizes decryption during recall. Seal encryption does not use it, and the relayer handles the Walrus upload.
 
 <Warning>
 With client-managed encryption the agent owns its key material. If the Sui key is lost, you cannot recover the encrypted memories, so treat it as a production secret and rotate the delegate key through the dashboard if it might be exposed.

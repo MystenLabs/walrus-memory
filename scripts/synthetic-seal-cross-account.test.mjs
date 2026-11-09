@@ -83,6 +83,52 @@ test("unrelated abort is misconfiguration, not a healthy deny", () => {
     assert.equal(result.code, 1);
 });
 
+// gRPC core simulateTransaction result shape (@mysten/sui SuiGrpcClient).
+function grpcFailure(error) {
+    return { $kind: "FailedTransaction", FailedTransaction: { status: { success: false, error } } };
+}
+
+test("gRPC simulateTransaction MoveAbort 100 is ENoAccess", () => {
+    const result = extractAbortCode(
+        grpcFailure({
+            $kind: "MoveAbort",
+            message:
+                "MoveAbort in 1st command, abort code: 100, in '0xabc::account::seal_approve' (instruction 11)",
+            command: 0,
+            MoveAbort: {
+                abortCode: "100",
+                location: { package: "0xabc", module: "account", functionName: "seal_approve", instruction: 11 },
+            },
+        }),
+    );
+    assert.equal(result.outcome, "abort");
+    assert.equal(result.code, E_NO_ACCESS);
+});
+
+test("gRPC simulateTransaction success is not classified as a deny", () => {
+    const result = extractAbortCode({
+        $kind: "Transaction",
+        Transaction: { status: { success: true, error: null } },
+    });
+    assert.equal(result.outcome, "success");
+});
+
+test("gRPC simulateTransaction unrelated abort keeps its code", () => {
+    const result = extractAbortCode(
+        grpcFailure({ $kind: "MoveAbort", message: "MoveAbort, abort code: 1", MoveAbort: { abortCode: "1" } }),
+    );
+    assert.equal(result.outcome, "abort");
+    assert.equal(result.code, 1);
+});
+
+test("gRPC simulateTransaction non-abort failure is a failure", () => {
+    const result = extractAbortCode(
+        grpcFailure({ $kind: "Unknown", message: "InsufficientGas", Unknown: null }),
+    );
+    assert.equal(result.outcome, "failure");
+    assert.match(result.detail, /InsufficientGas/);
+});
+
 test("skips with exit 0 when required secrets are unset", () => {
     const result = spawnScript();
     assert.equal(result.status, 0, result.stderr);

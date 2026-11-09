@@ -151,7 +151,7 @@ async function budgetedRemember(memwal: MemWal, text: string, eventId: string) {
 A headless agent holds secrets no human rotates by hand, so treat them with production discipline.
 
 - The **delegate key** authenticates the agent to the relayer.
-- For client-managed encryption, the **Sui key** signs the Seal and Walrus operations. See [holding your own keys](/sdk/usage/memwal-manual#agent-state-holding-your-own-keys).
+- For client-managed encryption, the **Sui key** signs the Seal session key that authorizes decryption during recall. Seal encryption does not use it. See [holding your own keys](/sdk/usage/memwal-manual#agent-state-holding-your-own-keys).
 
 Load keys from a secret manager, never from source or logs. Give each agent its own delegate key for individual revocation; these keys still grant access across the account's namespaces. The owner can replace a lost delegate key without transferring memory ownership. Revocation does not cover already-read data; see [Ownership and access](/fundamentals/concepts/ownership-and-access#access-control-enforcement).
 
