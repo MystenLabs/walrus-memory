@@ -1,11 +1,16 @@
 # @mysten-incubation/memwal-mcp
 
+## 0.2.0
+
+### Added
+
+- Productize the one-time proactive-memory setup flow for Claude Desktop, Claude web, and other chat clients without plugin lifecycle hooks. Exposes the `memwal_enable_proactive` MCP prompt in both bridge and auth-required modes to supply standard consent instructions.
+
 ## 0.1.0
 
 ### Added
 
 - Add `memwal-mcp status` and `whoami` CLI subcommand to inspect current account, delegate, label, relayer, namespace, credentials file, and auto-save configuration without interactive prompts. (#1340)
-- Productize the one-time proactive-memory setup flow for Claude Desktop, Claude web, and other chat clients without plugin lifecycle hooks. Exposes the `memwal_enable_proactive` MCP prompt in both bridge and auth-required modes to supply standard consent instructions.
 
 ## 0.0.18
 
