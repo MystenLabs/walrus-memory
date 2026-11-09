@@ -170,6 +170,11 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     migration!("028_memory_updated_xid.sql"),
 ];
 
+/// Applied after `backfill_updated_xid`: 029 validates NOT NULL and will
+/// error if any `updated_xid` row is still NULL (#1018).
+const MIGRATIONS_AFTER_XID_BACKFILL: &[Migration] =
+    &[migration!("029_memory_updated_xid_not_null.sql")];
+
 /// Every migration the pipeline applies, in the order it applies them.
 #[cfg(test)]
 fn all_migrations() -> impl Iterator<Item = &'static Migration> {
@@ -177,6 +182,7 @@ fn all_migrations() -> impl Iterator<Item = &'static Migration> {
         .iter()
         .chain(MIGRATIONS_AFTER_BACKFILL)
         .chain(MIGRATIONS_AFTER_INDEX_RECOVERY)
+        .chain(MIGRATIONS_AFTER_XID_BACKFILL)
 }
 
 /// Applies one slice of the pipeline, naming the file that failed.
@@ -592,6 +598,14 @@ mod tests {
         ] {
             execute_idempotent_migration(&pool, migration).await;
         }
+
+        super::backfill_updated_xid(&pool).await.unwrap();
+
+        execute_idempotent_migration(
+            &pool,
+            migration_sql("029_memory_updated_xid_not_null.sql"),
+        )
+        .await;
 
         let db = VectorDb {
             pool,
@@ -2552,6 +2566,41 @@ async fn backfill_updated_at(pool: &PgPool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Backfill `vector_entries.updated_xid` from `xmin` in restartable chunks (#1018).
+///
+/// Runs as batched Rust code between migration 028 (which adds the nullable column
+/// and sets the trigger) and migration 029 (which validates NOT NULL).
+async fn backfill_updated_xid(pool: &PgPool) -> Result<(), AppError> {
+    const BATCH_SIZE: i64 = 5000;
+    let mut total_rows: u64 = 0;
+
+    loop {
+        let result = sqlx::query(
+            "UPDATE vector_entries SET updated_xid = xmin::text::xid8 \
+             WHERE id IN (SELECT id FROM vector_entries WHERE updated_xid IS NULL LIMIT $1)",
+        )
+        .bind(BATCH_SIZE)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to backfill updated_xid: {}", e)))?;
+
+        let rows_affected = result.rows_affected();
+        total_rows += rows_affected;
+        if rows_affected == 0 {
+            break;
+        }
+    }
+
+    if total_rows > 0 {
+        tracing::info!(
+            rows = total_rows,
+            "backfilled vector_entries.updated_xid from xmin"
+        );
+    }
+
+    Ok(())
+}
+
 /// Drop any INVALID index left behind by an interrupted
 /// `CREATE INDEX CONCURRENTLY` build, so the migration that owns it can
 /// rebuild it on this same boot.
@@ -2855,6 +2904,10 @@ impl VectorDb {
         run_migrations(&pool, MIGRATIONS_AFTER_BACKFILL).await?;
 
         recover_and_rebuild_concurrent_indexes(&pool).await?;
+
+        backfill_updated_xid(&pool).await?;
+
+        run_migrations(&pool, MIGRATIONS_AFTER_XID_BACKFILL).await?;
 
         tracing::info!("database connected and migrations applied");
 

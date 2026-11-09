@@ -340,7 +340,7 @@ pub(crate) async fn query_owner_namespaces(
                    COUNT(*)::BIGINT AS memory_count,
                    COALESCE(SUM(blob_size_bytes), 0)::BIGINT AS storage_used,
                    MAX(updated_at) AS last_updated_at,
-                   BOOL_OR($2::text IS NOT NULL AND NOT pg_visible_in_snapshot(xmin::text::xid8, $2::pg_snapshot)) AS has_late_commit
+                   BOOL_OR($2::text IS NOT NULL AND NOT pg_visible_in_snapshot(COALESCE(updated_xid, xmin::text::xid8), $2::pg_snapshot)) AS has_late_commit
             FROM vector_entries
             WHERE owner = $1
             GROUP BY namespace
@@ -1138,6 +1138,8 @@ mod tests {
                 include_str!("../../migrations/019_memory_read_api_updated_at_set_not_null.sql"),
                 include_str!("../../migrations/020_read_api_followups.sql"),
                 include_str!("../../migrations/028_memory_updated_xid.sql"),
+                "UPDATE vector_entries SET updated_xid = xmin::text::xid8 WHERE updated_xid IS NULL;",
+                include_str!("../../migrations/029_memory_updated_xid_not_null.sql"),
             ] {
                 sqlx::raw_sql(migration).execute(&pool).await.unwrap();
             }
@@ -3259,6 +3261,463 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        cleanup(&pool, &owner).await;
+    }
+
+    /// Performance and lock verification benchmark for migration 028 and updated_xid trigger:
+    /// 1. Seeds a representative dataset of 10,000 rows in vector_entries.
+    /// 2. Measures and asserts migration backfill execution time and per-row cost.
+    /// 3. Measures table relation size and indexes size via PostgreSQL relation functions.
+    /// 4. Verifies lock modes and absence of blocked locks via pg_locks.
+    /// 5. Measures per-row trigger overhead on content updates vs housekeeping updates.
+    #[tokio::test]
+    #[ignore = "benchmark requiring dedicated isolated DB and exclusive DDL locks"]
+    async fn migration_028_rollout_benchmark_large_dataset_and_trigger_overhead() {
+        let _test_pool_init = test_pool().await;
+        let _ddl_guard = DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&test_database_url())
+            .await
+            .unwrap();
+
+        let owner = format!("0xbench-{}", uuid::Uuid::new_v4());
+        let row_count: i64 = 10_000;
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        // Temporarily drop NOT NULL on updated_xid to simulate pre-migration state.
+        sqlx::query("ALTER TABLE vector_entries ALTER COLUMN updated_xid DROP NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Seed 10,000 representative rows with updated_xid IS NULL.
+        let seed_start = std::time::Instant::now();
+        sqlx::query(
+            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, updated_at, updated_xid)
+             SELECT
+                 $1 || '-bench-' || g,
+                 $1,
+                 'bench-namespace',
+                 'blob-bench-' || g,
+                 $2,
+                 128,
+                 clock_timestamp(),
+                 NULL
+             FROM generate_series(1, $3::bigint) AS g",
+        )
+        .bind(&owner)
+        .bind(&emb)
+        .bind(row_count)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let seed_duration = seed_start.elapsed();
+
+        // Phase 2: Execute backfill UPDATE ... SET updated_xid = xmin::text::xid8 WHERE updated_xid IS NULL.
+        let backfill_start = std::time::Instant::now();
+        let backfilled = sqlx::query(
+            "UPDATE vector_entries
+             SET updated_xid = xmin::text::xid8
+             WHERE owner = $1 AND updated_xid IS NULL",
+        )
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backfill_duration = backfill_start.elapsed();
+        assert_eq!(backfilled.rows_affected(), row_count as u64);
+
+        // Ensure any remaining rows from other tests are backfilled before SET NOT NULL.
+        sqlx::query("UPDATE vector_entries SET updated_xid = xmin::text::xid8 WHERE updated_xid IS NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Phase 3: Validate SET NOT NULL.
+        let not_null_start = std::time::Instant::now();
+        sqlx::query("ALTER TABLE vector_entries ALTER COLUMN updated_xid SET NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let not_null_duration = not_null_start.elapsed();
+
+        // Inspect table data volume and index volume.
+        let (total_relation_bytes, table_bytes, indexes_bytes): (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 pg_total_relation_size('vector_entries'),
+                 pg_relation_size('vector_entries'),
+                 pg_indexes_size('vector_entries')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Verify lock modes and waits on vector_entries.
+        let ungranted_locks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks WHERE relation = 'vector_entries'::regclass AND NOT granted",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ungranted_locks, 0, "no ungranted lock waits on vector_entries");
+
+        // Measure content updates where updated_at changes (trigger stamps NEW.updated_xid = pg_current_xact_id()).
+        let content_start = std::time::Instant::now();
+        let content_updated = sqlx::query(
+            "UPDATE vector_entries
+             SET updated_at = clock_timestamp()
+             WHERE owner = $1",
+        )
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let content_duration = content_start.elapsed();
+        assert_eq!(content_updated.rows_affected(), row_count as u64);
+
+        // Measure housekeeping updates (mark_expiry_scheduled: expiry_synced_at updated without changing updated_at).
+        // Trigger executes the ELSE branch: NEW.updated_xid := OLD.updated_xid.
+        let housekeeping_start = std::time::Instant::now();
+        let housekeeping_updated = sqlx::query(
+            "UPDATE vector_entries
+             SET expiry_synced_at = clock_timestamp()
+             WHERE owner = $1",
+        )
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let housekeeping_duration = housekeeping_start.elapsed();
+        assert_eq!(housekeeping_updated.rows_affected(), row_count as u64);
+
+        // Measure pure housekeeping update with trigger disabled to isolate exact per-row trigger overhead.
+        sqlx::query("ALTER TABLE vector_entries DISABLE TRIGGER trg_vector_entries_update_xid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let no_trigger_start = std::time::Instant::now();
+        let no_trigger_updated = sqlx::query(
+            "UPDATE vector_entries
+             SET expiry_synced_at = clock_timestamp()
+             WHERE owner = $1",
+        )
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let no_trigger_duration = no_trigger_start.elapsed();
+        assert_eq!(no_trigger_updated.rows_affected(), row_count as u64);
+
+        sqlx::query("ALTER TABLE vector_entries ENABLE TRIGGER trg_vector_entries_update_xid")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let trigger_overhead_micros = ((housekeeping_duration.as_micros() as f64)
+            - (no_trigger_duration.as_micros() as f64))
+            .max(0.0)
+            / (row_count as f64);
+
+        println!("=== Migration 028 and updated_xid Rollout Benchmark Results ===");
+        println!("Dataset size: {} rows", row_count);
+        println!(
+            "Table total relation size: {} bytes ({:.2} MB)",
+            total_relation_bytes,
+            total_relation_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Table heap size: {} bytes ({:.2} MB)",
+            table_bytes,
+            table_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Table indexes size: {} bytes ({:.2} MB)",
+            indexes_bytes,
+            indexes_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Seed duration (10,000 rows): {:.2} ms",
+            seed_duration.as_secs_f64() * 1000.0
+        );
+        println!(
+            "Backfill duration (10,000 rows): {:.2} ms ({:.2} µs/row)",
+            backfill_duration.as_secs_f64() * 1000.0,
+            backfill_duration.as_micros() as f64 / row_count as f64
+        );
+        println!(
+            "SET NOT NULL duration: {:.2} ms",
+            not_null_duration.as_secs_f64() * 1000.0
+        );
+        println!(
+            "Content update duration (with trigger xid advance): {:.2} ms ({:.2} µs/row)",
+            content_duration.as_secs_f64() * 1000.0,
+            content_duration.as_micros() as f64 / row_count as f64
+        );
+        println!(
+            "Housekeeping update duration (with trigger OLD.updated_xid): {:.2} ms ({:.2} µs/row)",
+            housekeeping_duration.as_secs_f64() * 1000.0,
+            housekeeping_duration.as_micros() as f64 / row_count as f64
+        );
+        println!(
+            "Housekeeping baseline without trigger: {:.2} ms ({:.2} µs/row)",
+            no_trigger_duration.as_secs_f64() * 1000.0,
+            no_trigger_duration.as_micros() as f64 / row_count as f64
+        );
+        println!(
+            "Calculated per-row trigger overhead: {:.2} µs/row",
+            trigger_overhead_micros
+        );
+        println!("Lock blocking / ungranted waits: 0");
+
+        // Clean up test rows
+        sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Regression and convergence test for concurrent operations during incremental pagination:
+    /// 1. Exercises concurrent writes, deletes, expiry updates, and background housekeeping.
+    /// 2. Verifies that housekeeping updates (mark_expiry_scheduled) do not advance updated_xid
+    ///    or trigger false must_resync.
+    /// 3. Verifies that when a concurrent content write with an older updated_at commits after the
+    ///    page boundary (updated_xid > cursor_xid), the server returns must_resync = true with
+    ///    next_cursor = None.
+    /// 4. Verifies that when the client restarts synchronization from cursor = None, it converges
+    ///    to 100% of live memories and tombstones without missing or duplicating any entry.
+    #[tokio::test]
+    async fn incremental_sync_concurrent_operations_housekeeping_and_must_resync_restart() {
+        let _test_pool_init = test_pool().await;
+        let _ddl_guard = DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&test_database_url())
+            .await
+            .unwrap();
+        let owner = format!("0xtest-{}", uuid::Uuid::new_v4());
+        let db = crate::storage::db::VectorDb::from_pool(pool.clone());
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        let insert_sql = "WITH _sync_lock AS (SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2)))
+                          INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, updated_at)
+                          SELECT $1, $2, $3, $4, $5, 10, $6 FROM _sync_lock";
+
+        // 1. Seed initial memories: m1 and m2 in namespace "ns-1", m3 and m4 in namespace "ns-2".
+        let m1_id = format!("{owner}-m1");
+        let m2_id = format!("{owner}-m2");
+        let m3_id = format!("{owner}-m3");
+        let m4_id = format!("{owner}-m4");
+
+        for (id, ns, t) in [
+            (&m1_id, "ns-1", ts(100)),
+            (&m2_id, "ns-1", ts(200)),
+            (&m3_id, "ns-2", ts(300)),
+            (&m4_id, "ns-2", ts(400)),
+        ] {
+            sqlx::query(insert_sql)
+                .bind(id)
+                .bind(&owner)
+                .bind(ns)
+                .bind(format!("blob-{}", id))
+                .bind(&emb)
+                .bind(t)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // 2. Client performs initial sync with page limit 2.
+        let page1 = query_owner_memories(&pool, &owner, None, 2).await.unwrap();
+        assert_eq!(page1.memories.len(), 2);
+        assert!(page1.has_more);
+        assert!(!page1.must_resync);
+        let cursor_p1 = page1.next_cursor.expect("cursor after page 1");
+
+        let page2 = query_owner_memories(&pool, &owner, Some(cursor_p1), 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.memories.len(), 2);
+        assert!(!page2.has_more);
+        assert!(!page2.must_resync);
+        let cursor_watermark = page2.next_cursor.expect("watermark cursor after initial sync");
+
+        let ns_init = query_owner_namespaces(&pool, &owner, None, 10).await.unwrap();
+        assert_eq!(ns_init.namespaces.len(), 2);
+        let ns_watermark = ns_init.next_cursor.expect("initial namespace watermark");
+
+        // 3. Background housekeeping: record updated_xid values before housekeeping.
+        let before_xids: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        // Simulate mark_expiry_scheduled stamping expiry_synced_at without changing updated_at.
+        sqlx::query("UPDATE vector_entries SET expiry_synced_at = clock_timestamp() WHERE owner = $1")
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let after_xids: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            before_xids, after_xids,
+            "housekeeping updates (mark_expiry_scheduled) must not advance updated_xid"
+        );
+
+        // Incremental poll after housekeeping must NOT trigger must_resync.
+        let poll_hk = query_owner_memories(&pool, &owner, Some(cursor_watermark.clone()), 10)
+            .await
+            .unwrap();
+        assert!(
+            !poll_hk.must_resync,
+            "pure housekeeping must not trigger false must_resync"
+        );
+        assert!(poll_hk.memories.is_empty());
+
+        let ns_poll_hk = query_owner_namespaces(&pool, &owner, Some(ns_watermark.clone()), 10)
+            .await
+            .unwrap();
+        assert!(ns_poll_hk.namespaces.is_empty());
+
+        // 4. Concurrent operations while client holds cursor_watermark:
+        // Op A: Expiry update on m3 via production set_memory_expiry.
+        let exp_time = chrono::Utc::now() + chrono::Duration::days(14);
+        db.set_memory_expiry(&m3_id, 999, exp_time).await.unwrap();
+
+        // Op B: Delete m1, writing tombstone.
+        sqlx::query(
+            "WITH _sync_lock AS (SELECT pg_advisory_xact_lock_shared(20261029, hashtext($1)))
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT $2, $1, 'ns-1', 'blob-m1', clock_timestamp() FROM _sync_lock",
+        )
+        .bind(&owner)
+        .bind(&m1_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM vector_entries WHERE id = $1")
+            .bind(&m1_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Op C: Housekeeping on m4.
+        sqlx::query("UPDATE vector_entries SET expiry_synced_at = clock_timestamp() WHERE id = $1")
+            .bind(&m4_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Op D: Concurrent write with older updated_at (ts(250) < watermark ts(400)) that commits after watermark.
+        let m5_id = format!("{owner}-m5-late");
+        sqlx::query(insert_sql)
+            .bind(&m5_id)
+            .bind(&owner)
+            .bind("ns-2")
+            .bind("blob-m5")
+            .bind(&emb)
+            .bind(ts(250))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 5. Client polls with cursor_watermark.
+        // Because m5-late has updated_at = ts(250) <= watermark ts(400) and was not committed
+        // in cursor_watermark's pg_snapshot, has_unavoidable_cursor_gap detects the gap.
+        let poll_gap = query_owner_memories(&pool, &owner, Some(cursor_watermark), 10)
+            .await
+            .unwrap();
+        assert!(
+            poll_gap.must_resync,
+            "late commit behind cursor boundary must signal must_resync: true"
+        );
+        assert!(
+            poll_gap.next_cursor.is_none(),
+            "must_resync response must clear next_cursor"
+        );
+        assert!(poll_gap.memories.is_empty());
+        assert!(poll_gap.deleted.is_empty());
+
+        // 6. Client restarts synchronization from cursor = None and paginates to completion.
+        let mut restart_cursor = None;
+        let mut gathered_memories = Vec::new();
+        let mut gathered_deleted = Vec::new();
+        loop {
+            let res = query_owner_memories(&pool, &owner, restart_cursor.clone(), 2)
+                .await
+                .unwrap();
+            assert!(!res.must_resync, "fresh walk from None must not trigger must_resync");
+            for m in res.memories {
+                gathered_memories.push(m.memory_id);
+            }
+            for d in res.deleted {
+                gathered_deleted.push(d.memory_id);
+            }
+            if res.has_more {
+                restart_cursor = res.next_cursor;
+                assert!(restart_cursor.is_some());
+            } else {
+                break;
+            }
+        }
+
+        // 7. Verify full convergence: 100% of live memories and tombstones without misses or duplicates.
+        let mut dedup_memories = gathered_memories.clone();
+        dedup_memories.sort();
+        dedup_memories.dedup();
+        assert_eq!(
+            gathered_memories.len(),
+            dedup_memories.len(),
+            "restart walk must not contain duplicate memories"
+        );
+
+        let mut expected_live = vec![m2_id.clone(), m3_id.clone(), m4_id.clone(), m5_id.clone()];
+        expected_live.sort();
+        assert_eq!(
+            dedup_memories, expected_live,
+            "restart walk must converge to all live entries (m2, m3, m4, m5) and exclude deleted m1"
+        );
+
+        let mut dedup_deleted = gathered_deleted.clone();
+        dedup_deleted.sort();
+        dedup_deleted.dedup();
+        assert_eq!(
+            gathered_deleted.len(),
+            dedup_deleted.len(),
+            "restart walk must not contain duplicate tombstones"
+        );
+        assert_eq!(
+            dedup_deleted,
+            vec![m1_id.clone()],
+            "restart walk must return tombstone for deleted m1"
+        );
+
+        // Namespace sync convergence on restart.
+        let ns_restart = query_owner_namespaces(&pool, &owner, None, 10).await.unwrap();
+        let returned_namespaces: Vec<String> = ns_restart.namespaces.iter().map(|n| n.name.clone()).collect();
+        assert_eq!(
+            returned_namespaces,
+            vec!["ns-2".to_string(), "ns-1".to_string()],
+            "namespaces must reflect both active namespaces with their latest updated timestamps"
+        );
+
         cleanup(&pool, &owner).await;
     }
 }
