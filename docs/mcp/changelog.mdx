@@ -28,14 +28,23 @@ questions:
   - What changed in the MemWal MCP changelog?
   - When was the automatic memory plugin added to MemWal MCP?
 answer: >-
-  Version 0.2.0 productizes the one-time proactive-memory setup flow for chat clients. Version 0.1.0 adds non-interactive status and whoami commands that report the active account, delegate, label, relayer, namespace, credentials file, and auto-save configuration. Version 0.0.18 fixes environment-based auto-save consent overrides and wakes aborted SSE readers for reliable reconnects. Version 0.0.17 prevents duplicate bulk writes during bridge replay. Version 0.0.16 hardened transport dependencies and authenticated redirects.
+  Version 0.2.0 adds paginated namespace discovery and MCP server discovery metadata, productizes one-time proactive-memory setup for chat clients, preserves legacy namespace diagnostics, and bounds optional discovery waits. Version 0.1.0 adds non-interactive status and whoami commands that report the active account, delegate, label, relayer, namespace, credentials file, and auto-save configuration. Version 0.0.18 fixes environment-based auto-save consent overrides and wakes aborted SSE readers for reliable reconnects. Version 0.0.17 prevents duplicate bulk writes during bridge replay. Version 0.0.16 hardened transport dependencies and authenticated redirects.
 ---
 
 ## 0.2.0
 
 ### Added
 
+- Add `memwal_namespaces` with paginated account inventory and namespace suggestions for empty recall or restore results.
+- Publish SEP-2127 MCP server discovery metadata at `/.well-known/mcp/server-card.json`, `/mcp/server-card`, and `/api/mcp/server-card` for compatible clients.
+
 - Productize the one-time proactive-memory setup flow for Claude Desktop, Claude web, and other chat clients without plugin lifecycle hooks. Exposes the `memwal_enable_proactive` MCP prompt in both bridge and auth-required modes to supply standard consent instructions.
+
+### Fixed
+
+- Preserve exact legacy namespace names, including surrounding whitespace, when explaining empty recall results.
+- Limit optional namespace diagnostics to one second so unavailable metadata does not delay an otherwise completed recall or restore.
+- Restore focused proactive recall guidance in the opt-in setup instruction while keeping recalled entries explicitly untrusted.
 
 ## 0.1.0
 

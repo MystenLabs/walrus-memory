@@ -9,6 +9,7 @@ import {
     formatNamespacesResult,
     formatNamespaceSuggestionHint,
     isCloseNamespaceMatch,
+    tryListNamespaces,
     type NamespaceEntry,
 } from "../tools/namespaces.js";
 import { emptyRecallText } from "../tools/recall.js";
@@ -95,6 +96,66 @@ test("emptyRecallText distinguishes empty namespace from populated namespace wit
         incompletePageNs,
         'No matching memories found in namespace "other-ns".',
     );
+});
+
+for (const legacyNamespace of [" work ", "   "]) {
+    for (const explicit of [true, false]) {
+        test(`empty recall preserves ${JSON.stringify(legacyNamespace)} from ${explicit ? "the call" : "the session"}`, async (t) => {
+            let requestedNamespace: string | undefined;
+            const client = await openTestClient(t, {
+                recall: async (_query: string, _limit: number, namespace?: string) => {
+                    requestedNamespace = namespace;
+                    return { results: [], total: 0 };
+                },
+                listNamespaces: async () => ({
+                    namespaces: [{ name: legacyNamespace, memory_count: 3 }],
+                    has_more: false,
+                }),
+            }, { namespace: explicit ? "default" : legacyNamespace });
+            const result = await client.callTool({
+                name: "memwal_recall",
+                arguments: { query: "unmatched query", ...(explicit ? { namespace: legacyNamespace } : {}) },
+            });
+            assert.equal(requestedNamespace, explicit ? legacyNamespace : undefined);
+            assert.equal(textFromResult(result),
+                `No matching memories found in namespace "${legacyNamespace}" (0 matches among 3 memories).`);
+        });
+    }
+}
+
+test("optional namespace discovery times out and does not resume pagination", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    let calls = 0;
+    let finishPage!: (page: unknown) => void;
+    const session = { memwal: { listNamespaces: () => {
+        calls++;
+        return new Promise((resolve) => { finishPage = resolve; });
+    } } } as unknown as MemWalSession;
+    const pending = tryListNamespaces(session, "missing");
+    t.mock.timers.tick(1_000);
+    assert.equal(await pending, null);
+    finishPage({ namespaces: [], has_more: true, next_cursor: "next" });
+    await new Promise(setImmediate);
+    assert.equal(calls, 1);
+});
+
+test("optional namespace discovery shares one deadline across pages", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    let calls = 0;
+    const session = { memwal: { listNamespaces: async () => {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return { namespaces: [], has_more: true, next_cursor: `page-${calls}` };
+    } } } as unknown as MemWalSession;
+    const pending = tryListNamespaces(session, "missing");
+    t.mock.timers.tick(600);
+    await new Promise(setImmediate);
+    assert.equal(calls, 2);
+    t.mock.timers.tick(400);
+    assert.equal(await pending, null);
+    t.mock.timers.tick(200);
+    await new Promise(setImmediate);
+    assert.equal(calls, 2);
 });
 
 test("memwal_recall paginates across listNamespaces pages until targetNamespace is found", async (t) => {
