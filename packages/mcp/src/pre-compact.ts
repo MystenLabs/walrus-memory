@@ -399,6 +399,22 @@ export function hasConversationalOptOut(text: string): boolean {
     return CONVERSATIONAL_OPT_OUT_PATTERNS.some((pat) => pat.test(text));
 }
 
+/** Check if text contains explicit opt-out directives or markers. */
+export function isOptOutTurn(text: string): boolean {
+    if (!text) return false;
+    if (hasConversationalOptOut(text)) return true;
+    if (/(?:^|\s)(?:\[\s*no[-_\s]?(?:memory|save)\s*\]|#no[-_]?(?:memory|save)\b|\bMEMWAL_IGNORE\b)/i.test(text)) return true;
+    return false;
+}
+
+/** Check if text contains private blocks or credentials/secrets. */
+export function containsSensitiveContent(text: string): boolean {
+    if (!text) return false;
+    if (/<private>/i.test(text)) return true;
+    if (redactSecrets(text) !== text) return true;
+    return false;
+}
+
 function hasSalvageableContent(text: string): boolean {
     const withoutPlaceholders = text.replace(/\[redacted:[a-z-]+\]/g, " ");
     const words = withoutPlaceholders.match(/[\p{L}\p{N}]{2,}/gu) ?? [];
@@ -539,16 +555,22 @@ export async function runPreCompactSave(input: PreCompactInput): Promise<PreComp
     const lines = rawChunk.split("\n");
     const formattedTurns: string[] = [];
     let userTurnOptedOut = false;
+    let suppressAssistantEcho = false;
 
     for (const line of lines) {
         const turn = parseTranscriptLine(line);
         if (!turn) continue;
 
         if (turn.role === "user") {
-            userTurnOptedOut = hasConversationalOptOut(turn.text);
+            userTurnOptedOut = isOptOutTurn(turn.text);
+            suppressAssistantEcho = userTurnOptedOut || containsSensitiveContent(turn.text);
         }
 
         if (userTurnOptedOut) {
+            continue;
+        }
+
+        if (turn.role === "assistant" && suppressAssistantEcho) {
             continue;
         }
 

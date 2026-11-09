@@ -1071,3 +1071,75 @@ test("conversational opt-out instructions and trailing assistant echoes are excl
         rmSync(tempDir, { recursive: true, force: true });
     }
 });
+
+test("credential-bearing turns and private-tagged turns suppress trailing assistant echoes", async () => {
+    const tempDir = freshTempDir();
+    const mock = await startWorkerMockRelayer({ statusCode: 200 });
+
+    try {
+        writeSettings(tempDir, { autoSave: true });
+        await writeTestCreds(tempDir, { relayerUrl: mock.url });
+
+        const transcriptPath = join(tempDir, "sensitive-echoes.jsonl");
+        const lines = [
+            // 1. User turn with password assignment
+            JSON.stringify({
+                role: "user",
+                content: "Staging test account uses password: hunter2 for integration runs",
+            }),
+            // 2. Assistant echo of password
+            JSON.stringify({
+                role: "assistant",
+                content: "For integration testing, your staging database password is hunter2.",
+            }),
+            // 3. User turn with private tag
+            JSON.stringify({
+                role: "user",
+                content: "<private>My medical condition is synthetic-condition.</private>",
+            }),
+            // 4. Assistant echo of private info
+            JSON.stringify({
+                role: "assistant",
+                content: "I acknowledge your synthetic-condition medical information.",
+            }),
+            // 5. Normal durable turn
+            JSON.stringify({
+                role: "user",
+                content: "We use Vitest as our test runner across all TypeScript packages.",
+            }),
+            // 6. Assistant reply to normal turn
+            JSON.stringify({
+                role: "assistant",
+                content: "Understood, Vitest is configured as the test runner.",
+            }),
+        ];
+        writeFileSync(transcriptPath, lines.join("\n") + "\n");
+
+        const result = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-sensitive-echoes",
+                transcript_path: transcriptPath,
+            }
+        );
+
+        assert.equal(result.status, 0);
+        await waitForRequests(mock, 1);
+        assert.equal(mock.requests.length, 1);
+        const analyzedText = JSON.parse(mock.requests[0].body).text;
+
+        assert.ok(analyzedText.includes("We use Vitest as our test runner across all TypeScript packages."));
+        assert.ok(analyzedText.includes("Vitest is configured as the test runner."));
+        assert.ok(!analyzedText.includes("hunter2"));
+        assert.ok(!analyzedText.includes("staging database password"));
+        assert.ok(!analyzedText.includes("synthetic-condition"));
+        assert.ok(!analyzedText.includes("medical condition"));
+    } finally {
+        await mock.close();
+        rmSync(tempDir, { recursive: true, force: true });
+    }
+});
