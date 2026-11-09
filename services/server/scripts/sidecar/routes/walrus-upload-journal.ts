@@ -578,6 +578,15 @@ async function lookupPreparedRegisterTransaction(
     return undefined;
 }
 
+export class PreparedRegisterNotOnChainError extends Error {
+    readonly code = "PREPARED_REGISTER_NOT_ON_CHAIN";
+
+    constructor(message: string) {
+        super(message);
+        this.name = "PreparedRegisterNotOnChainError";
+    }
+}
+
 export async function executePreparedRegisterTransaction(
     prepared: ValidatedPreparedRegisterTransaction,
     client: PreparedRegisterClient = suiClient,
@@ -586,6 +595,7 @@ export async function executePreparedRegisterTransaction(
     mayHaveBeenSubmitted = false,
     executeSponsored: PreparedRegisterSponsorExecutor = executePreparedRegisterWithEnoki,
     indexAttempts = 8,
+    allowSubmission = true,
 ): Promise<unknown> {
     const include = { effects: true, objectTypes: true } as const;
     const assertExpectedDigest = (result: any): unknown => {
@@ -596,14 +606,46 @@ export async function executePreparedRegisterTransaction(
         return result;
     };
     let existing: unknown;
-    try {
-        existing = await client.getTransaction({ digest: prepared.digest, include });
-    } catch (error: any) {
-        if (error?.code !== "NOT_FOUND") throw error;
+    if (mayHaveBeenSubmitted || !allowSubmission) {
+        existing = await lookupPreparedRegisterTransaction(
+            client,
+            prepared.digest,
+            include,
+            assertExpectedDigest,
+            indexAttempts,
+        );
+    } else {
+        try {
+            existing = await client.getTransaction({ digest: prepared.digest, include });
+        } catch (error: any) {
+            if (error?.code !== "NOT_FOUND") throw error;
+        }
     }
     if (existing !== undefined) {
         onTransactionObservedOrSubmitted();
         return assertExpectedDigest(existing);
+    }
+    if (!allowSubmission) {
+        if (mayHaveBeenSubmitted) {
+            const maxEpoch = prepared.maxEpoch;
+            if (maxEpoch !== undefined && await getCurrentEpoch() > maxEpoch) {
+                throw Object.assign(
+                    new Error(
+                        `prepared register transaction ${prepared.digest} expired at epoch ${maxEpoch} but remains ambiguous`,
+                    ),
+                    { code: "UNAVAILABLE" },
+                );
+            }
+            throw Object.assign(
+                new Error(
+                    `prepared register transaction ${prepared.digest} is not visible on chain yet and remains ambiguous`,
+                ),
+                { code: "UNAVAILABLE" },
+            );
+        }
+        throw new PreparedRegisterNotOnChainError(
+            `prepared register transaction ${prepared.digest} is not on chain`,
+        );
     }
     const maxEpoch = prepared.maxEpoch;
     if (maxEpoch !== undefined && await getCurrentEpoch() > maxEpoch) {
@@ -823,6 +865,12 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     registerTransaction: rawRegisterTransaction,
                     resumeStep: rawResumeStep,
                 } = req.body;
+                const mayHaveBeenSubmitted = typeof req.body.mayHaveBeenSubmitted === "boolean"
+                    ? req.body.mayHaveBeenSubmitted
+                    : Boolean(reconcileOnly);
+                const indexAttempts = typeof req.body.indexAttempts === "number" && req.body.indexAttempts > 0
+                    ? req.body.indexAttempts
+                    : 8;
                 const jobId = sanitizeRequestId(rawJobId);
                 if (!data || keyIndex === undefined || !jobId) {
                     return res.status(400).json({ error: "Missing required fields: data, keyIndex, jobId" });
@@ -930,13 +978,16 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     encodeMs = Date.now() - started;
                     return encoded;
                 };
-                flightKey = uploadStepFlightKey(
+                const baseFlightKey = uploadStepFlightKey(
                     jobId,
                     resume?.step,
                     resume && "blobId" in resume ? resume.blobId : undefined,
                     preparedRegisterTransaction?.digest,
                     preparedRegisterTransaction?.sponsorDigest,
                 );
+                flightKey = reconcileOnly && !uploadStepFlights.has(baseFlightKey)
+                    ? `${baseFlightKey}|reconcile`
+                    : baseFlightKey;
                 if (preparedRegisterTransaction && resume?.step === "encoded") {
                     rejectedPreparation = {
                         key: uploadStepFlightKey(jobId, "encoded", resume.blobId, undefined),
@@ -953,161 +1004,235 @@ export function registerWalrusUploadJournalRoute(app: Express): void {
                     return;
                 }
                 flight = joined.flight;
-                // Do not cancel this step when the caller disconnects. The
-                // retry joins the same flight and needs the result. Cancelling
-                // here is what turned one dropped connection into a new upload.
-                releaseWalrusUploadSlots = await acquireWalrusUploadSlots(keySlot, traceId, jobId, {
-                    holdForJob: true,
-                });
 
                 let step: WriteBlobStep;
-                if (!resume) {
-                    step = await encodeFlow();
-                } else if (resume.step === "encoded") {
-                    const encoded = await encodeFlow();
-                    if (preparedRegisterTransaction) {
-                        let validated: ValidatedPreparedRegisterTransaction;
-                        try {
-                            validated = await validatePreparedRegisterTransaction(
-                                preparedRegisterTransaction,
-                                journaledWalletAddress,
-                            );
-                        } catch (validationError: unknown) {
-                            reply(409, {
-                                error: errorMessage(validationError),
-                                code: "INVALID_PREPARED_REGISTER_TRANSACTION",
-                                jobId,
-                            });
-                            return;
-                        }
-                        phaseCanSubmitSideEffect = true;
-                        // A persisted *_started marker means an earlier request
-                        // may already have submitted these exact bytes. Until a
-                        // digest lookup proves absence, lookup failures must
-                        // preserve the prepared transaction for reconciliation.
-                        if (reconcileOnly) submissionStarted = true;
-                        const result = await executePreparedRegisterTransaction(
+                if (reconcileOnly && resume?.step === "encoded") {
+                    if (!preparedRegisterTransaction) {
+                        reply(409, {
+                            error: "register reconciliation requires the journaled signed transaction",
+                            code: "MISSING_PREPARED_REGISTER_TRANSACTION",
+                            jobId,
+                            blobId: resume.blobId,
+                        });
+                        return;
+                    }
+                    let validated: ValidatedPreparedRegisterTransaction;
+                    try {
+                        validated = await validatePreparedRegisterTransaction(
+                            preparedRegisterTransaction,
+                            journaledWalletAddress,
+                        );
+                    } catch (validationError: unknown) {
+                        reply(409, {
+                            error: errorMessage(validationError),
+                            code: "INVALID_PREPARED_REGISTER_TRANSACTION",
+                            jobId,
+                        });
+                        return;
+                    }
+                    if (mayHaveBeenSubmitted) submissionStarted = true;
+                    let result: unknown;
+                    try {
+                        result = await executePreparedRegisterTransaction(
                             validated,
                             suiClient,
                             () => {
-                                // A successful digest lookup proves the effect
-                                // already exists; an execute call may create it.
                                 submissionStarted = true;
                             },
                             currentSuiEpoch,
-                            reconcileOnly,
+                            mayHaveBeenSubmitted,
+                            executePreparedRegisterWithEnoki,
+                            indexAttempts,
+                            false,
                         );
-                        const blobObjectId = createdBlobObjectIdFromTransaction(result);
-                        await validateRegisteredBlob(blobObjectId, encoded);
-                        step = registeredStep(encoded, blobObjectId, validated.digest);
-                    } else {
-                        if (reconcileOnly) {
+                    } catch (execError: unknown) {
+                        if (execError instanceof PreparedRegisterNotOnChainError) {
                             reply(409, {
-                                error: "register reconciliation requires the journaled signed transaction",
-                                code: "MISSING_PREPARED_REGISTER_TRANSACTION",
+                                error: execError.message,
+                                code: execError.code,
                                 jobId,
-                                blobId: encoded.blobId,
+                                digest: validated.digest,
                             });
                             return;
                         }
-                        const registerTx = flow.register({
-                            epochs,
-                            owner: signerAddress,
-                            deletable: true,
-                            attributes: {
-                                ...(namespace ? { memwal_namespace: namespace } : {}),
-                                ...(targetOwner ? { memwal_owner: targetOwner } : {}),
-                                ...(packageId ? { memwal_package_id: packageId } : {}),
-                                [MEMWAL_JOB_TAG_KEY]: jobId,
-                            },
-                        });
-                        enforceAddressBalanceCoinIntents(registerTx);
-                        const tipRecipient = ENOKI_API_KEY && DURABLE_ENOKI_REGISTER_ENABLED
-                            ? await getUploadRelayTipAddress()
-                            : null;
-                        const allowedAddresses = [...new Set(
-                            [signerAddress, tipRecipient]
-                                .filter((address): address is string => typeof address === "string"),
-                        )];
-                        const registerTransaction = await prepareRegisterTransaction(
-                            registerTx,
-                            signer,
-                            allowedAddresses,
-                            registerRebuild,
-                        );
-                        console.log(`[walrus/upload-step-v3] [${traceId}] prepared ${JSON.stringify({
-                            jobId,
-                            keyIndex: keySlot,
-                            step: "register_prepared",
-                            blobId: encoded.blobId,
-                            digest: registerTransaction.digest,
-                            sponsored: !!registerTransaction.sponsorDigest,
-                            encodeMs,
-                        })}`);
-                        deliver({
-                            registerTransaction,
-                            resumeStep: encoded,
-                            walletAddress: signerAddress,
-                            uploadExecutionIdentity: await executionIdentity(),
-                        }, true);
-                        return;
+                        throw execError;
                     }
-                } else if (resume.step === "registered") {
-                    const alreadyCertified = await certifiedStep(resume.blobId, resume.blobObjectId);
-                    if (alreadyCertified) {
-                        step = alreadyCertified;
-                    } else {
-                        await encodeFlow();
-                        step = await uploadWalrusBlobWithEffectsRetry(flow, resume.txDigest, {
-                            traceId,
-                            jobId,
-                            keyIndex: keySlot,
-                            // getBlobObject caches a miss. Clear it or the retry
-                            // reads the same Error and the job burns its attempts.
-                            resetWalrusCache: () => client.reset(),
-                        }, true) as WriteBlobStepUploaded;
-                    }
-                } else if (resume.step === "uploaded") {
-                    const alreadyCertified = await certifiedStep(resume.blobId, resume.blobObjectId);
-                    if (alreadyCertified) {
-                        step = alreadyCertified;
-                    } else if (reconcileOnly) {
-                        reply(409, {
-                            error: "Blob is not certified after an ambiguous certify phase",
-                            code: "AMBIGUOUS_CERTIFY_NOT_FOUND",
-                            jobId,
-                            blobId: resume.blobId,
-                            objectId: resume.blobObjectId,
-                        });
-                        return;
-                    } else {
-                        const digest = await submitRebuildableWalletTransaction(
-                            "certify_sponsor",
-                            () => client.certifyBlobTransaction({
-                                blobId: resume.blobId,
-                                blobObjectId: resume.blobObjectId,
-                                certificate: resume.certificate,
-                                deletable: true,
-                            }),
-                            signer,
-                            undefined,
-                            { traceId, jobId, keyIndex: keySlot },
-                            DURABLE_WALLET_FALLBACK_POLICY,
-                            () => {
-                                submissionStarted = true;
-                            },
-                        );
-                        const result = await suiClient.waitForTransaction({ digest });
-                        assertFinalizedTransactionSuccess(
-                            result,
-                            `certification transaction ${digest}`,
-                        );
-                        const certified = await waitForCertifiedStep(resume.blobId, resume.blobObjectId);
-                        if (!certified) throw new Error(`certified Blob ${resume.blobObjectId} is not certified on chain`);
-                        step = certified;
-                    }
+                    releaseWalrusUploadSlots = await acquireWalrusUploadSlots(keySlot, traceId, jobId, {
+                        holdForJob: true,
+                    });
+                    const encoded = await encodeFlow();
+                    const blobObjectId = createdBlobObjectIdFromTransaction(result);
+                    await validateRegisteredBlob(blobObjectId, encoded);
+                    step = registeredStep(encoded, blobObjectId, validated.digest);
                 } else {
-                    step = resume;
+                    // Do not cancel this step when the caller disconnects. The
+                    // retry joins the same flight and needs the result. Cancelling
+                    // here is what turned one dropped connection into a new upload.
+                    releaseWalrusUploadSlots = await acquireWalrusUploadSlots(keySlot, traceId, jobId, {
+                        holdForJob: true,
+                    });
+
+                    if (!resume) {
+                        step = await encodeFlow();
+                    } else if (resume.step === "encoded") {
+                        const encoded = await encodeFlow();
+                        if (preparedRegisterTransaction) {
+                            let validated: ValidatedPreparedRegisterTransaction;
+                            try {
+                                validated = await validatePreparedRegisterTransaction(
+                                    preparedRegisterTransaction,
+                                    journaledWalletAddress,
+                                );
+                            } catch (validationError: unknown) {
+                                reply(409, {
+                                    error: errorMessage(validationError),
+                                    code: "INVALID_PREPARED_REGISTER_TRANSACTION",
+                                    jobId,
+                                });
+                                return;
+                            }
+                            phaseCanSubmitSideEffect = true;
+                            if (mayHaveBeenSubmitted) submissionStarted = true;
+                            let result: unknown;
+                            try {
+                                result = await executePreparedRegisterTransaction(
+                                    validated,
+                                    suiClient,
+                                    () => {
+                                        // A successful digest lookup proves the effect
+                                        // already exists; an execute call may create it.
+                                        submissionStarted = true;
+                                    },
+                                    currentSuiEpoch,
+                                    mayHaveBeenSubmitted,
+                                    executePreparedRegisterWithEnoki,
+                                    indexAttempts,
+                                    !reconcileOnly,
+                                );
+                            } catch (execError: unknown) {
+                                if (execError instanceof PreparedRegisterNotOnChainError) {
+                                    reply(409, {
+                                        error: execError.message,
+                                        code: execError.code,
+                                        jobId,
+                                        digest: validated.digest,
+                                    });
+                                    return;
+                                }
+                                throw execError;
+                            }
+                            const blobObjectId = createdBlobObjectIdFromTransaction(result);
+                            await validateRegisteredBlob(blobObjectId, encoded);
+                            step = registeredStep(encoded, blobObjectId, validated.digest);
+                        } else {
+                            if (reconcileOnly) {
+                                reply(409, {
+                                    error: "register reconciliation requires the journaled signed transaction",
+                                    code: "MISSING_PREPARED_REGISTER_TRANSACTION",
+                                    jobId,
+                                    blobId: encoded.blobId,
+                                });
+                                return;
+                            }
+                            const registerTx = flow.register({
+                                epochs,
+                                owner: signerAddress,
+                                deletable: true,
+                                attributes: {
+                                    ...(namespace ? { memwal_namespace: namespace } : {}),
+                                    ...(targetOwner ? { memwal_owner: targetOwner } : {}),
+                                    ...(packageId ? { memwal_package_id: packageId } : {}),
+                                    [MEMWAL_JOB_TAG_KEY]: jobId,
+                                },
+                            });
+                            enforceAddressBalanceCoinIntents(registerTx);
+                            const tipRecipient = ENOKI_API_KEY && DURABLE_ENOKI_REGISTER_ENABLED
+                                ? await getUploadRelayTipAddress()
+                                : null;
+                            const allowedAddresses = [...new Set(
+                                [signerAddress, tipRecipient]
+                                    .filter((address): address is string => typeof address === "string"),
+                            )];
+                            const registerTransaction = await prepareRegisterTransaction(
+                                registerTx,
+                                signer,
+                                allowedAddresses,
+                                registerRebuild,
+                            );
+                            console.log(`[walrus/upload-step-v3] [${traceId}] prepared ${JSON.stringify({
+                                jobId,
+                                keyIndex: keySlot,
+                                step: "register_prepared",
+                                blobId: encoded.blobId,
+                                digest: registerTransaction.digest,
+                                sponsored: !!registerTransaction.sponsorDigest,
+                                encodeMs,
+                            })}`);
+                            deliver({
+                                registerTransaction,
+                                resumeStep: encoded,
+                                walletAddress: signerAddress,
+                                uploadExecutionIdentity: await executionIdentity(),
+                            }, true);
+                            return;
+                        }
+                    } else if (resume.step === "registered") {
+                        const alreadyCertified = await certifiedStep(resume.blobId, resume.blobObjectId);
+                        if (alreadyCertified) {
+                            step = alreadyCertified;
+                        } else {
+                            await encodeFlow();
+                            step = await uploadWalrusBlobWithEffectsRetry(flow, resume.txDigest, {
+                                traceId,
+                                jobId,
+                                keyIndex: keySlot,
+                                // getBlobObject caches a miss. Clear it or the retry
+                                // reads the same Error and the job burns its attempts.
+                                resetWalrusCache: () => client.reset(),
+                            }, true) as WriteBlobStepUploaded;
+                        }
+                    } else if (resume.step === "uploaded") {
+                        const alreadyCertified = await certifiedStep(resume.blobId, resume.blobObjectId);
+                        if (alreadyCertified) {
+                            step = alreadyCertified;
+                        } else if (reconcileOnly) {
+                            reply(409, {
+                                error: "Blob is not certified after an ambiguous certify phase",
+                                code: "AMBIGUOUS_CERTIFY_NOT_FOUND",
+                                jobId,
+                                blobId: resume.blobId,
+                                objectId: resume.blobObjectId,
+                            });
+                            return;
+                        } else {
+                            const digest = await submitRebuildableWalletTransaction(
+                                "certify_sponsor",
+                                () => client.certifyBlobTransaction({
+                                    blobId: resume.blobId,
+                                    blobObjectId: resume.blobObjectId,
+                                    certificate: resume.certificate,
+                                    deletable: true,
+                                }),
+                                signer,
+                                undefined,
+                                { traceId, jobId, keyIndex: keySlot },
+                                DURABLE_WALLET_FALLBACK_POLICY,
+                                () => {
+                                    submissionStarted = true;
+                                },
+                            );
+                            const result = await suiClient.waitForTransaction({ digest });
+                            assertFinalizedTransactionSuccess(
+                                result,
+                                `certification transaction ${digest}`,
+                            );
+                            const certified = await waitForCertifiedStep(resume.blobId, resume.blobObjectId);
+                            if (!certified) throw new Error(`certified Blob ${resume.blobObjectId} is not certified on chain`);
+                            step = certified;
+                        }
+                    } else {
+                        step = resume;
+                    }
                 }
 
                 console.log(`[walrus/upload-step-v3] [${traceId}] ok ${JSON.stringify({

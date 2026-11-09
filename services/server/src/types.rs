@@ -2130,15 +2130,26 @@ impl RecallSort {
 #[derive(Debug, Serialize)]
 pub struct RecallResponse {
     pub results: Vec<RecallResult>,
+    /// Number of usable results returned, equal to `results.len()`.
+    /// An all-dropped recall has `total: 0`, `dropped_count > 0`, and
+    /// `degraded: true`; use those fields to distinguish it from no matches.
     pub total: usize,
     /// Count of matches whose blob download / SEAL decrypt / UTF-8 decode
     /// failed and were silently omitted from `results`. Zero on the happy path.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub dropped_count: usize,
+    /// True whenever one or more matched blobs were dropped (`dropped_count > 0`).
+    /// Omitted on healthy responses so happy-path wire payloads stay unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub degraded: bool,
 }
 
 fn is_zero_usize(n: &usize) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize)]
@@ -4498,9 +4509,7 @@ mod tests {
             "OpenRouter upstream error (code=504) [body scrubbed]"
         );
         assert_eq!(
-            sanitize_upstream_error_for_logging(
-                "Failed to read LLM response body: stream closed"
-            ),
+            sanitize_upstream_error_for_logging("Failed to read LLM response body: stream closed"),
             "Failed to read LLM response body [transport error]"
         );
         assert_eq!(

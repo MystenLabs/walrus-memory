@@ -659,7 +659,9 @@ def with_memwal_langchain(
             return messages
 
         try:
-            recall_result = await memwal.recall(user_text, max_memories, namespace)
+            recall_result = await memwal.recall(
+                user_text, max_memories, namespace, on_dropped="throw"
+            )
             relevant = [
                 m for m in recall_result.results
                 if (1 - m.distance) >= min_relevance
@@ -837,7 +839,9 @@ def _wrap_async_openai(
             user_text = _find_last_user_message(messages)
             if user_text:
                 try:
-                    recall_result = await memwal.recall(user_text, max_memories, namespace)
+                    recall_result = await memwal.recall(
+                        user_text, max_memories, namespace, on_dropped="throw"
+                    )
                     relevant = [
                         m for m in recall_result.results
                         if (1 - m.distance) >= min_relevance
@@ -915,7 +919,9 @@ def _wrap_sync_openai(
             if user_text:
                 try:
                     recall_result = _run_memwal(
-                        lambda: memwal.recall(user_text, max_memories, namespace)
+                        lambda: memwal.recall(
+                            user_text, max_memories, namespace, on_dropped="throw"
+                        )
                     )
                     relevant = [
                         m for m in recall_result.results

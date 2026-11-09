@@ -2,6 +2,7 @@ import { createSession } from "@/lib/auth/session";
 import {
   getUserBySuiAddress,
   createEnokiUser,
+  resolveAndMigrateUserDelegateKey,
   updateEnokiUserCredentials,
 } from "@/lib/db/queries";
 import * as ed from "@noble/ed25519";
@@ -88,13 +89,22 @@ export async function POST(request: Request) {
       const existing = await getUserBySuiAddress(suiAddress);
 
       if (existing?.delegatePrivateKey && existing?.publicKey && existing?.accountId) {
-        // Returning user — recreate session from stored credentials
-        await createSession(
-          existing.id,
-          existing.publicKey,
-          existing.accountId,
-        );
-        return Response.json({ success: true, needsSetup: false });
+        let canDecrypt = false;
+        try {
+          await resolveAndMigrateUserDelegateKey(existing);
+          canDecrypt = Boolean(existing.publicKey && existing.accountId);
+        } catch {
+          canDecrypt = false;
+        }
+        if (canDecrypt && existing.publicKey && existing.accountId) {
+          // Returning user — recreate session from stored credentials
+          await createSession(
+            existing.id,
+            existing.publicKey,
+            existing.accountId,
+          );
+          return Response.json({ success: true, needsSetup: false });
+        }
       }
 
       // No stored credentials — client needs to generate key + register on-chain

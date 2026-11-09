@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MemWal } from "../dist/memwal.js";
+import { MemWal, MemWalRecallAllDroppedError } from "../dist/index.js";
 
 // End-to-end coverage of the recall() wiring (not just the pure applyTokenBudget
 // function): confirms maxTokens is honored on the real client path and that
@@ -46,7 +46,7 @@ function client() {
 
 const chars = (n) => "a".repeat(n);
 
-test("recall surfaces dropped_count when the relayer omitted matches", async () => {
+test("recall returns degraded result by default when all matches are dropped and throws on explicit onDropped throw", async () => {
     globalThis.fetch = async (url, init = {}) => {
         const path = new URL(url).pathname;
         if (path === "/version") {
@@ -60,13 +60,90 @@ test("recall surfaces dropped_count when the relayer omitted matches", async () 
             return Response.json({ packageId: "0x1", network: "testnet" });
         }
         if (path === "/api/recall" && init.method === "POST") {
-            return Response.json({ results: [], total: 0, dropped_count: 3 });
+            return Response.json({ results: [], total: 0, dropped_count: 3, degraded: true });
         }
         throw new Error(`unexpected request ${path}`);
     };
-    const result = await client().recall({ query: "x", namespace: "default" });
-    assert.equal(result.dropped_count, 3);
-    assert.equal(result.results.length, 0);
+
+    const byDefault = await client().recall({ query: "x", namespace: "default" });
+    assert.equal(byDefault.dropped_count, 3);
+    assert.equal(byDefault.total, 0);
+    assert.equal(byDefault.degraded, true);
+    assert.equal(byDefault.results.length, 0);
+
+    const positionalDefault = await client().recall("x", 10, "default");
+    assert.equal(positionalDefault.dropped_count, 3);
+    assert.equal(positionalDefault.total, 0);
+    assert.equal(positionalDefault.degraded, true);
+    assert.equal(positionalDefault.results.length, 0);
+
+    const ignored = await client().recall({
+        query: "x",
+        namespace: "default",
+        onDropped: "ignore",
+    });
+    assert.equal(ignored.dropped_count, 3);
+    assert.equal(ignored.total, 0);
+    assert.equal(ignored.degraded, true);
+    assert.equal(ignored.results.length, 0);
+
+    await assert.rejects(
+        () => client().recall({ query: "x", namespace: "default", onDropped: "throw" }),
+        (err) => {
+            assert.ok(err instanceof MemWalRecallAllDroppedError);
+            assert.equal(err.code, "RECALL_ALL_DROPPED");
+            assert.equal(err.droppedCount, 3);
+            assert.equal(err.total, 3);
+            assert.equal(err.namespace, "default");
+            return true;
+        },
+    );
+});
+
+test("recall preserves total=0 on legacy all-dropped response by default, throws on explicit throw, and validates onDropped", async () => {
+    globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/version") {
+            return Response.json({
+                apiVersion: "1.0.0",
+                relayerVersion: "1.0.0",
+                minSupportedSdk: { typescript: "0.0.4" },
+            });
+        }
+        if (path === "/api/config") {
+            return Response.json({ packageId: "0x1", network: "testnet" });
+        }
+        if (path === "/api/recall" && init.method === "POST") {
+            return Response.json({ results: [], total: 0, dropped_count: 2 });
+        }
+        throw new Error(`unexpected request ${path}`);
+    };
+
+    await assert.rejects(
+        () => client().recall({ query: "x", onDropped: /** @type {any} */ ("warn") }),
+        TypeError,
+    );
+
+    const omitted = await client().recall({
+        query: "x",
+        namespace: "profile",
+    });
+    assert.equal(omitted.results.length, 0);
+    assert.equal(omitted.total, 0);
+    assert.equal(omitted.dropped_count, 2);
+    assert.equal(omitted.degraded, true);
+
+    await assert.rejects(
+        () => client().recall({ query: "x", namespace: "profile", onDropped: "throw" }),
+        (err) => {
+            assert.ok(err instanceof MemWalRecallAllDroppedError);
+            assert.equal(err.code, "RECALL_ALL_DROPPED");
+            assert.equal(err.droppedCount, 2);
+            assert.equal(err.total, 2);
+            assert.equal(err.namespace, "profile");
+            return true;
+        },
+    );
 });
 
 test("recall preserves dropped_count when maxDistance and maxTokens are applied", async () => {
@@ -99,6 +176,7 @@ test("recall preserves dropped_count when maxDistance and maxTokens are applied"
         maxTokens: 10,
     });
     assert.equal(result.dropped_count, 25);
+    assert.equal(result.degraded, true);
     assert.equal(result.total, 3);
     assert.equal(result.results.length, 1);
     assert.equal(result.results[0].blob_id, "b1");
@@ -109,6 +187,7 @@ test("recall omits dropped_count when the relayer does", async () => {
     stubRecall([]);
     const result = await client().recall({ query: "x", namespace: "default" });
     assert.equal("dropped_count" in result, false);
+    assert.equal("degraded" in result, false);
 });
 
 test("recall without maxTokens: response unchanged, NO meta (backward compatible)", async () => {

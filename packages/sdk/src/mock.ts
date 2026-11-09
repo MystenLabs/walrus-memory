@@ -431,6 +431,12 @@ export class MemWalMock {
         ) {
             throw new Error("maxDistance must be a non-negative finite number");
         }
+        const onDropped = options.onDropped ?? "ignore";
+        if (onDropped !== "throw" && onDropped !== "ignore") {
+            throw new TypeError(
+                `onDropped must be "throw" or "ignore", got ${String(options.onDropped)}`,
+            );
+        }
 
         const queryTokens = tokenize(query);
         const semantic = this.memories

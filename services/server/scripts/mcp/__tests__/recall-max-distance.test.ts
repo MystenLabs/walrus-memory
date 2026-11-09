@@ -8,7 +8,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { emptyRecallText, filterByMaxDistance, formatRecallLine } from "../tools/recall.js";
+import {
+    allDroppedCountFromError,
+    emptyRecallText,
+    filterByMaxDistance,
+    formatRecallLine,
+} from "../tools/recall.js";
 
 const row = (text: string, distance: number) => ({ text, distance });
 
@@ -61,4 +66,15 @@ test("displayed score is 1 minus cosine distance", () => {
         0,
     );
     assert.match(line, /\[score=0\.750 distance=0\.250\]/);
+});
+
+test("allDroppedCountFromError extracts droppedCount from SDK all-dropped errors", () => {
+    const sdkErr = Object.assign(new Error("all 3 dropped"), {
+        name: "MemWalRecallAllDropped",
+        code: "RECALL_ALL_DROPPED",
+        droppedCount: 3,
+    });
+    assert.equal(allDroppedCountFromError(sdkErr), 3);
+    assert.match(emptyRecallText(0, 3), /This is not an empty namespace/);
+    assert.equal(allDroppedCountFromError(new Error("network failed")), null);
 });

@@ -160,7 +160,12 @@ export interface RecallResult {
     meta?: RecallTokenMeta;
     /** Matches omitted because blob download or decrypt failed. Omitted when 0. */
     dropped_count?: number;
+    /** True when one or more matched blobs were dropped (`dropped_count > 0`). Omitted when false. */
+    degraded?: boolean;
 }
+
+/** Policy when every matched recall hit failed to download or decrypt. */
+export type RecallOnDropped = "throw" | "ignore";
 
 /**
  * How recall trims recalled memories to fit a `maxTokens` budget.
@@ -258,6 +263,17 @@ export interface RecallOptions {
      * naming that preflight instead.
      */
     timeoutMs?: number;
+    /**
+     * How `recall()` handles an all-dropped response where the relayer matched
+     * memories (`dropped_count > 0` or `degraded: true`) and none survived
+     * download or decrypt (`results.length === 0`).
+     *
+     * Defaults to `"ignore"`, which returns the degraded `RecallResult`
+     * (`results: []`, `degraded: true`, `dropped_count`, `total: 0`) so
+     * callers can inspect the failure without catching an exception. Set
+     * `"throw"` to throw `MemWalRecallAllDroppedError` instead.
+     */
+    onDropped?: RecallOnDropped;
 }
 
 /** Recommended object-style recall input — preferred over positional args. */

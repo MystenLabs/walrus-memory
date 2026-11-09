@@ -2,6 +2,11 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
+import {
+    formatNamespaceSuggestionHint,
+    tryListNamespaces,
+    type NamespaceEntry,
+} from "./namespaces.js";
 import { wrapTool } from "./util.js";
 
 const RECALL_INPUT = {
@@ -169,6 +174,27 @@ export function filterByMaxDistance<T extends { distance: number }>(
     return results.filter((memory) => memory.distance < maxDistance);
 }
 
+/** Extract `droppedCount` when the SDK throws `MemWalRecallAllDroppedError`. */
+export function allDroppedCountFromError(err: unknown): number | null {
+    if (err == null || typeof err !== "object") return null;
+    const e = err as {
+        code?: unknown;
+        name?: unknown;
+        droppedCount?: unknown;
+        dropped_count?: unknown;
+    };
+    if (e.code !== "RECALL_ALL_DROPPED" && e.name !== "MemWalRecallAllDropped") {
+        return null;
+    }
+    if (typeof e.droppedCount === "number" && e.droppedCount > 0) {
+        return e.droppedCount;
+    }
+    if (typeof e.dropped_count === "number" && e.dropped_count > 0) {
+        return e.dropped_count;
+    }
+    return 1;
+}
+
 /**
  * Empty-result copy after the maxDistance filter.
  *
@@ -178,7 +204,15 @@ export function filterByMaxDistance<T extends { distance: number }>(
  * speak for it either: when both counts are non-zero, say both rather than
  * letting "outside maxDistance" imply the namespace held nothing relevant.
  */
-export function emptyRecallText(resultCount: number, dropped: number): string {
+export function emptyRecallText(
+    resultCount: number,
+    dropped: number,
+    namespaceContext?: {
+        activeNamespace: string;
+        namespaces: readonly NamespaceEntry[];
+        has_more?: boolean;
+    },
+): string {
     if (resultCount > 0) {
         const unchecked =
             dropped > 0
@@ -188,6 +222,22 @@ export function emptyRecallText(resultCount: number, dropped: number): string {
     }
     if (dropped > 0) {
         return `No matching memories could be returned (${dropped} matched but failed to download or decrypt). This is not an empty namespace.`;
+    }
+    if (namespaceContext) {
+        const { activeNamespace, namespaces, has_more } = namespaceContext;
+        const activeEntry = namespaces.find((ns) => ns.name === activeNamespace);
+        if (activeEntry) {
+            if (activeEntry.memory_count === 0) {
+                const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+                return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
+            }
+            return `No matching memories found in namespace "${activeNamespace}" (0 matches among ${activeEntry.memory_count} ${activeEntry.memory_count === 1 ? "memory" : "memories"}).`;
+        }
+        if (has_more) {
+            return `No matching memories found in namespace "${activeNamespace}".`;
+        }
+        const hint = formatNamespaceSuggestionHint(activeNamespace, namespaces);
+        return `No matching memories found (namespace "${activeNamespace}" currently holds 0 memories).${hint ? ` ${hint}` : ""}`;
     }
     return "No matching memories found.";
 }
@@ -252,18 +302,53 @@ export function registerRecallTool(
             inputSchema: RECALL_INPUT,
         },
         wrapTool<{ query: string; limit: number; namespace?: string; maxDistance?: number }>(session, "memwal_recall", async ({ query, limit, namespace, maxDistance }) => {
-            const result = await session.memwal.recall(query, limit, namespace);
+            let result: Awaited<ReturnType<typeof session.memwal.recall>>;
+            try {
+                result = await session.memwal.recall(query, limit, namespace);
+            } catch (err) {
+                const allDropped = allDroppedCountFromError(err);
+                if (allDropped !== null) {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: emptyRecallText(0, allDropped),
+                            },
+                        ],
+                        isError: true,
+                    };
+                }
+                throw err;
+            }
             const droppedRaw = (result as { dropped_count?: unknown }).dropped_count;
             const dropped = typeof droppedRaw === "number" ? droppedRaw : 0;
             const filtered = filterByMaxDistance(result.results, maxDistance);
             if (filtered.length === 0) {
+                const activeNamespace =
+                    namespace ?? session.namespace ?? "default";
+                const discovery =
+                    result.results.length === 0 && dropped === 0
+                        ? await tryListNamespaces(session, activeNamespace, 50)
+                        : null;
+                const allDropped = result.results.length === 0 && dropped > 0;
                 return {
                     content: [
                         {
                             type: "text",
-                            text: emptyRecallText(result.results.length, dropped),
+                            text: emptyRecallText(
+                                result.results.length,
+                                dropped,
+                                discovery
+                                    ? {
+                                          activeNamespace,
+                                          namespaces: discovery.namespaces,
+                                          has_more: discovery.has_more,
+                                      }
+                                    : undefined,
+                            ),
                         },
                     ],
+                    ...(allDropped ? { isError: true } : {}),
                 };
             }
             const { unique, duplicates } = collapseDuplicates(filtered);

@@ -17,7 +17,8 @@
  * =============================================================================
  */
 import { json, type Request, type Response, type Router } from "express";
-import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { createHash, randomUUID } from "node:crypto";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -37,6 +38,168 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 const log = createLogger("mcp");
 const parseSseBody = json({ limit: MCP_MAX_REQUEST_BODY_BYTES, strict: false });
+
+const requirePkg = createRequire(import.meta.url);
+const PACKAGE_VERSION: string =
+    (requirePkg("../package.json") as { version?: string }).version ?? "0.0.0";
+
+export interface BuildMcpServerCardOptions {
+    relayerUrl?: string;
+    publicRelayerUrl?: string;
+    oauthEnabled?: boolean;
+    oauthProtectedResourceUrl?: string;
+    oauthAuthorizationServerUrl?: string;
+}
+
+export function computeServerCardEtag(body: string | Buffer): { quotedEtag: string; rawEtag: string } {
+    const hash = createHash("sha256").update(body).digest("hex").slice(0, 32);
+    return {
+        quotedEtag: `"${hash}"`,
+        rawEtag: hash,
+    };
+}
+
+export const MCP_SERVER_CARD_SCHEMA =
+    "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json";
+export const MCP_SERVER_CARD_NAME = "xyz.walrus.memory/memwal";
+export const MCP_SERVER_CARD_TITLE = "Walrus Memory MCP Server";
+export const MCP_SERVER_CARD_DESCRIPTION =
+    "Portable, SEAL-encrypted long-term memory for AI agents on Walrus and Sui.";
+export const MCP_SERVER_CARD_WEBSITE_URL = "https://memory.walrus.xyz";
+export const MCP_SERVER_CARD_REPO_URL = "https://github.com/MystenLabs/walrus-memory";
+
+export function buildMcpServerCard(options: BuildMcpServerCardOptions = {}): Record<string, unknown> {
+    const rawOrigin =
+        options.publicRelayerUrl ||
+        process.env.MEMWAL_PUBLIC_RELAYER_URL ||
+        process.env.MEMWAL_RELAYER_URL ||
+        "";
+    const configuredOrigin = rawOrigin.trim().replace(/\/+$/, "");
+    const isTemplated = !configuredOrigin;
+
+    const streamableUrl = isTemplated
+        ? "{relayer_url}/api/mcp"
+        : `${configuredOrigin}/api/mcp`;
+    const sseUrl = isTemplated
+        ? "{relayer_url}/api/mcp/sse"
+        : `${configuredOrigin}/api/mcp/sse`;
+
+    const remoteVariables = isTemplated
+        ? {
+              relayer_url: {
+                  description: "Walrus Memory relayer base URL.",
+                  isRequired: true,
+                  default: "https://relayer.memory.walrus.xyz",
+              },
+          }
+        : undefined;
+
+    const headers = [
+        {
+            name: "Authorization",
+            description:
+                "Bearer token: either a 64-hex Ed25519 delegate private key (with X-MemWal-Account-Id) or an OAuth 2.0 access token.",
+            isRequired: true,
+            isSecret: true,
+            value: "Bearer {bearer_token}",
+            variables: {
+                bearer_token: {
+                    description:
+                        "Walrus Memory delegate private key (64 hex characters) or OAuth 2.0 access token.",
+                    isRequired: true,
+                    isSecret: true,
+                },
+            },
+        },
+        {
+            name: "X-MemWal-Account-Id",
+            description:
+                "0x-prefixed 64-hex Walrus Memory Sui account object ID (required when bearer_token is a delegate key; omit for OAuth access tokens).",
+            isRequired: false,
+            placeholder: "0x...",
+        },
+        {
+            name: "X-MemWal-Namespace",
+            description:
+                "Optional default memory namespace used when tool calls omit namespace.",
+            isRequired: false,
+            default: "default",
+        },
+    ];
+
+    const supportedProtocolVersions = ["2025-03-26", "2024-11-05"];
+
+    const remotes = [
+        {
+            type: "streamable-http",
+            url: streamableUrl,
+            headers,
+            supportedProtocolVersions,
+            ...(remoteVariables ? { variables: remoteVariables } : {}),
+        },
+        {
+            type: "sse",
+            url: sseUrl,
+            headers,
+            supportedProtocolVersions,
+            ...(remoteVariables ? { variables: remoteVariables } : {}),
+        },
+    ];
+
+    const oauthEnabled = Boolean(
+        options.oauthEnabled ??
+        (options.oauthProtectedResourceUrl || process.env.MCP_OAUTH_DELEGATE_ENCRYPTION_KEY)
+    );
+
+    const protectedResourceMetadata =
+        options.oauthProtectedResourceUrl ??
+        (isTemplated
+            ? "{relayer_url}/.well-known/oauth-protected-resource"
+            : `${configuredOrigin}/.well-known/oauth-protected-resource`);
+
+    const authorizationServerMetadata =
+        options.oauthAuthorizationServerUrl ??
+        (isTemplated
+            ? "{relayer_url}/.well-known/oauth-authorization-server"
+            : `${configuredOrigin}/.well-known/oauth-authorization-server`);
+
+    const oauth2 = oauthEnabled
+        ? {
+              enabled: true,
+              protectedResourceMetadata,
+              authorizationServerMetadata,
+          }
+        : {
+              enabled: false,
+          };
+
+    return {
+        $schema: MCP_SERVER_CARD_SCHEMA,
+        name: MCP_SERVER_CARD_NAME,
+        version: PACKAGE_VERSION,
+        title: MCP_SERVER_CARD_TITLE,
+        description: MCP_SERVER_CARD_DESCRIPTION,
+        websiteUrl: MCP_SERVER_CARD_WEBSITE_URL,
+        repository: {
+            url: MCP_SERVER_CARD_REPO_URL,
+            source: "github",
+        },
+        remotes,
+        _meta: {
+            "xyz.walrus.memory/auth": {
+                delegateBearer: {
+                    authorizationHeader: "Authorization",
+                    scheme: "Bearer",
+                    accountHeader: "X-MemWal-Account-Id",
+                    namespaceHeader: "X-MemWal-Namespace",
+                },
+                oauth2,
+            },
+        },
+    };
+}
+
+export const MCP_SERVER_CARD = buildMcpServerCard();
 
 // Global limiter — caps concurrent MCP sessions per source IP and total. The
 // limiter MUST run BEFORE resolveAuth() so a flood of forged bearers cannot
@@ -584,6 +747,12 @@ export interface MountMcpOptions {
      * and is loopback on every deployment that does not override it.
      */
     publicRelayerUrl?: string;
+    /** Optional override to enable or disable OAuth metadata advertisement in server card. */
+    oauthEnabled?: boolean;
+    /** Optional override for RFC 9728 protected resource metadata URL in server card. */
+    oauthProtectedResourceUrl?: string;
+    /** Optional override for RFC 8414 authorization server metadata URL in server card. */
+    oauthAuthorizationServerUrl?: string;
 }
 
 /**
@@ -661,11 +830,47 @@ export function mountMcpRoutes(
     app.post("/mcp", streamableHandler);
     app.delete("/mcp", streamableHandler);
 
+    const mcpApp = app;
+    const serverCard = buildMcpServerCard({
+        relayerUrl,
+        publicRelayerUrl,
+        oauthEnabled: options.oauthEnabled,
+        oauthProtectedResourceUrl: options.oauthProtectedResourceUrl,
+        oauthAuthorizationServerUrl: options.oauthAuthorizationServerUrl,
+    });
+    const serverCardBody = JSON.stringify(serverCard);
+    const { quotedEtag, rawEtag } = computeServerCardEtag(serverCardBody);
+
+    const serverCardHandler = (req: Request, res: Response) => {
+        const ifNoneMatch = req.headers["if-none-match"];
+        res.setHeader("cache-control", "public, max-age=300");
+        res.setHeader("etag", quotedEtag);
+        if (
+            ifNoneMatch === "*" ||
+            ifNoneMatch === quotedEtag ||
+            ifNoneMatch === rawEtag ||
+            ifNoneMatch === `W/${quotedEtag}` ||
+            (typeof ifNoneMatch === "string" &&
+                (ifNoneMatch === PACKAGE_VERSION ||
+                 ifNoneMatch.includes(quotedEtag) ||
+                 ifNoneMatch.includes(rawEtag)))
+        ) {
+            res.status(304).end();
+            return;
+        }
+        res.setHeader("content-type", "application/mcp-server-card+json; charset=utf-8");
+        res.status(200).send(serverCardBody);
+    };
+    mcpApp.get("/server-card", serverCardHandler);
+    mcpApp.get("/mcp/server-card", serverCardHandler);
+    mcpApp.get("/.well-known/mcp/server-card.json", serverCardHandler);
+
     log.info("mcp.routes.mounted", {
         routes: [
             "GET /mcp/sse",
             "POST /mcp/messages",
             "GET|POST|DELETE /mcp (streamable HTTP)",
+            "GET /server-card (MCP server card discovery)",
         ],
         relayerUrl,
         publicRelayerUrl: publicRelayerUrl ?? null,

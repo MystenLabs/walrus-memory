@@ -44,6 +44,8 @@ struct BatchDecryptItem {
 #[derive(serde::Deserialize)]
 struct BatchDecryptError {
     index: usize,
+    #[serde(default)]
+    code: Option<String>,
     error: String,
 }
 
@@ -313,11 +315,32 @@ impl DecryptOutcome {
     /// a permanent failure never gets discovered-and-decrypted again for
     /// this owner, while a transient one must keep being retried so an
     /// infra blip can never permanently blacklist a legitimate blob.
+    pub(crate) fn permanent_from_code_and_error(code: Option<&str>, err: &str) -> bool {
+        match code {
+            Some("CORRUPT_CIPHERTEXT") => true,
+            Some("SHARED_SERVICE_UNAVAILABLE") => false,
+            _ => Self::permanent_from_error(err),
+        }
+    }
+
     pub(crate) fn permanent_from_error(err: &str) -> bool {
+        if err.contains("Not enough shares")
+            || err.contains("InvalidCiphertext")
+            || err.contains("InvalidPersonalMessageSignature")
+            // @mysten/seal's NoAccessError: key servers rejected the request
+            // because the caller doesn't hold access to the requested key(s).
+            // Checked before "fetch_keys failed" because /seal/decrypt-batch
+            // prefixes every fetchKeys error with "fetch_keys failed: ...".
+            || err.contains("NoAccessError")
+            || err.contains("Ciphertext packageId does not match")
+        {
+            return true;
+        }
+
         let lower = err.to_ascii_lowercase();
         // sendSealFailure (sidecar) echoes the configured request timeout as
         // "(traceId=..., timeoutMs=...)" on every single error it composes,
-        // permanent or not — so a bare "timeout" substring match here would
+        // permanent or not, so a bare "timeout" substring match here would
         // misclassify everything (including NoAccessError/InvalidCiphertext)
         // as transient. Match the actual timeout signal instead.
         if lower.contains("timeouterror")
@@ -333,18 +356,7 @@ impl DecryptOutcome {
             return false;
         }
 
-        err.contains("Not enough shares")
-            || err.contains("InvalidCiphertext")
-            || err.contains("InvalidPersonalMessageSignature")
-            // @mysten/seal's NoAccessError — key servers rejected the request
-            // because the caller doesn't hold access to the requested key(s).
-            // This is the exact failure produced by GH #501/WALM-299: a
-            // foreign blob transferred onto the victim's address that isn't
-            // encrypted to the victim. Deterministic for this (owner, blob),
-            // never resolves on retry, so it's safe (and required) to
-            // negative-cache — omitting it left restore()'s bounded-retry fix
-            // never actually firing for the reported attack.
-            || err.contains("NoAccessError")
+        false
     }
 }
 
@@ -461,7 +473,8 @@ pub async fn seal_decrypt_batch(
             .get(err.index)
             .map(|(id, _)| id.as_str())
             .unwrap_or("?");
-        let permanent = DecryptOutcome::permanent_from_error(&err.error);
+        let permanent =
+            DecryptOutcome::permanent_from_code_and_error(err.code.as_deref(), &err.error);
         tracing::warn!(
             "seal decrypt-batch: sidecar error for blob {} (index {}, permanent={}): {}",
             blob_id,
@@ -622,5 +635,27 @@ mod tests {
             "expected transient: {}",
             msg
         );
+    }
+
+    #[test]
+    fn classifies_batch_prefixed_no_access_error_as_permanent() {
+        let msg = "fetch_keys failed: NoAccessError: user does not have access to one or more of the requested keys";
+        assert!(
+            DecryptOutcome::permanent_from_error(msg),
+            "expected permanent even with fetch_keys prefix: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn code_takes_precedence_for_decrypt_permanence() {
+        assert!(DecryptOutcome::permanent_from_code_and_error(
+            Some("CORRUPT_CIPHERTEXT"),
+            "unexpected error string"
+        ));
+        assert!(!DecryptOutcome::permanent_from_code_and_error(
+            Some("SHARED_SERVICE_UNAVAILABLE"),
+            "unexpected error string"
+        ));
     }
 }

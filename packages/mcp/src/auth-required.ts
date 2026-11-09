@@ -26,6 +26,7 @@ import { rememberInitializeClientInfo } from "./client-info.js";
 import { loginFailureNotice, loginPrompt, loginSuccessNotification } from "./messages.js";
 import { log } from "./logger.js";
 import { startOrReuseLoginFlow, resolveLoginTimeoutMs, isLoginSuperseded } from "./login.js";
+import { localPromptReply } from "./consent-instruction.js";
 import { AUTH_REQUIRED_INSTRUCTIONS } from "./instructions.js";
 import {
     SECRET_EXCLUSION_RULES,
@@ -532,11 +533,29 @@ function handleAuthLine(
                 // `false` here would be entitled to ignore it and never pick up
                 // the real upstream tools (or `memwal_logout`). Advertise the
                 // capability the handoff depends on.
-                capabilities: { tools: { listChanged: true } },
+                capabilities: { tools: { listChanged: true }, prompts: {} },
                 serverInfo: { name: "memwal", version: MEMWAL_MCP_VERSION },
                 instructions: AUTH_REQUIRED_INSTRUCTIONS,
             },
         });
+        return null;
+    }
+
+    const promptReply = localPromptReply(method, req.params);
+    if (promptReply && id != null) {
+        if (promptReply.error) {
+            writeStdoutMessage({
+                jsonrpc: "2.0",
+                id,
+                error: promptReply.error,
+            });
+        } else {
+            writeStdoutMessage({
+                jsonrpc: "2.0",
+                id,
+                result: promptReply.result,
+            });
+        }
         return null;
     }
 
