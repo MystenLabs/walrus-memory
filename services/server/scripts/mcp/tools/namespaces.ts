@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MemWalSession } from "../auth.js";
 import { TOOL_METADATA } from "./annotations.js";
 import { wrapTool } from "./util.js";
+import { withDeadline } from "./remember-wait.js";
 
 export interface NamespaceEntry {
     name: string;
@@ -166,7 +167,7 @@ export interface DiscoveredNamespaces {
 /**
  * Best-effort call to `session.memwal.listNamespaces()`.
  * Paginate until `targetNamespace` is found or pagination completes,
- * up to `maxPages` pages. Never throws so unit tests with partial stubs
+ * up to `maxPages` pages within one second. Never throws so partial stubs
  * or older relayers degrade gracefully without failing callers.
  */
 export async function tryListNamespaces(
@@ -186,13 +187,20 @@ export async function tryListNamespaces(
         typeof targetNamespaceOrLimit === "string" ? targetNamespaceOrLimit : undefined;
     const pageSize =
         typeof targetNamespaceOrLimit === "number" ? targetNamespaceOrLimit : limit;
+    const deadline = Date.now() + 1_000;
 
     try {
         const all: NamespaceEntry[] = [];
         let cursor: string | undefined;
         let hasMore = false;
         for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
-            const page = await fn.call(session!.memwal, { limit: pageSize, cursor });
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) return null;
+            const page = await withDeadline<NamespacesPage>(
+                fn.call(session!.memwal, { limit: pageSize, cursor }),
+                remainingMs,
+                "Namespace discovery timed out",
+            );
             if (!page || !Array.isArray(page.namespaces)) return null;
             all.push(...page.namespaces);
             hasMore = page.has_more === true;

@@ -325,7 +325,7 @@ export function registerRecallTool(
             const filtered = filterByMaxDistance(result.results, maxDistance);
             if (filtered.length === 0) {
                 const activeNamespace =
-                    namespace?.trim() || session.namespace?.trim() || "default";
+                    namespace ?? session.namespace ?? "default";
                 const discovery =
                     result.results.length === 0 && dropped === 0
                         ? await tryListNamespaces(session, activeNamespace, 50)

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { test } from "node:test";
+import { before, beforeEach, mock, test } from "node:test";
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
+import type { MigratedUserCredentials } from "../db/queries";
 import {
   decryptDelegatePrivateKey,
   DelegateKeyCryptoError,
@@ -14,6 +17,48 @@ import {
 const SECRET_A = "0123456789abcdef0123456789abcdef";
 const SECRET_B = "fedcba9876543210fedcba9876543210";
 const SAMPLE_KEY = "cd".repeat(32);
+
+let updateRows: Array<{ delegatePrivateKey: string }>;
+let reloadedRows: Array<Partial<MigratedUserCredentials>>;
+let writtenEnvelope: string;
+let updatePredicate: SQL;
+let selectedFields: string[];
+
+beforeEach(() => {
+  updateRows = [];
+  reloadedRows = [];
+  writtenEnvelope = "";
+  selectedFields = [];
+});
+
+mock.module("server-only", { namedExports: {} });
+mock.module("@/lib/db/drizzle", {
+  namedExports: {
+    db: {
+      update: () => ({
+        set: (values: { delegatePrivateKey: string }) => {
+          writtenEnvelope = values.delegatePrivateKey;
+          return {
+            where: (predicate: SQL) => {
+              updatePredicate = predicate;
+              return { returning: async () => updateRows };
+            },
+          };
+        },
+      }),
+      select: (fields: Record<string, unknown>) => {
+        selectedFields = Object.keys(fields);
+        return { from: () => ({ where: async () => reloadedRows }) };
+      },
+    },
+  },
+});
+
+let resolveAndMigrateUserDelegateKey:
+  typeof import("../db/queries").resolveAndMigrateUserDelegateKey;
+before(async () => {
+  ({ resolveAndMigrateUserDelegateKey } = await import("../db/queries"));
+});
 
 test("encrypts into a v1.<nonce>.<ct> envelope and round-trips", () => {
   const envelope = encryptDelegatePrivateKey(SAMPLE_KEY, SECRET_A);
@@ -126,90 +171,69 @@ test("queries.ts, session.ts, and enoki/route.ts wire encryptDelegatePrivateKey 
   );
 });
 
-test("extracted helper probe: migration CAS propagates the full rotated credential tuple to getSession and returning Enoki callers", async () => {
+test("migration losing its CAS reloads the complete rotated credential tuple", async () => {
   const legacyPlaintext = "a".repeat(64);
   const rotatedKey = "b".repeat(64);
   const rotatedEnvelope = encryptDelegatePrivateKey(rotatedKey, SECRET_A);
 
-  let dbRow = {
+  const targetUser = {
     id: "user-1",
     publicKey: "pk-1",
     accountId: "acct-1",
     delegatePrivateKey: legacyPlaintext,
   };
 
-  // Helper probe simulating resolveAndMigrateUserDelegateKey atomic CAS + full tuple reload:
-  async function probeResolveAndMigrate(userParam: {
-    id: string;
-    delegatePrivateKey: string | null;
-    publicKey?: string | null;
-    accountId?: string | null;
-  }) {
-    if (!userParam.delegatePrivateKey) {
-      throw new DelegateKeyCryptoError("Encrypted delegate key envelope is empty");
-    }
-    const originalPlaintext = userParam.delegatePrivateKey;
-    const resolved = openOrMigrateDelegatePrivateKey(originalPlaintext, SECRET_A);
-    if (!resolved.migrated) return resolved.plaintextKey;
-
-    // Simulate concurrent rotation updating the row before our CAS update lands
-    // (e.g. updateEnokiUserCredentials replaces delegatePrivateKey, publicKey, and accountId)
-    dbRow = {
-      ...dbRow,
-      publicKey: "pk-rotated",
-      accountId: "acct-rotated",
-      delegatePrivateKey: rotatedEnvelope,
-    };
-
-    // Atomic CAS update: only updates if delegatePrivateKey == originalPlaintext
-    let updateCount = 0;
-    if (dbRow.id === userParam.id && dbRow.delegatePrivateKey === originalPlaintext) {
-      dbRow.delegatePrivateKey = resolved.encryptedEnvelope;
-      updateCount = 1;
-    }
-
-    if (updateCount > 0) {
-      userParam.delegatePrivateKey = resolved.encryptedEnvelope;
-      return resolved.plaintextKey;
-    }
-
-    // Lost race: reload complete credential tuple (delegatePrivateKey, publicKey, accountId)
-    const reloaded = {
-      delegatePrivateKey: dbRow.delegatePrivateKey,
-      publicKey: dbRow.publicKey,
-      accountId: dbRow.accountId,
-    };
-    userParam.delegatePrivateKey = reloaded.delegatePrivateKey;
-    userParam.publicKey = reloaded.publicKey;
-    userParam.accountId = reloaded.accountId;
-    return openOrMigrateDelegatePrivateKey(reloaded.delegatePrivateKey, SECRET_A).plaintextKey;
-  }
-
-  // Probe getSession caller: reads initial row, runs resolveAndMigrate, then returns session.user tuple
-  async function probeGetSession() {
-    const user = { ...dbRow };
-    const privateKey = await probeResolveAndMigrate(user);
-    return {
-      user: {
-        id: user.id,
-        publicKey: user.publicKey,
-        privateKey,
-        accountId: user.accountId,
-      },
-    };
-  }
-
-  const session = await probeGetSession();
-
-  // Caller tuple must contain the complete rotated credential tuple (never new key + old account/publicKey)
-  assert.deepEqual(session.user, {
-    id: "user-1",
+  reloadedRows = [{
+    delegatePrivateKey: rotatedEnvelope,
     publicKey: "pk-rotated",
-    privateKey: rotatedKey,
     accountId: "acct-rotated",
-  });
-  // Stored row must retain the rotated credentials (not overwritten by old migrated envelope)
-  assert.equal(dbRow.delegatePrivateKey, rotatedEnvelope);
-  assert.equal(dbRow.publicKey, "pk-rotated");
-  assert.equal(dbRow.accountId, "acct-rotated");
+  }];
+
+  const privateKey = await resolveAndMigrateUserDelegateKey(targetUser, SECRET_A);
+
+  assert.equal(privateKey, rotatedKey);
+  assert.deepEqual(targetUser, { id: "user-1", ...reloadedRows[0] });
+  assert.deepEqual(selectedFields.sort(), ["accountId", "delegatePrivateKey", "publicKey"]);
+  assert.deepEqual(new PgDialect().sqlToQuery(updatePredicate).params, [
+    targetUser.id,
+    legacyPlaintext,
+  ]);
+});
+
+test("successful migration encrypts the existing plaintext key without changing account metadata", async () => {
+  const targetUser = {
+    id: "user-1",
+    delegatePrivateKey: SAMPLE_KEY,
+    publicKey: "pk-existing",
+    accountId: "acct-existing",
+  };
+  updateRows = [{ delegatePrivateKey: "updated" }];
+
+  assert.equal(await resolveAndMigrateUserDelegateKey(targetUser, SECRET_A), SAMPLE_KEY);
+  assert.equal(decryptDelegatePrivateKey(writtenEnvelope, SECRET_A), SAMPLE_KEY);
+  assert.equal(targetUser.delegatePrivateKey, writtenEnvelope);
+  assert.equal(targetUser.publicKey, "pk-existing");
+  assert.equal(targetUser.accountId, "acct-existing");
+  assert.deepEqual(selectedFields, []);
+});
+
+test("migration fails closed when a concurrent rotation leaves an incomplete credential tuple", async () => {
+  const targetUser = {
+    id: "user-1",
+    delegatePrivateKey: SAMPLE_KEY,
+    publicKey: "pk-existing",
+    accountId: "acct-existing",
+  };
+  reloadedRows = [{
+    delegatePrivateKey: encryptDelegatePrivateKey("b".repeat(64), SECRET_A),
+    publicKey: "pk-rotated",
+    accountId: null,
+  }];
+
+  await assert.rejects(
+    resolveAndMigrateUserDelegateKey(targetUser, SECRET_A),
+    DelegateKeyCryptoError
+  );
+  assert.equal(targetUser.delegatePrivateKey, SAMPLE_KEY);
+  assert.equal(targetUser.accountId, "acct-existing");
 });

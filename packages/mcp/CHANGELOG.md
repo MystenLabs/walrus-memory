@@ -4,7 +4,16 @@
 
 ### Added
 
+- Add `memwal_namespaces` with paginated account inventory and namespace suggestions for empty recall or restore results.
+- Publish SEP-2127 MCP server discovery metadata at `/.well-known/mcp/server-card.json`, `/mcp/server-card`, and `/api/mcp/server-card` for compatible clients.
+
 - Productize the one-time proactive-memory setup flow for Claude Desktop, Claude web, and other chat clients without plugin lifecycle hooks. Exposes the `memwal_enable_proactive` MCP prompt in both bridge and auth-required modes to supply standard consent instructions.
+
+### Fixed
+
+- Preserve exact legacy namespace names, including surrounding whitespace, when explaining empty recall results.
+- Limit optional namespace diagnostics to one second so unavailable metadata does not delay an otherwise completed recall or restore.
+- Restore focused proactive recall guidance in the opt-in setup instruction while keeping recalled entries explicitly untrusted.
 
 ## 0.1.0
 

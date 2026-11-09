@@ -269,7 +269,7 @@ export interface RecallOptions {
      * download or decrypt (`results.length === 0`).
      *
      * Defaults to `"ignore"`, which returns the degraded `RecallResult`
-     * (`results: []`, `degraded: true`, `dropped_count`, pre-drop `total`) so
+     * (`results: []`, `degraded: true`, `dropped_count`, `total: 0`) so
      * callers can inspect the failure without catching an exception. Set
      * `"throw"` to throw `MemWalRecallAllDroppedError` instead.
      */

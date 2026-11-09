@@ -2130,10 +2130,9 @@ impl RecallSort {
 #[derive(Debug, Serialize)]
 pub struct RecallResponse {
     pub results: Vec<RecallResult>,
-    /// Pre-drop vector-search match count selected for hydration. Equals
-    /// `results.len() + dropped_count` so an all-dropped recall (`results: []`,
-    /// `total: N`, `dropped_count: N`, `degraded: true`) is distinguishable
-    /// from an empty namespace (`results: []`, `total: 0`).
+    /// Number of usable results returned, equal to `results.len()`.
+    /// An all-dropped recall has `total: 0`, `dropped_count > 0`, and
+    /// `degraded: true`; use those fields to distinguish it from no matches.
     pub total: usize,
     /// Count of matches whose blob download / SEAL decrypt / UTF-8 decode
     /// failed and were silently omitted from `results`. Zero on the happy path.
