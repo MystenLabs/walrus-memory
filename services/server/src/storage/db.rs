@@ -352,7 +352,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///
@@ -2800,8 +2800,9 @@ async fn release_orphaned_concurrent_index_lock(
                 a.state,
                 left(a.query, 120),
                 a.state_change,
-                (a.application_name = 'pgbouncer'
-                 OR a.state_change <= NOW() - ($3::bigint * INTERVAL '1 millisecond'))
+                ((a.application_name = 'pgbouncer' AND a.state = 'idle')
+                 OR (a.state IN ('idle', 'idle in transaction')
+                     AND a.state_change <= NOW() - ($3::bigint * INTERVAL '1 millisecond')))
          FROM pg_locks l
          JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
          WHERE l.locktype = 'advisory'
@@ -2830,16 +2831,19 @@ async fn release_orphaned_concurrent_index_lock(
 
     let mut terminated = 0usize;
     for (pid, application_name, state, query, state_change, eligible_by_age_or_pooler) in holders {
-        tracing::warn!(
+        tracing::debug!(
             pid,
             application_name = application_name.as_deref().unwrap_or(""),
             state = state.as_deref().unwrap_or(""),
             query = query.as_deref().unwrap_or(""),
             "vector db: concurrent-index advisory lock is held by another backend"
         );
-        if !matches!(state.as_deref(), Some("idle") | Some("idle in transaction"))
-            || !eligible_by_age_or_pooler
-        {
+        let is_valid_state = match state.as_deref() {
+            Some("idle") => true,
+            Some("idle in transaction") => application_name.as_deref() != Some("pgbouncer"),
+            _ => false,
+        };
+        if !is_valid_state || !eligible_by_age_or_pooler {
             continue;
         }
         let Some(observed_state_change) = state_change else {
@@ -2857,10 +2861,10 @@ async fn release_orphaned_concurrent_index_lock(
                AND l.objid::bigint = $2
                AND a.pid = $3
                AND a.pid <> pg_backend_pid()
-               AND a.state IN ('idle', 'idle in transaction')
                AND a.state_change = $4
-               AND (a.application_name = 'pgbouncer'
-                    OR a.state_change <= NOW() - ($5::bigint * INTERVAL '1 millisecond'))
+               AND ((a.application_name = 'pgbouncer' AND a.state = 'idle')
+                    OR (a.state IN ('idle', 'idle in transaction')
+                        AND a.state_change <= NOW() - ($5::bigint * INTERVAL '1 millisecond')))
                AND NOT EXISTS (
                    SELECT 1 FROM pg_stat_progress_create_index p WHERE p.pid = a.pid
                )",
@@ -6743,6 +6747,55 @@ mod stale_sweep_tests {
         assert!(
             super::unlock_concurrent_index_lock(&mut migrator).await,
             "pg_advisory_unlock on the owning session must report true"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_lock_does_not_evict_fresh_or_active_holder() {
+        let db = test_db().await;
+        let _setup_guard = super::DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        let mut holder = db.pool.acquire().await.expect("acquire holder connection");
+        let mut migrator = db
+            .pool
+            .acquire()
+            .await
+            .expect("acquire migrator connection");
+
+        assert!(
+            super::try_acquire_concurrent_index_lock(&mut holder)
+                .await
+                .expect("holder acquires concurrent-index lock"),
+            "holder must acquire concurrent-index lock"
+        );
+
+        // Holder does not have application_name = 'pgbouncer' and was acquired just now (idle < 5s).
+        // release_orphaned_concurrent_index_lock must NOT terminate it.
+        let terminated = super::release_orphaned_concurrent_index_lock(
+            &mut migrator,
+            super::CONCURRENT_INDEX_ORPHAN_IDLE,
+        )
+        .await;
+        assert_eq!(
+            terminated, 0,
+            "fresh non-pgbouncer holder must not be terminated"
+        );
+
+        // Migrator still cannot acquire the lock because holder is still alive.
+        assert!(
+            !super::try_acquire_concurrent_index_lock(&mut migrator)
+                .await
+                .expect("migrator try_acquire"),
+            "migrator must not acquire lock while non-orphaned holder is alive"
+        );
+
+        // Clean up: holder releases lock
+        assert!(
+            super::unlock_concurrent_index_lock(&mut holder).await,
+            "holder unlocks concurrent-index lock"
         );
     }
 }
