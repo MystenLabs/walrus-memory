@@ -530,12 +530,46 @@ export async function runPreCompactSave(input: PreCompactInput): Promise<PreComp
         return { saved: false, reason: "nothing_to_save" };
     }
 
-    // Read newly appended bytes
+    // Read newly appended bytes (and recover preceding user-turn privacy state when resuming from a watermark)
     const bytesToRead = fileSize - startOffset;
     let rawChunk = "";
+    let initialUserTurnOptedOut = false;
+    let initialSuppressAssistantEcho = false;
     try {
         const fd = openSync(input.transcript_path, constants.O_RDONLY | O_NOFOLLOW);
         try {
+            if (startOffset > 0) {
+                const maxLookback = 262_144;
+                const prefixLen = Math.min(startOffset, maxLookback);
+                const prefixStart = startOffset - prefixLen;
+                const prefixBuf = Buffer.alloc(prefixLen);
+                let prefixRead = 0;
+                while (prefixRead < prefixLen) {
+                    const r = readSync(
+                        fd,
+                        prefixBuf,
+                        prefixRead,
+                        prefixLen - prefixRead,
+                        prefixStart + prefixRead
+                    );
+                    if (r === 0) break;
+                    prefixRead += r;
+                }
+                let prefixStr = prefixBuf.toString("utf8", 0, prefixRead);
+                if (prefixStart > 0) {
+                    const firstNl = prefixStr.indexOf("\n");
+                    prefixStr = firstNl === -1 ? "" : prefixStr.slice(firstNl + 1);
+                }
+                for (const prevLine of prefixStr.split("\n")) {
+                    const prevTurn = parseTranscriptLine(prevLine);
+                    if (prevTurn && prevTurn.role === "user") {
+                        initialUserTurnOptedOut = isOptOutTurn(prevTurn.text);
+                        initialSuppressAssistantEcho =
+                            initialUserTurnOptedOut || containsSensitiveContent(prevTurn.text);
+                    }
+                }
+            }
+
             const buf = Buffer.alloc(bytesToRead);
             let totalRead = 0;
             while (totalRead < bytesToRead) {
@@ -554,8 +588,8 @@ export async function runPreCompactSave(input: PreCompactInput): Promise<PreComp
     // 5. Parse turns and filter
     const lines = rawChunk.split("\n");
     const formattedTurns: string[] = [];
-    let userTurnOptedOut = false;
-    let suppressAssistantEcho = false;
+    let userTurnOptedOut = initialUserTurnOptedOut;
+    let suppressAssistantEcho = initialSuppressAssistantEcho;
 
     for (const line of lines) {
         const turn = parseTranscriptLine(line);

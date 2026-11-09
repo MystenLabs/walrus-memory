@@ -1143,3 +1143,108 @@ test("credential-bearing turns and private-tagged turns suppress trailing assist
         rmSync(tempDir, { recursive: true, force: true });
     }
 });
+
+test("privacy and opt-out suppression persists across incremental watermark saves", async () => {
+    const tempDir = freshTempDir();
+    const mock = await startWorkerMockRelayer({ statusCode: 200 });
+
+    try {
+        writeSettings(tempDir, { autoSave: true });
+        await writeTestCreds(tempDir, { relayerUrl: mock.url });
+
+        const transcriptPath = join(tempDir, "incremental-privacy.jsonl");
+        const firstBatch = [
+            JSON.stringify({
+                role: "user",
+                content: "We standardize on PostgreSQL 16 for our primary relational database cluster.",
+            }),
+            JSON.stringify({
+                role: "user",
+                content: "<private>My medical condition is synthetic-condition.</private>",
+            }),
+        ];
+        writeFileSync(transcriptPath, firstBatch.join("\n") + "\n");
+
+        const firstResult = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-incremental-privacy",
+                transcript_path: transcriptPath,
+            }
+        );
+        assert.equal(firstResult.status, 0);
+        await waitForRequests(mock, 1);
+        assert.equal(mock.requests.length, 1);
+        const firstPayload = JSON.parse(mock.requests[0].body).text;
+        assert.ok(firstPayload.includes("We standardize on PostgreSQL 16"));
+        assert.ok(!firstPayload.includes("synthetic-condition"));
+
+        // Second save: append only an assistant paraphrase of the private turn, plus a later opt-out user turn
+        const secondBatch = [
+            ...firstBatch,
+            JSON.stringify({
+                role: "assistant",
+                content: "I have noted synthetic-condition when scheduling your upcoming appointments.",
+            }),
+            JSON.stringify({
+                role: "user",
+                content: "We deploy all worker services on Railway using multi-stage Dockerfiles.",
+            }),
+            JSON.stringify({
+                role: "user",
+                content: "Please do not save this: our internal merger codename is Project Borealis.",
+            }),
+        ];
+        writeFileSync(transcriptPath, secondBatch.join("\n") + "\n");
+
+        const secondResult = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-incremental-privacy",
+                transcript_path: transcriptPath,
+            }
+        );
+        assert.equal(secondResult.status, 0);
+        await waitForRequests(mock, 2);
+        assert.equal(mock.requests.length, 2);
+        const secondPayload = JSON.parse(mock.requests[1].body).text;
+        assert.ok(secondPayload.includes("We deploy all worker services on Railway"));
+        assert.ok(!secondPayload.includes("synthetic-condition"));
+        assert.ok(!secondPayload.includes("Project Borealis"));
+
+        // Third save: append only an assistant echo of the opted-out turn
+        const thirdBatch = [
+            ...secondBatch,
+            JSON.stringify({
+                role: "assistant",
+                content: "Understood, I will keep Project Borealis confidential and off the record.",
+            }),
+        ];
+        writeFileSync(transcriptPath, thirdBatch.join("\n") + "\n");
+
+        const thirdResult = runPreCompactHook(
+            {
+                MEMWAL_CREDS_DIR: tempDir,
+                MEMWAL_SERVER_URL: mock.url,
+                TMPDIR: tempDir,
+            },
+            {
+                session_id: "test-session-incremental-privacy",
+                transcript_path: transcriptPath,
+            }
+        );
+        assert.equal(thirdResult.status, 0);
+        assert.equal(mock.requests.length, 2, "assistant echo of prior-chunk opt-out turn must not trigger an upload");
+    } finally {
+        await mock.close();
+        rmSync(tempDir, { recursive: true, force: true });
+    }
+});
