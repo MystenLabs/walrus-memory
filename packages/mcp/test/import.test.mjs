@@ -928,3 +928,43 @@ test("screens ancestor-heading labelled private keys and preserves public conten
     assert.equal(tokenSkip.length, 1);
     assert.equal(tokenSkip[0].section, "Staging deployment");
 });
+
+test("waitForRememberJobs bounds each status request by the remaining wait budget and settles pending on timeout", async () => {
+    // Start a hanging HTTP mock server that accepts the connection but never answers /api/remember/bulk/status
+    const server = createServer((req, res) => {
+        if (req.url === "/api/remember/bulk") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ job_ids: ["job-hang-1", "job-hang-2"] }));
+            return;
+        }
+        // Do not respond for /api/remember/bulk/status to simulate a stalled relayer
+    });
+
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    const serverUrl = `http://127.0.0.1:${port}`;
+
+    try {
+        const client = createSignedRelayerClient({
+            key: "11".repeat(32),
+            accountId: `0x${"33".repeat(32)}`,
+            serverUrl,
+        });
+
+        const start = Date.now();
+        const outcome = await client.waitForRememberJobs(
+            ["job-hang-1", "job-hang-2"],
+            ["default", "default"],
+            { timeoutMs: 50, pollIntervalMs: 10 },
+        );
+        const elapsed = Date.now() - start;
+
+        // Must complete promptly around ~50ms (not hang indefinitely)
+        assert.ok(elapsed < 1000, `Expected prompt timeout under 1000ms, took ${elapsed}ms`);
+        assert.equal(outcome.results.length, 2);
+        assert.equal(outcome.results[0].status, "pending");
+        assert.equal(outcome.results[1].status, "pending");
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+});

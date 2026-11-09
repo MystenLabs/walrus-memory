@@ -16,13 +16,16 @@ import { bytesToHex, hexToBytes, signMessage } from "./crypto.js";
 import { log, note } from "./logger.js";
 
 export interface ImportClient {
-    rememberBulk(items: Array<{ text: string; namespace: string }>): Promise<{
+    rememberBulk(
+        items: Array<{ text: string; namespace: string }>,
+        options?: { timeoutMs?: number; signal?: AbortSignal },
+    ): Promise<{
         job_ids?: string[];
     }>;
     waitForRememberJobs?(
         jobIds: string[],
         namespaces: string[],
-        options?: { timeoutMs?: number; pollIntervalMs?: number },
+        options?: { timeoutMs?: number; pollIntervalMs?: number; signal?: AbortSignal },
     ): Promise<{
         results: Array<{ id: string; status: string; namespace?: string; error?: string }>;
         total?: number;
@@ -804,7 +807,11 @@ export function createSignedRelayerClient(params: {
         return pubKeyHexPromise;
     }
 
-    async function signedPost<T>(path: string, payload: unknown): Promise<T> {
+    async function signedPost<T>(
+        path: string,
+        payload: unknown,
+        options: { timeoutMs?: number; signal?: AbortSignal } = {},
+    ): Promise<T> {
         const bodyStr = JSON.stringify(payload);
         const bodyHash = createHash("sha256").update(bodyStr, "utf8").digest("hex");
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -812,6 +819,14 @@ export function createSignedRelayerClient(params: {
         const canonical = `${timestamp}.POST.${path}.${bodyHash}.${nonce}.${params.accountId}`;
         const signature = await signMessage(params.key, canonical);
         const publicKeyHex = await getPublicKeyHex();
+
+        const signals: AbortSignal[] = [];
+        if (options.signal) signals.push(options.signal);
+        if (typeof options.timeoutMs === "number" && options.timeoutMs > 0) {
+            signals.push(AbortSignal.timeout(options.timeoutMs));
+        }
+        const effectiveSignal =
+            signals.length === 1 ? signals[0] : signals.length > 1 ? AbortSignal.any(signals) : undefined;
 
         const resp = await fetch(`${baseUrl}${path}`, {
             method: "POST",
@@ -824,6 +839,7 @@ export function createSignedRelayerClient(params: {
                 "x-account-id": params.accountId,
             },
             body: bodyStr,
+            signal: effectiveSignal,
         });
 
         const text = await resp.text();
@@ -834,8 +850,14 @@ export function createSignedRelayerClient(params: {
     }
 
     return {
-        async rememberBulk(items) {
-            return signedPost<{ job_ids?: string[] }>("/api/remember/bulk", { items });
+        async rememberBulk(items, options = {}) {
+            // Keep acceptance deadlines separate so ambiguous writes are not blindly retried
+            const timeoutMs = options.timeoutMs ?? 30_000;
+            return signedPost<{ job_ids?: string[] }>(
+                "/api/remember/bulk",
+                { items },
+                { timeoutMs, signal: options.signal },
+            );
         },
         async waitForRememberJobs(jobIds, namespaces, options = {}) {
             const timeoutMs = options.timeoutMs ?? 60_000;
@@ -847,23 +869,36 @@ export function createSignedRelayerClient(params: {
             }
 
             while (Date.now() < deadline) {
+                const remainingBudget = deadline - Date.now();
+                if (remainingBudget <= 0) break;
+
                 const pendingIds = jobIds.filter((id) => {
                     const st = latest.get(id)?.status;
                     return st !== "done" && st !== "failed";
                 });
                 if (pendingIds.length === 0) break;
 
-                const statusResp = await signedPost<{
-                    results?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
-                    jobs?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
-                }>("/api/remember/bulk/status", { job_ids: pendingIds });
+                try {
+                    const statusResp = await signedPost<{
+                        results?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
+                        jobs?: Array<{ job_id?: string; id?: string; status: string; error?: string }>;
+                    }>(
+                        "/api/remember/bulk/status",
+                        { job_ids: pendingIds },
+                        { timeoutMs: remainingBudget, signal: options.signal },
+                    );
 
-                const rawList = statusResp.results ?? statusResp.jobs ?? [];
-                for (const job of rawList) {
-                    const id = job.job_id ?? job.id;
-                    if (id && latest.has(id)) {
-                        const prev = latest.get(id)!;
-                        latest.set(id, { ...prev, status: job.status, error: job.error });
+                    const rawList = statusResp.results ?? statusResp.jobs ?? [];
+                    for (const job of rawList) {
+                        const id = job.job_id ?? job.id;
+                        if (id && latest.has(id)) {
+                            const prev = latest.get(id)!;
+                            latest.set(id, { ...prev, status: job.status, error: job.error });
+                        }
+                    }
+                } catch (err: any) {
+                    if (Date.now() >= deadline || err?.name === "TimeoutError" || err?.name === "AbortError") {
+                        break;
                     }
                 }
 
@@ -872,7 +907,10 @@ export function createSignedRelayerClient(params: {
                     return st !== "done" && st !== "failed";
                 });
                 if (!stillPending) break;
-                await new Promise((r) => setTimeout(r, pollIntervalMs));
+
+                const nextSleep = Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()));
+                if (nextSleep <= 0) break;
+                await new Promise((r) => setTimeout(r, nextSleep));
             }
 
             return {
