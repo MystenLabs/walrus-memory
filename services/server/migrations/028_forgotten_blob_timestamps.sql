@@ -7,8 +7,8 @@
 -- Retention and Deletion Lifecycle:
 -- 1. Retention period: Records persist indefinitely across multiple forget/restore
 --    cycles and tombstone cleanups, ensuring temporal recency ordering remains true.
--- 2. Account wipe / purge: Completely deleted upon account cleanup or unblock requests
---    via DELETE FROM forgotten_blob_timestamps WHERE owner = $1.
+-- 2. Account wipe / cleanup: Retained indefinitely in production; can be pruned
+--    manually by operators via DELETE FROM forgotten_blob_timestamps WHERE owner = $1.
 CREATE TABLE IF NOT EXISTS forgotten_blob_timestamps (
     owner TEXT NOT NULL,
     namespace TEXT NOT NULL,
