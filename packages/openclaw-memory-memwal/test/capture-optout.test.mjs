@@ -55,6 +55,8 @@ test("shouldCapture rejects turns containing inline secrets and credentials", ()
     "-----BEGIN ED25519 PRIVATE KEY----- AAAAC3NzaC1lZDI1NTE5",
     "My delegate_key = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "My delegate private key is 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "# Delegate private key\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "My delegate private key is\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     'Config uses api_key = "sk-1234567890abcdefghijklmnop" in local tests',
     "Staging test account uses password: hunter2 for integration runs",
     'Service webhook uses secret="my_super_secret_123" for local verification',
@@ -209,6 +211,31 @@ test("registerCaptureHook suppresses both opted-out user turn and trailing assis
     analyzedPayloads.length,
     1,
     "opt-out phrases like 'don't save any of this' must suppress assistant echoes from reaching analyze()",
+  );
+
+  // 5. Labelled private keys across Markdown line breaks suppress both user turn and assistant echo.
+  await handler(
+    {
+      success: true,
+      messages: [
+        {
+          id: "u5",
+          role: "user",
+          content: "# Delegate private key\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        },
+        {
+          id: "a5",
+          role: "assistant",
+          content: "Acknowledged your delegate private key configuration.",
+        },
+      ],
+    },
+    { sessionKey: "agent:main:test-secret-markdown-turn" },
+  );
+  assert.equal(
+    analyzedPayloads.length,
+    1,
+    "labelled private keys across Markdown line breaks must suppress user turn and assistant echoes from reaching analyze()",
   );
 
   await handler(

@@ -110,9 +110,9 @@ const SECRET_PATTERNS = [
   /(?:\b|(?<=[a-z0-9_-]))(?:session[_-]?cookies?|session[_-]?ids?|connect\.sid)\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false)\b)[^\s'",;}{)\]]{6,})/i,
   /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
   /\btoken["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{8,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{12,})/i,
-  /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|api[\s_-]*key|seed)\b[^.\n]{0,32}\b(?:0x)?[0-9a-fA-F]{64}\b/i,
-  /\b(?:0x)?[0-9a-fA-F]{64}\b[^A-Za-z0-9\n]{0,4}(?:is|was)?[^A-Za-z0-9\n]{0,4}(?:my|the|our)?[^A-Za-z0-9\n]{0,4}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
-  /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9\n]{0,4}(?:is|are)?[^A-Za-z0-9\n]{0,4}(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}\b/i,
+  /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|api[\s_-]*key|seed)\b[^.]{0,48}\b(?:0x)?[0-9a-fA-F]{64}\b/i,
+  /\b(?:0x)?[0-9a-fA-F]{64}\b[^A-Za-z0-9]{0,8}(?:is|was)?[^A-Za-z0-9]{0,8}(?:my|the|our)?[^A-Za-z0-9]{0,8}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
+  /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9]{0,8}(?:is|are)?[^A-Za-z0-9]{0,8}(?:[a-z]{3,8}[ \t\r\n]+){11,23}[a-z]{3,8}\b/i,
 ];
 
 /** Memory trigger patterns — always capture if matched. */
