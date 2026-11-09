@@ -22,7 +22,7 @@ import {
 } from "./auth.js";
 import { recoverPendingLogin, formatStrandedLoginNotice } from "./recovery.js";
 import { runAuthRequiredServer } from "./auth-required.js";
-import { notePendingLoginSuccess, runBridge } from "./bridge.js";
+import { normalizeNamespaceValue, notePendingLoginSuccess, runBridge } from "./bridge.js";
 import { loginFlow } from "./login.js";
 import {
     autoSaveStatus,
@@ -437,12 +437,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // On-chain delegate-key display name; users can rename it in the dashboard.
     const label = args.label ?? process.env.MEMWAL_CLIENT_LABEL ?? "MCP Client";
     // Default memory namespace applied to memory tool calls when the agent
-    // omits one. CLI > env, then UNSET — we deliberately do NOT hardcode a
-    // fallback here: if neither is set, the namespace argument is left off
+    // omits one. CLI > env, then UNSET. Trims whitespace and rejects control
+    // characters. If neither is set, the namespace argument is left off
     // the forwarded call and the relayer applies its own "default" namespace.
-    // An explicit per-call `namespace` from the agent always wins (see
+    // An explicit per-call namespace from the agent always wins (see
     // applyDefaultNamespace in bridge.ts).
-    const namespace = args.namespace ?? process.env.MEMWAL_NAMESPACE;
+    const rawNamespace = args.namespace ?? process.env.MEMWAL_NAMESPACE;
+    const namespace = normalizeNamespaceValue(rawNamespace);
 
     // Explicit `login` is a human command. When stdin is not a TTY the
     // process was spawned by a script or MCP client — booting the
@@ -838,5 +839,5 @@ export {
 } from "./auto-save.js";
 export { askAutoSaveConsent, interpretConsentAnswer, CONSENT_PROMPT } from "./consent.js";
 export { loginFlow } from "./login.js";
-export { runBridge } from "./bridge.js";
+export { runBridge, normalizeNamespaceValue, normalizeToolNamespace, applyDefaultNamespace } from "./bridge.js";
 export type { MemWalCredentials, CredsResolution, ProjectCredsDecision } from "./auth.js";

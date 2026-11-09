@@ -50,3 +50,5 @@ export {
     registerNamespacesTool,
     registerHealthTool,
 };
+
+export { normalizeMcpNamespace } from "./util.js";

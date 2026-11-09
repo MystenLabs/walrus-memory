@@ -7,7 +7,7 @@ import {
     tryListNamespaces,
     type NamespaceEntry,
 } from "./namespaces.js";
-import { wrapTool } from "./util.js";
+import { wrapTool, normalizeMcpNamespace } from "./util.js";
 
 const RECALL_INPUT = {
     query: z
@@ -302,9 +302,10 @@ export function registerRecallTool(
             inputSchema: RECALL_INPUT,
         },
         wrapTool<{ query: string; limit: number; namespace?: string; maxDistance?: number }>(session, "memwal_recall", async ({ query, limit, namespace, maxDistance }) => {
+            const cleanNamespace = normalizeMcpNamespace(namespace);
             let result: Awaited<ReturnType<typeof session.memwal.recall>>;
             try {
-                result = await session.memwal.recall(query, limit, namespace);
+                result = await session.memwal.recall(query, limit, cleanNamespace);
             } catch (err) {
                 const allDropped = allDroppedCountFromError(err);
                 if (allDropped !== null) {
