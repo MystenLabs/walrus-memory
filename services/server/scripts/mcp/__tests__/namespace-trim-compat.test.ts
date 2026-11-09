@@ -6,10 +6,18 @@ import type { MemWalSession } from "../auth.js";
 import { createMcpServer } from "../server.js";
 import { normalizeMcpNamespace } from "../tools/index.js";
 
-test("normalizeMcpNamespace trims whitespace and preserves mixed case", () => {
+test("normalizeMcpNamespace trims whitespace by default and preserves outer whitespace when requested", () => {
     assert.equal(normalizeMcpNamespace("  MyTeam_2026  "), "MyTeam_2026");
     assert.equal(normalizeMcpNamespace("MyTeam_2026"), "MyTeam_2026");
     assert.equal(normalizeMcpNamespace("\t ProjectScope \t"), "ProjectScope");
+    assert.equal(
+        normalizeMcpNamespace(" work ", { preserveOuterWhitespace: true }),
+        " work "
+    );
+    assert.equal(
+        normalizeMcpNamespace("   ", { preserveOuterWhitespace: true }),
+        undefined
+    );
 });
 
 test("normalizeMcpNamespace returns undefined for omitted or whitespace-only inputs", () => {
@@ -146,7 +154,7 @@ test("MCP write tools trim namespace and preserve mixed case on remember, rememb
     assert.equal(recorded[2].namespace, "AnalyzeZone_V2");
 });
 
-test("MCP read tools trim namespace and preserve mixed case on recall and restore", async (t) => {
+test("MCP read and restore tools preserve exact existing namespaces including outer whitespace so legacy buckets remain reachable", async (t) => {
     const recorded: RecordedCall[] = [];
     const session = createTestSession(recorded);
     const server = createMcpServer(session);
@@ -161,27 +169,49 @@ test("MCP read tools trim namespace and preserve mixed case on recall and restor
     await server.connect(serverTransport);
     await client.connect(clientTransport);
 
-    const recallRes = await client.callTool({
+    const recallPadded = await client.callTool({
         name: "memwal_recall",
         arguments: {
             query: "database latency decision",
-            namespace: "  RecallScope_2026  ",
+            namespace: " work ",
         },
     });
-    assert.equal(recallRes.isError, undefined);
+    assert.equal(recallPadded.isError, undefined);
     assert.equal(recorded[0].tool, "memwal_recall");
-    assert.equal(recorded[0].namespace, "RecallScope_2026");
+    assert.equal(recorded[0].namespace, " work ");
 
-    const restoreRes = await client.callTool({
+    const recallTrimmed = await client.callTool({
+        name: "memwal_recall",
+        arguments: {
+            query: "database latency decision",
+            namespace: "work",
+        },
+    });
+    assert.equal(recallTrimmed.isError, undefined);
+    assert.equal(recorded[1].tool, "memwal_recall");
+    assert.equal(recorded[1].namespace, "work");
+
+    const restorePadded = await client.callTool({
+        name: "memwal_restore",
+        arguments: {
+            namespace: " work ",
+            limit: 10,
+        },
+    });
+    assert.equal(restorePadded.isError, undefined);
+    assert.equal(recorded[2].tool, "memwal_restore");
+    assert.equal(recorded[2].namespace, " work ");
+
+    const restoreMixed = await client.callTool({
         name: "memwal_restore",
         arguments: {
             namespace: "  RestoreZone_Alpha  ",
             limit: 10,
         },
     });
-    assert.equal(restoreRes.isError, undefined);
-    assert.equal(recorded[1].tool, "memwal_restore");
-    assert.equal(recorded[1].namespace, "RestoreZone_Alpha");
+    assert.equal(restoreMixed.isError, undefined);
+    assert.equal(recorded[3].tool, "memwal_restore");
+    assert.equal(recorded[3].namespace, "  RestoreZone_Alpha  ");
 });
 
 test("memwal_restore rejects whitespace-only namespace as empty", async (t) => {

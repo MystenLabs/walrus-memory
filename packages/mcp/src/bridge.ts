@@ -63,15 +63,23 @@ export interface BridgeConfig {
  * optional; `memwal_restore` requires it (its upstream schema still lists
  * `namespace` as required, so agents normally pass one — but a configured
  * default is filled in if the agent calls it without). */
-const NAMESPACE_TOOLS = new Set([
+const WRITE_NAMESPACE_TOOLS = new Set([
     "memwal_remember",
     "memwal_remember_bulk",
-    "memwal_recall",
     "memwal_analyze",
+    "memwal_forget",
+]);
+
+const READ_NAMESPACE_TOOLS = new Set([
+    "memwal_recall",
     "memwal_restore",
     "memwal_ask",
     "memwal_stats",
-    "memwal_forget",
+]);
+
+const NAMESPACE_TOOLS = new Set([
+    ...WRITE_NAMESPACE_TOOLS,
+    ...READ_NAMESPACE_TOOLS,
 ]);
 
 /**
@@ -81,8 +89,14 @@ const NAMESPACE_TOOLS = new Set([
  * Rejects control characters ([\r\n\0]) with an Error.
  * Rejects namespaces exceeding 255 bytes in UTF-8.
  * Preserves internal casing without lowercasing.
+ * When `preserveOuterWhitespace` is true (used for read/restore paths),
+ * preserves leading/trailing whitespace on non-blank strings so legacy
+ * namespaces like `" work "` remain reachable.
  */
-export function normalizeNamespaceValue(raw: unknown): string | undefined {
+export function normalizeNamespaceValue(
+    raw: unknown,
+    options?: { preserveOuterWhitespace?: boolean },
+): string | undefined {
     if (typeof raw !== "string") {
         return undefined;
     }
@@ -93,16 +107,19 @@ export function normalizeNamespaceValue(raw: unknown): string | undefined {
     if (trimmed.length === 0) {
         return undefined;
     }
-    if (Buffer.byteLength(trimmed, "utf8") > 255) {
+    const candidate = options?.preserveOuterWhitespace ? raw : trimmed;
+    if (Buffer.byteLength(candidate, "utf8") > 255) {
         throw new Error("Namespace cannot exceed 255 bytes");
     }
-    return trimmed;
+    return candidate;
 }
 
 /**
  * Normalize the namespace argument on outbound memory tool calls.
  *
- * Trims surrounding whitespace for explicit namespaces on namespace-aware tools.
+ * Trims surrounding whitespace for explicit namespaces on write tools while
+ * preserving exact non-blank namespaces (including outer whitespace) on read
+ * and restore tools so legacy namespaces remain reachable.
  * If args.namespace was whitespace-only, treats it as empty so the trimmed
  * default namespace applies if configured, or deletes args.namespace if not.
  * Injects the trimmed default namespace if args.namespace was omitted.
@@ -119,6 +136,7 @@ export function normalizeToolNamespace(
         return msg;
     }
     const toolName = params.name;
+    const preserveOuterWhitespace = READ_NAMESPACE_TOOLS.has(toolName);
     const args = (params.arguments ??= {});
     const normalizedDefault = normalizeNamespaceValue(defaultNamespace);
 
@@ -128,7 +146,9 @@ export function normalizeToolNamespace(
             if (toolName === "memwal_restore" && raw.trim().length === 0) {
                 throw new Error("Namespace cannot be empty");
             }
-            const normalized = normalizeNamespaceValue(raw);
+            const normalized = normalizeNamespaceValue(raw, {
+                preserveOuterWhitespace,
+            });
             if (normalized !== undefined) {
                 args.namespace = normalized;
                 return msg;

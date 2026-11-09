@@ -302,7 +302,9 @@ export function registerRecallTool(
             inputSchema: RECALL_INPUT,
         },
         wrapTool<{ query: string; limit: number; namespace?: string; maxDistance?: number }>(session, "memwal_recall", async ({ query, limit, namespace, maxDistance }) => {
-            const cleanNamespace = normalizeMcpNamespace(namespace);
+            const cleanNamespace = normalizeMcpNamespace(namespace, {
+                preserveOuterWhitespace: true,
+            });
             let result: Awaited<ReturnType<typeof session.memwal.recall>>;
             try {
                 result = await session.memwal.recall(query, limit, cleanNamespace);
@@ -326,7 +328,7 @@ export function registerRecallTool(
             const filtered = filterByMaxDistance(result.results, maxDistance);
             if (filtered.length === 0) {
                 const activeNamespace =
-                    namespace?.trim() || session.namespace?.trim() || "default";
+                    cleanNamespace || session.namespace?.trim() || "default";
                 const discovery =
                     result.results.length === 0 && dropped === 0
                         ? await tryListNamespaces(session, activeNamespace, 50)

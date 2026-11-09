@@ -53,19 +53,15 @@ test("normalizeNamespaceValue rejects control characters and excessive length", 
     assert.equal(normalizeNamespaceValue(valid255), valid255);
 });
 
-test("normalizeToolNamespace trims surrounding whitespace across read and write memory tools", () => {
-    const tools = [
-        "memwal_recall",
-        "memwal_ask",
-        "memwal_stats",
-        "memwal_restore",
+test("normalizeToolNamespace trims surrounding whitespace on write tools and preserves exact legacy namespaces on read/restore tools", () => {
+    const writeTools = [
         "memwal_remember",
         "memwal_remember_bulk",
         "memwal_analyze",
         "memwal_forget",
     ];
 
-    for (const tool of tools) {
+    for (const tool of writeTools) {
         const msg = {
             jsonrpc: "2.0",
             id: 10,
@@ -73,7 +69,7 @@ test("normalizeToolNamespace trims surrounding whitespace across read and write 
             params: {
                 name: tool,
                 arguments: {
-                    namespace: "  work-ns  ",
+                    namespace: " work ",
                 },
             },
         };
@@ -81,8 +77,58 @@ test("normalizeToolNamespace trims surrounding whitespace across read and write 
         const updated = normalizeToolNamespace(msg, "default-ns");
         assert.equal(
             updated.params.arguments.namespace,
-            "work-ns",
-            `expected trimmed namespace for ${tool}`
+            "work",
+            `expected trimmed namespace for write tool ${tool}`
+        );
+    }
+
+    const readTools = [
+        "memwal_recall",
+        "memwal_restore",
+        "memwal_ask",
+        "memwal_stats",
+    ];
+
+    for (const tool of readTools) {
+        const paddedMsg = {
+            jsonrpc: "2.0",
+            id: 20,
+            method: "tools/call",
+            params: {
+                name: tool,
+                arguments: {
+                    namespace: " work ",
+                },
+            },
+        };
+        const trimmedMsg = {
+            jsonrpc: "2.0",
+            id: 21,
+            method: "tools/call",
+            params: {
+                name: tool,
+                arguments: {
+                    namespace: "work",
+                },
+            },
+        };
+
+        const updatedPadded = normalizeToolNamespace(paddedMsg, "default-ns");
+        const updatedTrimmed = normalizeToolNamespace(trimmedMsg, "default-ns");
+        assert.equal(
+            updatedPadded.params.arguments.namespace,
+            " work ",
+            `expected exact legacy namespace preserved for read tool ${tool}`
+        );
+        assert.equal(
+            updatedTrimmed.params.arguments.namespace,
+            "work",
+            `expected canonical namespace preserved for read tool ${tool}`
+        );
+        assert.notEqual(
+            updatedPadded.params.arguments.namespace,
+            updatedTrimmed.params.arguments.namespace,
+            `expected " work " and "work" to remain distinct on ${tool}`
         );
     }
 });

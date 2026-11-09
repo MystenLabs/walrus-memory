@@ -95,7 +95,9 @@ export function registerRestoreTool(
             inputSchema: RESTORE_INPUT,
         },
         wrapTool<{ namespace: string; limit: number }>(session, "memwal_restore", async ({ namespace, limit }) => {
-            const cleanNamespace = normalizeMcpNamespace(namespace);
+            const cleanNamespace = normalizeMcpNamespace(namespace, {
+                preserveOuterWhitespace: true,
+            });
             if (!cleanNamespace) {
                 throw new Error("Namespace cannot be empty");
             }
