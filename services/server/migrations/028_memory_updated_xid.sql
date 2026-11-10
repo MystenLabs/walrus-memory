@@ -42,9 +42,11 @@
 --    lacking updated_xid falls back to tuple xmin for MVCC gap detection.
 -- 2. Housekeeping stability:
 --    Housekeeping jobs (such as mark_expiry_scheduled or sync timestamps) update rows without
---    bumping updated_at. The trigger executes the ELSE branch, setting NEW.updated_xid to
---    OLD.updated_xid. This prevents housekeeping updates from advancing updated_xid and avoids
---    spurious must_resync signals to polling clients.
+--    bumping updated_at. The trigger executes the ELSIF branch, setting NEW.updated_xid to
+--    OLD.updated_xid when OLD.updated_xid is already initialized. This prevents housekeeping
+--    updates from advancing updated_xid and avoids spurious must_resync signals to polling clients.
+--    Pre-migration rows where updated_xid is NULL execute the ELSE branch, allowing the batched
+--    backfill to initialize updated_xid with xmin::text::xid8 without getting overridden by NULL.
 
 ALTER TABLE vector_entries ADD COLUMN IF NOT EXISTS updated_xid xid8;
 
@@ -56,8 +58,10 @@ RETURNS trigger AS $$
 BEGIN
     IF NEW.updated_at IS DISTINCT FROM OLD.updated_at THEN
         NEW.updated_xid := pg_current_xact_id();
-    ELSE
+    ELSIF OLD.updated_xid IS NOT NULL THEN
         NEW.updated_xid := OLD.updated_xid;
+    ELSE
+        NEW.updated_xid := COALESCE(NEW.updated_xid, pg_current_xact_id());
     END IF;
     RETURN NEW;
 END;

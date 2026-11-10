@@ -677,11 +677,153 @@ mod tests {
             "the temporary CHECK constraint should have been dropped by migration 019"
         );
 
+        let remaining_null_xids: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vector_entries WHERE updated_xid IS NULL")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining_null_xids, 0,
+            "backfill should have cleared every NULL updated_xid row"
+        );
+
         // Running the whole pipeline a second time (simulating a restart)
         // must still be clean and idempotent.
         VectorDb::new(&database_url)
             .await
             .expect("second run of the full migration pipeline should also complete cleanly");
+    }
+
+    /// Regression test for #1018: batched `backfill_updated_xid` must terminate
+    /// and successfully populate existing rows with `updated_xid = NULL` even
+    /// after `trg_vector_entries_update_xid` is installed.
+    ///
+    /// Previously, the trigger's ELSE branch unconditionally overwrote
+    /// `NEW.updated_xid := OLD.updated_xid` when `updated_at` was unchanged,
+    /// replacing the assigned `xmin::text::xid8` with `NULL` and causing an
+    /// infinite startup backfill loop on nonempty pre-migration tables.
+    #[tokio::test]
+    async fn backfill_updated_xid_terminates_and_migrates_populated_table() {
+        let Some(db) = test_db().await else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+
+        let _guard = VECTOR_SCHEMA_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        let owner = format!("0xtest-backfill-xid-{}", uuid::Uuid::new_v4());
+        let namespace = "test-backfill-ns";
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        // Temporarily relax NOT NULL on updated_xid to simulate pre-migration table state.
+        sqlx::query("ALTER TABLE vector_entries ALTER COLUMN updated_xid DROP NOT NULL")
+            .execute(db.pool())
+            .await
+            .expect("should allow dropping NOT NULL for test setup");
+
+        // Seed pre-migration rows with updated_xid IS NULL.
+        for i in 1..=5 {
+            let id = format!("{owner}-entry-{i}");
+            let blob_id = format!("blob-xid-{i}");
+            sqlx::query(
+                "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, updated_at, updated_xid)
+                 VALUES ($1, $2, $3, $4, $5, 100, clock_timestamp(), NULL)",
+            )
+            .bind(&id)
+            .bind(&owner)
+            .bind(namespace)
+            .bind(&blob_id)
+            .bind(&emb)
+            .execute(db.pool())
+            .await
+            .expect("inserting pre-migration rows with NULL updated_xid should succeed");
+        }
+
+        // Verify that the NULL rows exist.
+        let pre_null_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid IS NULL",
+        )
+        .bind(&owner)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_null_count, 5);
+
+        // Execute batched backfill. This must terminate and not loop indefinitely.
+        super::backfill_updated_xid(db.pool())
+            .await
+            .expect("backfill_updated_xid must succeed and terminate");
+
+        // Verify that all rows now have non-null updated_xid matching xmin::text::xid8.
+        let post_null_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid IS NULL",
+        )
+        .bind(&owner)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            post_null_count, 0,
+            "all pre-migration rows must have updated_xid populated"
+        );
+
+        let matching_xmin_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid = xmin::text::xid8",
+        )
+        .bind(&owner)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            matching_xmin_count, 5,
+            "backfilled updated_xid must match the row tuple xmin"
+        );
+
+        // Verify that migration 029 (enforcing NOT NULL) succeeds cleanly on the populated table.
+        execute_idempotent_migration(
+            db.pool(),
+            migration_sql("029_memory_updated_xid_not_null.sql"),
+        )
+        .await;
+
+        // Verify that housekeeping updates (without updating updated_at) preserve updated_xid.
+        let orig_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE vector_entries SET blob_size_bytes = 200 WHERE owner = $1",
+        )
+        .bind(&owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let preserved_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            orig_xids, preserved_xids,
+            "housekeeping updates where updated_at is unchanged must preserve updated_xid"
+        );
+
+        // Clean up test rows.
+        sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(&owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
     }
 
     async fn oauth_test_db() -> Option<VectorDb> {
