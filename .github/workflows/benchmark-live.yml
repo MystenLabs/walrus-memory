@@ -7,6 +7,14 @@ on:
       - dev
   workflow_dispatch:
     inputs:
+      session_recall:
+        description: Read-only deployed recall with fresh versus reused SEAL sessions
+        type: boolean
+        default: false
+      expected_server_commit:
+        description: Required deployment SHA for session recall (optional)
+        type: string
+        default: ''
       seal_ab:
         description: Read-only live SEAL source A/B instead of deployed HTTP API benchmark (manual only)
         type: boolean
@@ -85,6 +93,8 @@ jobs:
       cancel-in-progress: false
 
     env:
+      SESSION_RECALL: ${{ inputs.session_recall || false }}
+      EXPECTED_SERVER_COMMIT: ${{ inputs.expected_server_commit || '' }}
       SERVER_URL: ${{ github.event.inputs.server_url || vars.BENCH_SERVER_URL }}
       NAMESPACE: ${{ github.event.inputs.namespace || 'benchmark' }}
       REMEMBER_TEXT: ${{ github.event.inputs.remember_text || 'benchmark memory' }}
@@ -136,6 +146,13 @@ jobs:
           fi
 
           mkdir -p benchmark-results
+          if [ "$SESSION_RECALL" = "true" ]; then
+            services/server/scripts/node_modules/.bin/tsx services/server/scripts/bench-recall-session-live.ts \
+              --server-url "$SERVER_URL" --namespace "$NAMESPACE" --query "$QUERY" \
+              --limit "$LIMIT" --runs "$WARM_RUNS" --expected-commit "$EXPECTED_SERVER_COMMIT" \
+              --output benchmark-results/memory-api.json
+            exit 0
+          fi
           services/server/scripts/node_modules/.bin/tsx services/server/scripts/bench-recall-latency.ts \
             --server-url "$SERVER_URL" \
             --delegate-key "$BENCH_DELEGATE_KEY" \
