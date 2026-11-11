@@ -185,9 +185,14 @@ export function createSealSessionPool(
     };
 }
 
+interface InFlightAuthRead {
+    token: symbol;
+    promise: Promise<string>;
+}
+
 const MAX_SHARED_VERSION_CACHE = 1024;
 const sharedInitialVersions = new Map<string, string>();
-const inFlightAuthReads = new WeakMap<object, Map<string, Promise<string>>>();
+const inFlightAuthReads = new WeakMap<object, Map<string, InFlightAuthRead>>();
 
 function canonicalObjectKey(objectId: string): string {
     return /^0x[0-9a-fA-F]{1,64}$/.test(objectId) ? normalizeSuiAddress(objectId) : objectId;
@@ -267,9 +272,10 @@ export async function readSealAuthorizationVersions(
     }
     const flightKey = `${accountId}\0${registryId}`;
     const existing = perClient.get(flightKey);
-    if (existing) return existing;
+    if (existing) return await existing.promise;
 
-    const work = (async () => {
+    const token = Symbol("seal-auth-read");
+    const promise = (async () => {
         if (typeof client.getObjects === "function") {
             const batch = await withReadTimeout(
                 client.getObjects({ objectIds: [accountId, registryId] }),
@@ -292,16 +298,16 @@ export async function readSealAuthorizationVersions(
         return JSON.stringify(objects);
     })();
 
-    perClient.set(flightKey, work);
+    perClient.set(flightKey, { token, promise });
     try {
-        return await work;
+        return await promise;
     } finally {
-        if (perClient.get(flightKey) === work) {
+        if (perClient.get(flightKey)?.token === token) {
             perClient.delete(flightKey);
         }
     }
 }
 
-function inFlightReadsSet(client: object, map: Map<string, Promise<string>>): void {
+function inFlightReadsSet(client: object, map: Map<string, InFlightAuthRead>): void {
     inFlightAuthReads.set(client, map);
 }

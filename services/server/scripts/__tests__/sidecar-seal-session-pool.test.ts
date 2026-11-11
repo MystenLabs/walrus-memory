@@ -198,7 +198,7 @@ test("readSealAuthorizationVersions batches getObjects, caches initialSharedVers
             batchCalls += 1;
             if (batchCalls === 1) await gate;
             return {
-                objects: objectIds.map((id, idx) => ({
+                objects: objectIds.map((_id, idx) => ({
                     version: String(10 + batchCalls + idx),
                     digest: `d-${batchCalls}-${idx}`,
                     owner: { $kind: "Shared", Shared: { initialSharedVersion: String(100 + idx) } },

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { DemType, EncryptedObject, type SealClient, type SessionKey } from "@mysten/seal";
+import { EncryptedObject, type SealClient, type SessionKey } from "@mysten/seal";
 import {
     decryptBonehFranklinItem,
     decryptBonehFranklinSlice,
