@@ -4,11 +4,16 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { EncryptedObject, type SealClient, type SessionKey } from "@mysten/seal";
 import {
+    combineSharesGF256,
     decryptBonehFranklinItem,
     decryptBonehFranklinSlice,
     FallbackShareSubsetError,
 } from "../sidecar/seal-decrypt-crypto.mjs";
-import { decryptBatchSealItems, stopSealDecryptPool } from "../sidecar/seal-decrypt-pool.js";
+import {
+    decryptBatchSealItems,
+    decryptSingleSealItem,
+    stopSealDecryptPool,
+} from "../sidecar/seal-decrypt-pool.js";
 
 const sealEntryUrl = import.meta.resolve("@mysten/seal");
 const sealRequire = createRequire(sealEntryUrl);
@@ -19,6 +24,7 @@ const [
     { encrypt: sealEncryptRaw },
     { decrypt: sealDecryptRaw },
     { AesGcm256, Hmac256Ctr },
+    { split: sealShamirSplit, combine: sealShamirCombine },
 ] = await Promise.all([
     import(pathToFileURL(sealRequire.resolve("@noble/curves/bls12-381.js")).href),
     import(pathToFileURL(sealRequire.resolve("@noble/curves/utils.js")).href),
@@ -26,6 +32,7 @@ const [
     import(new URL("./encrypt.mjs", sealEntryUrl).href),
     import(new URL("./decrypt.mjs", sealEntryUrl).href),
     import(new URL("./dem.mjs", sealEntryUrl).href),
+    import(new URL("./shamir.mjs", sealEntryUrl).href),
 ]);
 
 const PKG = `0x${"ab".repeat(32)}`;
@@ -311,7 +318,7 @@ test("stateless worker_threads decrypt pool decrypts 25 items in parallel, prese
 
     // Expired session during or after worker execution must reject before returning plaintext.
     let checks = 0;
-    await assert.rejects(
+        await assert.rejects(
         () =>
             decryptBatchSealItems({
                 sealClient: mockSealClient,
@@ -326,4 +333,83 @@ test("stateless worker_threads decrypt pool decrypts 25 items in parallel, prese
             }),
         /SEAL session expired/,
     );
+});
+
+test("threshold=1 single-server MPC committee ciphertexts and GF(256) denom=1 subsets match @mysten/seal without fallback", async () => {
+    const committee = makeCommittee([1]);
+    const innerId = "686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595";
+    const { sdkKeys, fastKeys } = committee.deriveUserSecretKeys(innerId);
+
+    const mockSealClient = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [
+                    objId,
+                    { toString: () => toHex(bytes) },
+                ]),
+            );
+        },
+        async decrypt() {
+            throw new Error("fast Boneh-Franklin path must decrypt threshold=1 committee items without fallback");
+        },
+    } as unknown as SealClient;
+
+    for (const dem of ["aes", "hmac"] as const) {
+        const plaintext = Buffer.from(`mainnet-committee-${dem}-payload`);
+        const encryptedData = await committee.encryptPayload(innerId, plaintext, 1, dem);
+        const parsed = EncryptedObject.parse(encryptedData);
+        assert.equal(parsed.threshold, 1);
+
+        const expected = await sealDecryptRaw({
+            encryptedObject: parsed,
+            keys: sdkKeys,
+            checkLEEncoding: false,
+        });
+        const actualDirect = decryptBonehFranklinItem({
+            encryptedData,
+            parsedObject: parsed,
+            derivedKeysByObjectId: fastKeys,
+            serverWeights: committee.serverWeights,
+            totalServerWeight: committee.totalWeight,
+        });
+        assert.deepEqual(Buffer.from(actualDirect), Buffer.from(expected));
+        assert.deepEqual(Buffer.from(actualDirect), plaintext);
+
+        const actualSingle = await decryptSingleSealItem({
+            sealClient: mockSealClient,
+            encryptedData,
+            parsedObject: parsed,
+            fullId: `${PKG}${innerId}`,
+            sessionKey: {} as SessionKey,
+            getTxBytes: async () => Uint8Array.of(1),
+        });
+        assert.deepEqual(Buffer.from(actualSingle), plaintext);
+
+        const actualBatch = await decryptBatchSealItems({
+            sealClient: mockSealClient,
+            parsedItems: [{ index: 0, encryptedData, parsedObject: parsed, fullId: innerId }],
+            uniqueIds: [innerId],
+            sessionKey: {} as SessionKey,
+            getTxBytes: async () => Uint8Array.of(1),
+        });
+        assert.equal(actualBatch.errors.length, 0);
+        assert.deepEqual(Buffer.from(actualBatch.results[0].decryptedData, "base64"), plaintext);
+    }
+
+    // Verify Shamir GF(256) interpolation across threshold = 1, 2, 3, 5 AND k=2 subsets
+    // where x_0 * (x_0 ^ x_1) === 1 in GF(256) (for example x_0 = 2, x_1 = 140 since 2 * 142 = 1 in Rijndael GF(2^8)).
+    const secret = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 13) & 0xff);
+    for (const threshold of [1, 2, 3, 5]) {
+        const allShares = sealShamirSplit(secret, threshold, 10);
+        const subset = allShares.slice(0, threshold);
+        assert.deepEqual(Buffer.from(combineSharesGF256(subset)), Buffer.from(sealShamirCombine(subset)));
+        assert.deepEqual(Buffer.from(combineSharesGF256(subset)), Buffer.from(secret));
+    }
+    const all150 = sealShamirSplit(secret, 2, 150);
+    // Test every index pair (2, idx) up to 150 to hit denom === 1 in GF(2^8) during k=2 interpolation.
+    for (let idx = 1; idx <= 150; idx++) {
+        if (idx === 2) continue;
+        const pair = [all150[1], all150[idx - 1]];
+        assert.deepEqual(Buffer.from(combineSharesGF256(pair)), Buffer.from(secret));
+    }
 });

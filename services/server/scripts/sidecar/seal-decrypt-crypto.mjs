@@ -105,11 +105,11 @@ function gfMul(a, b) {
 
 function gfDiv(a, b) {
     if (b === 0) throw new Error("Division by zero in GF(256)");
-    if (a === 0) return 0;
-    return gfMul(a, GF256_EXP[255 - GF256_LOG[b - 1]]);
+    if (a === 0 || b === 1) return a;
+    return gfMul(a, GF256_EXP[(255 - GF256_LOG[b - 1]) % 255]);
 }
 
-function combineSharesGF256(shares) {
+export function combineSharesGF256(shares) {
     if (shares.length < 1) throw new Error("At least one share is required");
     const shareLength = shares[0].share.length;
     const seenIndices = new Set();
@@ -123,6 +123,9 @@ function combineSharesGF256(shares) {
     }
 
     const k = shares.length;
+    if (k === 1) {
+        return new Uint8Array(shares[0].share);
+    }
     // Precompute Lagrange basis scalars at x = 0 once across all 32 secret bytes:
     // L_j(0) = (prod_{m} x_m) / (x_j * prod_{i != j} (x_i ^ x_j)) in GF(2^8).
     let allXProduct = 1;

@@ -202,15 +202,21 @@ export async function decryptSingleSealItem(params: {
 }): Promise<Uint8Array> {
     const { sealClient, encryptedData, parsedObject, fullId, sessionKey, getTxBytes, assertLive } = params;
     assertLive?.();
+    const itemId = String(parsedObject?.id ?? fullId);
+    const rawThreshold = Number(parsedObject?.threshold) || SEAL_THRESHOLD;
+    const singleThreshold =
+        TOTAL_SERVER_WEIGHT > 0 && rawThreshold > TOTAL_SERVER_WEIGHT
+            ? SEAL_THRESHOLD
+            : Math.max(SEAL_THRESHOLD, rawThreshold);
     const rawById = await extractDerivedKeyBytesById(
         sealClient,
-        [fullId],
+        [itemId],
         sessionKey,
         getTxBytes,
-        Math.max(SEAL_THRESHOLD, Number(parsedObject?.threshold) || SEAL_THRESHOLD),
+        singleThreshold,
     );
     try {
-        const entries = rawById.get(fullId) ?? [];
+        const entries = rawById.get(itemId) ?? [];
         const plain = decryptBonehFranklinItem({
             encryptedData,
             parsedObject,
@@ -255,12 +261,16 @@ export async function decryptBatchSealItems(params: {
     }
 
     assertLive?.();
+    const validThresholds = parsedItems
+        .map((it) => Number(it.parsedObject?.threshold) || 0)
+        .filter((t) => t >= 1 && (TOTAL_SERVER_WEIGHT <= 0 || t <= TOTAL_SERVER_WEIGHT));
+    const batchThreshold = Math.max(SEAL_THRESHOLD, ...validThresholds);
     const rawById = await extractDerivedKeyBytesById(
         sealClient,
         uniqueIds,
         sessionKey,
         getTxBytes,
-        SEAL_THRESHOLD,
+        batchThreshold,
     );
 
     try {
