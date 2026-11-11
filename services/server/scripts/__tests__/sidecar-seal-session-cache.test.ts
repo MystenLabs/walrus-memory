@@ -5,6 +5,9 @@ import type { SealClient } from "@mysten/seal";
 import {
     createSealSessionClientCache,
     delegateKeyCacheKey,
+    forgetSealClientKeys,
+    markSealClientKeys,
+    sealClientHasKeys,
     sessionCacheKeyFromExportedSession,
     SEAL_LEGACY_KEY_CACHE_TTL_MS,
     type SealSessionCacheKey,
@@ -196,6 +199,28 @@ test("a failed client creation is not cached", async () => {
     const recovered = await cache.get(key);
     assert.equal((recovered as unknown as { testClientId: number }).testClientId, 2);
     assert.equal(attempts, 2);
+});
+
+test("the derived-key mirror is per client and can forget an id", () => {
+    const a = fakeClient(1);
+    const b = fakeClient(2);
+
+    assert.equal(sealClientHasKeys(a, ["id-a"]), false);
+    markSealClientKeys(a, ["id-a", "id-b"]);
+    assert.equal(sealClientHasKeys(a, ["id-a"]), true);
+    assert.equal(sealClientHasKeys(a, ["id-a", "id-b"]), true);
+    assert.equal(sealClientHasKeys(a, ["id-a", "missing"]), false);
+    assert.equal(sealClientHasKeys(b, ["id-a"]), false, "another client starts empty");
+
+    forgetSealClientKeys(a, ["id-a"]);
+    assert.equal(sealClientHasKeys(a, ["id-a"]), false);
+    assert.equal(sealClientHasKeys(a, ["id-b"]), true);
+
+    // Marking is idempotent, and forgetting an unknown id is a no-op.
+    markSealClientKeys(a, ["id-b"]);
+    forgetSealClientKeys(a, ["never-seen"]);
+    assert.equal(sealClientHasKeys(a, ["id-b"]), true);
+    assert.equal(sealClientHasKeys(a, []), true, "no ids means no missing keys");
 });
 
 test("reset drops every entry and isolates in-flight creations", async () => {

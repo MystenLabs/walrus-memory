@@ -20,11 +20,13 @@ const { appendSealPersistenceFence, InvalidSealPersistenceFenceError, parseSealP
     "../sidecar/blob-metadata.js"
 );
 const {
+    fetchKeysForCachedClient,
     parseSealDecryptBatchItems,
     registerSealRoutes,
     retryTransientSealDecryptRpc,
     sealEncryptCommitteeFailure,
 } = await import("../sidecar/routes/seal.js");
+const { sealClientHasKeys } = await import("../sidecar/seal-session-cache.js");
 const { SEAL_COMMITTEE_IDENTITY } = await import("../sidecar/config.js");
 
 const ROUTE_POLICY = {
@@ -443,4 +445,103 @@ test("retryTransientSealDecryptRpc retries transient key-server errors once and 
         /NoAccessError/,
     );
     assert.equal(permanentCalls, 1);
+});
+
+// ── cached-key build skip ───────────────────────────────────────────
+
+const CACHE_KEY = { fingerprint: "session-under-test", expiresAt: Date.now() + 60_000 };
+
+function fakeSealClient(): any {
+    return {};
+}
+
+test("a client with every derived key skips the approval-PTB build", async () => {
+    const client = fakeSealClient();
+    let builds = 0;
+    const fetched: Uint8Array[] = [];
+    const buildTx = async () => {
+        builds += 1;
+        return Uint8Array.of(7);
+    };
+    const fetchKeys = async (txBytes: Uint8Array) => {
+        fetched.push(txBytes);
+    };
+
+    const first = await fetchKeysForCachedClient(client, ["id-a"], CACHE_KEY, buildTx, fetchKeys);
+    assert.equal(first.reusedCachedKeys, false);
+    assert.equal(builds, 1);
+    assert.deepEqual([...first.txBytes], [7]);
+    assert.deepEqual([...fetched[0]], [7]);
+
+    const second = await fetchKeysForCachedClient(client, ["id-a"], CACHE_KEY, buildTx, fetchKeys);
+    assert.equal(second.reusedCachedKeys, true, "the second call must use the key mirror");
+    assert.equal(builds, 1, "no second tx.build");
+    assert.equal(second.txBytes.length, 0, "cached path passes the empty sentinel");
+    assert.equal(second.buildMs, 0);
+    assert.equal(fetched[1].length, 0);
+});
+
+test("a stale key mirror falls back to a real approval build once", async () => {
+    const client = fakeSealClient();
+    let builds = 0;
+    const buildTx = async () => {
+        builds += 1;
+        return Uint8Array.of(9);
+    };
+
+    // Warm the mirror with a successful first fetch.
+    await fetchKeysForCachedClient(client, ["id-a"], CACHE_KEY, buildTx, async () => {});
+    assert.equal(builds, 1);
+    assert.equal(sealClientHasKeys(client, ["id-a"]), true);
+
+    let fetches = 0;
+    const fetchKeys = async () => {
+        fetches += 1;
+        if (fetches === 1) throw new Error("cached key vanished");
+    };
+    const result = await fetchKeysForCachedClient(client, ["id-a"], CACHE_KEY, buildTx, fetchKeys);
+
+    assert.equal(result.reusedCachedKeys, false);
+    assert.equal(builds, 2, "the fallback must build a real PTB");
+    assert.equal(fetches, 2);
+    assert.equal(sealClientHasKeys(client, ["id-a"]), true, "success re-marks the id");
+});
+
+test("without a credential cache key every call builds and fetches", async () => {
+    const client = fakeSealClient();
+    let builds = 0;
+    const buildTx = async () => {
+        builds += 1;
+        return Uint8Array.of(1);
+    };
+    const fetchKeys = async () => {};
+
+    const first = await fetchKeysForCachedClient(client, ["id-a"], undefined, buildTx, fetchKeys);
+    const second = await fetchKeysForCachedClient(client, ["id-a"], undefined, buildTx, fetchKeys);
+    assert.equal(first.reusedCachedKeys, false);
+    assert.equal(second.reusedCachedKeys, false);
+    assert.equal(builds, 2);
+});
+
+test("a failed fresh fetch throws and never marks the ids", async () => {
+    const client = fakeSealClient();
+    let builds = 0;
+    await assert.rejects(
+        () =>
+            fetchKeysForCachedClient(
+                client,
+                ["id-a"],
+                CACHE_KEY,
+                async () => {
+                    builds += 1;
+                    return Uint8Array.of(1);
+                },
+                async () => {
+                    throw new Error("key server down");
+                },
+            ),
+        /key server down/,
+    );
+    assert.equal(builds, 1);
+    assert.equal(sealClientHasKeys(client, ["id-a"]), false);
 });

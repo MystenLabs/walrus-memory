@@ -75,6 +75,40 @@ export function delegateKeyCacheKey(privateKey: string, now: number = Date.now()
 }
 
 /**
+ * Which encrypted-object ids a given SealClient already has derived keys for.
+ *
+ * `SealClient`'s key map is private, so this WeakMap mirrors it from the
+ * outside. The client is the key: when a cache entry expires or is evicted,
+ * the old client (and its set) becomes unreachable and is collected. A set is
+ * only updated after `fetchKeys` succeeds, which is the SDK's own signal that
+ * a threshold of key servers returned a key for every requested id.
+ */
+const fetchedKeysByClient = new WeakMap<SealClient, Set<string>>();
+
+/** Record that `client` now holds derived keys for every id. */
+export function markSealClientKeys(client: SealClient, ids: readonly string[]): void {
+    let fetched = fetchedKeysByClient.get(client);
+    if (!fetched) {
+        fetched = new Set();
+        fetchedKeysByClient.set(client, fetched);
+    }
+    for (const id of ids) fetched.add(id);
+}
+
+/** True when `client` has a derived key for every requested id. */
+export function sealClientHasKeys(client: SealClient, ids: readonly string[]): boolean {
+    const fetched = fetchedKeysByClient.get(client);
+    return fetched !== undefined && ids.every((id) => fetched.has(id));
+}
+
+/** Drop ids from the mirror after a cached-key assumption proved wrong. */
+export function forgetSealClientKeys(client: SealClient, ids: readonly string[]): void {
+    const fetched = fetchedKeysByClient.get(client);
+    if (!fetched) return;
+    for (const id of ids) fetched.delete(id);
+}
+
+/**
  * Bounded, credential-scoped cache of SealClients.
  *
  * `SealClient` keeps derived keys in an internal map keyed by
@@ -96,6 +130,7 @@ export function createSealSessionClientCache(
     createClient: () => Promise<SealClient>,
     options: SealSessionClientCacheOptions = {},
 ): { get(key: SealSessionCacheKey): Promise<SealClient>; reset(): void; size(): number } {
+
     const maxEntries = options.maxEntries ?? 256;
     const maxTtlMs = options.maxTtlMs ?? 5 * 60 * 1000;
     const now = options.now ?? Date.now;

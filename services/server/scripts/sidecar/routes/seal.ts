@@ -18,7 +18,7 @@ import express, { type Express, type Response as ExpressResponse } from "express
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { normalizeSuiAddress } from "@mysten/sui/utils";
-import { EncryptedObject, SessionKey } from "@mysten/seal";
+import { EncryptedObject, SessionKey, type SealClient } from "@mysten/seal";
 import {
   JSON_LIMIT_SEAL_DECRYPT,
   JSON_LIMIT_SEAL_DECRYPT_BATCH,
@@ -34,6 +34,9 @@ import { sealCommitteeIdentityMatches, type SealCommitteeIdentity } from "../../
 import { createDecryptSealClient, sealEncryptClient, suiClient } from "../clients.js";
 import {
   delegateKeyCacheKey,
+  forgetSealClientKeys,
+  markSealClientKeys,
+  sealClientHasKeys,
   sessionCacheKeyFromExportedSession,
   type SealSessionCacheKey,
 } from "../seal-session-cache.js";
@@ -195,6 +198,72 @@ async function resolveSessionKey(
     // The fingerprint isolates different delegate keys.
     cacheKey: delegateKeyCacheKey(privateKey),
   };
+}
+
+/**
+ * Bytes passed to SealClient when every requested id already has a derived
+ * key cached. `fetchKeys` checks its key map before it touches the approval
+ * transaction, so it returns without consulting these bytes. Avoiding
+ * `tx.build` here skips the Sui RPC that resolves the registry/account object
+ * refs — 250–900ms per batch in production.
+ */
+const EMPTY_TX_BYTES = new Uint8Array(0);
+
+interface CachedKeyFetchResult {
+  txBytes: Uint8Array;
+  buildMs: number;
+  fetchMs: number;
+  reusedCachedKeys: boolean;
+}
+
+/**
+ * Fetch SEAL keys for `ids`, skipping the approval-PTB build when `client`
+ * already holds every derived key.
+ *
+ * A cached-key shortcut is an optimization, not an invariant: if `fetchKeys`
+ * rejects while we assumed the keys were present (for example a SEAL SDK
+ * upgrade changed the cache, or a key-server set changed), forget the ids,
+ * build a real approval PTB, and retry once. That keeps the fast path from
+ * turning a stale mirror into a permanently failing request.
+ */
+export async function fetchKeysForCachedClient(
+  client: SealClient,
+  ids: string[],
+  cacheKey: SealSessionCacheKey | undefined,
+  buildTx: (ids: string[]) => Promise<Uint8Array>,
+  fetchKeys: (txBytes: Uint8Array) => Promise<void>,
+  onBuild?: () => void
+): Promise<CachedKeyFetchResult> {
+  let reusedCachedKeys = cacheKey !== undefined && sealClientHasKeys(client, ids);
+  let txBytes = EMPTY_TX_BYTES;
+  let buildMs = 0;
+  let fetchMs = 0;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!reusedCachedKeys) {
+      onBuild?.();
+      const buildStarted = performance.now();
+      txBytes = await buildTx(ids);
+      buildMs = performance.now() - buildStarted;
+    }
+
+    const fetchStarted = performance.now();
+    try {
+      await fetchKeys(txBytes);
+      fetchMs += performance.now() - fetchStarted;
+      if (cacheKey) markSealClientKeys(client, ids);
+      return { txBytes, buildMs, fetchMs, reusedCachedKeys };
+    } catch (err) {
+      fetchMs += performance.now() - fetchStarted;
+      if (!reusedCachedKeys) throw err;
+      // The mirror said every key was present; the SDK disagreed. Forget the
+      // ids and make the second pass build and fetch for real.
+      if (cacheKey) forgetSealClientKeys(client, ids);
+      reusedCachedKeys = false;
+    }
+  }
+
+  throw new Error("SEAL key fetch exhausted its cached-key fallback");
 }
 
 const ACCOUNT_READ_ATTEMPTS = 4;
@@ -403,23 +472,39 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           return res.status(400).json({ error: identityError });
         }
 
-        phase = "build_ptb";
-            const txBytes = await buildSealApproveTxBytes(sealApprovePackageId(req.body, policy.sealPolicyPackageId)!, registryId, accountId, [
-                fullId,
-            ]);
-
+        // Resolve the (possibly cached) client first: its derived-key mirror
+        // decides whether the approval PTB can be skipped.
         phase = "fetch_keys";
-        // Fetch keys from key servers with one bounded retry on transient RPC drops
-        const sealClient = await retryTransientSealDecryptRpc(async () => {
-          const client = await createDecryptSealClient(cacheKey);
-          await client.fetchKeys({
-            ids: [fullId],
-            txBytes,
-            sessionKey,
-            threshold: SEAL_THRESHOLD,
-          });
-          return client;
-        });
+        const sealClient = await retryTransientSealDecryptRpc(() =>
+          createDecryptSealClient(cacheKey)
+        );
+        const keyFetch = await fetchKeysForCachedClient(
+          sealClient,
+          [fullId],
+          cacheKey,
+          (ids) =>
+            buildSealApproveTxBytes(
+              sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
+              registryId,
+              accountId,
+              ids
+            ),
+          (txBytes) => {
+            phase = "fetch_keys";
+            return retryTransientSealDecryptRpc(() =>
+              sealClient.fetchKeys({
+                ids: [fullId],
+                txBytes,
+                sessionKey,
+                threshold: SEAL_THRESHOLD,
+              })
+            );
+          },
+          () => {
+            phase = "build_ptb";
+          }
+        );
+        const txBytes = keyFetch.txBytes;
 
         phase = "decrypt";
         // Decrypt locally
@@ -491,33 +576,40 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           return res.json({ results: [], errors });
         }
 
-        phase = "build_ptb";
-        // Build ONE PTB with seal_approve for ALL unique IDs
-        const buildStarted = performance.now();
-        const allIds = [...new Set(parsedItems.map((p) => p.fullId))];
-        const txBytes = await buildSealApproveTxBytes(
-          sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
-          registryId,
-          accountId,
-          allIds
-        );
-        const buildMs = performance.now() - buildStarted;
-
         phase = "fetch_keys";
-        // ONE fetchKeys call for ALL IDs, retrying once on transient RPC failure
-        const fetchStarted = performance.now();
+        const allIds = [...new Set(parsedItems.map((p) => p.fullId))];
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
+        let keyFetch: CachedKeyFetchResult;
         try {
-          sealClient = await retryTransientSealDecryptRpc(async () => {
-            const client = await createDecryptSealClient(cacheKey);
-            await client.fetchKeys({
-              ids: allIds,
-              txBytes,
-              sessionKey,
-              threshold: SEAL_THRESHOLD,
-            });
-            return client;
-          });
+          sealClient = await retryTransientSealDecryptRpc(() =>
+            createDecryptSealClient(cacheKey)
+          );
+          keyFetch = await fetchKeysForCachedClient(
+            sealClient,
+            allIds,
+            cacheKey,
+            (ids) =>
+              buildSealApproveTxBytes(
+                sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
+                registryId,
+                accountId,
+                ids
+              ),
+            (txBytes) => {
+              phase = "fetch_keys";
+              return retryTransientSealDecryptRpc(() =>
+                sealClient.fetchKeys({
+                  ids: allIds,
+                  txBytes,
+                  sessionKey,
+                  threshold: SEAL_THRESHOLD,
+                })
+              );
+            },
+            () => {
+              phase = "build_ptb";
+            }
+          );
         } catch (err: any) {
           const traceId = randomUUID();
           const message = formattedError(err);
@@ -538,7 +630,9 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
             ],
           });
         }
-        const fetchMs = performance.now() - fetchStarted;
+        const txBytes = keyFetch.txBytes;
+        const buildMs = keyFetch.buildMs;
+        const fetchMs = keyFetch.fetchMs;
 
         phase = "decrypt";
         // Decrypt each blob using the shared sessionKey
