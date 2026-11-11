@@ -31,7 +31,7 @@ import {
   SIDECAR_ENABLE_MIGRATION_SEAL_ROUTE,
 } from "../config.js";
 import { sealCommitteeIdentityMatches, type SealCommitteeIdentity } from "../../seal-config.js";
-import { createDecryptSealClient, sealEncryptClient, suiClient } from "../clients.js";
+import { createDecryptSealClient, sealEncryptClient, suiClient, sealSessionCacheMetrics } from "../clients.js";
 import { buildSealEncryptId, fetchSealEncryptIdentity, type SealEncryptPurpose } from "../seal-identity.js";
 import {
   buildSealApproveTx,
@@ -286,6 +286,8 @@ const DEFAULT_SEAL_ROUTE_POLICY: SealRoutePolicy = {
 };
 
 export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POLICY): void {
+    // Protected by the sidecar's existing shared-secret middleware.
+    app.get("/metrics/seal", (_req, res) => res.type("text/plain").send(sealSessionCacheMetrics()));
   // /seal/encrypt receives the full plaintext for SEAL encryption. Must
   // accept up to PROTECTED_BODY_LIMIT_BYTES (1.5 MiB) of plaintext plus
   // base64 + JSON framing overhead.
@@ -382,7 +384,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         phase = "fetch_keys";
         // Fetch keys from key servers with one bounded retry on transient RPC drops
         const sealClient = await retryTransientSealDecryptRpc(async () => {
-          const client = await createDecryptSealClient();
+          const client = await createDecryptSealClient({
+            sessionHeader: typeof req.headers["x-seal-session"] === "string" ? req.headers["x-seal-session"] : undefined,
+            session: sessionKey, packageId: normalizeSuiAddress(packageId),
+            policyPackageId: sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
+            accountId: normalizeSuiAddress(accountId), registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
+            ids: [fullId],
+          });
           await client.fetchKeys({
             ids: [fullId],
             txBytes,
@@ -461,6 +469,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           return res.json({ results: [], errors });
         }
 
+        const buildStarted = performance.now();
         phase = "build_ptb";
         // Build ONE PTB with seal_approve for ALL unique IDs
         const allIds = [...new Set(parsedItems.map((p) => p.fullId))];
@@ -471,12 +480,20 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           allIds
         );
 
+        const buildMs = performance.now() - buildStarted;
+        const keysStarted = performance.now();
         phase = "fetch_keys";
         // ONE fetchKeys call for ALL IDs, retrying once on transient RPC failure
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
         try {
           sealClient = await retryTransientSealDecryptRpc(async () => {
-            const client = await createDecryptSealClient();
+            const client = await createDecryptSealClient({
+              sessionHeader: typeof req.headers["x-seal-session"] === "string" ? req.headers["x-seal-session"] : undefined,
+              session: sessionKey, packageId: normalizeSuiAddress(packageId),
+              policyPackageId: sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
+              accountId: normalizeSuiAddress(accountId), registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
+              ids: allIds,
+            });
             await client.fetchKeys({
               ids: allIds,
               txBytes,
@@ -506,6 +523,8 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           });
         }
 
+        const keysMs = performance.now() - keysStarted;
+        const decryptStarted = performance.now();
         phase = "decrypt";
         // Decrypt each blob using the shared sessionKey
         const results: { index: number; decryptedData: string }[] = [];
@@ -530,7 +549,10 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           }
         }
 
-            console.log(`[seal/decrypt-batch] ${results.length}/${items.length} decrypted ok, ${errors.length} errors`);
+            console.log(JSON.stringify({ event: "seal_decrypt_batch", request_id: requestIdFor(req),
+                items: items.length, unique_ids: allIds.length, results: results.length, errors: errors.length,
+                build_ptb_ms: Math.round(buildMs), fetch_keys_ms: Math.round(keysMs),
+                decrypt_ms: Math.round(performance.now() - decryptStarted) }));
         res.json({ results, errors });
       } catch (err: any) {
             sendSealFailure(res, "seal/decrypt-batch", phase, err, requestIdFor(req));

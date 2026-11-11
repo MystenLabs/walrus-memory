@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSealSessionPool } from "../sidecar/seal-session-pool.js";
 import assert from "node:assert/strict";
 import { SealClient, type SessionKey } from "@mysten/seal";
 import { bcs } from "@mysten/sui/bcs";
@@ -84,6 +85,7 @@ test("TTL starts after successful verification and refresh picks up rotated meta
     now = 80;
     firstLoad.resolve(metadata());
     const oldClient = await pending;
+    const originalFingerprint = await factory.fingerprint();
     revision = 2;
     now = 179;
     assert.equal((await (await factory.create()).getKeyServers()).get(SERVER_ID)!.name, "server-1");
@@ -91,6 +93,7 @@ test("TTL starts after successful verification and refresh picks up rotated meta
 
     now = 180;
     const rotated = (await (await factory.create()).getKeyServers()).get(SERVER_ID)!;
+    assert.notEqual(await factory.fingerprint(), originalFingerprint, "metadata refresh must invalidate session pool scopes");
     assert.equal(verificationCount, 2, "refresh must verify again");
     assert.equal(rotated.url, "https://seal-2.invalid");
     assert.deepEqual(rotated.pk, Uint8Array.of(2, 2, 3));
@@ -319,6 +322,21 @@ test("actual Seal SDK saves metadata reads while every request fetches and autho
     await assert.rejects(decrypt(await factory.create(), session("denied", false)), /SessionKey authorization denied/);
     assert.equal(counts.certificate, 4, "the second principal must authorize despite warm metadata");
     assert.equal(counts.fetchKey, 3, "a denied certificate stops the request before key fetch");
+
+    // Exercise the real SDK's private key map, not just a fake cache.
+    let state = "account-v1/registry-v1";
+    const pool = createSealSessionPool(() => factory.create(), async () => state, { now: () => 0 });
+    const poolInput = { header: "approved-session", expiresAt: 1000, scope: [PACKAGE_ID, "account", "registry"], ids: ["aabb"] };
+    const allowed = await pool.get(poolInput);
+    const before = counts.fetchKey;
+    assert.deepEqual(await decrypt(allowed, session("pooled")), plaintext);
+    assert.deepEqual(await decrypt(await pool.get(poolInput), session("pooled")), plaintext);
+    assert.equal(counts.fetchKey, before + 1, "warm same-session SDK must not fetch keys again");
+    await assert.rejects(decrypt(await pool.get({ ...poolInput, header: "denied-session" }), session("denied", false)), /authorization denied/);
+    state = "account-revoked-v2/registry-v1";
+    await assert.rejects(decrypt(await pool.get(poolInput), session("revoked", false)), /authorization denied/);
+    state = "account-v1/registry-upgraded-v2";
+    await assert.rejects(decrypt(await pool.get(poolInput), session("wrong-policy", false)), /authorization denied/);
 
     // Exercise an actual SDK PoP rejection as well as the unit failure cases.
     factory.reset();
