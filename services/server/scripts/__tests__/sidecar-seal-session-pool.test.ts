@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { SealClient, SessionKey } from "@mysten/seal";
-import { createSealSessionPool, readSealAuthorizationVersions, type SessionClientInput } from "../sidecar/seal-session-pool.js";
+import {
+    assertSealSessionClientLive,
+    clearCachedInitialSharedVersionsForTests,
+    createSealSessionPool,
+    getCachedInitialSharedVersion,
+    hasSealSessionApprovedKeys,
+    readSealAuthorizationVersions,
+    type SessionClientInput,
+} from "../sidecar/seal-session-pool.js";
 
 const input = (changes: Partial<SessionClientInput> = {}): SessionClientInput => ({
     header: "opaque-session-A", expiresAt: 10_000,
@@ -172,4 +180,61 @@ test("authorization state reader requires current versions and digests of both o
     for (const object of [null, {}, { version: "1" }, { version: "garbage", digest: "x" }]) {
         await assert.rejects(readSealAuthorizationVersions({ getObject: async () => ({ object }) }, "a", "r"), /Cannot verify/);
     }
+});
+
+test("readSealAuthorizationVersions batches getObjects, caches initialSharedVersion, and coalesces only concurrent in-flight reads", async () => {
+    clearCachedInitialSharedVersionsForTests();
+    let batchCalls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const acc = `0x${"3".repeat(64)}`;
+    const reg = `0x${"9".repeat(64)}`;
+
+    const batchedReader = {
+        getObject: async () => {
+            throw new Error("getObjects should be preferred when available");
+        },
+        getObjects: async ({ objectIds }: { objectIds: string[] }) => {
+            batchCalls += 1;
+            if (batchCalls === 1) await gate;
+            return {
+                objects: objectIds.map((id, idx) => ({
+                    version: String(10 + batchCalls + idx),
+                    digest: `d-${batchCalls}-${idx}`,
+                    owner: { $kind: "Shared", Shared: { initialSharedVersion: String(100 + idx) } },
+                })),
+            };
+        },
+    };
+
+    const concurrent = Array.from({ length: 4 }, () =>
+        readSealAuthorizationVersions(batchedReader, acc, reg),
+    );
+    await Promise.resolve();
+    release();
+    const states = await Promise.all(concurrent);
+    assert.equal(batchCalls, 1, "concurrent reads must coalesce into a single BatchGetObjects call");
+    assert.equal(new Set(states).size, 1);
+    assert.equal(getCachedInitialSharedVersion(acc), "100");
+    assert.equal(getCachedInitialSharedVersion(reg), "101");
+
+    // Subsequent sequential call must perform a fresh live read (zero post-settlement TTL).
+    const nextState = await readSealAuthorizationVersions(batchedReader, acc, reg);
+    assert.equal(batchCalls, 2, "sequential reads must never serve stale authorization versions");
+    assert.notEqual(nextState, states[0]);
+});
+
+test("hasSealSessionApprovedKeys tracks approved thresholds per identity and enforces liveness", async () => {
+    const f = fixture();
+    const client = await f.pool.get(input({ ids: ["id-1", "id-2"] }));
+    assert.equal(hasSealSessionApprovedKeys(client, ["id-1"], 2), false);
+
+    await client.fetchKeys({ ...args, ids: ["id-1"], threshold: 2 });
+    assert.equal(hasSealSessionApprovedKeys(client, ["id-1"], 2), true);
+    assert.equal(hasSealSessionApprovedKeys(client, ["id-1"], 3), false);
+    assert.equal(hasSealSessionApprovedKeys(client, ["id-1", "id-2"], 2), false);
+
+    f.setTime(10_000);
+    assert.throws(() => assertSealSessionClientLive(client), /expired/);
+    assert.throws(() => hasSealSessionApprovedKeys(client, ["id-1"], 2), /expired/);
 });

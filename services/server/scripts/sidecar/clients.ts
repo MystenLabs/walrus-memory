@@ -12,7 +12,11 @@ import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { SuiGraphQLClient } from "@mysten/sui/graphql";
 import { normalizeStructTag } from "@mysten/sui/utils";
 import { SealClient } from "@mysten/seal";
-import { createSealSessionPool, readSealAuthorizationVersions } from "./seal-session-pool.js";
+import {
+    clearCachedInitialSharedVersionsForTests,
+    createSealSessionPool,
+    readSealAuthorizationVersions,
+} from "./seal-session-pool.js";
 import { WalrusClient, type WalrusClientConfig } from "@mysten/walrus";
 import {
     SEAL_KEY_SERVER_TIMEOUT_MS,
@@ -78,6 +82,7 @@ let sessionBypasses = 0;
 export function resetSealKeyServerTrustForTests(): void {
     decryptSessions.reset();
     decryptSealClients.reset();
+    clearCachedInitialSharedVersionsForTests();
 }
 
 export function sealSessionCacheMetrics(): string {

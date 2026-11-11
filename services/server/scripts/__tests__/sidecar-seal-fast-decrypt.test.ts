@@ -1,0 +1,329 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { DemType, EncryptedObject, type SealClient, type SessionKey } from "@mysten/seal";
+import {
+    decryptBonehFranklinItem,
+    decryptBonehFranklinSlice,
+    FallbackShareSubsetError,
+} from "../sidecar/seal-decrypt-crypto.mjs";
+import { decryptBatchSealItems, stopSealDecryptPool } from "../sidecar/seal-decrypt-pool.js";
+
+const sealEntryUrl = import.meta.resolve("@mysten/seal");
+const sealRequire = createRequire(sealEntryUrl);
+const [
+    { bls12_381 },
+    { bytesToNumberBE },
+    { fromHex, toHex },
+    { encrypt: sealEncryptRaw },
+    { decrypt: sealDecryptRaw },
+    { AesGcm256, Hmac256Ctr },
+] = await Promise.all([
+    import(pathToFileURL(sealRequire.resolve("@noble/curves/bls12-381.js")).href),
+    import(pathToFileURL(sealRequire.resolve("@noble/curves/utils.js")).href),
+    import(pathToFileURL(sealRequire.resolve("@mysten/bcs")).href),
+    import(new URL("./encrypt.mjs", sealEntryUrl).href),
+    import(new URL("./decrypt.mjs", sealEntryUrl).href),
+    import(new URL("./dem.mjs", sealEntryUrl).href),
+]);
+
+const PKG = `0x${"ab".repeat(32)}`;
+const SERVER_IDS = [
+    `0x${"11".repeat(32)}`,
+    `0x${"22".repeat(32)}`,
+    `0x${"33".repeat(32)}`,
+];
+const DST = Buffer.from("SUI-SEAL-IBE-BLS12381-00", "utf8");
+
+function makeCommittee(weights: number[]) {
+    const masterScalars = weights.map(() => {
+        const skBytes = bls12_381.utils.randomSecretKey();
+        return bytesToNumberBE(skBytes) % bls12_381.fields.Fr.ORDER;
+    });
+    const weightedKeyServers: Array<{
+        objectId: string;
+        name: string;
+        url: string;
+        keyType: number;
+        pk: Uint8Array;
+        serverType: string;
+    }> = [];
+    const serverWeights = new Map<string, number>();
+    let totalWeight = 0;
+
+    weights.forEach((weight, idx) => {
+        const objectId = SERVER_IDS[idx];
+        const pk = bls12_381.G2.Point.BASE.multiply(masterScalars[idx]).toBytes();
+        serverWeights.set(objectId, weight);
+        totalWeight += weight;
+        for (let w = 0; w < weight; w++) {
+            weightedKeyServers.push({
+                objectId,
+                name: `ks-${idx}`,
+                url: `https://ks-${idx}.example`,
+                keyType: 0,
+                pk,
+                serverType: "Independent",
+            });
+        }
+    });
+
+    function deriveUserSecretKeys(innerIdHex: string) {
+        const pkgBytes = fromHex(PKG.slice(2));
+        const idBytes = fromHex(innerIdHex);
+        const fullIdBytes = new Uint8Array(pkgBytes.length + idBytes.length);
+        fullIdBytes.set(pkgBytes, 0);
+        fullIdBytes.set(idBytes, pkgBytes.length);
+        const fullIdHex = toHex(fullIdBytes);
+
+        const dstInput = new Uint8Array(DST.length + fullIdBytes.length);
+        dstInput.set(DST, 0);
+        dstInput.set(fullIdBytes, DST.length);
+        const hPoint = bls12_381.G1.Point.fromAffine(bls12_381.G1.hashToCurve(dstInput).toAffine());
+
+        const sdkKeys = new Map<string, any>();
+        const fastKeys = new Map<string, Uint8Array>();
+
+        weights.forEach((_, idx) => {
+            const objectId = SERVER_IDS[idx];
+            const uskPoint = hPoint.multiply(masterScalars[idx]);
+            const uskBytes = uskPoint.toBytes();
+            fastKeys.set(objectId, uskBytes);
+            sdkKeys.set(`${fullIdHex}:${objectId}`, {
+                point: uskPoint,
+                pairing(other: { point: any }) {
+                    const elem = bls12_381.pairing(uskPoint, other.point);
+                    return {
+                        toBytes() {
+                            const raw = bls12_381.fields.Fp12.toBytes(elem);
+                            const out = new Uint8Array(576);
+                            const perm = [0, 3, 1, 4, 2, 5];
+                            for (let i = 0; i < 6; i++) {
+                                out.set(raw.subarray(perm[i] * 96, (perm[i] + 1) * 96), i * 96);
+                            }
+                            return out;
+                        },
+                    };
+                },
+            });
+        });
+
+        return { fullIdHex, sdkKeys, fastKeys };
+    }
+
+    async function encryptPayload(
+        innerIdHex: string,
+        plaintext: Uint8Array,
+        threshold: number,
+        dem: "aes" | "hmac" = "aes",
+        aad: Uint8Array = new Uint8Array(0),
+    ): Promise<Uint8Array> {
+        const encryptionInput = dem === "aes" ? new AesGcm256(plaintext, aad) : new Hmac256Ctr(plaintext, aad);
+        const { encryptedObject } = await sealEncryptRaw({
+            keyServers: weightedKeyServers,
+            kemType: 0,
+            threshold,
+            packageId: PKG,
+            id: innerIdHex,
+            encryptionInput,
+        });
+        return encryptedObject;
+    }
+
+    return { serverWeights, totalWeight, deriveUserSecretKeys, encryptPayload };
+}
+
+test.after(async () => {
+    await stopSealDecryptPool();
+});
+
+test("fast Boneh-Franklin decrypt matches @mysten/seal byte-for-byte across AES-GCM, HMAC-CTR, subsets, and weighted committees", async () => {
+    for (const weights of [[1, 1, 1], [2, 1]]) {
+        const committee = makeCommittee(weights);
+        const innerId = "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff";
+        const { sdkKeys, fastKeys } = committee.deriveUserSecretKeys(innerId);
+
+        for (const dem of ["aes", "hmac"] as const) {
+            for (const size of [0, 1, 31, 32, 33, 1024, 16_384]) {
+                const plaintext = Buffer.alloc(size, (size % 251) + 1);
+                const aad = size % 2 === 0 ? new Uint8Array(0) : Buffer.from("memwal-aad");
+                const encryptedData = await committee.encryptPayload(innerId, plaintext, 2, dem, aad);
+                const parsed = EncryptedObject.parse(encryptedData);
+
+                const expected = await sealDecryptRaw({
+                    encryptedObject: parsed,
+                    keys: sdkKeys,
+                    checkLEEncoding: false,
+                });
+
+                // Test full 3-key map (threshold slicing to 2 pairings) and exact 2-key subsets.
+                const subsets: Array<Map<string, Uint8Array>> = [fastKeys];
+                if (weights.length === 3) {
+                    subsets.push(
+                        new Map([[SERVER_IDS[0], fastKeys.get(SERVER_IDS[0])!], [SERVER_IDS[1], fastKeys.get(SERVER_IDS[1])!]]),
+                        new Map([[SERVER_IDS[0], fastKeys.get(SERVER_IDS[0])!], [SERVER_IDS[2], fastKeys.get(SERVER_IDS[2])!]]),
+                        new Map([[SERVER_IDS[1], fastKeys.get(SERVER_IDS[1])!], [SERVER_IDS[2], fastKeys.get(SERVER_IDS[2])!]]),
+                    );
+                }
+
+                for (const subset of subsets) {
+                    const actual = decryptBonehFranklinItem({
+                        encryptedData,
+                        derivedKeysByObjectId: subset,
+                        serverWeights: committee.serverWeights,
+                        totalServerWeight: committee.totalWeight,
+                    });
+                    assert.deepEqual(Buffer.from(actual), Buffer.from(expected));
+                    assert.deepEqual(Buffer.from(actual), plaintext);
+                }
+            }
+        }
+    }
+});
+
+test("fast decrypt rejects tampered ciphertext, tampered MAC, insufficient shares, and triggers subset fallback when needed", async () => {
+    const committee = makeCommittee([1, 1, 1]);
+    const innerId = "deadbeef01020304";
+    const { fastKeys } = committee.deriveUserSecretKeys(innerId);
+    const plaintext = Buffer.from("sensitive memory payload");
+
+    const aesEncrypted = await committee.encryptPayload(innerId, plaintext, 2, "aes");
+    const parsedAes = EncryptedObject.parse(new Uint8Array(aesEncrypted));
+    parsedAes.ciphertext.Aes256Gcm.blob[0] ^= 0xff;
+    const tamperedAesBytes = EncryptedObject.serialize(parsedAes).toBytes();
+    assert.throws(
+        () =>
+            decryptBonehFranklinItem({
+                encryptedData: tamperedAesBytes,
+                derivedKeysByObjectId: fastKeys,
+                serverWeights: committee.serverWeights,
+                totalServerWeight: committee.totalWeight,
+            }),
+        /Decryption failed/,
+    );
+
+    const hmacEncrypted = await committee.encryptPayload(innerId, plaintext, 2, "hmac");
+    const parsedHmac = EncryptedObject.parse(new Uint8Array(hmacEncrypted));
+    parsedHmac.ciphertext.Hmac256Ctr.mac[0] ^= 0xff;
+    const tamperedHmacBytes = EncryptedObject.serialize(parsedHmac).toBytes();
+    assert.throws(
+        () =>
+            decryptBonehFranklinItem({
+                encryptedData: tamperedHmacBytes,
+                derivedKeysByObjectId: fastKeys,
+                serverWeights: committee.totalWeight ? committee.serverWeights : undefined,
+                totalServerWeight: committee.totalWeight,
+            }),
+        /Invalid MAC/,
+    );
+
+    // Only 1 share when threshold is 2 -> Not enough shares.
+    const singleKey = new Map([[SERVER_IDS[0], fastKeys.get(SERVER_IDS[0])!]]);
+    assert.throws(
+        () =>
+            decryptBonehFranklinItem({
+                encryptedData: aesEncrypted,
+                derivedKeysByObjectId: singleKey,
+            }),
+        /Not enough shares/,
+    );
+
+    // Corrupt share 0 while 3 keys are present -> raises FallbackShareSubsetError so coordinator can fall back.
+    const parsedCorruptShare0 = EncryptedObject.parse(new Uint8Array(aesEncrypted));
+    parsedCorruptShare0.encryptedShares.BonehFranklinBLS12381.encryptedShares[0][0] ^= 0xff;
+    const corruptShare0Bytes = EncryptedObject.serialize(parsedCorruptShare0).toBytes();
+    assert.throws(
+        () =>
+            decryptBonehFranklinItem({
+                encryptedData: corruptShare0Bytes,
+                derivedKeysByObjectId: fastKeys,
+            }),
+        FallbackShareSubsetError,
+    );
+
+    // Slice zeroes ephemeral key buffers in finally.
+    const disposableKey = new Uint8Array(fastKeys.get(SERVER_IDS[0])!);
+    const disposableKey2 = new Uint8Array(fastKeys.get(SERVER_IDS[1])!);
+    const sliceOut = decryptBonehFranklinSlice({
+        items: [{ index: 0, encryptedData: aesEncrypted, fullId: innerId }],
+        derivedKeysById: [[innerId, [[SERVER_IDS[0], disposableKey], [SERVER_IDS[1], disposableKey2]]]],
+    });
+    assert.equal(sliceOut.results.length, 1);
+    assert.equal(Buffer.from(sliceOut.results[0].decryptedData, "base64").toString("utf8"), "sensitive memory payload");
+    assert.ok(disposableKey.every((b) => b === 0), "ephemeral derived key buffer must be zeroized");
+    assert.ok(disposableKey2.every((b) => b === 0), "ephemeral derived key buffer 2 must be zeroized");
+});
+
+test("stateless worker_threads decrypt pool decrypts 25 items in parallel, preserves order, and enforces session expiry", async () => {
+    const committee = makeCommittee([1, 1, 1]);
+    const innerId = "cafebabe00112233";
+    const { fastKeys } = committee.deriveUserSecretKeys(innerId);
+
+    const items = await Promise.all(
+        Array.from({ length: 25 }, async (_, index) => {
+            const encryptedData = await committee.encryptPayload(
+                innerId,
+                Buffer.from(`memory-item-${index}-${"payload-".repeat(20)}`),
+                2,
+                index % 2 === 0 ? "aes" : "hmac",
+            );
+            return { index, encryptedData, fullId: innerId };
+        }),
+    );
+
+    const mockSealClient = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [
+                    objId,
+                    { toString: () => toHex(bytes) },
+                ]),
+            );
+        },
+        async decrypt() {
+            throw new Error("worker fast-path should handle all valid Boneh-Franklin items without fallback");
+        },
+    } as unknown as SealClient;
+
+    let getTxBytesCalls = 0;
+    const out = await decryptBatchSealItems({
+        sealClient: mockSealClient,
+        parsedItems: items,
+        uniqueIds: [innerId],
+        sessionKey: {} as SessionKey,
+        getTxBytes: async () => {
+            getTxBytesCalls += 1;
+            return Uint8Array.of(1);
+        },
+    });
+
+    assert.equal(out.errors.length, 0);
+    assert.equal(out.results.length, 25);
+    assert.equal(getTxBytesCalls, 1);
+    for (let i = 0; i < 25; i++) {
+        assert.equal(out.results[i].index, i);
+        assert.equal(
+            Buffer.from(out.results[i].decryptedData, "base64").toString("utf8"),
+            `memory-item-${i}-${"payload-".repeat(20)}`,
+        );
+    }
+
+    // Expired session during or after worker execution must reject before returning plaintext.
+    let checks = 0;
+    await assert.rejects(
+        () =>
+            decryptBatchSealItems({
+                sealClient: mockSealClient,
+                parsedItems: items.slice(0, 4),
+                uniqueIds: [innerId],
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+                assertLive: () => {
+                    checks += 1;
+                    if (checks >= 2) throw new Error("SEAL session expired");
+                },
+            }),
+        /SEAL session expired/,
+    );
+});

@@ -130,3 +130,27 @@ test("sealApproveArgsError enforces the ids and the sealAbi/registryId pairing",
     assert.match(sealApproveArgsError({ ...base, sealAbi: "v1" }, { ...POLICY, allowLegacySealAbi: false })!, /disabled/);
     assert.match(sealApproveArgsError({ ...base, sealAbi: "v1-new", registryId: REG, policyPackageId: PKG }, POLICY)!, /configured/);
 });
+
+test("seal_approve PTB builds locally without RPC client when immutable initialSharedVersions are supplied", async () => {
+    const tx = buildSealApproveTx(POLICY_PKG, REG, ACC, ["aabbccdd"], {
+        registryInitialSharedVersion: "941625040",
+        accountInitialSharedVersion: "966338902",
+    });
+    const data = tx.getData();
+    const mc = (data.commands[0] as any).MoveCall;
+    const inputs = mc.arguments.map((a: any) => data.inputs[a.Input]);
+
+    assert.equal(inputs[0].$kind, "Pure");
+    assert.equal(inputs[1].$kind, "Object");
+    assert.equal(normalizeSuiAddress(inputs[1].Object.SharedObject.objectId), normalizeSuiAddress(REG));
+    assert.equal(String(inputs[1].Object.SharedObject.initialSharedVersion), "941625040");
+    assert.equal(inputs[1].Object.SharedObject.mutable, false);
+
+    assert.equal(inputs[2].$kind, "Object");
+    assert.equal(normalizeSuiAddress(inputs[2].Object.SharedObject.objectId), normalizeSuiAddress(ACC));
+    assert.equal(String(inputs[2].Object.SharedObject.initialSharedVersion), "966338902");
+    assert.equal(inputs[2].Object.SharedObject.mutable, false);
+
+    const bytes = await tx.build({ onlyTransactionKind: true });
+    assert.ok(bytes.length > 64);
+});

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizeSuiAddress } from "@mysten/sui/utils";
 import type { SealClient } from "@mysten/seal";
 
 export interface SessionClientInput {
@@ -15,7 +16,27 @@ interface Entry {
     credentialExpiresAt: number;
     idleUntil: number;
     ids: Set<string>;
+    approvedThresholds: Map<string, number>;
     client: Promise<SealClient>;
+}
+
+const liveGuards = new WeakMap<SealClient, () => void>();
+const approvedKeyMaps = new WeakMap<SealClient, Map<string, number>>();
+
+export function assertSealSessionClientLive(client: SealClient): void {
+    liveGuards.get(client)?.();
+}
+
+export function hasSealSessionApprovedKeys(
+    client: SealClient,
+    ids: readonly string[],
+    threshold: number,
+): boolean {
+    const guard = liveGuards.get(client);
+    const approved = approvedKeyMaps.get(client);
+    if (!guard || !approved || ids.length === 0) return false;
+    guard();
+    return ids.every((id) => (approved.get(id) ?? 0) >= threshold);
 }
 
 /**
@@ -83,14 +104,22 @@ export function createSealSessionPool(
             } else {
                 counters.miss++;
                 const expiresAt = Math.min(input.expiresAt, now() + 300_000);
-                entry = { expiresAt, credentialExpiresAt: input.expiresAt,
-                    idleUntil: Math.min(expiresAt, now() + idleMs), ids, client: undefined! };
+                entry = {
+                    expiresAt,
+                    credentialExpiresAt: input.expiresAt,
+                    idleUntil: Math.min(expiresAt, now() + idleMs),
+                    ids,
+                    approvedThresholds: new Map(),
+                    client: undefined!,
+                };
                 const current = entry;
                 const assertLive = () => {
                     if (now() >= current.credentialExpiresAt) throw new Error("SEAL session expired");
                 };
                 entry.client = Promise.resolve().then(createClient).then(client => {
                     assertLive();
+                    liveGuards.set(client, assertLive);
+                    approvedKeyMaps.set(client, current.approvedThresholds);
                     // Wrap the SDK method too: client.decrypt() internally
                     // calls fetchKeys(), so cold chunks share the actual key
                     // fetch, not just construction of a shared client.
@@ -106,8 +135,14 @@ export function createSealSessionPool(
                             work = Promise.resolve().then(() => originalFetch(args));
                             pending.set(fetchKey, work);
                         }
-                        try { await work; assertLive(); }
-                        catch (err) {
+                        try {
+                            await work;
+                            assertLive();
+                            for (const id of args.ids) {
+                                const prev = current.approvedThresholds.get(id) ?? 0;
+                                if (args.threshold > prev) current.approvedThresholds.set(id, args.threshold);
+                            }
+                        } catch (err) {
                             counters.failure++;
                             if (entries.get(key) === current) entries.delete(key);
                             throw err;
@@ -115,6 +150,16 @@ export function createSealSessionPool(
                             if (pending.get(fetchKey) === work) pending.delete(fetchKey);
                         }
                     };
+                    if (typeof client.getDerivedKeys === "function") {
+                        const originalGetDerivedKeys = client.getDerivedKeys.bind(client);
+                        client.getDerivedKeys = async args => {
+                            assertLive();
+                            if (!current.ids.has(args.id)) throw new Error("Unreserved SEAL identity");
+                            const derived = await originalGetDerivedKeys(args);
+                            assertLive();
+                            return derived;
+                        };
+                    }
                     const originalDecrypt = client.decrypt.bind(client);
                     client.decrypt = async args => {
                         assertLive();
@@ -140,21 +185,123 @@ export function createSealSessionPool(
     };
 }
 
-/** Read only stable version/digest metadata; never trust caller-supplied versions. */
+const MAX_SHARED_VERSION_CACHE = 1024;
+const sharedInitialVersions = new Map<string, string>();
+const inFlightAuthReads = new WeakMap<object, Map<string, Promise<string>>>();
+
+function canonicalObjectKey(objectId: string): string {
+    return /^0x[0-9a-fA-F]{1,64}$/.test(objectId) ? normalizeSuiAddress(objectId) : objectId;
+}
+
+function recordInitialSharedVersion(objectId: string, owner: unknown): void {
+    const sharedVersion = (owner as { Shared?: { initialSharedVersion?: unknown } } | null | undefined)
+        ?.Shared?.initialSharedVersion;
+    const text = sharedVersion !== undefined && sharedVersion !== null ? String(sharedVersion) : "";
+    if (!/^\d+$/.test(text)) return;
+    const key = canonicalObjectKey(objectId);
+    if (sharedInitialVersions.has(key)) {
+        sharedInitialVersions.delete(key);
+    } else if (sharedInitialVersions.size >= MAX_SHARED_VERSION_CACHE) {
+        sharedInitialVersions.delete(sharedInitialVersions.keys().next().value!);
+    }
+    sharedInitialVersions.set(key, text);
+}
+
+export function getCachedInitialSharedVersion(objectId: string): string | undefined {
+    return sharedInitialVersions.get(canonicalObjectKey(objectId));
+}
+
+export function clearCachedInitialSharedVersionsForTests(): void {
+    sharedInitialVersions.clear();
+}
+
+function withReadTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`SEAL authorization state read timed out after ${timeoutMs}ms`)), timeoutMs);
+        timer.unref?.();
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+    });
+}
+
+type AuthObjectShape = {
+    version?: unknown;
+    digest?: unknown;
+    owner?: unknown;
+} | null | undefined;
+
+export type SealAuthorizationVersionReader = {
+    getObject: (input: { objectId: string; signal?: AbortSignal }) => Promise<{
+        object?: AuthObjectShape;
+    }>;
+    getObjects?: (input: { objectIds: string[] }) => Promise<{
+        objects: Array<AuthObjectShape | Error>;
+    }>;
+};
+
+function validateAuthObject(objectId: string, object: AuthObjectShape): [string, string, string] {
+    if (!object || object instanceof Error || !/^\d+$/.test(String(object.version)) || typeof object.digest !== "string" || !object.digest) {
+        throw new Error("Cannot verify current SEAL authorization state");
+    }
+    recordInitialSharedVersion(objectId, object.owner);
+    return [objectId, String(object.version), String(object.digest)];
+}
+
+/**
+ * Read only stable version/digest metadata; never trust caller-supplied versions.
+ * Uses `getObjects` (`BatchGetObjects`) when available to collapse two unary gRPC
+ * calls into one, and coalesces strictly concurrent in-flight reads for the same
+ * `(accountId, registryId)` with zero post-settlement retention.
+ */
 export async function readSealAuthorizationVersions(
-    client: { getObject: (input: { objectId: string; signal?: AbortSignal }) => Promise<{
-        object?: { version?: unknown; digest?: unknown } | null;
-    }> },
+    client: SealAuthorizationVersionReader,
     accountId: string,
     registryId: string,
 ): Promise<string> {
-    const objects = await Promise.all([accountId, registryId].map(async objectId => {
-        const result = await client.getObject({ objectId, signal: AbortSignal.timeout(5_000) });
-        const object = result?.object;
-        if (!object || !/^\d+$/.test(String(object.version)) || typeof object.digest !== "string" || !object.digest) {
-            throw new Error("Cannot verify current SEAL authorization state");
+    let perClient = inFlightAuthReads.get(client);
+    if (!perClient) {
+        perClient = new Map();
+        inFlightReadsSet(client, perClient);
+    }
+    const flightKey = `${accountId}\0${registryId}`;
+    const existing = perClient.get(flightKey);
+    if (existing) return existing;
+
+    const work = (async () => {
+        if (typeof client.getObjects === "function") {
+            const batch = await withReadTimeout(
+                client.getObjects({ objectIds: [accountId, registryId] }),
+                5_000,
+            );
+            if (!Array.isArray(batch?.objects) || batch.objects.length !== 2) {
+                throw new Error("Cannot verify current SEAL authorization state");
+            }
+            const entries = [
+                validateAuthObject(accountId, batch.objects[0] as AuthObjectShape),
+                validateAuthObject(registryId, batch.objects[1] as AuthObjectShape),
+            ];
+            return JSON.stringify(entries);
         }
-        return [objectId, String(object.version), String(object.digest)];
-    }));
-    return JSON.stringify(objects);
+
+        const objects = await Promise.all([accountId, registryId].map(async objectId => {
+            const result = await client.getObject({ objectId, signal: AbortSignal.timeout(5_000) });
+            return validateAuthObject(objectId, result?.object);
+        }));
+        return JSON.stringify(objects);
+    })();
+
+    perClient.set(flightKey, work);
+    try {
+        return await work;
+    } finally {
+        if (perClient.get(flightKey) === work) {
+            perClient.delete(flightKey);
+        }
+    }
+}
+
+function inFlightReadsSet(client: object, map: Map<string, Promise<string>>): void {
+    inFlightAuthReads.set(client, map);
 }

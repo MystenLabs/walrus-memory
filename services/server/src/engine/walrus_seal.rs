@@ -24,6 +24,7 @@
 //! today via `seal::SealCredential::from_auth_or_fallback`.
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,8 @@ use super::{FetchTimings, HydratedMemory, MemoryEngine, MemoryRef};
 const BLOB_CACHE_KEY_PREFIX: &str = "memwal:blob:v1:";
 /// SEAL decrypt-batch chunk size (matches the inlined `recall` value).
 const SEAL_DECRYPT_BATCH_SIZE: usize = 25;
+/// Default max in-flight `/seal/decrypt-batch` chunk requests per recall.
+const DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY: usize = 4;
 /// Backoff before retrying a transient Walrus aggregator download failure.
 const WALRUS_DOWNLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 /// Backoff before retrying a transient SEAL decrypt-batch failure.
@@ -135,27 +138,48 @@ impl WalrusSealEngine {
         let mut redis = self.redis.clone();
         let cache_key = format!("{}{}", BLOB_CACHE_KEY_PREFIX, blob_id);
         match redis.get::<_, Option<Vec<u8>>>(&cache_key).await {
-            Ok(Some(ciphertext)) => {
-                match read_decision(ciphertext.len(), self.blob_cache_max_bytes) {
-                    CacheReadDecision::Serve => Some(ciphertext),
-                    CacheReadDecision::IgnoreOversize => {
-                        // ignore entries larger than the configured cap.
-                        // The entry will be evicted by TTL eventually; we don't
-                        // delete it here to keep `cache_get` read-only.
-                        tracing::info!(
-                            "blob cache ignored for {}: {} bytes exceeds max {}",
-                            blob_id,
-                            ciphertext.len(),
-                            self.blob_cache_max_bytes
-                        );
-                        None
-                    }
-                }
-            }
-            Ok(None) => None,
+            Ok(opt) => filter_cached_ciphertext(blob_id, opt, self.blob_cache_max_bytes),
             Err(e) => {
                 tracing::warn!("blob cache get failed for {}: {}", blob_id, e);
                 None
+            }
+        }
+    }
+
+    /// Batched Redis `MGET` lookup for `fetch_batch` so a 100-item recall
+    /// performs one Redis round-trip instead of 100 individual `GET` calls.
+    async fn cache_get_many(&self, blob_ids: &[String]) -> Vec<Option<Vec<u8>>> {
+        if self.blob_cache_max_bytes == 0 || blob_ids.is_empty() {
+            return vec![None; blob_ids.len()];
+        }
+        let cache_keys: Vec<String> = blob_ids
+            .iter()
+            .map(|blob_id| format!("{}{}", BLOB_CACHE_KEY_PREFIX, blob_id))
+            .collect();
+        let mut redis = self.redis.clone();
+        let raw: redis::RedisResult<Vec<Option<Vec<u8>>>> = redis::cmd("MGET")
+            .arg(&cache_keys)
+            .query_async(&mut redis)
+            .await;
+        match raw {
+            Ok(entries) if entries.len() == blob_ids.len() => blob_ids
+                .iter()
+                .zip(entries)
+                .map(|(blob_id, opt)| {
+                    filter_cached_ciphertext(blob_id, opt, self.blob_cache_max_bytes)
+                })
+                .collect(),
+            Ok(entries) => {
+                tracing::warn!(
+                    "blob cache mget length mismatch: expected {}, got {}",
+                    blob_ids.len(),
+                    entries.len()
+                );
+                vec![None; blob_ids.len()]
+            }
+            Err(e) => {
+                tracing::warn!("blob cache mget failed for {} keys: {}", blob_ids.len(), e);
+                vec![None; blob_ids.len()]
             }
         }
     }
@@ -189,20 +213,13 @@ impl WalrusSealEngine {
         }
     }
 
-    /// Fetch a blob's ciphertext: cache → Walrus (+ cache write-back).
-    /// Returns `Some((ciphertext, was_cached))` — `was_cached` is `true` on
-    /// a Redis hit, `false` on a cold fetch from Walrus. Returns `None` if
-    /// the blob is gone (Walrus 404 → reactive cleanup) or any other
-    /// download error.
-    async fn fetch_ciphertext(
+    /// Download a cache-cold ciphertext from Walrus and populate the Redis cache.
+    async fn download_and_cache_ciphertext(
         &self,
         blob_id: &str,
         owner: &str,
         namespace: &str,
-    ) -> Option<(Vec<u8>, bool)> {
-        if let Some(ciphertext) = self.cache_get(blob_id).await {
-            return Some((ciphertext, true));
-        }
+    ) -> Option<Vec<u8>> {
         let race_after = Duration::from_millis(self.config.walrus_aggregator_race_after_ms);
         let skip_consistency = self.config.walrus_skip_consistency_check;
         let result = download_ciphertext_with_retry(blob_id, || {
@@ -218,7 +235,7 @@ impl WalrusSealEngine {
         match result {
             Ok(ciphertext) => {
                 self.cache_put(blob_id, &ciphertext).await;
-                Some((ciphertext, false))
+                Some(ciphertext)
             }
             Err(AppError::BlobNotFound(msg)) => {
                 tracing::warn!("Blob expired, cleaning up: {}", msg);
@@ -230,6 +247,25 @@ impl WalrusSealEngine {
                 None
             }
         }
+    }
+
+    /// Fetch a blob's ciphertext: cache → Walrus (+ cache write-back).
+    /// Returns `Some((ciphertext, was_cached))` — `was_cached` is `true` on
+    /// a Redis hit, `false` on a cold fetch from Walrus. Returns `None` if
+    /// the blob is gone (Walrus 404 → reactive cleanup) or any other
+    /// download error.
+    async fn fetch_ciphertext(
+        &self,
+        blob_id: &str,
+        owner: &str,
+        namespace: &str,
+    ) -> Option<(Vec<u8>, bool)> {
+        if let Some(ciphertext) = self.cache_get(blob_id).await {
+            return Some((ciphertext, true));
+        }
+        self.download_and_cache_ciphertext(blob_id, owner, namespace)
+            .await
+            .map(|ciphertext| (ciphertext, false))
     }
 }
 
@@ -427,20 +463,33 @@ impl MemoryEngine for WalrusSealEngine {
             was_cached: bool,
         }
         let walrus_start = std::time::Instant::now();
-        let fetch_tasks = hits.iter().map(|(blob_id, distance)| {
-            let blob_id = blob_id.clone();
-            let distance = *distance;
-            async move {
-                self.fetch_ciphertext(&blob_id, owner, namespace).await.map(
-                    |(ciphertext, was_cached)| Fetched {
-                        blob_id,
-                        distance,
-                        ciphertext,
-                        was_cached,
-                    },
-                )
-            }
-        });
+        let hit_blob_ids: Vec<String> = hits.iter().map(|(blob_id, _)| blob_id.clone()).collect();
+        let cached_ciphertexts = self.cache_get_many(&hit_blob_ids).await;
+        let fetch_tasks = hits
+            .iter()
+            .zip(cached_ciphertexts)
+            .map(|((blob_id, distance), cached)| {
+                let blob_id = blob_id.clone();
+                let distance = *distance;
+                async move {
+                    if let Some(ciphertext) = cached {
+                        return Some(Fetched {
+                            blob_id,
+                            distance,
+                            ciphertext,
+                            was_cached: true,
+                        });
+                    }
+                    self.download_and_cache_ciphertext(&blob_id, owner, namespace)
+                        .await
+                        .map(|ciphertext| Fetched {
+                            blob_id,
+                            distance,
+                            ciphertext,
+                            was_cached: false,
+                        })
+                }
+            });
         let fetched: Vec<Fetched> = futures::future::join_all(fetch_tasks)
             .await
             .into_iter()
@@ -459,16 +508,22 @@ impl MemoryEngine for WalrusSealEngine {
             download_drops
         );
 
-        // Step 2: batch-decrypt the ciphertexts in chunks.
+        // Step 2: batch-decrypt the ciphertexts in bounded concurrent chunks on
+        // the current task (preserving `stage` task-local deadline tracking and
+        // deterministic chunk ordering while letting the sidecar coalesce live
+        // Sui state reads, SEAL key fetches, and multi-thread BLS decryption).
         super::stage::enter(super::stage::RecallStage::SealDecrypt);
         let seal_start = std::time::Instant::now();
         let batch_input: Vec<(String, Vec<u8>)> = fetched
             .iter()
             .map(|f| (f.blob_id.clone(), f.ciphertext.clone()))
             .collect();
-        let mut chunk_results = Vec::new();
-        for chunk in batch_input.chunks(SEAL_DECRYPT_BATCH_SIZE) {
-            let res = decrypt_chunk_with_retry(chunk, |items| {
+        let chunk_concurrency = seal_decrypt_batch_concurrency();
+        let chunk_results = run_decrypt_chunks_bounded(
+            &batch_input,
+            SEAL_DECRYPT_BATCH_SIZE,
+            chunk_concurrency,
+            |items| {
                 let credential = credential.clone();
                 async move {
                     seal::seal_decrypt_batch(
@@ -484,17 +539,9 @@ impl MemoryEngine for WalrusSealEngine {
                     )
                     .await
                 }
-            })
-            .await;
-            if let Err(ref e) = res {
-                tracing::warn!(
-                    "engine.fetch_batch: seal_decrypt_batch failed for {} blobs: {}",
-                    chunk.len(),
-                    e
-                );
-            }
-            chunk_results.push((chunk.len(), res));
-        }
+            },
+        )
+        .await;
         let decrypted = fold_decrypt_chunk_results(chunk_results)?;
         let seal_ms = seal_start.elapsed().as_millis();
 
@@ -571,6 +618,50 @@ where
         }
         Err(err) => Err(err),
     }
+}
+
+fn seal_decrypt_batch_concurrency() -> usize {
+    std::env::var("SEAL_DECRYPT_BATCH_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|parsed| parsed.clamp(1, 8))
+        .unwrap_or(DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY)
+}
+
+async fn run_decrypt_chunks_bounded<F, Fut>(
+    batch_input: &[(String, Vec<u8>)],
+    batch_size: usize,
+    concurrency: usize,
+    decrypt_fn: F,
+) -> Vec<(usize, Result<Vec<DecryptOutcome>, AppError>)>
+where
+    F: Fn(Vec<(String, Vec<u8>)>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<DecryptOutcome>, AppError>>,
+{
+    if batch_input.is_empty() {
+        return Vec::new();
+    }
+    let decrypt_ref = &decrypt_fn;
+    let chunks: Vec<Vec<(String, Vec<u8>)>> = batch_input
+        .chunks(batch_size.max(1))
+        .map(|c| c.to_vec())
+        .collect();
+    stream::iter(chunks)
+        .map(|chunk| async move {
+            let chunk_len = chunk.len();
+            let res = decrypt_chunk_with_retry(&chunk, |items| decrypt_ref(items)).await;
+            if let Err(ref e) = res {
+                tracing::warn!(
+                    "engine.fetch_batch: seal_decrypt_batch failed for {} blobs: {}",
+                    chunk_len,
+                    e
+                );
+            }
+            (chunk_len, res)
+        })
+        .buffered(concurrency.max(1))
+        .collect()
+        .await
 }
 
 async fn decrypt_chunk_with_retry<F, Fut>(
@@ -771,6 +862,26 @@ fn read_decision(ciphertext_len: usize, max_bytes: usize) -> CacheReadDecision {
     }
 }
 
+fn filter_cached_ciphertext(
+    blob_id: &str,
+    cached: Option<Vec<u8>>,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let ciphertext = cached?;
+    match read_decision(ciphertext.len(), max_bytes) {
+        CacheReadDecision::Serve => Some(ciphertext),
+        CacheReadDecision::IgnoreOversize => {
+            tracing::info!(
+                "blob cache ignored for {}: {} bytes exceeds max {}",
+                blob_id,
+                ciphertext.len(),
+                max_bytes
+            );
+            None
+        }
+    }
+}
+
 /// What `cache_put` should do with a freshly-downloaded ciphertext,
 /// given the configured TTL + size cap.
 #[derive(Debug, PartialEq, Eq)]
@@ -800,7 +911,8 @@ mod tests {
 
     use super::{
         assemble_decrypted, decrypt_chunk_with_retry, download_ciphertext_with_retry,
-        fold_decrypt_chunk_results, read_decision, write_decision, AppError, CacheReadDecision,
+        filter_cached_ciphertext, fold_decrypt_chunk_results, read_decision,
+        run_decrypt_chunks_bounded, write_decision, AppError, CacheReadDecision,
         CacheWriteDecision, DecryptOutcome,
     };
 
@@ -1232,5 +1344,75 @@ mod tests {
             CacheWriteDecision::Skip,
             "max=0 should skip via Skip, not SkipOversize"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_decrypt_chunks_bounded_executes_in_parallel_and_preserves_order() {
+        let batch_input: Vec<(String, Vec<u8>)> = (0..8)
+            .map(|i| (format!("blob-{i}"), vec![i as u8]))
+            .collect();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        let marker = super::super::stage::StageMarker::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+
+        let chunk_results =
+            super::super::stage::run_with_deadline(&marker, Some(deadline), async {
+                run_decrypt_chunks_bounded(&batch_input, 2, 4, |items| {
+                    let active_ref = &active;
+                    let peak_ref = &peak;
+                    async move {
+                        let now_active = active_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak_ref.fetch_max(now_active, Ordering::SeqCst);
+                        // Finish later chunks earlier so out-of-order completion exercises buffered ordering.
+                        let first_byte = items[0].1[0] as u64;
+                        let sleep_ms = 400u64.saturating_sub(first_byte * 40);
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        // Task-local deadline context must remain visible inside buffered futures.
+                        assert!(super::super::stage::remaining_budget().is_some());
+                        active_ref.fetch_sub(1, Ordering::SeqCst);
+                        Ok(items
+                            .into_iter()
+                            .map(|(blob_id, _)| DecryptOutcome::Ok(blob_id.into_bytes()))
+                            .collect())
+                    }
+                })
+                .await
+            })
+            .await
+            .expect("within deadline");
+
+        assert_eq!(peak.load(Ordering::SeqCst), 4, "all 4 chunks must run in parallel");
+        assert!(
+            started.elapsed() <= Duration::from_millis(450),
+            "4 concurrent chunks must complete in ~1 chunk window, got {:?}",
+            started.elapsed()
+        );
+
+        let outcomes = fold_decrypt_chunk_results(chunk_results).expect("all chunks succeeded");
+        let pairs: Vec<(String, f64)> = (0..8).map(|i| (format!("blob-{i}"), i as f64)).collect();
+        let (hydrated, drops) = assemble_decrypted(&pairs, outcomes);
+        assert_eq!(drops, 0);
+        let texts: Vec<String> = hydrated.into_iter().map(|m| m.text).collect();
+        assert_eq!(
+            texts,
+            (0..8).map(|i| format!("blob-{i}")).collect::<Vec<_>>(),
+            "buffered concurrency must preserve exact hit order even when later chunks finish first"
+        );
+    }
+
+    #[test]
+    fn filter_cached_ciphertext_enforces_size_cap_per_entry() {
+        assert_eq!(
+            filter_cached_ciphertext("b1", Some(vec![1, 2, 3]), 4),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            filter_cached_ciphertext("b2", Some(vec![1, 2, 3, 4, 5]), 4),
+            None
+        );
+        assert_eq!(filter_cached_ciphertext("b3", None, 4), None);
     }
 }
