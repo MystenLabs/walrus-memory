@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       session_recall:
-        description: Read-only deployed recall with fresh versus reused SEAL sessions
+        description: Deployed recall sessions (remember_runs seeds isolated bench-session-* namespace; 0 is read-only)
         type: boolean
         default: false
       expected_server_commit:
@@ -149,7 +149,7 @@ jobs:
           if [ "$SESSION_RECALL" = "true" ]; then
             services/server/scripts/node_modules/.bin/tsx services/server/scripts/bench-recall-session-live.ts \
               --server-url "$SERVER_URL" --namespace "$NAMESPACE" --query "$QUERY" \
-              --limit "$LIMIT" --runs "$WARM_RUNS" --expected-commit "$EXPECTED_SERVER_COMMIT" \
+              --limit "$LIMIT" --runs "$WARM_RUNS" --seed-count "$REMEMBER_RUNS" --expected-commit "$EXPECTED_SERVER_COMMIT" \
               --output benchmark-results/memory-api.json
             exit 0
           fi

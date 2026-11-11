@@ -1,4 +1,4 @@
-/** Read-only deployed HTTP recall: fresh-session control vs reused-session cache. */
+/** Deployed HTTP recall: fresh/reused sessions, with optional isolated synthetic fixture seeding. */
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -17,6 +17,10 @@ async function main() {
     const server = arg("--server-url", process.env.BENCH_SERVER_URL).replace(/\/$/, "");
     const output = arg("--output", "benchmark-results/memory-api.json");
     const runs = Number(arg("--runs", "10")), limit = Number(arg("--limit", "10"));
+    const namespace = arg("--namespace", "benchmark");
+    const seedCount = Number(arg("--seed-count", "0"));
+    assert.ok(Number.isInteger(seedCount) && seedCount >= 0 && seedCount <= 25);
+    if (seedCount) assert.ok(namespace.startsWith("bench-session-"), "Seed writes require an isolated bench-session-* namespace");
     assert.ok(Number.isInteger(runs) && runs >= 2 && runs <= 30);
     assert.ok(Number.isInteger(limit) && limit > 0 && limit <= 100);
     const secret = process.env.BENCH_DELEGATE_KEY, accountId = process.env.BENCH_ACCOUNT_ID;
@@ -37,7 +41,18 @@ async function main() {
         await key.getCertificate();
         return Buffer.from(JSON.stringify({ ...key.export() })).toString("base64");
     };
-    const body = JSON.stringify({ query: arg("--query", "benchmark memory"), namespace: arg("--namespace", "benchmark"), limit, deadline_ms: 14_000 });
+    if (seedCount) {
+        const { MemWal } = await import("@mysten-incubation/memwal");
+        const sdk = MemWal.create({ key: secret, accountId, serverUrl: server, namespace });
+        try {
+            for (let i = 0; i < seedCount; i++) {
+                const job = await sdk.rememberAsync(`benchmark memory: synthetic session-cache fixture ${i}, run ${randomUUID()}`);
+                await sdk.waitForRememberJob(job.job_id, { timeoutMs: 180_000 });
+                console.log(`Stored synthetic fixture ${i + 1}/${seedCount}`);
+            }
+        } finally { sdk.destroy(); }
+    }
+    const body = JSON.stringify({ query: arg("--query", "benchmark memory"), namespace, limit, deadline_ms: 14_000 });
     const hash = createHash("sha256").update(body).digest("hex");
     async function recall(header: string) {
         const timestamp = String(Math.floor(Date.now() / 1000)), nonce = randomUUID(), requestId = randomUUID();
@@ -52,12 +67,16 @@ async function main() {
         assert.equal(response.status, 200, `Recall HTTP ${response.status}, stage=${value.stage ?? "unknown"}`);
         assert.ok(value.results?.length > 0, "No benchmark memories; empty recall cannot validate hydration performance");
         assert.equal(value.dropped_count ?? 0, 0, "Dropped results invalidate the timing comparison");
+        if (seedCount) assert.equal(value.results.length, Math.min(limit, seedCount), "Missing freshly stored fixtures");
         const digest = createHash("sha256").update(JSON.stringify(value.results)).digest("hex");
         return { latencyMs, resultCount: value.results.length, digest, requestId };
     }
+    const measurementHealth = await get("/health");
+    if (arg("--expected-commit")) assert.equal(measurementHealth.build.commit, arg("--expected-commit"));
     const samples: any[] = [];
     const report: any = { timestamp: new Date().toISOString(), scope: "Deployed HTTP /api/recall; read-only; all requests use x-seal-session",
-        serverCommit: health.build.commit, runnerCommit: process.env.GITHUB_SHA ?? null, limit, runs, completed: false, samples,
+        serverCommit: measurementHealth.build.commit, runnerCommit: process.env.GITHUB_SHA ?? null, limit, runs,
+        fixtureNamespace: namespace, seededFixtures: seedCount, completed: false, samples,
         notes: ["Session construction excluded; HTTP response body read included", "Embedding/blob cache prewarmed equally",
             "Fresh-session control uses new credentials per request; reused-session arm uses identical bytes",
             "This is a same-deployment session-cache control, not a historical-deployment end-to-end A/B"] };
@@ -73,7 +92,7 @@ async function main() {
             }
             console.log(`Completed deployed session pair ${i + 1}/${runs}`);
         }
-        assert.equal((await get("/health")).build.commit, health.build.commit, "Deployment changed during benchmark");
+        assert.equal((await get("/health")).build.commit, measurementHealth.build.commit, "Deployment changed during benchmark");
         assert.equal(new Set(samples.map(x => x.digest)).size, 1, "Results changed between arms; comparison invalid");
         const stats = (arm: string) => {
             const values = samples.filter(x => x.arm === arm).map(x => x.latencyMs).sort((a, b) => a - b);
