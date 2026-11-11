@@ -359,7 +359,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///
@@ -601,11 +601,8 @@ mod tests {
 
         super::backfill_updated_xid(&pool).await.unwrap();
 
-        execute_idempotent_migration(
-            &pool,
-            migration_sql("029_memory_updated_xid_not_null.sql"),
-        )
-        .await;
+        execute_idempotent_migration(&pool, migration_sql("029_memory_updated_xid_not_null.sql"))
+            .await;
 
         let db = VectorDb {
             pool,
@@ -752,12 +749,22 @@ mod tests {
         .unwrap();
         assert_eq!(pre_null_count, 5);
 
+        // Capture each seeded row's original pre-update xmin before running the backfill.
+        let pre_backfill_xmins: Vec<i64> = sqlx::query_scalar(
+            "SELECT xmin::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_backfill_xmins.len(), 5);
+
         // Execute batched backfill. This must terminate and not loop indefinitely.
         super::backfill_updated_xid(db.pool())
             .await
             .expect("backfill_updated_xid must succeed and terminate");
 
-        // Verify that all rows now have non-null updated_xid matching xmin::text::xid8.
+        // Verify that all rows now have non-null updated_xid matching their pre-update xmin.
         let post_null_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid IS NULL",
         )
@@ -770,16 +777,16 @@ mod tests {
             "all pre-migration rows must have updated_xid populated"
         );
 
-        let matching_xmin_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid = xmin::text::xid8",
+        let backfilled_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
         )
         .bind(&owner)
-        .fetch_one(db.pool())
+        .fetch_all(db.pool())
         .await
         .unwrap();
         assert_eq!(
-            matching_xmin_count, 5,
-            "backfilled updated_xid must match the row tuple xmin"
+            backfilled_xids, pre_backfill_xmins,
+            "backfilled updated_xid must match each row's pre-update xmin"
         );
 
         // Verify that migration 029 (enforcing NOT NULL) succeeds cleanly on the populated table.
@@ -798,13 +805,11 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::query(
-            "UPDATE vector_entries SET blob_size_bytes = 200 WHERE owner = $1",
-        )
-        .bind(&owner)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        sqlx::query("UPDATE vector_entries SET blob_size_bytes = 200 WHERE owner = $1")
+            .bind(&owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
 
         let preserved_xids: Vec<i64> = sqlx::query_scalar(
             "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
