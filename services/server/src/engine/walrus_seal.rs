@@ -14,9 +14,10 @@
 //!   delete: they are logged and dropped. Returns `Ok(None)` for "gone",
 //!   not an error.
 //! - **fetch_batch**: per-id cache lookup, then `seal::seal_decrypt_batch`
-//!   the cache-cold blobs in chunks of 25; same cleanup-on-404 semantics;
-//!   returns `(hydrated, dropped_count)` so callers can tell "no matches"
-//!   from "matches we couldn't return".
+//!   the cache-cold blobs in chunks of 25, with a bounded number of chunks
+//!   in flight; same cleanup-on-404 semantics; returns
+//!   `(hydrated, dropped_count)` so callers can tell "no matches" from
+//!   "matches we couldn't return".
 //!
 //! The SEAL credential is derived from `&AuthInfo` here (prefer the
 //! exported SessionKey, fall back to the legacy delegate key, then to
@@ -24,6 +25,7 @@
 //! today via `seal::SealCredential::from_auth_or_fallback`.
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +48,28 @@ const SEAL_DECRYPT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Minimum remaining recall deadline budget required after backoff to start a retry.
 const RETRY_MIN_DEADLINE_HEADROOM: Duration = Duration::from_millis(1_000);
 
+/// Default number of `seal/decrypt-batch` chunks in flight at once.
+///
+/// Each chunk pays a fixed cost (build the `seal_approve` PTB, fetch derived
+/// keys from the SEAL key servers, then decrypt locally). Recalls with more
+/// than `SEAL_DECRYPT_BATCH_SIZE` hits currently pay that cost once per chunk,
+/// serially. Overlapping chunks shortens the cold path from
+/// `O(chunks)` to roughly `O(ceil(chunks / concurrency))` without changing the
+/// per-chunk request shape the sidecar already enforces.
+pub const DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY: usize = 2;
+/// Upper bound for `SEAL_DECRYPT_BATCH_CONCURRENCY`. Keep this small: each
+/// chunk fans out to the shared SEAL key servers.
+pub const MAX_SEAL_DECRYPT_BATCH_CONCURRENCY: usize = 8;
+
+/// Parse `SEAL_DECRYPT_BATCH_CONCURRENCY`, falling back to the default for
+/// missing, malformed, or out-of-range values. A performance knob must never
+/// prevent the relayer from booting.
+pub fn parse_seal_decrypt_batch_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=MAX_SEAL_DECRYPT_BATCH_CONCURRENCY).contains(value))
+        .unwrap_or(DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY)
+}
+
 /// Production engine — uploads prepared ciphertext to Walrus, indexes
 /// the row in Postgres, serves reads through the Redis blob cache.
 ///
@@ -64,6 +88,8 @@ pub struct WalrusSealEngine {
     /// writes skip blobs larger than this. Zero disables the cache
     /// entirely (read and write).
     blob_cache_max_bytes: usize,
+    /// Number of SEAL decrypt-batch chunks that may run in flight at once.
+    seal_decrypt_batch_concurrency: usize,
 }
 
 impl WalrusSealEngine {
@@ -75,6 +101,7 @@ impl WalrusSealEngine {
         redis: redis::aio::ConnectionManager,
         blob_cache_ttl: Duration,
         blob_cache_max_bytes: usize,
+        seal_decrypt_batch_concurrency: usize,
     ) -> Self {
         Self {
             db,
@@ -84,6 +111,8 @@ impl WalrusSealEngine {
             redis,
             blob_cache_ttl,
             blob_cache_max_bytes,
+            seal_decrypt_batch_concurrency: seal_decrypt_batch_concurrency
+                .clamp(1, MAX_SEAL_DECRYPT_BATCH_CONCURRENCY),
         }
     }
 
@@ -462,38 +491,58 @@ impl MemoryEngine for WalrusSealEngine {
         // Step 2: batch-decrypt the ciphertexts in chunks.
         super::stage::enter(super::stage::RecallStage::SealDecrypt);
         let seal_start = std::time::Instant::now();
-        let batch_input: Vec<(String, Vec<u8>)> = fetched
-            .iter()
-            .map(|f| (f.blob_id.clone(), f.ciphertext.clone()))
-            .collect();
-        let mut chunk_results = Vec::new();
-        for chunk in batch_input.chunks(SEAL_DECRYPT_BATCH_SIZE) {
-            let res = decrypt_chunk_with_retry(chunk, |items| {
-                let credential = credential.clone();
-                async move {
-                    seal::seal_decrypt_batch(
-                        &self.http_client,
-                        &self.config.seal_sidecar_url,
-                        self.config.sidecar_secret.as_deref(),
-                        &items,
-                        &credential,
-                        &self.config.package_id,
-                        &self.config.seal_policy_package_id,
-                        &self.config.registry_id,
-                        &auth.account_id,
-                    )
-                    .await
-                }
+        let batch_chunks: Vec<Vec<(String, Vec<u8>)>> = fetched
+            .chunks(SEAL_DECRYPT_BATCH_SIZE)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|f| (f.blob_id.clone(), f.ciphertext.clone()))
+                    .collect()
             })
+            .collect();
+        // Chunks are independent and each one pays the same fixed PTB +
+        // key-server cost, so overlap a bounded number of them. The chunk
+        // index travels with the result because `buffer_unordered` completes
+        // in arrival order, while `assemble_decrypted` zips outcomes
+        // positionally with `fetched`; the fold must see them in input order.
+        let chunk_tasks = batch_chunks.into_iter().enumerate().map(|(index, chunk)| {
+            let credential = credential.clone();
+            async move {
+                let chunk_len = chunk.len();
+                let res = decrypt_chunk_with_retry(&chunk, |items| {
+                    let credential = credential.clone();
+                    async move {
+                        seal::seal_decrypt_batch(
+                            &self.http_client,
+                            &self.config.seal_sidecar_url,
+                            self.config.sidecar_secret.as_deref(),
+                            &items,
+                            &credential,
+                            &self.config.package_id,
+                            &self.config.seal_policy_package_id,
+                            &self.config.registry_id,
+                            &auth.account_id,
+                        )
+                        .await
+                    }
+                })
+                .await;
+                (index, chunk_len, res)
+            }
+        });
+        let chunk_results = futures::stream::iter(chunk_tasks)
+            .buffer_unordered(self.seal_decrypt_batch_concurrency)
+            .collect::<Vec<_>>()
             .await;
-            if let Err(ref e) = res {
+        let chunk_results = order_chunk_results(chunk_results);
+        for (chunk_len, res) in &chunk_results {
+            if let Err(e) = res {
                 tracing::warn!(
                     "engine.fetch_batch: seal_decrypt_batch failed for {} blobs: {}",
-                    chunk.len(),
+                    chunk_len,
                     e
                 );
             }
-            chunk_results.push((chunk.len(), res));
         }
         let decrypted = fold_decrypt_chunk_results(chunk_results)?;
         let seal_ms = seal_start.elapsed().as_millis();
@@ -644,6 +693,22 @@ where
             Ok(outcomes)
         }
     }
+}
+
+/// Put concurrently-completed chunk results back into chunk order.
+///
+/// `buffer_unordered` yields chunks as they finish, but the decrypted outcome
+/// vector is later zipped positionally with `fetched`. Sorting by the chunk
+/// index captured before the await is what keeps a fast chunk from being
+/// associated with another chunk's blobs.
+fn order_chunk_results(
+    mut chunks: Vec<(usize, usize, Result<Vec<DecryptOutcome>, AppError>)>,
+) -> Vec<(usize, Result<Vec<DecryptOutcome>, AppError>)> {
+    chunks.sort_by_key(|(index, _, _)| *index);
+    chunks
+        .into_iter()
+        .map(|(_, chunk_len, res)| (chunk_len, res))
+        .collect()
 }
 
 /// Fold per-chunk `seal_decrypt_batch` results across all chunks.
@@ -800,8 +865,9 @@ mod tests {
 
     use super::{
         assemble_decrypted, decrypt_chunk_with_retry, download_ciphertext_with_retry,
-        fold_decrypt_chunk_results, read_decision, write_decision, AppError, CacheReadDecision,
-        CacheWriteDecision, DecryptOutcome,
+        fold_decrypt_chunk_results, order_chunk_results, parse_seal_decrypt_batch_concurrency,
+        read_decision, write_decision, AppError, CacheReadDecision, CacheWriteDecision,
+        DecryptOutcome, DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY, MAX_SEAL_DECRYPT_BATCH_CONCURRENCY,
     };
 
     // ── transient download & decrypt retries ───────────────────────
@@ -1028,6 +1094,70 @@ mod tests {
         assert_eq!(results[0].text, "alpha");
         assert_eq!(results[1].blob_id, "blob-1");
         assert_eq!(results[1].text, "beta");
+    }
+
+    // ── chunk concurrency ─────────────────────────────────────────
+
+    #[test]
+    fn seal_decrypt_batch_concurrency_parses_valid_values_and_falls_back_safely() {
+        assert_eq!(
+            parse_seal_decrypt_batch_concurrency(None),
+            DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY
+        );
+        assert_eq!(parse_seal_decrypt_batch_concurrency(Some("1")), 1);
+        assert_eq!(parse_seal_decrypt_batch_concurrency(Some(" 4 ")), 4);
+        assert_eq!(
+            parse_seal_decrypt_batch_concurrency(Some(
+                &MAX_SEAL_DECRYPT_BATCH_CONCURRENCY.to_string()
+            )),
+            MAX_SEAL_DECRYPT_BATCH_CONCURRENCY
+        );
+        for invalid in ["", "0", "9", "-1", "two"] {
+            assert_eq!(
+                parse_seal_decrypt_batch_concurrency(Some(invalid)),
+                DEFAULT_SEAL_DECRYPT_BATCH_CONCURRENCY,
+                "{invalid:?} must not be accepted"
+            );
+        }
+    }
+
+    /// `buffer_unordered` completes chunks in whichever order the sidecar
+    /// answers. This pins the reassembly: the fold must see chunk order, or a
+    /// fast chunk's plaintext would be attached to another chunk's blobs.
+    #[test]
+    fn out_of_order_chunk_completion_is_reassembled_in_input_order() {
+        let fetched = vec![
+            ("blob-0".to_string(), 0.1),
+            ("blob-1".to_string(), 0.2),
+            ("blob-2".to_string(), 0.3),
+            ("blob-3".to_string(), 0.4),
+        ];
+        // Completion order is 2, 0, 1 while the input order is 0, 1, 2.
+        let chunks = vec![
+            (2, 1, Ok(vec![DecryptOutcome::Ok(b"delta".to_vec())])),
+            (
+                0,
+                2,
+                Ok(vec![
+                    DecryptOutcome::Ok(b"alpha".to_vec()),
+                    DecryptOutcome::Ok(b"beta".to_vec()),
+                ]),
+            ),
+            (1, 1, Ok(vec![DecryptOutcome::Ok(b"gamma".to_vec())])),
+        ];
+
+        let outcomes =
+            fold_decrypt_chunk_results(order_chunk_results(chunks)).expect("all chunks succeeded");
+        let (results, drops) = assemble_decrypted(&fetched, outcomes);
+
+        assert_eq!(drops, 0);
+        let texts: Vec<&str> = results.iter().map(|result| result.text.as_str()).collect();
+        assert_eq!(texts, vec!["alpha", "beta", "gamma", "delta"]);
+        let blob_ids: Vec<&str> = results
+            .iter()
+            .map(|result| result.blob_id.as_str())
+            .collect();
+        assert_eq!(blob_ids, vec!["blob-0", "blob-1", "blob-2", "blob-3"]);
     }
 
     #[test]

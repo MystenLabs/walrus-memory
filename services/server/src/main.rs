@@ -2547,6 +2547,16 @@ async fn main() {
         Arc::new(PlaintextEngine::new(Arc::clone(&db)))
     } else {
         tracing::info!("  storage: WalrusSealEngine (production)");
+        let seal_decrypt_batch_concurrency =
+            engine::walrus_seal::parse_seal_decrypt_batch_concurrency(
+                std::env::var("SEAL_DECRYPT_BATCH_CONCURRENCY")
+                    .ok()
+                    .as_deref(),
+            );
+        tracing::info!(
+            "  seal decrypt batch concurrency: {} (SEAL_DECRYPT_BATCH_CONCURRENCY)",
+            seal_decrypt_batch_concurrency
+        );
         Arc::new(WalrusSealEngine::new(
             Arc::clone(&db),
             http_client.clone(),
@@ -2555,6 +2565,7 @@ async fn main() {
             redis.clone(),
             blob_cache_ttl,
             blob_cache_max_bytes,
+            seal_decrypt_batch_concurrency,
         ))
     };
 

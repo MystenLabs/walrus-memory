@@ -32,6 +32,10 @@ import {
 } from "./config.js";
 import { shortAddress } from "./util.js";
 import { createSealDecryptClientFactory } from "./seal-metadata.js";
+import {
+    createSealSessionClientCache,
+    type SealSessionCacheKey,
+} from "./seal-session-cache.js";
 
 // Shared gRPC core client for Walrus, SEAL, Enoki, and blob queries.
 export const suiClient = new SuiGrpcClient({ network: SUI_NETWORK, baseUrl: SUI_GRPC_URL });
@@ -64,14 +68,30 @@ export function createSealClient(options?: { verifyKeyServers?: boolean }): Seal
 // otherwise repeat the Sui object/dynamic-field reads on every decrypt.
 const decryptSealClients = createSealDecryptClientFactory(createSealClient);
 
+// Derived keys are cached per credential (not globally): a SealClient's
+// internal key map is not scoped to the SessionKey that fetched a key, so
+// sharing one client across sessions would let one caller reuse another
+// caller's derived key. See seal-session-cache.ts.
+const decryptSealSessions = createSealSessionClientCache(() => decryptSealClients.create());
+
 export function resetSealKeyServerTrustForTests(): void {
+    decryptSealSessions.reset();
     decryptSealClients.reset();
 }
 
-// Derived keys remain request-local; only public key-server metadata and its
-// verification are shared for the five-minute trust window.
-export async function createDecryptSealClient(): Promise<SealClient> {
-    return decryptSealClients.create();
+/**
+ * Resolve a SealClient for a decrypt request.
+ *
+ * With a `cacheKey` (a session header or a legacy delegate key), the client —
+ * and therefore its derived-key cache — is reused for the credential's
+ * bounded lifetime. Without one (manual callers that deliberately bypass the
+ * cache), every call gets a fresh client.
+ */
+export async function createDecryptSealClient(
+    cacheKey?: SealSessionCacheKey,
+): Promise<SealClient> {
+    if (!cacheKey) return decryptSealClients.create();
+    return decryptSealSessions.get(cacheKey);
 }
 
 // Encryption caches public key-server metadata only. Decrypt routes must use a

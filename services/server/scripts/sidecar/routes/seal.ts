@@ -32,6 +32,11 @@ import {
 } from "../config.js";
 import { sealCommitteeIdentityMatches, type SealCommitteeIdentity } from "../../seal-config.js";
 import { createDecryptSealClient, sealEncryptClient, suiClient } from "../clients.js";
+import {
+  delegateKeyCacheKey,
+  sessionCacheKeyFromExportedSession,
+  type SealSessionCacheKey,
+} from "../seal-session-cache.js";
 import { buildSealEncryptId, fetchSealEncryptIdentity, type SealEncryptPurpose } from "../seal-identity.js";
 import {
   buildSealApproveTx,
@@ -136,13 +141,29 @@ function sendSealFailure(
  *
  * Returns `null` when neither header is present so the caller can emit a
  * 400 with a clear error message.
+ *
+ * `cacheKey` is the credential-scoped key for the sidecar's derived-key cache.
+ * It is absent only if an exported session lacks the expiry fields needed to
+ * bound the cache entry; in that case the request still decrypts, but with a
+ * fresh SealClient.
  */
-async function resolveSessionKey(req: express.Request, packageId: string): Promise<SessionKey | null> {
+export interface ResolvedSealCredential {
+  sessionKey: SessionKey;
+  cacheKey?: SealSessionCacheKey;
+}
+
+async function resolveSessionKey(
+  req: express.Request,
+  packageId: string
+): Promise<ResolvedSealCredential | null> {
   const sessionHeader = req.headers["x-seal-session"] as string | undefined;
   if (sessionHeader) {
     const exportedJson = Buffer.from(sessionHeader, "base64").toString("utf8");
     const exported = JSON.parse(exportedJson);
-    return SessionKey.import(exported, suiClient as any);
+    return {
+      sessionKey: SessionKey.import(exported, suiClient as any),
+      cacheKey: sessionCacheKeyFromExportedSession(sessionHeader, exported),
+    };
   }
 
   const privateKey = req.headers["x-delegate-key"] as string | undefined;
@@ -160,13 +181,20 @@ async function resolveSessionKey(req: express.Request, packageId: string): Promi
         const keyBytes = Uint8Array.from(privateKey.match(/.{1,2}/g)!.map((b: string) => parseInt(b, 16)));
     keypair = Ed25519Keypair.fromSecretKey(keyBytes);
   }
-  return await SessionKey.create({
-    address: keypair.getPublicKey().toSuiAddress(),
-    packageId,
-    ttlMin: 5,
-    signer: keypair,
-    suiClient: suiClient as any,
-  });
+  return {
+    sessionKey: await SessionKey.create({
+      address: keypair.getPublicKey().toSuiAddress(),
+      packageId,
+      ttlMin: 5,
+      signer: keypair,
+      suiClient: suiClient as any,
+    }),
+    // The delegate key is a long-lived credential, so cache its derived keys
+    // for only one minute (see SEAL_LEGACY_KEY_CACHE_TTL_MS) — enough for a
+    // burst of recalls while a key revoked on-chain stops decrypting promptly.
+    // The fingerprint isolates different delegate keys.
+    cacheKey: delegateKeyCacheKey(privateKey),
+  };
 }
 
 const ACCOUNT_READ_ATTEMPTS = 4;
@@ -357,12 +385,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         phase = "resolve_session";
         // resolve credential (x-seal-session preferred; legacy
         // x-delegate-key supported during the deprecation window).
-            const sessionKey = await resolveSessionKey(req, normalizeSuiAddress(packageId));
-        if (!sessionKey) {
+            const resolvedCredential = await resolveSessionKey(req, normalizeSuiAddress(packageId));
+        if (!resolvedCredential) {
           return res.status(400).json({
                     error: "Missing credential: provide x-seal-session (preferred) or x-delegate-key header",
           });
         }
+        const { sessionKey, cacheKey } = resolvedCredential;
 
         phase = "parse";
         // Parse encrypted object to get key ID
@@ -382,7 +411,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         phase = "fetch_keys";
         // Fetch keys from key servers with one bounded retry on transient RPC drops
         const sealClient = await retryTransientSealDecryptRpc(async () => {
-          const client = await createDecryptSealClient();
+          const client = await createDecryptSealClient(cacheKey);
           await client.fetchKeys({
             ids: [fullId],
             txBytes,
@@ -440,12 +469,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         phase = "resolve_session";
         // resolve credential (x-seal-session preferred; legacy
         // x-delegate-key supported during the deprecation window).
-            const sessionKey = await resolveSessionKey(req, normalizeSuiAddress(packageId));
-        if (!sessionKey) {
+            const resolvedCredential = await resolveSessionKey(req, normalizeSuiAddress(packageId));
+        if (!resolvedCredential) {
           return res.status(400).json({
                     error: "Missing credential: provide x-seal-session (preferred) or x-delegate-key header",
           });
         }
+        const { sessionKey, cacheKey } = resolvedCredential;
             const sessionIdentityError = sealIdentityPackageError(packageId, [], sessionKey.getPackageId());
         if (sessionIdentityError) {
           return res.status(400).json({ error: sessionIdentityError });
@@ -463,6 +493,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
 
         phase = "build_ptb";
         // Build ONE PTB with seal_approve for ALL unique IDs
+        const buildStarted = performance.now();
         const allIds = [...new Set(parsedItems.map((p) => p.fullId))];
         const txBytes = await buildSealApproveTxBytes(
           sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
@@ -470,13 +501,15 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           accountId,
           allIds
         );
+        const buildMs = performance.now() - buildStarted;
 
         phase = "fetch_keys";
         // ONE fetchKeys call for ALL IDs, retrying once on transient RPC failure
+        const fetchStarted = performance.now();
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
         try {
           sealClient = await retryTransientSealDecryptRpc(async () => {
-            const client = await createDecryptSealClient();
+            const client = await createDecryptSealClient(cacheKey);
             await client.fetchKeys({
               ids: allIds,
               txBytes,
@@ -505,9 +538,11 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
             ],
           });
         }
+        const fetchMs = performance.now() - fetchStarted;
 
         phase = "decrypt";
         // Decrypt each blob using the shared sessionKey
+        const decryptStarted = performance.now();
         const results: { index: number; decryptedData: string }[] = [];
 
         for (const item of parsedItems) {
@@ -530,7 +565,11 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           }
         }
 
-            console.log(`[seal/decrypt-batch] ${results.length}/${items.length} decrypted ok, ${errors.length} errors`);
+            const decryptMs = performance.now() - decryptStarted;
+            console.log(
+              `[seal/decrypt-batch] ${results.length}/${items.length} decrypted ok, ${errors.length} errors ` +
+              `build_ptb=${buildMs.toFixed(0)}ms fetch_keys=${fetchMs.toFixed(0)}ms decrypt=${decryptMs.toFixed(0)}ms`
+            );
         res.json({ results, errors });
       } catch (err: any) {
             sendSealFailure(res, "seal/decrypt-batch", phase, err, requestIdFor(req));
