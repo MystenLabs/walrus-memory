@@ -413,3 +413,146 @@ test("threshold=1 single-server MPC committee ciphertexts and GF(256) denom=1 su
         assert.deepEqual(Buffer.from(combineSharesGF256(pair)), Buffer.from(secret));
     }
 });
+
+test("session expiry during batch fallback or single-item post-check rejects instead of leaking fast-path plaintext", async () => {
+    const committee = makeCommittee([1, 1, 1]);
+    const innerId = "feedface01020304";
+    const { fastKeys } = committee.deriveUserSecretKeys(innerId);
+
+    const validCiphertext = await committee.encryptPayload(
+        innerId,
+        Buffer.from("secret-fast-path-memory"),
+        2,
+        "aes",
+    );
+    // Corrupt share 0 while 3 derived keys are available so item 1 raises FallbackShareSubsetError
+    // and enters the per-item sealClient.decrypt fallback loop after item 0 already decrypted.
+    const fallbackParsed = EncryptedObject.parse(new Uint8Array(validCiphertext));
+    fallbackParsed.encryptedShares.BonehFranklinBLS12381.encryptedShares[0][0] ^= 0xff;
+    const fallbackCiphertext = EncryptedObject.serialize(fallbackParsed).toBytes();
+
+    const mixedItems = [
+        { index: 0, encryptedData: validCiphertext, fullId: innerId, threshold: 2 },
+        { index: 1, encryptedData: fallbackCiphertext, fullId: innerId, threshold: 2 },
+    ];
+
+    // Case 1: session expires while sealClient.decrypt succeeds on fallback item 1.
+    let expired1 = false;
+    const mockClient1 = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [objId, { toString: () => toHex(bytes) }]),
+            );
+        },
+        async decrypt() {
+            expired1 = true;
+            return Buffer.from("fallback-plaintext");
+        },
+    } as unknown as SealClient;
+
+    await assert.rejects(
+        () =>
+            decryptBatchSealItems({
+                sealClient: mockClient1,
+                parsedItems: mixedItems,
+                uniqueIds: [innerId],
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+                assertLive: () => {
+                    if (expired1) throw new Error("SEAL session expired");
+                },
+            }),
+        /SEAL session expired/,
+        "session expiry after fallback decrypt must reject the entire batch without returning item 0",
+    );
+
+    // Case 2: fallback item 1 throws a normal decrypt failure AFTER session expiry.
+    let expired2 = false;
+    const mockClient2 = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [objId, { toString: () => toHex(bytes) }]),
+            );
+        },
+        async decrypt() {
+            expired2 = true;
+            throw new Error("corrupt fallback ciphertext");
+        },
+    } as unknown as SealClient;
+
+    await assert.rejects(
+        () =>
+            decryptBatchSealItems({
+                sealClient: mockClient2,
+                parsedItems: mixedItems,
+                uniqueIds: [innerId],
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+                assertLive: () => {
+                    if (expired2) throw new Error("SEAL session expired");
+                },
+            }),
+        /SEAL session expired/,
+        "session expiry coinciding with fallback cipher error must reject the entire batch",
+    );
+
+    // Case 3: fallback sealClient.decrypt itself throws ExpiredSessionKeyError.
+    const mockClient3 = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [objId, { toString: () => toHex(bytes) }]),
+            );
+        },
+        async decrypt() {
+            const err = new Error("Session key has expired");
+            err.name = "ExpiredSessionKeyError";
+            throw err;
+        },
+    } as unknown as SealClient;
+
+    await assert.rejects(
+        () =>
+            decryptBatchSealItems({
+                sealClient: mockClient3,
+                parsedItems: mixedItems,
+                uniqueIds: [innerId],
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+            }),
+        /Session key has expired/,
+        "ExpiredSessionKeyError from SDK fallback must propagate instead of becoming per-item DECRYPT_FAILED",
+    );
+
+    // Case 4: decryptSingleSealItem expiring right after fast-path decrypt must NOT fall through to sealClient.decrypt.
+    let singleChecks = 0;
+    let fallbackDecryptCalls = 0;
+    const mockSingleClient = {
+        async getDerivedKeys() {
+            return new Map(
+                Array.from(fastKeys, ([objId, bytes]) => [objId, { toString: () => toHex(bytes) }]),
+            );
+        },
+        async decrypt() {
+            fallbackDecryptCalls += 1;
+            return Buffer.from("should-not-run");
+        },
+    } as unknown as SealClient;
+
+    await assert.rejects(
+        () =>
+            decryptSingleSealItem({
+                sealClient: mockSingleClient,
+                encryptedData: validCiphertext,
+                parsedObject: EncryptedObject.parse(validCiphertext),
+                fullId: innerId,
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+                assertLive: () => {
+                    singleChecks += 1;
+                    if (singleChecks >= 3) throw new Error("SEAL session expired");
+                },
+            }),
+        /SEAL session expired/,
+    );
+    assert.equal(fallbackDecryptCalls, 0, "post-decrypt session expiry must not enter fallback sealClient.decrypt");
+});

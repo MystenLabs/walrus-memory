@@ -336,6 +336,9 @@ function decryptHmac256CtrFast(demKey, hmacPayload) {
 }
 
 function validateEncryptionServices(serviceObjectIds, threshold, serverWeights, totalServerWeight) {
+    if (!Number.isInteger(threshold) || threshold < 1) {
+        throw new InvalidThresholdError(`Invalid threshold ${threshold}`);
+    }
     if (serverWeights && typeof totalServerWeight === "number") {
         for (const objectId of serviceObjectIds) {
             const configuredWeight = serverWeights.get(objectId) ?? 0;

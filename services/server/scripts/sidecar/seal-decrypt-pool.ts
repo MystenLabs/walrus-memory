@@ -30,6 +30,56 @@ const SERVER_WEIGHTS_ENTRIES: Array<[string, number]> = SEAL_SERVER_CONFIGS.map(
 const SERVER_WEIGHTS_MAP = new Map<string, number>(SERVER_WEIGHTS_ENTRIES);
 const TOTAL_SERVER_WEIGHT = SEAL_SERVER_CONFIGS.reduce((sum, s) => sum + s.weight, 0);
 
+export function effectiveSealSingleThreshold(rawThreshold: unknown): number {
+    const parsed = Number(rawThreshold) || 0;
+    if (parsed < 1 || (TOTAL_SERVER_WEIGHT > 0 && parsed > TOTAL_SERVER_WEIGHT)) {
+        return SEAL_THRESHOLD;
+    }
+    return Math.max(SEAL_THRESHOLD, parsed);
+}
+
+export function effectiveSealBatchThreshold(
+    items: ReadonlyArray<{ threshold?: number; parsedObject?: { threshold?: unknown } }>,
+): number {
+    let resolved = SEAL_THRESHOLD;
+    for (const item of items) {
+        const candidate = Number(item.threshold ?? item.parsedObject?.threshold) || 0;
+        if (candidate >= 1 && (TOTAL_SERVER_WEIGHT <= 0 || candidate <= TOTAL_SERVER_WEIGHT)) {
+            if (candidate > resolved) resolved = candidate;
+        }
+    }
+    return resolved;
+}
+
+function isSealSessionExpiredError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    return (
+        err.name === "ExpiredSessionKeyError" ||
+        err.message === "SEAL session expired" ||
+        err.message === "Session key has expired"
+    );
+}
+
+function wipeClonedKeyEntries(entriesById: Array<[string, Array<[string, Uint8Array]>]>): void {
+    for (const [, entries] of entriesById) {
+        for (const [, bytes] of entries) {
+            if (bytes.byteLength > 0) bytes.fill(0);
+        }
+    }
+}
+
+function keyTransferList(entriesById: Array<[string, Array<[string, Uint8Array]>]>): ArrayBuffer[] {
+    const buffers: ArrayBuffer[] = [];
+    for (const [, entries] of entriesById) {
+        for (const [, bytes] of entries) {
+            if (bytes.buffer instanceof ArrayBuffer) {
+                buffers.push(bytes.buffer);
+            }
+        }
+    }
+    return buffers;
+}
+
 interface PendingTask {
     payload: {
         items: DecryptSliceItem[];
@@ -117,7 +167,19 @@ function dispatchNext(): void {
         idle.currentTaskId = next.id;
         idle.worker.ref();
         inFlightTasks.set(next.id, next.task);
-        idle.worker.postMessage({ id: next.id, payload: next.task.payload });
+        try {
+            idle.worker.postMessage(
+                { id: next.id, payload: next.task.payload },
+                keyTransferList(next.task.payload.derivedKeysById),
+            );
+        } catch (err) {
+            wipeClonedKeyEntries(next.task.payload.derivedKeysById);
+            inFlightTasks.delete(next.id);
+            idle.busy = false;
+            idle.currentTaskId = null;
+            idle.worker.unref();
+            next.task.reject(err);
+        }
     }
 }
 
@@ -136,6 +198,7 @@ export async function stopSealDecryptPool(): Promise<void> {
     const active = workers.splice(0, workers.length);
     while (taskQueue.length > 0) {
         const queued = taskQueue.shift()!;
+        wipeClonedKeyEntries(queued.task.payload.derivedKeysById);
         queued.task.reject(new Error("seal decrypt worker pool stopped"));
     }
     await Promise.allSettled(active.map((slot) => slot.worker.terminate()));
@@ -143,11 +206,17 @@ export async function stopSealDecryptPool(): Promise<void> {
 
 function cloneKeyEntries(
     rawById: Map<string, Array<[string, Uint8Array]>>,
+    filterIds?: ReadonlySet<string>,
 ): Array<[string, Array<[string, Uint8Array]>]> {
-    return Array.from(rawById, ([id, entries]) => [
-        id,
-        entries.map(([objectId, bytes]) => [objectId, new Uint8Array(bytes)]),
-    ]);
+    const cloned: Array<[string, Array<[string, Uint8Array]>]> = [];
+    for (const [id, entries] of rawById) {
+        if (filterIds && !filterIds.has(id)) continue;
+        cloned.push([
+            id,
+            entries.map(([objectId, bytes]) => [objectId, new Uint8Array(bytes)]),
+        ]);
+    }
+    return cloned;
 }
 
 function wipeKeyMap(rawById: Map<string, Array<[string, Uint8Array]>>): void {
@@ -203,11 +272,7 @@ export async function decryptSingleSealItem(params: {
     const { sealClient, encryptedData, parsedObject, fullId, sessionKey, getTxBytes, assertLive } = params;
     assertLive?.();
     const itemId = String(parsedObject?.id ?? fullId);
-    const rawThreshold = Number(parsedObject?.threshold) || SEAL_THRESHOLD;
-    const singleThreshold =
-        TOTAL_SERVER_WEIGHT > 0 && rawThreshold > TOTAL_SERVER_WEIGHT
-            ? SEAL_THRESHOLD
-            : Math.max(SEAL_THRESHOLD, rawThreshold);
+    const singleThreshold = effectiveSealSingleThreshold(parsedObject?.threshold);
     const rawById = await extractDerivedKeyBytesById(
         sealClient,
         [itemId],
@@ -216,18 +281,27 @@ export async function decryptSingleSealItem(params: {
         singleThreshold,
     );
     try {
-        const entries = rawById.get(itemId) ?? [];
-        const plain = decryptBonehFranklinItem({
-            encryptedData,
-            parsedObject,
-            derivedKeysByObjectId: new Map(entries),
-            serverWeights: SERVER_WEIGHTS_MAP,
-            totalServerWeight: TOTAL_SERVER_WEIGHT,
-        });
         assertLive?.();
-        return plain;
-    } catch {
+        let plain: Uint8Array | undefined;
+        try {
+            const entries = rawById.get(itemId) ?? [];
+            plain = decryptBonehFranklinItem({
+                encryptedData,
+                parsedObject,
+                derivedKeysByObjectId: new Map(entries),
+                serverWeights: SERVER_WEIGHTS_MAP,
+                totalServerWeight: TOTAL_SERVER_WEIGHT,
+            });
+        } catch (err) {
+            assertLive?.();
+            if (isSealSessionExpiredError(err)) throw err;
+        }
+        if (plain !== undefined) {
+            assertLive?.();
+            return plain;
+        }
         const txBytes = await getTxBytes();
+        assertLive?.();
         const fallback = await sealClient.decrypt({
             data: encryptedData,
             sessionKey,
@@ -261,10 +335,7 @@ export async function decryptBatchSealItems(params: {
     }
 
     assertLive?.();
-    const validThresholds = parsedItems
-        .map((it) => Number(it.parsedObject?.threshold) || 0)
-        .filter((t) => t >= 1 && (TOTAL_SERVER_WEIGHT <= 0 || t <= TOTAL_SERVER_WEIGHT));
-    const batchThreshold = Math.max(SEAL_THRESHOLD, ...validThresholds);
+    const batchThreshold = effectiveSealBatchThreshold(parsedItems);
     const rawById = await extractDerivedKeyBytesById(
         sealClient,
         uniqueIds,
@@ -274,6 +345,7 @@ export async function decryptBatchSealItems(params: {
     );
 
     try {
+        assertLive?.();
         const workerCount = configuredDecryptWorkerCount();
         let sliceOutputs: DecryptBonehFranklinSliceOutput[];
 
@@ -292,10 +364,11 @@ export async function decryptBatchSealItems(params: {
             const promises: Array<Promise<DecryptBonehFranklinSliceOutput>> = [];
             for (let offset = 0; offset < parsedItems.length; offset += sliceSize) {
                 const sliceItems = parsedItems.slice(offset, offset + sliceSize);
+                const sliceIds = new Set(sliceItems.map((it) => it.fullId));
                 promises.push(
                     runSliceOnWorker({
                         items: sliceItems,
-                        derivedKeysById: cloneKeyEntries(rawById),
+                        derivedKeysById: cloneKeyEntries(rawById, sliceIds),
                         serverWeightsEntries: SERVER_WEIGHTS_ENTRIES,
                         totalServerWeight: TOTAL_SERVER_WEIGHT,
                     }),
@@ -317,30 +390,37 @@ export async function decryptBatchSealItems(params: {
         }
 
         if (fallbackSet.size > 0) {
+            assertLive?.();
             const txBytes = await getTxBytes();
+            assertLive?.();
             for (const item of parsedItems) {
                 if (!fallbackSet.has(item.index)) continue;
+                let decrypted: Uint8Array;
                 try {
-                    const decrypted = await sealClient.decrypt({
+                    decrypted = await sealClient.decrypt({
                         data: item.encryptedData,
                         sessionKey,
                         txBytes,
                     });
-                    assertLive?.();
-                    results.push({
-                        index: item.index,
-                        decryptedData: Buffer.from(decrypted).toString("base64"),
-                    });
                 } catch (err) {
+                    assertLive?.();
+                    if (isSealSessionExpiredError(err)) throw err;
                     errors.push({
                         index: item.index,
                         code: "DECRYPT_FAILED",
                         error: `decrypt failed: ${formattedError(err)}`,
                     });
+                    continue;
                 }
+                assertLive?.();
+                results.push({
+                    index: item.index,
+                    decryptedData: Buffer.from(decrypted).toString("base64"),
+                });
             }
         }
 
+        assertLive?.();
         results.sort((a, b) => a.index - b.index);
         errors.sort((a, b) => a.index - b.index);
         return { results, errors };

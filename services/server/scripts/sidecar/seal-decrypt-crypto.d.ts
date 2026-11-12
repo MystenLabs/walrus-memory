@@ -14,6 +14,8 @@ export interface DecryptSliceItem {
     index: number;
     encryptedData: Uint8Array;
     fullId: string;
+    threshold?: number;
+    parsedObject?: any;
 }
 
 export interface DecryptBonehFranklinSliceInput {
@@ -30,5 +32,6 @@ export interface DecryptBonehFranklinSliceOutput {
     fallbackIndices: number[];
 }
 
+export function combineSharesGF256(shares: Array<{ index: number; share: Uint8Array }>): Uint8Array;
 export function decryptBonehFranklinItem(input: DecryptBonehFranklinItemInput): Uint8Array;
 export function decryptBonehFranklinSlice(input: DecryptBonehFranklinSliceInput): DecryptBonehFranklinSliceOutput;

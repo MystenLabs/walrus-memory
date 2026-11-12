@@ -182,7 +182,7 @@ test("authorization state reader requires current versions and digests of both o
     }
 });
 
-test("readSealAuthorizationVersions batches getObjects, caches initialSharedVersion, and coalesces only concurrent in-flight reads", async () => {
+test("readSealAuthorizationVersions batches getObjects, caches initialSharedVersion, and never shares an already-started read", async () => {
     clearCachedInitialSharedVersionsForTests();
     let batchCalls = 0;
     let release!: () => void;
@@ -195,33 +195,120 @@ test("readSealAuthorizationVersions batches getObjects, caches initialSharedVers
             throw new Error("getObjects should be preferred when available");
         },
         getObjects: async ({ objectIds }: { objectIds: string[] }) => {
-            batchCalls += 1;
-            if (batchCalls === 1) await gate;
+            const callNumber = ++batchCalls;
+            if (callNumber === 1) await gate;
             return {
                 objects: objectIds.map((_id, idx) => ({
-                    version: String(10 + batchCalls + idx),
-                    digest: `d-${batchCalls}-${idx}`,
+                    version: String(10 + callNumber + idx),
+                    digest: `d-${callNumber}-${idx}`,
                     owner: { $kind: "Shared", Shared: { initialSharedVersion: String(100 + idx) } },
                 })),
             };
         },
     };
 
-    const concurrent = Array.from({ length: 4 }, () =>
-        readSealAuthorizationVersions(batchedReader, acc, reg),
-    );
+    const firstLookup = readSealAuthorizationVersions(batchedReader, acc, reg);
     await Promise.resolve();
+    const secondLookup = readSealAuthorizationVersions(batchedReader, acc, reg);
     release();
-    const states = await Promise.all(concurrent);
-    assert.equal(batchCalls, 1, "concurrent reads must coalesce into a single BatchGetObjects call");
-    assert.equal(new Set(states).size, 1);
+    const [firstState, secondState] = await Promise.all([firstLookup, secondLookup]);
+    assert.equal(batchCalls, 2, "each lookup must issue its own BatchGetObjects read after arrival");
+    assert.notEqual(firstState, secondState);
     assert.equal(getCachedInitialSharedVersion(acc), "100");
     assert.equal(getCachedInitialSharedVersion(reg), "101");
+});
 
-    // Subsequent sequential call must perform a fresh live read (zero post-settlement TTL).
-    const nextState = await readSealAuthorizationVersions(batchedReader, acc, reg);
-    assert.equal(batchCalls, 2, "sequential reads must never serve stale authorization versions");
-    assert.notEqual(nextState, states[0]);
+test("revoke between auth snapshot and concurrent lookup never reuses pre-revocation warm session", async () => {
+    clearCachedInitialSharedVersionsForTests();
+    const acc = `0x${"3".repeat(64)}`;
+    const reg = `0x${"9".repeat(64)}`;
+    let accountVersion = 1;
+    const registryVersion = 10;
+    let pauseNextAfterSnapshot = false;
+    let releaseInFlight!: () => void;
+    const inFlightGate = new Promise<void>((r) => { releaseInFlight = r; });
+    let snapshotEntered!: () => void;
+    const snapshotReady = new Promise<void>((r) => { snapshotEntered = r; });
+    let creates = 0;
+    let fetches = 0;
+
+    const batchedReader = {
+        getObject: async () => {
+            throw new Error("getObjects should be preferred");
+        },
+        getObjects: async () => {
+            // Fullnode snapshots on-chain state at RPC receipt time (t1).
+            const snapAcc = accountVersion;
+            const snapReg = registryVersion;
+            if (pauseNextAfterSnapshot) {
+                pauseNextAfterSnapshot = false;
+                snapshotEntered();
+                await inFlightGate;
+            }
+            return {
+                objects: [
+                    {
+                        version: String(snapAcc),
+                        digest: `acc-digest-v${snapAcc}`,
+                        owner: { $kind: "Shared", Shared: { initialSharedVersion: "200" } },
+                    },
+                    {
+                        version: String(snapReg),
+                        digest: `reg-digest-v${snapReg}`,
+                        owner: { $kind: "Shared", Shared: { initialSharedVersion: "201" } },
+                    },
+                ],
+            };
+        },
+    };
+
+    const pool = createSealSessionPool(
+        async () => {
+            creates += 1;
+            return {
+                async fetchKeys() { fetches += 1; },
+                async decrypt() { return Uint8Array.of(7); },
+            } as unknown as SealClient;
+        },
+        (scope) => readSealAuthorizationVersions(batchedReader, scope[3], scope[4]),
+        { now: () => 0 },
+    );
+
+    const sessionScope = ["testnet", "package", "policy", acc, reg, "committee"];
+    const warmClient = await pool.get(input({ scope: sessionScope }));
+    await warmClient.fetchKeys(args);
+    assert.equal(creates, 1);
+    assert.equal(fetches, 1);
+    assert.equal(hasSealSessionApprovedKeys(warmClient, ["id"], 1), true);
+
+    // Lookup A arrives before revocation and snapshots v1 on the fullnode (t1),
+    // while its network response remains in flight.
+    pauseNextAfterSnapshot = true;
+    const lookupA = pool.get(input({ scope: sessionScope }));
+    await snapshotReady;
+
+    // Owner revokes delegate on-chain at t2 > t1, bumping MemWalAccount to v2.
+    accountVersion = 2;
+
+    // Lookup B arrives at t3 > t2 while Lookup A's RPC response is still returning.
+    const lookupB = pool.get(input({ scope: sessionScope }));
+    releaseInFlight();
+
+    const [clientA, clientB] = await Promise.all([lookupA, lookupB]);
+    assert.equal(clientA, warmClient, "pre-revocation lookup may use the v1 snapshot taken after it started");
+    assert.notEqual(
+        clientB,
+        warmClient,
+        "post-revocation lookup must never join Lookup A's older v1 snapshot",
+    );
+    assert.equal(
+        hasSealSessionApprovedKeys(clientB, ["id"], 1),
+        false,
+        "post-revocation client must have zero approved keys and force fresh policy evaluation",
+    );
+    await clientB.fetchKeys(args);
+    assert.equal(creates, 2);
+    assert.equal(fetches, 2, "post-revocation lookup must re-evaluate key-server policy");
 });
 
 test("hasSealSessionApprovedKeys tracks approved thresholds per identity and enforces liveness", async () => {

@@ -32,7 +32,12 @@ import {
 } from "../config.js";
 import { sealCommitteeIdentityMatches, type SealCommitteeIdentity } from "../../seal-config.js";
 import { createDecryptSealClient, sealEncryptClient, suiClient, sealSessionCacheMetrics } from "../clients.js";
-import { decryptBatchSealItems, decryptSingleSealItem } from "../seal-decrypt-pool.js";
+import {
+  decryptBatchSealItems,
+  decryptSingleSealItem,
+  effectiveSealBatchThreshold,
+  effectiveSealSingleThreshold,
+} from "../seal-decrypt-pool.js";
 import { buildSealEncryptId, fetchSealEncryptIdentity, type SealEncryptPurpose } from "../seal-identity.js";
 import {
   buildSealApproveTx,
@@ -238,6 +243,7 @@ export function parseSealDecryptBatchItems(items: unknown[], packageId: string) 
     index: number;
     encryptedData: Uint8Array;
     fullId: string;
+    threshold: number;
   }[] = [];
   const errors: { index: number; code: string; error: string }[] = [];
 
@@ -253,7 +259,7 @@ export function parseSealDecryptBatchItems(items: unknown[], packageId: string) 
         });
         continue;
       }
-      parsedItems.push({ index: i, encryptedData, fullId: parsed.id });
+      parsedItems.push({ index: i, encryptedData, fullId: parsed.id, threshold: parsed.threshold });
     } catch (err: any) {
       errors.push({
         index: i,
@@ -433,6 +439,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         };
 
         phase = "fetch_keys";
+        const singleThreshold = effectiveSealSingleThreshold(parsed.threshold);
         // Fetch keys from key servers with one bounded retry on transient RPC drops.
         // Warm session hits skip building the PTB entirely.
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
@@ -447,13 +454,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
               registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
               ids: [fullId],
             });
-            if (!hasSealSessionApprovedKeys(client, [fullId], SEAL_THRESHOLD)) {
+            if (!hasSealSessionApprovedKeys(client, [fullId], singleThreshold)) {
               const txBytes = await getTxBytes();
               await client.fetchKeys({
                 ids: [fullId],
                 txBytes,
                 sessionKey,
-                threshold: SEAL_THRESHOLD,
+                threshold: singleThreshold,
               });
             }
             return client;
@@ -576,6 +583,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
 
         const keysStarted = performance.now();
         phase = "fetch_keys";
+        const batchThreshold = effectiveSealBatchThreshold(parsedItems);
         // ONE fetchKeys call for ALL IDs on cold misses; warm session hits skip PTB
         // construction and key-server round-trips while still verifying live auth state.
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
@@ -590,13 +598,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
               registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
               ids: allIds,
             });
-            if (!hasSealSessionApprovedKeys(client, allIds, SEAL_THRESHOLD)) {
+            if (!hasSealSessionApprovedKeys(client, allIds, batchThreshold)) {
               const txBytes = await getTxBytes();
               await client.fetchKeys({
                 ids: allIds,
                 txBytes,
                 sessionKey,
-                threshold: SEAL_THRESHOLD,
+                threshold: batchThreshold,
               });
             }
             return client;

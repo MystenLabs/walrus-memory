@@ -346,11 +346,14 @@ test("/seal/decrypt rejects a SessionKey from another immutable package", async 
     });
 });
 
-test("batch parsing quarantines a foreign package and preserves the valid subset", () => {
+test("batch parsing quarantines a foreign package and preserves the valid subset and item threshold", () => {
     const parsed = parseSealDecryptBatchItems([ciphertext(PKG), ciphertext(OTHER_PKG)], PKG);
     assert.deepEqual(
-        parsed.parsedItems.map((item: { index: number }) => item.index),
-        [0]
+        parsed.parsedItems.map((item: { index: number; threshold?: number }) => ({
+            index: item.index,
+            threshold: item.threshold,
+        })),
+        [{ index: 0, threshold: 1 }]
     );
     assert.equal(parsed.errors.length, 1);
     assert.equal(parsed.errors[0].index, 1);

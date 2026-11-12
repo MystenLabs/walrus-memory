@@ -510,8 +510,8 @@ impl MemoryEngine for WalrusSealEngine {
 
         // Step 2: batch-decrypt the ciphertexts in bounded concurrent chunks on
         // the current task (preserving `stage` task-local deadline tracking and
-        // deterministic chunk ordering while letting the sidecar coalesce live
-        // Sui state reads, SEAL key fetches, and multi-thread BLS decryption).
+        // deterministic chunk ordering while letting the sidecar coalesce cold
+        // SEAL key fetches and parallelize multi-thread BLS decryption).
         super::stage::enter(super::stage::RecallStage::SealDecrypt);
         let seal_start = std::time::Instant::now();
         let batch_input: Vec<(String, Vec<u8>)> = fetched

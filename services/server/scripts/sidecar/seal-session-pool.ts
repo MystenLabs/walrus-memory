@@ -185,14 +185,8 @@ export function createSealSessionPool(
     };
 }
 
-interface InFlightAuthRead {
-    token: symbol;
-    promise: Promise<string>;
-}
-
 const MAX_SHARED_VERSION_CACHE = 1024;
 const sharedInitialVersions = new Map<string, string>();
-const inFlightAuthReads = new WeakMap<object, Map<string, InFlightAuthRead>>();
 
 function canonicalObjectKey(objectId: string): string {
     return /^0x[0-9a-fA-F]{1,64}$/.test(objectId) ? normalizeSuiAddress(objectId) : objectId;
@@ -257,57 +251,32 @@ function validateAuthObject(objectId: string, object: AuthObjectShape): [string,
 /**
  * Read only stable version/digest metadata; never trust caller-supplied versions.
  * Uses `getObjects` (`BatchGetObjects`) when available to collapse two unary gRPC
- * calls into one, and coalesces strictly concurrent in-flight reads for the same
- * `(accountId, registryId)` with zero post-settlement retention.
+ * calls into one. Every lookup issues its own fresh read after arrival so a lookup
+ * starting after an on-chain revocation can never join an older in-flight snapshot.
  */
 export async function readSealAuthorizationVersions(
     client: SealAuthorizationVersionReader,
     accountId: string,
     registryId: string,
 ): Promise<string> {
-    let perClient = inFlightAuthReads.get(client);
-    if (!perClient) {
-        perClient = new Map();
-        inFlightReadsSet(client, perClient);
-    }
-    const flightKey = `${accountId}\0${registryId}`;
-    const existing = perClient.get(flightKey);
-    if (existing) return await existing.promise;
-
-    const token = Symbol("seal-auth-read");
-    const promise = (async () => {
-        if (typeof client.getObjects === "function") {
-            const batch = await withReadTimeout(
-                client.getObjects({ objectIds: [accountId, registryId] }),
-                5_000,
-            );
-            if (!Array.isArray(batch?.objects) || batch.objects.length !== 2) {
-                throw new Error("Cannot verify current SEAL authorization state");
-            }
-            const entries = [
-                validateAuthObject(accountId, batch.objects[0] as AuthObjectShape),
-                validateAuthObject(registryId, batch.objects[1] as AuthObjectShape),
-            ];
-            return JSON.stringify(entries);
+    if (typeof client.getObjects === "function") {
+        const batch = await withReadTimeout(
+            client.getObjects({ objectIds: [accountId, registryId] }),
+            5_000,
+        );
+        if (!Array.isArray(batch?.objects) || batch.objects.length !== 2) {
+            throw new Error("Cannot verify current SEAL authorization state");
         }
-
-        const objects = await Promise.all([accountId, registryId].map(async objectId => {
-            const result = await client.getObject({ objectId, signal: AbortSignal.timeout(5_000) });
-            return validateAuthObject(objectId, result?.object);
-        }));
-        return JSON.stringify(objects);
-    })();
-
-    perClient.set(flightKey, { token, promise });
-    try {
-        return await promise;
-    } finally {
-        if (perClient.get(flightKey)?.token === token) {
-            perClient.delete(flightKey);
-        }
+        const entries = [
+            validateAuthObject(accountId, batch.objects[0] as AuthObjectShape),
+            validateAuthObject(registryId, batch.objects[1] as AuthObjectShape),
+        ];
+        return JSON.stringify(entries);
     }
-}
 
-function inFlightReadsSet(client: object, map: Map<string, InFlightAuthRead>): void {
-    inFlightAuthReads.set(client, map);
+    const objects = await Promise.all([accountId, registryId].map(async objectId => {
+        const result = await client.getObject({ objectId, signal: AbortSignal.timeout(5_000) });
+        return validateAuthObject(objectId, result?.object);
+    }));
+    return JSON.stringify(objects);
 }
