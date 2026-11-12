@@ -1,0 +1,77 @@
+@startuml c4-container
+' C4 level 2 (containers) for Walrus Memory as it runs today.
+' Render: see docs/architecture/README.md ("Rendering the diagrams").
+!include <C4/C4_Container>
+
+LAYOUT_TOP_DOWN()
+HIDE_STEREOTYPE()
+skinparam wrapWidth 260
+skinparam maxMessageSize 180
+skinparam defaultFontSize 13
+skinparam dpi 110
+skinparam actorBorderColor #08427B
+skinparam actorBackgroundColor #08427B
+skinparam actorFontColor #000000
+skinparam actorStyle stick
+
+title Walrus Memory: containers (C4 level 2)
+
+actor "**Memory owner**\nOwns memories through a Sui\nwallet or Google zkLogin" as owner
+actor "**Agent builder**\nBuilds agents that remember\nand recall through SDK or MCP" as builder
+
+System_Ext(agent, "AI agent / MCP client", "Claude Code, Claude.ai connectors, Cursor, Codex, OpenClaw or a custom app using the TypeScript or Python SDK.")
+System_Ext(console, "Walrus Console", "Mints owner-scoped read tokens and lists an owner's agents and memories.")
+
+System_Boundary(wm, "Walrus Memory") {
+  Container(dashboard, "Dashboard", "React 19, Vite SPA, Node static server", "Account onboarding, delegate key management, memory browser, memory deletion, and the consent page for MCP OAuth sign-in. In the browser it also signs Sui transactions and decrypts blob previews with Seal and Walrus.")
+  Container(mcp, "MCP connector", "Node.js, npm @mysten-incubation/memwal-mcp", "Runs on the user's machine. Bridges stdio MCP to the relayer's remote MCP endpoint and handles first-run wallet login.")
+  Container(relayer, "Relayer API", "Rust, axum, apalis job queue", "Public HTTPS API. Verifies Ed25519 signed requests, rate limits, runs remember / recall / restore / analyze / ask, queues async jobs, is the OAuth server for MCP connectors, serves the owner-token read API, sponsored transactions and security delete.")
+  Container(sidecar, "Sidecar", "Node.js, TypeScript, @mysten/seal, @mysten/walrus, MCP SDK", "Runs in the relayer container on localhost. Seal encrypt and decrypt (separate listener process), Walrus uploads, blob metadata and transfer transactions from server wallets, Enoki sponsorship, and the hosted MCP server (tools remember, recall, restore).")
+  Container(indexer, "Indexer", "Rust, sui-indexer-alt-framework", "Reads Sui checkpoints, decodes AccountCreated events of the Memory package, and keeps the accounts read model.")
+  ContainerDb(pg, "Database", "PostgreSQL, pgvector", "Memory vectors (HNSW, cosine), blob and namespace metadata, job queue, OAuth clients and sessions, owner tokens, quotas, accounts read model.")
+  ContainerDb(redis, "Cache", "Redis", "Signed-request nonce replay guard, rate-limit counters, short-lived caches. Auth fails closed without it.")
+}
+
+System_Ext(sui, "Sui network", "Fullnode gRPC (primary), JSON-RPC fallback, GraphQL archive, checkpoint store. Memory and Seal policy Move packages.")
+System_Ext(walrus, "Walrus", "Upload relay or publisher for writes, aggregators for reads. Stores encrypted memory blobs.")
+System_Ext(seal, "Seal key servers", "Threshold key servers that release decryption keys when the onchain policy allows.")
+System_Ext(enoki, "Enoki", "Gas sponsorship for user transactions, zkLogin for Google sign-in.")
+System_Ext(llm, "LLM gateway", "OpenAI-compatible API (OpenRouter). text-embedding-3-small embeddings, fact extraction, consolidation and ask.")
+System_Ext(slack, "Slack", "Operational alerts: gas pool, wallet balance, embedding provider, sidecar saturation.")
+
+Rel(owner, dashboard, "Signs in, manages keys and memories", "HTTPS")
+Rel(builder, agent, "Configures")
+Rel(agent, mcp, "Calls memory tools", "stdio MCP")
+Rel(agent, relayer, "SDK calls, or remote MCP with OAuth", "HTTPS, signed requests")
+Rel(console, relayer, "Owner tokens, read API", "HTTPS")
+Rel(mcp, relayer, "Remote MCP", "HTTPS, SSE / streamable HTTP")
+Rel(dashboard, relayer, "Account, key, OAuth consent and memory APIs", "HTTPS")
+
+Rel(relayer, sidecar, "Encrypt, decrypt, upload, sponsor; proxies /api/mcp", "HTTP, localhost, shared secret")
+Rel(relayer, pg, "Reads and writes", "SQL, TLS")
+Rel(relayer, redis, "Nonces, rate limits, caches", "RESP")
+Rel(indexer, pg, "Writes accounts, watermarks", "SQL, TLS")
+
+Rel(relayer, llm, "Embeds, extracts, ranks", "HTTPS")
+Rel(relayer, sui, "Verifies accounts and delegate keys", "gRPC")
+Rel(relayer, walrus, "Reads blobs", "HTTPS")
+Rel(relayer, slack, "Alerts", "Webhook")
+Rel(sidecar, seal, "Gets key shares", "HTTPS")
+Rel(sidecar, walrus, "Uploads blobs", "HTTPS")
+Rel(sidecar, sui, "Submits transactions", "gRPC")
+Rel(sidecar, enoki, "Sponsors transactions", "HTTPS")
+Rel(indexer, sui, "Streams checkpoints", "HTTPS")
+Rel(dashboard, enoki, "zkLogin, sponsorship", "HTTPS")
+
+' Layout hints: keep externals in two stacked rows under the system.
+Lay_D(redis, seal)
+Lay_D(pg, llm)
+Lay_R(seal, enoki)
+Lay_R(enoki, walrus)
+Lay_D(seal, sui)
+Lay_R(sui, llm)
+Lay_R(llm, slack)
+Lay_R(owner, builder)
+
+SHOW_LEGEND()
+@enduml
