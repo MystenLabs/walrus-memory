@@ -352,7 +352,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///
@@ -2478,6 +2478,7 @@ const CONCURRENTLY_BUILT_INDEXES: &[(&str, &str)] = &[
 const CONCURRENT_INDEX_LOCK_KEYS: (i32, i32) = (872_122, 22);
 const CONCURRENT_INDEX_LOCK_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const CONCURRENT_INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const CONCURRENT_INDEX_ORPHAN_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn should_drop_invalid_concurrent_index(build_in_progress: bool) -> bool {
     !build_in_progress
@@ -2720,17 +2721,12 @@ async fn lock_and_rebuild_concurrent_indexes(
 ) -> (Result<(), AppError>, bool) {
     let mut waited = std::time::Duration::ZERO;
     loop {
-        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1, $2)")
-            .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
-            .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to lock concurrent-index rebuild: {}", e))
-            });
+        let acquired = try_acquire_concurrent_index_lock(conn).await;
         match acquired {
             Ok(true) => break,
-            Ok(false) => {}
+            Ok(false) => {
+                release_orphaned_concurrent_index_lock(conn, CONCURRENT_INDEX_ORPHAN_IDLE).await;
+            }
             Err(e) => return (Err(e), true),
         }
         if waited >= CONCURRENT_INDEX_LOCK_WAIT {
@@ -2753,14 +2749,163 @@ async fn lock_and_rebuild_concurrent_indexes(
     }
     .await;
 
-    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1, $2)")
-        .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
-        .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
-        .execute(&mut *conn)
-        .await
-        .is_ok();
+    let unlocked = unlock_concurrent_index_lock(conn).await;
 
     (result, unlocked)
+}
+
+async fn try_acquire_concurrent_index_lock(conn: &mut PgConnection) -> Result<bool, AppError> {
+    sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1, $2)")
+        .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
+        .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to lock concurrent-index rebuild: {}", e)))
+}
+
+async fn unlock_concurrent_index_lock(conn: &mut PgConnection) -> bool {
+    matches!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1, $2)")
+            .bind(CONCURRENT_INDEX_LOCK_KEYS.0)
+            .bind(CONCURRENT_INDEX_LOCK_KEYS.1)
+            .fetch_one(&mut *conn)
+            .await,
+        Ok(true)
+    )
+}
+
+type AdvisoryLockHolderRow = (
+    i32,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    bool,
+);
+
+/// Advisory locks are database-wide. If an earlier pooled backend or stalled
+/// session in the current database leaked `CONCURRENT_INDEX_LOCK_KEYS` and is
+/// now sitting idle, terminate that backend after atomically revalidating that
+/// its `state_change` has not advanced and it has no entry in
+/// `pg_stat_progress_create_index`. Active sessions (`state = 'active'`) or
+/// locks in other databases on the same cluster are never terminated.
+async fn release_orphaned_concurrent_index_lock(
+    conn: &mut PgConnection,
+    min_idle: std::time::Duration,
+) -> usize {
+    let min_idle_ms = i64::try_from(min_idle.as_millis()).unwrap_or(i64::MAX);
+    let holders: Vec<AdvisoryLockHolderRow> = match sqlx::query_as(
+        "SELECT a.pid,
+                a.application_name,
+                a.state,
+                left(a.query, 120),
+                a.state_change,
+                ((a.application_name = 'pgbouncer' AND a.state = 'idle')
+                 OR (a.state IN ('idle', 'idle in transaction')
+                     AND a.state_change <= NOW() - ($3::bigint * INTERVAL '1 millisecond')))
+         FROM pg_locks l
+         JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
+         WHERE l.locktype = 'advisory'
+           AND l.granted
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND l.objsubid = 2
+           AND l.classid::bigint = $1
+           AND l.objid::bigint = $2
+           AND l.pid <> pg_backend_pid()",
+    )
+    .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.0))
+    .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.1))
+    .bind(min_idle_ms)
+    .fetch_all(&mut *conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "vector db: could not inspect pg_locks for concurrent-index advisory lock"
+            );
+            return 0;
+        }
+    };
+
+    let mut terminated = 0usize;
+    for (pid, application_name, state, query, state_change, eligible_by_age_or_pooler) in holders {
+        tracing::debug!(
+            pid,
+            application_name = application_name.as_deref().unwrap_or(""),
+            state = state.as_deref().unwrap_or(""),
+            query = query.as_deref().unwrap_or(""),
+            "vector db: concurrent-index advisory lock is held by another backend"
+        );
+        let is_valid_state = match state.as_deref() {
+            Some("idle") => true,
+            Some("idle in transaction") => application_name.as_deref() != Some("pgbouncer"),
+            _ => false,
+        };
+        if !is_valid_state || !eligible_by_age_or_pooler {
+            continue;
+        }
+        let Some(observed_state_change) = state_change else {
+            continue;
+        };
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT pg_terminate_backend(a.pid)
+             FROM pg_locks l
+             JOIN pg_stat_activity a ON a.pid = l.pid AND a.datid = l.database
+             WHERE l.locktype = 'advisory'
+               AND l.granted
+               AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND l.objsubid = 2
+               AND l.classid::bigint = $1
+               AND l.objid::bigint = $2
+               AND a.pid = $3
+               AND a.pid <> pg_backend_pid()
+               AND a.state_change = $4
+               AND ((a.application_name = 'pgbouncer' AND a.state = 'idle')
+                    OR (a.state IN ('idle', 'idle in transaction')
+                        AND a.state_change <= NOW() - ($5::bigint * INTERVAL '1 millisecond')))
+               AND NOT EXISTS (
+                   SELECT 1 FROM pg_stat_progress_create_index p WHERE p.pid = a.pid
+               )",
+        )
+        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.0))
+        .bind(i64::from(CONCURRENT_INDEX_LOCK_KEYS.1))
+        .bind(pid)
+        .bind(observed_state_change)
+        .bind(min_idle_ms)
+        .fetch_optional(&mut *conn)
+        .await
+        {
+            Ok(Some(true)) => {
+                terminated += 1;
+                tracing::warn!(
+                    pid,
+                    "vector db: terminated idle backend holding leaked concurrent-index advisory lock"
+                );
+            }
+            Ok(Some(false)) => {
+                tracing::warn!(
+                    pid,
+                    "vector db: pg_terminate_backend returned false for concurrent-index lock holder"
+                );
+            }
+            Ok(None) => {
+                tracing::info!(
+                    pid,
+                    "vector db: skipped terminating lock holder after state changed since inspection"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pid,
+                    %error,
+                    "vector db: pg_terminate_backend failed for concurrent-index lock holder"
+                );
+            }
+        }
+    }
+    terminated
 }
 
 /// Release storage reservations given only a pool handle.
@@ -2834,25 +2979,53 @@ pub enum StorageAdmission {
 impl VectorDb {
     /// Initialize database connection pool and run migrations
     pub async fn new(database_url: &str) -> Result<Self, AppError> {
+        let migrate_url = super::postgres_url::direct_postgres_url(database_url);
+        if super::postgres_url::is_transaction_pooler_url(database_url) {
+            tracing::info!(
+                original_host = super::postgres_url::postgres_host(database_url),
+                direct_host = super::postgres_url::postgres_host(migrate_url.as_ref()),
+                "vector db: running migrations and concurrent-index recovery on the direct Postgres endpoint"
+            );
+        }
+
+        let migrate_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(migrate_url.as_ref())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to connect to database for migrations: {}",
+                    e
+                ))
+            })?;
+
+        let migration_result = async {
+            // Run migrations. The ordering, and the two Rust steps woven
+            // between these slices, are load-bearing (see
+            // MIGRATIONS_BEFORE_BACKFILL's comment).
+            run_migrations(&migrate_pool, MIGRATIONS_BEFORE_BACKFILL).await?;
+
+            // Backfill runs as batched Rust code, not a migration file, since
+            // Postgres cannot COMMIT mid-loop inside a plain migration
+            // statement (see backfill_updated_at()'s doc comment).
+            backfill_updated_at(&migrate_pool).await?;
+
+            run_migrations(&migrate_pool, MIGRATIONS_AFTER_BACKFILL).await?;
+
+            recover_and_rebuild_concurrent_indexes(&migrate_pool).await?;
+
+            Ok::<(), AppError>(())
+        }
+        .await;
+
+        migrate_pool.close().await;
+        migration_result?;
+
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .connect(database_url)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
-
-        // Run migrations. The ordering, and the two Rust steps woven
-        // between these slices, are load-bearing — see
-        // MIGRATIONS_BEFORE_BACKFILL's comment.
-        run_migrations(&pool, MIGRATIONS_BEFORE_BACKFILL).await?;
-
-        // Backfill runs as batched Rust code, not a migration file, since
-        // Postgres can't COMMIT mid-loop inside a plain migration
-        // statement — see backfill_updated_at()'s doc comment.
-        backfill_updated_at(&pool).await?;
-
-        run_migrations(&pool, MIGRATIONS_AFTER_BACKFILL).await?;
-
-        recover_and_rebuild_concurrent_indexes(&pool).await?;
 
         tracing::info!("database connected and migrations applied");
 
@@ -6499,5 +6672,130 @@ mod stale_sweep_tests {
             .bind(&owner)
             .execute(&db.pool)
             .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_lock_detects_unheld_unlock_and_evicts_orphaned_holder() {
+        let db = test_db().await;
+        let _setup_guard = super::DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        let mut holder = db.pool.acquire().await.expect("acquire holder connection");
+        let mut migrator = db
+            .pool
+            .acquire()
+            .await
+            .expect("acquire migrator connection");
+
+        // Unlocking on a session that does not hold the lock must return false
+        // so `recover_and_rebuild_concurrent_indexes` knows the lock was not
+        // released on that session.
+        assert!(
+            !super::unlock_concurrent_index_lock(&mut migrator).await,
+            "pg_advisory_unlock on a session that does not own the lock must report false"
+        );
+
+        assert!(
+            super::try_acquire_concurrent_index_lock(&mut holder)
+                .await
+                .expect("holder acquires concurrent-index lock"),
+            "holder must acquire concurrent-index lock"
+        );
+        assert!(
+            !super::try_acquire_concurrent_index_lock(&mut migrator)
+                .await
+                .expect("migrator try_acquire"),
+            "migrator must see lock held by holder"
+        );
+
+        // Mark the holder connection as a pooled pgbouncer session that leaked
+        // the session advisory lock and returned to idle.
+        sqlx::query("SET application_name = 'pgbouncer'")
+            .execute(&mut *holder)
+            .await
+            .expect("set application_name");
+
+        let terminated = super::release_orphaned_concurrent_index_lock(
+            &mut migrator,
+            super::CONCURRENT_INDEX_ORPHAN_IDLE,
+        )
+        .await;
+        assert_eq!(
+            terminated, 1,
+            "orphaned idle pgbouncer holder must be terminated"
+        );
+
+        // Wait briefly for Postgres to finish cleaning up the terminated backend's locks.
+        let mut acquired_after_evict = false;
+        for _ in 0..20 {
+            if super::try_acquire_concurrent_index_lock(&mut migrator)
+                .await
+                .expect("migrator try_acquire after eviction")
+            {
+                acquired_after_evict = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            acquired_after_evict,
+            "migrator must acquire concurrent-index lock after orphaned holder is terminated"
+        );
+
+        assert!(
+            super::unlock_concurrent_index_lock(&mut migrator).await,
+            "pg_advisory_unlock on the owning session must report true"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_lock_does_not_evict_fresh_or_active_holder() {
+        let db = test_db().await;
+        let _setup_guard = super::DB_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        let mut holder = db.pool.acquire().await.expect("acquire holder connection");
+        let mut migrator = db
+            .pool
+            .acquire()
+            .await
+            .expect("acquire migrator connection");
+
+        assert!(
+            super::try_acquire_concurrent_index_lock(&mut holder)
+                .await
+                .expect("holder acquires concurrent-index lock"),
+            "holder must acquire concurrent-index lock"
+        );
+
+        // Holder does not have application_name = 'pgbouncer' and was acquired just now (idle < 5s).
+        // release_orphaned_concurrent_index_lock must NOT terminate it.
+        let terminated = super::release_orphaned_concurrent_index_lock(
+            &mut migrator,
+            super::CONCURRENT_INDEX_ORPHAN_IDLE,
+        )
+        .await;
+        assert_eq!(
+            terminated, 0,
+            "fresh non-pgbouncer holder must not be terminated"
+        );
+
+        // Migrator still cannot acquire the lock because holder is still alive.
+        assert!(
+            !super::try_acquire_concurrent_index_lock(&mut migrator)
+                .await
+                .expect("migrator try_acquire"),
+            "migrator must not acquire lock while non-orphaned holder is alive"
+        );
+
+        // Clean up: holder releases lock
+        assert!(
+            super::unlock_concurrent_index_lock(&mut holder).await,
+            "holder unlocks concurrent-index lock"
+        );
     }
 }
