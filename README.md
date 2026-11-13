@@ -130,8 +130,7 @@ rate limits, and stores encrypted memories on Walrus.
 ![Walrus Memory containers](docs/architecture/c4-container.png)
 
 See [docs/architecture](docs/architecture/README.md) for what each component
-does, its external dependencies, and the production and dev deployment
-diagrams.
+does and its external dependencies.
 
 ## License
 
