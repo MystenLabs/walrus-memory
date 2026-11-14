@@ -270,6 +270,8 @@ pub struct AppState {
     pub blob_cache_max_bytes: usize,
     /// Redis TTL for recall query embedding cache entries.
     pub embedding_cache_ttl: std::time::Duration,
+    /// Real-time memory events hub for SSE change feeds.
+    pub events: Arc<crate::events::EventHub>,
 }
 
 // ============================================================
