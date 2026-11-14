@@ -127,6 +127,8 @@ Open a browser to sign in (or re-sign in) with your Sui wallet. Use to switch wa
 
 Returns a one-time URL valid for **5 minutes**. If it expires, call the tool again to mint a fresh URL.
 
+The sign-in page verifies the session and hands credentials back to a loopback listener (`http://127.0.0.1:<port>`) on the machine running `memwal-mcp`, so you must open the URL in a browser on that same machine. When `memwal-mcp` runs on a remote host, container, or bot without a local browser, run `npx -y @mysten-incubation/memwal-mcp login` on the machine with your browser and copy `~/.memwal/credentials.json` (`chmod 600`) to `~/.memwal/credentials.json` on the remote host (see [Sign-in page says nothing answered on your computer](/troubleshooting/overview#sign-in-page-says-nothing-answered-on-your-computer)).
+
 ### memwal_logout
 
 Remove the saved credentials from this machine, from whichever file is currently in use (see [Credential locations](#credential-locations)). Takes no parameters.

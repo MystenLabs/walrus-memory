@@ -23,7 +23,7 @@
  */
 import { credsPath, loadCreds, type MemWalCredentials } from "./auth.js";
 import { rememberInitializeClientInfo } from "./client-info.js";
-import { loginFailureNotice, loginPrompt, loginSuccessNotification } from "./messages.js";
+import { loginFailureNotice, loginPrompt, loginSuccessNotification, remoteLoginCommand } from "./messages.js";
 import { log } from "./logger.js";
 import { startOrReuseLoginFlow, resolveLoginTimeoutMs, isLoginSuperseded } from "./login.js";
 import { localPromptReply } from "./consent-instruction.js";
@@ -447,6 +447,11 @@ async function handleLoginToolCall(
         }
         const msg = err instanceof Error ? err.message : String(err);
         log.error("memwal_login.tool.url_not_ready", { msg });
+        const fallbackCmd = remoteLoginCommand({
+            url: config.webUrl,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
+        });
         return {
             isError: true,
             text: [
@@ -454,7 +459,7 @@ async function handleLoginToolCall(
                 "",
                 "Try the CLI fallback:",
                 "",
-                "    npx -y @mysten-incubation/memwal-mcp login",
+                `    ${fallbackCmd}`,
             ].join("\n"),
         };
     }
@@ -471,6 +476,8 @@ async function handleLoginToolCall(
             credentialsPath: credsPath(),
             signedIn: loadCreds() !== null,
             discardedKey,
+            relayerUrl: config.relayerUrl,
+            webUrl: config.webUrl,
         }),
     };
 }
