@@ -346,11 +346,14 @@ test("/seal/decrypt rejects a SessionKey from another immutable package", async 
     });
 });
 
-test("batch parsing quarantines a foreign package and preserves the valid subset", () => {
+test("batch parsing quarantines a foreign package and preserves the valid subset and item threshold", () => {
     const parsed = parseSealDecryptBatchItems([ciphertext(PKG), ciphertext(OTHER_PKG)], PKG);
     assert.deepEqual(
-        parsed.parsedItems.map((item: { index: number }) => item.index),
-        [0]
+        parsed.parsedItems.map((item: { index: number; threshold?: number }) => ({
+            index: item.index,
+            threshold: item.threshold,
+        })),
+        [{ index: 0, threshold: 1 }]
     );
     assert.equal(parsed.errors.length, 1);
     assert.equal(parsed.errors[0].index, 1);
@@ -443,4 +446,27 @@ test("retryTransientSealDecryptRpc retries transient key-server errors once and 
         /NoAccessError/,
     );
     assert.equal(permanentCalls, 1);
+});
+
+
+test("legacy delegate headers and explicit rollback never reuse a derived-key client", async t => {
+    const { SealClient } = await import("@mysten/seal");
+    t.mock.method(SealClient.prototype, "getKeyServers", async () => new Map());
+    const { createDecryptSealClient } = await import("../sidecar/clients.js");
+    const context = {
+        session: { export() { throw new Error("legacy/disabled path must not inspect session"); } },
+        packageId: "0x1", policyPackageId: "0x1", accountId: "0x2", registryId: "0x3", ids: ["id"],
+    };
+    const a = await createDecryptSealClient(context as any);
+    const b = await createDecryptSealClient(context as any);
+    assert.notEqual(a, b, "legacy delegate keys always get distinct SDK key maps");
+    const previous = process.env.SEAL_SESSION_CACHE_ENABLED;
+    process.env.SEAL_SESSION_CACHE_ENABLED = "false";
+    try {
+        const disabled = { ...context, sessionHeader: "opaque-session" };
+        assert.notEqual(await createDecryptSealClient(disabled as any), await createDecryptSealClient(disabled as any));
+    } finally {
+        if (previous === undefined) delete process.env.SEAL_SESSION_CACHE_ENABLED;
+        else process.env.SEAL_SESSION_CACHE_ENABLED = previous;
+    }
 });

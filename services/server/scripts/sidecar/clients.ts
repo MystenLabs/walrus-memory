@@ -12,9 +12,16 @@ import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { SuiGraphQLClient } from "@mysten/sui/graphql";
 import { normalizeStructTag } from "@mysten/sui/utils";
 import { SealClient } from "@mysten/seal";
+import {
+    clearCachedInitialSharedVersionsForTests,
+    createSealSessionPool,
+    readSealAuthorizationVersions,
+} from "./seal-session-pool.js";
 import { WalrusClient, type WalrusClientConfig } from "@mysten/walrus";
 import {
     SEAL_KEY_SERVER_TIMEOUT_MS,
+    SEAL_COMMITTEE_IDENTITY,
+    SEAL_POLICY_PACKAGE_ID,
     SEAL_SERVER_CONFIGS,
     SUI_GRAPHQL_URL,
     SUI_GRPC_URL,
@@ -64,19 +71,62 @@ export function createSealClient(options?: { verifyKeyServers?: boolean }): Seal
 // otherwise repeat the Sui object/dynamic-field reads on every decrypt.
 const decryptSealClients = createSealDecryptClientFactory(createSealClient);
 
+// The pool's live state fence invalidates derived keys on any account or
+// registry change. Public metadata keeps its independent five-minute cache.
+const decryptSessions = createSealSessionPool(
+    () => decryptSealClients.create(),
+    scope => readSealAuthorizationVersions(suiClient, scope[3], scope[4]),
+);
+let sessionBypasses = 0;
+
 export function resetSealKeyServerTrustForTests(): void {
+    decryptSessions.reset();
     decryptSealClients.reset();
+    clearCachedInitialSharedVersionsForTests();
 }
 
-// Derived keys remain request-local; only public key-server metadata and its
-// verification are shared for the five-minute trust window.
-export async function createDecryptSealClient(): Promise<SealClient> {
-    return decryptSealClients.create();
+export function sealSessionCacheMetrics(): string {
+    const stats = decryptSessions.stats();
+    return [
+        "# TYPE memwal_seal_session_cache_total counter",
+        ...Object.entries(stats).filter(([key]) => key !== "entries").map(([key, value]) =>
+            `memwal_seal_session_cache_total{result="${key}"} ${value}`),
+        `memwal_seal_session_cache_total{result="bypass"} ${sessionBypasses}`,
+        "# TYPE memwal_seal_session_cache_entries gauge",
+        `memwal_seal_session_cache_entries ${stats.entries}`,
+        "",
+    ].join("\n");
 }
 
-// Encryption caches public key-server metadata only. Decrypt routes must use a
-// fresh client per request because SealClient's derived-key cache is not scoped
-// to the authenticated SessionKey.
+export async function createDecryptSealClient(context?: {
+    sessionHeader?: string;
+    session: { export(): { creationTimeMs: number; ttlMin: number } };
+    packageId: string;
+    policyPackageId: string;
+    accountId: string;
+    registryId?: string;
+    ids: string[];
+}): Promise<SealClient> {
+    // Legacy delegate keys and the legacy ABI deliberately stay request-local.
+    if (!context?.sessionHeader || !context.registryId || process.env.SEAL_SESSION_CACHE_ENABLED === "false") {
+        sessionBypasses++;
+        return decryptSealClients.create();
+    }
+    const exported = context.session.export();
+    // The pool caps each retained client at five minutes, without rejecting
+    // a still-valid longer SDK session when that cache lease expires.
+    const expiresAt = exported.creationTimeMs + exported.ttlMin * 60_000 - 10_000;
+    return decryptSessions.get({
+        header: context.sessionHeader,
+        expiresAt,
+        scope: [SUI_NETWORK, context.packageId, context.policyPackageId || SEAL_POLICY_PACKAGE_ID,
+            context.accountId, context.registryId, JSON.stringify(SEAL_COMMITTEE_IDENTITY),
+            await decryptSealClients.fingerprint()],
+        ids: context.ids,
+    });
+}
+
+// Encryption shares public metadata only; derived-key reuse is confined to the pool.
 export const sealEncryptClient = createSealClient();
 
 const metadataEncoder = new MetadataEncoder();

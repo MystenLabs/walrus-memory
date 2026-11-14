@@ -1,4 +1,5 @@
 import type { SealClient } from "@mysten/seal";
+import { createHash } from "node:crypto";
 
 type KeyServers = Awaited<ReturnType<SealClient["getKeyServers"]>>;
 type CreateSealClient = (options: { verifyKeyServers: boolean }) => SealClient;
@@ -24,7 +25,7 @@ function cloneKeyServers(servers: KeyServers): KeyServers {
 export function createSealDecryptClientFactory(
     createClient: CreateSealClient,
     options: { metadataTtlMs?: number; now?: () => number } = {},
-): { create: () => Promise<SealClient>; reset: () => void } {
+): { create: () => Promise<SealClient>; fingerprint: () => Promise<string>; reset: () => void } {
     const metadataTtlMs = options.metadataTtlMs ?? 5 * 60 * 1000;
     const now = options.now ?? Date.now;
     let metadata: KeyServers | undefined;
@@ -60,6 +61,14 @@ export function createSealDecryptClientFactory(
     }
 
     return {
+        async fingerprint() {
+            const snapshot = await verifiedMetadata();
+            // A pooled client must not extend the public metadata trust
+            // window: refreshed URLs/public keys force a new derived-key map.
+            const normalized = [...snapshot].sort(([a], [b]) => a.localeCompare(b))
+                .map(([id, server]) => [id, { ...server, pk: Buffer.from(server.pk).toString("base64") }]);
+            return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+        },
         async create() {
             const snapshot = await verifiedMetadata();
             // Derived-key caches in Seal 1.1.0 are not SessionKey scoped.
