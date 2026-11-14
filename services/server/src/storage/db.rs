@@ -167,7 +167,13 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
     migration!("026_drop_owner_idempotency_key_index.sql"),
     migration!("027_owner_rate_limits.sql"),
+    migration!("028_memory_updated_xid.sql"),
 ];
+
+/// Applied after `backfill_updated_xid`: 029 validates NOT NULL and will
+/// error if any `updated_xid` row is still NULL (#1018).
+const MIGRATIONS_AFTER_XID_BACKFILL: &[Migration] =
+    &[migration!("029_memory_updated_xid_not_null.sql")];
 
 /// Every migration the pipeline applies, in the order it applies them.
 #[cfg(test)]
@@ -176,6 +182,7 @@ fn all_migrations() -> impl Iterator<Item = &'static Migration> {
         .iter()
         .chain(MIGRATIONS_AFTER_BACKFILL)
         .chain(MIGRATIONS_AFTER_INDEX_RECOVERY)
+        .chain(MIGRATIONS_AFTER_XID_BACKFILL)
 }
 
 /// Applies one slice of the pipeline, naming the file that failed.
@@ -352,7 +359,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///
@@ -587,9 +594,15 @@ mod tests {
             migration_sql("018_memory_expiry_synced_at_index.sql"),
             migration_sql("019_memory_read_api_updated_at_set_not_null.sql"),
             migration_sql("020_read_api_followups.sql"),
+            migration_sql("028_memory_updated_xid.sql"),
         ] {
             execute_idempotent_migration(&pool, migration).await;
         }
+
+        super::backfill_updated_xid(&pool).await.unwrap();
+
+        execute_idempotent_migration(&pool, migration_sql("029_memory_updated_xid_not_null.sql"))
+            .await;
 
         let db = VectorDb {
             pool,
@@ -661,11 +674,161 @@ mod tests {
             "the temporary CHECK constraint should have been dropped by migration 019"
         );
 
+        let remaining_null_xids: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vector_entries WHERE updated_xid IS NULL")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining_null_xids, 0,
+            "backfill should have cleared every NULL updated_xid row"
+        );
+
         // Running the whole pipeline a second time (simulating a restart)
         // must still be clean and idempotent.
         VectorDb::new(&database_url)
             .await
             .expect("second run of the full migration pipeline should also complete cleanly");
+    }
+
+    /// Regression test for #1018: batched `backfill_updated_xid` must terminate
+    /// and successfully populate existing rows with `updated_xid = NULL` even
+    /// after `trg_vector_entries_update_xid` is installed.
+    ///
+    /// Previously, the trigger's ELSE branch unconditionally overwrote
+    /// `NEW.updated_xid := OLD.updated_xid` when `updated_at` was unchanged,
+    /// replacing the assigned `xmin::text::xid8` with `NULL` and causing an
+    /// infinite startup backfill loop on nonempty pre-migration tables.
+    #[tokio::test]
+    async fn backfill_updated_xid_terminates_and_migrates_populated_table() {
+        let Some(db) = test_db().await else {
+            eprintln!("skipping DB integration test: DATABASE_URL is not configured");
+            return;
+        };
+
+        let _guard = VECTOR_SCHEMA_SETUP_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        let owner = format!("0xtest-backfill-xid-{}", uuid::Uuid::new_v4());
+        let namespace = "test-backfill-ns";
+        let emb = pgvector::Vector::from(vec![0.0_f32; 1536]);
+
+        // Temporarily relax NOT NULL on updated_xid to simulate pre-migration table state.
+        sqlx::query("ALTER TABLE vector_entries ALTER COLUMN updated_xid DROP NOT NULL")
+            .execute(db.pool())
+            .await
+            .expect("should allow dropping NOT NULL for test setup");
+
+        // Seed pre-migration rows with updated_xid IS NULL.
+        for i in 1..=5 {
+            let id = format!("{owner}-entry-{i}");
+            let blob_id = format!("blob-xid-{i}");
+            sqlx::query(
+                "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, updated_at, updated_xid)
+                 VALUES ($1, $2, $3, $4, $5, 100, clock_timestamp(), NULL)",
+            )
+            .bind(&id)
+            .bind(&owner)
+            .bind(namespace)
+            .bind(&blob_id)
+            .bind(&emb)
+            .execute(db.pool())
+            .await
+            .expect("inserting pre-migration rows with NULL updated_xid should succeed");
+        }
+
+        // Verify that the NULL rows exist.
+        let pre_null_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid IS NULL",
+        )
+        .bind(&owner)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_null_count, 5);
+
+        // Capture each seeded row's original pre-update xmin before running the backfill.
+        let pre_backfill_xmins: Vec<i64> = sqlx::query_scalar(
+            "SELECT xmin::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_backfill_xmins.len(), 5);
+
+        // Execute batched backfill. This must terminate and not loop indefinitely.
+        super::backfill_updated_xid(db.pool())
+            .await
+            .expect("backfill_updated_xid must succeed and terminate");
+
+        // Verify that all rows now have non-null updated_xid matching their pre-update xmin.
+        let post_null_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vector_entries WHERE owner = $1 AND updated_xid IS NULL",
+        )
+        .bind(&owner)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            post_null_count, 0,
+            "all pre-migration rows must have updated_xid populated"
+        );
+
+        let backfilled_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            backfilled_xids, pre_backfill_xmins,
+            "backfilled updated_xid must match each row's pre-update xmin"
+        );
+
+        // Verify that migration 029 (enforcing NOT NULL) succeeds cleanly on the populated table.
+        execute_idempotent_migration(
+            db.pool(),
+            migration_sql("029_memory_updated_xid_not_null.sql"),
+        )
+        .await;
+
+        // Verify that housekeeping updates (without updating updated_at) preserve updated_xid.
+        let orig_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE vector_entries SET blob_size_bytes = 200 WHERE owner = $1")
+            .bind(&owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let preserved_xids: Vec<i64> = sqlx::query_scalar(
+            "SELECT updated_xid::text::bigint FROM vector_entries WHERE owner = $1 ORDER BY id",
+        )
+        .bind(&owner)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            orig_xids, preserved_xids,
+            "housekeeping updates where updated_at is unchanged must preserve updated_xid"
+        );
+
+        // Clean up test rows.
+        sqlx::query("DELETE FROM vector_entries WHERE owner = $1")
+            .bind(&owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
     }
 
     async fn oauth_test_db() -> Option<VectorDb> {
@@ -2550,6 +2713,41 @@ async fn backfill_updated_at(pool: &PgPool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Backfill `vector_entries.updated_xid` from `xmin` in restartable chunks (#1018).
+///
+/// Runs as batched Rust code between migration 028 (which adds the nullable column
+/// and sets the trigger) and migration 029 (which validates NOT NULL).
+async fn backfill_updated_xid(pool: &PgPool) -> Result<(), AppError> {
+    const BATCH_SIZE: i64 = 5000;
+    let mut total_rows: u64 = 0;
+
+    loop {
+        let result = sqlx::query(
+            "UPDATE vector_entries SET updated_xid = xmin::text::xid8 \
+             WHERE id IN (SELECT id FROM vector_entries WHERE updated_xid IS NULL LIMIT $1)",
+        )
+        .bind(BATCH_SIZE)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to backfill updated_xid: {}", e)))?;
+
+        let rows_affected = result.rows_affected();
+        total_rows += rows_affected;
+        if rows_affected == 0 {
+            break;
+        }
+    }
+
+    if total_rows > 0 {
+        tracing::info!(
+            rows = total_rows,
+            "backfilled vector_entries.updated_xid from xmin"
+        );
+    }
+
+    Ok(())
+}
+
 /// Drop any INVALID index left behind by an interrupted
 /// `CREATE INDEX CONCURRENTLY` build, so the migration that owns it can
 /// rebuild it on this same boot.
@@ -2854,6 +3052,10 @@ impl VectorDb {
 
         recover_and_rebuild_concurrent_indexes(&pool).await?;
 
+        backfill_updated_xid(&pool).await?;
+
+        run_migrations(&pool, MIGRATIONS_AFTER_XID_BACKFILL).await?;
+
         tracing::info!("database connected and migrations applied");
 
         let db = Self {
@@ -3028,8 +3230,12 @@ impl VectorDb {
                 AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
             })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, importance, agent_id, package_id, end_epoch, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp()
+             FROM _sync_lock
              WHERE NOT EXISTS (
                  SELECT 1 FROM memory_tombstones WHERE memory_id = $1
              )
@@ -3043,7 +3249,7 @@ impl VectorDb {
                 agent_id = EXCLUDED.agent_id,
                 package_id = EXCLUDED.package_id,
                 end_epoch = EXCLUDED.end_epoch,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(row.id)
         .bind(row.owner)
@@ -3122,8 +3328,12 @@ impl VectorDb {
                 AppError::Internal(format!("Failed to acquire namespace insert lock: {}", e))
             })?;
         let result = sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8
+            "WITH _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             INSERT INTO vector_entries (id, owner, namespace, blob_id, embedding, blob_size_bytes, plaintext, importance, updated_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp()
+             FROM _sync_lock
              WHERE NOT EXISTS (
                  SELECT 1 FROM memory_tombstones WHERE memory_id = $1
              )
@@ -3135,7 +3345,7 @@ impl VectorDb {
                 blob_size_bytes = EXCLUDED.blob_size_bytes,
                 plaintext = EXCLUDED.plaintext,
                 importance = EXCLUDED.importance,
-                updated_at = NOW()",
+                updated_at = clock_timestamp()",
         )
         .bind(id)
         .bind(owner)
@@ -3457,14 +3667,18 @@ impl VectorDb {
             )));
         }
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($1))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE owner = $1 AND namespace = $2
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(owner)
         .bind(namespace)
@@ -3581,8 +3795,12 @@ impl VectorDb {
     ) -> Result<bool, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "UPDATE vector_entries
-             SET importance = $4, updated_at = NOW()
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             )
+             UPDATE vector_entries
+             SET importance = $4, updated_at = clock_timestamp()
+             FROM _sync_lock
              WHERE id = $1 AND owner = $2 AND namespace = $3",
         )
         .bind(id)
@@ -3612,14 +3830,18 @@ impl VectorDb {
     ) -> Result<u64, AppError> {
         let started = std::time::Instant::now();
         let result = sqlx::query(
-            "WITH removed AS (
+            "WITH _sync_lock AS (
+                SELECT pg_advisory_xact_lock_shared(20261029, hashtext($2))
+             ),
+             removed AS (
                 DELETE FROM vector_entries
+                USING _sync_lock
                 WHERE blob_id = $1 AND owner = $2 AND namespace = $3
                 RETURNING id, owner, namespace, blob_id
              )
-             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id)
-             SELECT id, owner, namespace, blob_id FROM removed
-             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = NOW()",
+             INSERT INTO memory_tombstones (memory_id, owner, namespace, blob_id, deleted_at)
+             SELECT id, owner, namespace, blob_id, clock_timestamp() FROM removed
+             ON CONFLICT (memory_id) DO UPDATE SET deleted_at = clock_timestamp()",
         )
         .bind(blob_id)
         .bind(owner)
@@ -3935,23 +4157,39 @@ impl VectorDb {
         end_epoch: i32,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            AppError::Internal(format!("Failed to begin set memory expiry tx: {}", e))
+        })?;
         sqlx::query(
-            "UPDATE vector_entries
+            "WITH target AS (
+                 SELECT id, owner
+                 FROM vector_entries
+                 WHERE id = $3
+             ),
+             _sync_lock AS (
+                 SELECT pg_advisory_xact_lock_shared(20261029, hashtext(owner))
+                 FROM target
+             )
+             UPDATE vector_entries
              SET end_epoch = $1,
                  expires_at = $2,
                  updated_at = CASE
-                     WHEN end_epoch IS DISTINCT FROM $1 OR expires_at IS NULL
-                     THEN NOW()
-                     ELSE updated_at
+                     WHEN vector_entries.end_epoch IS DISTINCT FROM $1 OR vector_entries.expires_at IS NULL
+                     THEN clock_timestamp()
+                     ELSE vector_entries.updated_at
                  END
-             WHERE id = $3",
+             FROM target, _sync_lock
+             WHERE vector_entries.id = target.id",
         )
         .bind(end_epoch)
         .bind(expires_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to set memory expiry: {}", e)))?;
+        tx.commit().await.map_err(|e| {
+            AppError::Internal(format!("Failed to commit set memory expiry tx: {}", e))
+        })?;
         Ok(())
     }
 
