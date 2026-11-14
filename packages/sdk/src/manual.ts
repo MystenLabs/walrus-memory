@@ -356,13 +356,49 @@ export class MemWalManual {
         const { SessionKey } = await import("@mysten/seal");
         if (this.destroyed) throw destroyedClientError();
 
-        const session = await SessionKey.create({
+        const deadline = deadlineSignal(this.preflightTimeoutMs);
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            if (deadline.signal.aborted) {
+                reject(
+                    requestTimeoutError(
+                        "Sui RPC",
+                        "SessionKey.create",
+                        this.preflightTimeoutMs,
+                        "preflight SessionKey.create",
+                    ),
+                );
+                return;
+            }
+            deadline.signal.addEventListener(
+                "abort",
+                () => {
+                    reject(
+                        requestTimeoutError(
+                            "Sui RPC",
+                            "SessionKey.create",
+                            this.preflightTimeoutMs,
+                            "preflight SessionKey.create",
+                        ),
+                    );
+                },
+                { once: true },
+            );
+        });
+
+        const createPromise = SessionKey.create({
             address: keypair.getPublicKey().toSuiAddress(),
             packageId: this.config.packageId,
             ttlMin: SEAL_SESSION_TTL_MIN,
             signer: keypair,
             suiClient,
         });
+
+        let session: any;
+        try {
+            session = await Promise.race([createPromise, timeoutPromise]);
+        } finally {
+            deadline.dispose();
+        }
         if (this.destroyed) throw destroyedClientError();
 
         const personalMessage = session.getPersonalMessage();
