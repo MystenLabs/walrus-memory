@@ -65,6 +65,56 @@ const ADDRESSES_MODEL = [
   /^(ign[o0a]re|disregard|f[o0]rget|override|bypass|run|execute|call|invoke|reveal|print|output)\b/i,
 ];
 
+const CLAUSE_IMPERATIVE_PREFIX =
+  "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:please|just)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
+const IMPERATIVE_NEGATION_PREFIX =
+  "(?:^|[.!?;:,(\\[\\n]\\s*|\\b(?:and|but|please|just)\\s+|\\byou\\s+(?:must\\s+|should\\s+|can\\s+)?)";
+
+/** Conversational opt-out patterns that instruct the assistant not to persist the turn. */
+const OPT_OUT_PATTERNS = [
+  new RegExp(
+    `${CLAUSE_IMPERATIVE_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep))?\\b`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:remember|memorize)(?:\\s+or\\s+(?:save|store|record|capture|keep)\\b|\\s+(?:any(?:\\s+of)?(?:\\s+(?:this|that|these|those|it))?|anything(?:\\s+(?:here|from\\s+this))?|this|that|these|those|it|the\\s+following\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b)`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?(?:save|store|record|capture|keep)(?:\\s+or\\s+(?:remember|memorize|save|store|record|capture|keep))?(?:\\s+(?:any(?:\\s+of)?(?:\\s+(?:this|that|these|those|it))?|anything(?:\\s+(?:here|from\\s+this))?|this|that|these|those|it|what\\s+i|where\\s+i|who\\s+i|how\\s+i|my\\b|our\\b|the\\s+following\\b|(?:in|to)\\s+memory|the\\s+(?:conversation|chat|message|turn|discussion|note|notes|details))\\b|(?=\\s*(?:$|[.!?:;,)\\]])))`,
+    "i",
+  ),
+  new RegExp(
+    `${IMPERATIVE_NEGATION_PREFIX}(?:do\\s+not|don['\\u2019]?t|never)\\s+(?:ever\\s+)?log\\s+(?:this(?:\\s+(?:conversation|message|chat|turn|session))?|anything\\s+(?:here|from\\s+this)|our\\s+(?:conversation|chat))\\b`,
+    "i",
+  ),
+  /\b(?:off\s+the\s+record|(?:do\s+not|don['\u2019]?t|never)\s+keep\s+(?:this\s+|that\s+|it\s+)?in\s+memory|(?:please\s+)?forget\s+(?:this(?:\s+(?:conversation|message|chat|turn))?|what\s+i\s+just\s+said))\b/i,
+  /(?:^|\s)(?:\[\s*no[-_\s]?save\s*\]|#no[-_]?save\b)/i,
+];
+
+/** High-confidence inline credential and secret patterns excluded from automatic capture. */
+const SECRET_PATTERNS = [
+  /\bsuiprivkey1[02-9ac-hj-np-z]{50,}\b/i,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+  /\bsk-(?:proj-|ant-(?:api\d+-)?|live-|test-)?[A-Za-z0-9_-]{20,}\b/,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  /\bAIza[0-9A-Za-z_-]{35}\b/,
+  /\b(?:glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{36}|[sprk]k_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{30,})\b/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  /[A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/[^\s/@:?=&]+:[^\s/@?=&]+@/,
+  /\b(?:(?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)\s+\S+|bearer\s+[A-Za-z0-9._~+/=-]{20,})/i,
+  /\b(?:set-)?cookie\s*[:=]\s*\S+/i,
+  /(?:\b|(?<=[a-z0-9_-]))(?:session[_-]?cookies?|session[_-]?ids?|connect\.sid)\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false)\b)[^\s'",;}{)\]]{6,})/i,
+  /(?:\b|(?<=[a-z0-9_-]))(?:passwords?|passwd|pwd|db[_-]?pass(?:word)?s?|passphrases?|api[_-\s]?keys?|apikeys?|secret[_-\s]?keys?|access[_-\s]?keys?|encryption[_-\s]?keys?|client[_-\s]?secrets?|secrets?|access[_-\s]?tokens?|refresh[_-\s]?tokens?|auth[_-\s]?tokens?|bearer[_-\s]?tokens?|session[_-\s]?tokens?|api[_-\s]?tokens?|private[_-\s]?keys?|priv[_-\s]?keys?|delegate[_-\s]?(?:private[_-\s]*)?keys?)["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{4,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{6,})/i,
+  /\btoken["'`]?\s*[:=]\s*(?:["'`](?!\s*["'`])[^"'`\n]{8,}["'`]|(?!(?:string|number|boolean|null|undefined|none|true|false|required|optional)\b)[^\s'",;}{)\]]{12,})/i,
+  /(?:private[\s_-]*key|secret[\s_-]*key|delegate[\s_-]*(?:private[\s_-]*)?key|signing[\s_-]*key|api[\s_-]*key|seed)\b[^.]{0,48}\b(?:0x)?[0-9a-fA-F]{64}\b/i,
+  /\b(?:0x)?[0-9a-fA-F]{64}\b[^A-Za-z0-9]{0,8}(?:is|was)?[^A-Za-z0-9]{0,8}(?:my|the|our)?[^A-Za-z0-9]{0,8}(?:delegate[\s_-]*)?(?:private|secret|signing)[\s_-]*key\b/i,
+  /(?:\b|(?<=[a-z]))(?:(?:seed|recovery|secret|mnemonic)[\s_-]*(?:phrase|words)|mnemonic)[^A-Za-z0-9]{0,8}(?:is|are)?[^A-Za-z0-9]{0,8}(?:[a-z]{3,8}[ \t\r\n]+){11,23}[a-z]{3,8}\b/i,
+];
+
 /** Memory trigger patterns — always capture if matched. */
 const TRIGGER_PATTERNS = [
   /remember|prefer|radši|zapamatuj/i,
@@ -117,6 +167,25 @@ export function looksLikeInjection(text: string): boolean {
   );
 }
 
+/** Check if text contains an explicit conversational opt-out directive. */
+export function hasCaptureOptOut(text: string): boolean {
+  if (!text) return false;
+  if (OPT_OUT_PATTERNS.some((p) => p.test(text))) return true;
+  const normalized = normalizeForInjectionCheck(text);
+  return Boolean(normalized && OPT_OUT_PATTERNS.some((p) => p.test(normalized)));
+}
+
+/** Alias for `hasCaptureOptOut` kept for callers checking opt-out predicates. */
+export function looksLikeOptOut(text: string): boolean {
+  return hasCaptureOptOut(text);
+}
+
+/** Check if text contains high-confidence inline credentials or secret keys. */
+export function looksLikeSecret(text: string): boolean {
+  if (!text) return false;
+  return SECRET_PATTERNS.some((p) => p.test(text));
+}
+
 /** Determine whether a conversation turn is worth capturing. */
 export function shouldCapture(text: string): boolean {
   if (text.length < MIN_CAPTURE_LENGTH) return false;
@@ -127,6 +196,8 @@ export function shouldCapture(text: string): boolean {
   if (emojiCount > MAX_EMOJI_COUNT) return false;
 
   if (looksLikeInjection(text)) return false;
+  if (hasCaptureOptOut(text)) return false;
+  if (looksLikeSecret(text)) return false;
   if (TRIGGER_PATTERNS.some((p) => p.test(text))) return true;
 
   return true;
