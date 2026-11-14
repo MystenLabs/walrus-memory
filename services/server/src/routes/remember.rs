@@ -2489,6 +2489,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/028_forgotten_blob_timestamps.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::raw_sql(
             "SELECT pg_advisory_lock(72819041);
              CREATE TABLE IF NOT EXISTS memory_tombstones (
