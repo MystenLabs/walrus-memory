@@ -44,12 +44,16 @@ The recommended default client. The relayer handles embeddings, SEAL encryption,
 import { MemWal } from "@mysten-incubation/memwal";
 
 const memwal = MemWal.create({
-  key: "<your-ed25519-private-key>",
-  accountId: "<your-memwal-account-id>",
-  serverUrl: "https://your-relayer-url.com",
+  key: process.env.MEMWAL_KEY ?? "<your-ed25519-private-key>",
+  accountId: process.env.MEMWAL_ACCOUNT_ID ?? "<your-memwal-account-id>",
+  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.memory.walrus.xyz",
   namespace: "chatbot-prod",
 });
 ```
+
+<Warning>
+**Pass plaintext to `remember()`**: The default `MemWal` client sends `text` to the relayer so the relayer can generate a vector embedding and encrypt the payload with Seal. If you encrypt `text` on the client first and pass ciphertext to `remember()`, the relayer embeds the ciphertext bytes — the write succeeds, but semantic `recall()` will not match natural-language queries. For zero-trust client-side encryption where the relayer never sees plaintext, use [`MemWalManual`](/sdk/usage/memwal-manual) (`rememberManual` / `recallManual`) and compute embeddings on the client before encrypting.
+</Warning>
 
 ## Core Methods
 
