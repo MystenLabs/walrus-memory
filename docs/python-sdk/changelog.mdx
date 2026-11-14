@@ -29,7 +29,7 @@ questions:
   - What changes were made in memwal 0.1.4?
   - Where can I find the release history for the Walrus Memory Python SDK?
 answer: >-
-  Version 0.2.3 adds degraded recall flags (degraded and dropped_count on RecallResult, returned by default via on_dropped="ignore") and opt-in MemWalRecallAllDropped when on_dropped="throw" is passed. Version 0.2.2 adds namespace-level erasure with forget() and forget_namespace() on MemWal and MemWalSync, along with zeroing in-memory keys on destroy(). Version 0.2.1 adds verbatim auto-save and save confirmation, preserves pending jobs on cancellation, validates vectors and limits before signing, and rejects empty namespaces. Version 0.2.0 requires Python 3.11+ and updates the certificate and TLS dependency minimums.
+  Version 0.2.3 adds degraded recall flags (degraded and dropped_count on RecallResult, returned by default via on_dropped="ignore") and opt-in MemWalRecallAllDropped when on_dropped="throw" is passed, and updates remember_and_wait to clear _pending_remember_keys and salt _failed_remember_keys on terminal job failures (MemWalRememberJobFailed and MemWalRememberJobNotFound) while preserving pending keys across polling timeouts. Version 0.2.2 adds namespace-level erasure with forget() and forget_namespace() on MemWal and MemWalSync, along with zeroing in-memory keys on destroy(). Version 0.2.1 adds verbatim auto-save and save confirmation, preserves pending jobs on cancellation, validates vectors and limits before signing, and rejects empty namespaces. Version 0.2.0 requires Python 3.11+ and updates the certificate and TLS dependency minimums.
 ---
 
 Track what's new, changed, and fixed in `memwal` (Python).
@@ -42,6 +42,10 @@ For the latest version, see the [PyPI project page](https://pypi.org/project/mem
 
 - `RecallResult` gains `degraded: bool = False`, set to `True` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results=[]`, `degraded=True`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070)
 - `recall()` and `RecallParams` accept `on_dropped: str = "ignore"` (`"ignore"` or `"throw"`) across `MemWal`, `MemWalSync`, `MemWalMock`, and `MemWalMockSync`. Passing `on_dropped="throw"` raises `MemWalRecallAllDropped` (`code = "RECALL_ALL_DROPPED"`, exposing `total`, `dropped_count`, and `namespace`) when all vector search matches are dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
+
+### Fixed
+
+- `remember_and_wait` removes `_pending_remember_keys` and salts `_failed_remember_keys` on terminal job failures (`MemWalRememberJobFailed` and `MemWalRememberJobNotFound`) while preserving pending keys across polling timeouts. (#1001)
 
 ## 0.2.2
 
