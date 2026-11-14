@@ -24,6 +24,7 @@ mod rate_limit;
 mod security_delete_auth;
 mod security_delete_error;
 mod services;
+mod sidecar_saturation;
 mod storage;
 pub mod sui;
 mod types;
