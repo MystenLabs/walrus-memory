@@ -9,6 +9,7 @@ import {
     prepareDeletion,
     SdApiError,
     submitDeletion,
+    type DeletionScope,
     type PrepareResponse,
 } from '../utils/securityDeleteApi'
 
@@ -31,11 +32,12 @@ const errorInfo = (error: unknown) => ({
 })
 class DeletionCancelledError extends Error {}
 
-export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => void }) {
+export function useSecurityDeletion({ onStateChanged, scope }: { onStateChanged: () => void; scope?: DeletionScope }) {
     const account = useCurrentAccount()
     const { mutateAsync: signPersonal } = useSignPersonalMessage()
     const { mutateAsync: signTransaction } = useSignTransaction()
     const [phase, setPhase] = useState<DeletionPhase>({ kind: 'idle' })
+    const [lastDigest, setLastDigest] = useState<string | null>(null)
     const running = useRef(false)
     const mounted = useRef(true)
     const generation = useRef(0)
@@ -58,6 +60,7 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
         cancellationGeneration.current++
         running.current = false
         activeBatch.current = null
+        setLastDigest(null)
         setPhase({ kind: 'idle' })
     }, [address])
 
@@ -87,9 +90,10 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
     }, [address, authed, onStateChanged, safePhase])
 
     const prepareWithRetry = useCallback(async (body: { mode: 'all' } | { mode: 'selection'; blobIds: string[] }) => {
+        const requestBody = scope ? { ...body, scope } : body
         let delayed = false
         for (;;) {
-            try { return await authed(token => prepareDeletion(token, body)) } catch (error) {
+            try { return await authed(token => prepareDeletion(token, requestBody)) } catch (error) {
                 if (error instanceof SdApiError && error.action === 'RETRY_AFTER' && !delayed) {
                     delayed = true
                     await sleep(retryDelayMs(error.details.retryAfterSecs, 5))
@@ -98,7 +102,7 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
                 throw error
             }
         }
-    }, [authed])
+    }, [authed, scope])
 
     const submitWithRecovery = useCallback(async (prepared: PrepareResponse, signature: string) => {
         const batchId = prepared.batchId!
@@ -175,6 +179,9 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
             try {
                 const result = await submitWithRecovery(prepared, signature)
                 activeBatch.current = null
+                if (result.digest && mounted.current && generation.current === run) {
+                    setLastDigest(result.digest)
+                }
                 onStateChanged()
                 return result.deleted
             } catch (error) {
@@ -193,6 +200,7 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
         if (running.current || !address) return
         running.current = true
         const run = generation.current
+        if (mounted.current) setLastDigest(null)
         let deleted = 0
         trackEvent('memory_delete_start', { blobs: expectedCount })
         try {
@@ -238,5 +246,5 @@ export function useSecurityDeletion({ onStateChanged }: { onStateChanged: () => 
         return execute(unique.length, chunks)
     }, [execute])
 
-    return { phase, deleteAll, deleteSelection, cancelActive }
+    return { phase, lastDigest, deleteAll, deleteSelection, cancelActive }
 }

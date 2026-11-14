@@ -177,9 +177,14 @@ Before you choose:
 Your choice [1/2]:
 ```
 
-**Saved memories are permanent.** Walrus is immutable storage: you can stop
-saving new ones at any time, but you cannot delete one already saved — which is
-why you are asked before it starts rather than after.
+**Saved memories are written to Walrus.** MCP tools only append and read
+memories: an assistant cannot edit or delete a saved memory through MCP, which
+is why you are asked before automatic saving starts rather than after. As the
+account owner, you can permanently delete individual or selected memory blobs by
+signing with your connected wallet or zkLogin account in the dashboard at
+`https://memory.walrus.xyz/dashboard` (or via the Security Delete API), though
+deletion cannot retract copies already read by clients or held in transient HTTP
+caches.
 
 Until you answer, nothing is saved unprompted on a new install; "remember this"
 and recall work throughout. If you were using MemWal before this question
@@ -219,10 +224,13 @@ no costs nothing and is not asked about again.
 
 ### What is never saved
 
-Walrus storage is append-only and encrypted: a memory that lands **cannot be
-edited or deleted**. So credentials are excluded whichever way you answer, by the same
-rules stated in the server instructions, the tool descriptions and the plugin
-hooks — and enforced by a check that runs before any text is sent:
+Walrus storage is encrypted and MCP tools are append-only: a memory that lands
+**cannot be edited through MCP**, and even if the account owner later deletes
+the Walrus `Blob` object from the dashboard, copies already read or cached
+outside Walrus remain. Credentials are therefore excluded whichever way you
+answer, by the same rules stated in the server instructions, the tool
+descriptions, and the plugin hooks, enforced by a check that runs before any
+text is sent:
 
 - passwords, API keys, access and refresh tokens, private keys, seed and
   recovery phrases, authorization headers, session cookies, and connection

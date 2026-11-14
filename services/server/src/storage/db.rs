@@ -352,7 +352,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///
@@ -2219,7 +2219,7 @@ mod tests {
     }
 
     /// A probe that errors must not turn off a filter a previous probe
-    /// enabled. `main` re-probes after `LegacyDb::new()`; a transient failure
+    /// enabled. `main` re-probes after security-delete initialization; a transient failure
     /// there used to disable the filter for the life of the process.
     #[tokio::test]
     async fn a_failed_probe_keeps_the_pending_delete_filter_it_already_had() {
@@ -2871,10 +2871,9 @@ impl VectorDb {
     /// pending-delete filter is now active.
     ///
     /// Called once at the end of `new()`, and again from `main` right after
-    /// `LegacyDb::new()` — the legacy migrations *create* that table, and
-    /// they run after `VectorDb::new()`, so without the second probe the
-    /// first boot that turns security deletion on would keep serving
-    /// pending-delete rows until the next restart.
+    /// `ensure_post_migration_schema` creates `delete_blobs_tracking` on the
+    /// primary database, so without the second probe the first boot that turns
+    /// security deletion on would keep serving pending-delete rows until the next restart.
     ///
     /// The flag starts `false`, so a table that is genuinely absent can never
     /// turn recall into an `undefined_table` 500. A probe that *errors* is not

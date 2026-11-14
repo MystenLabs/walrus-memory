@@ -1,8 +1,8 @@
 ---
 title: "Delete memories programmatically"
 description: >-
-  Find and permanently delete old Walrus Memory blobs through the Security Delete API
-  using a Node.js script with wallet authentication and sponsored Sui transactions.
+  Find and permanently delete post-migration or pre-migration Walrus Memory blobs through
+  the Security Delete API using wallet authentication and sponsored Sui transactions.
 keywords:
   - Walrus Memory
   - MemWal
@@ -11,7 +11,7 @@ keywords:
   - programmatic deletion
   - Sui transaction
 goal:
-  description: Write a script that signs with a wallet, lists memories older than a cutoff date, and permanently deletes them via the Security Delete API — suitable for scheduled cleanup jobs.
+  description: Write a script that signs with a wallet, lists post-migration or legacy memories by scope or cutoff date, and permanently deletes single blobs or batches via the Security Delete API.
   requires:
     - has_frontmatter:
         - title
@@ -26,20 +26,25 @@ goal:
       label: Needs answer summary for AI citation
 questions:
   - "How do I delete Walrus Memory blobs programmatically?"
+  - "How do I delete a single post-migration memory blob via the Security Delete API?"
   - "What endpoints does the MemWal Security Delete API use?"
-  - "How do I authenticate with the Security Delete API to remove old memories?"
+  - "How do I authenticate with the Security Delete API to remove memories?"
 answer: >-
-  Use the Security Delete API to authenticate with a wallet challenge, list deletable blobs,
-  and permanently remove them via sponsored Sui transactions. The flow involves requesting a
-  challenge, verifying the signed challenge for a Bearer token, listing blobs, preparing a
-  batch deletion transaction, and submitting the wallet signature.
+  Use the Security Delete API with scope=current (post-migration) or scope=legacy
+  (pre-migration) to authenticate with a wallet challenge, list deletable blobs, prepare
+  a single-blob or batch sponsored deletion transaction, and submit the wallet signature.
+  Interactive apps and zkLogin accounts sign challenges and transactions directly in the
+  browser without exporting a private key.
 ---
 
 ## Overview
 
-Use the Security Delete API to find memories owned by a wallet, select memories older
-than a cutoff date, and permanently delete them. The API prepares and sponsors the Sui
-transaction; your wallet authenticates the requests and signs the prepared transaction.
+Use the Security Delete API to list memories owned by a wallet, select a single blob ID
+or memories older than a cutoff date, and permanently delete them. Pass `scope=current`
+to target post-migration memories in the active relayer database, or `scope=legacy`
+(the default when omitted) to target pre-migration records. The API prepares and sponsors
+the Sui transaction; your wallet authenticates the requests and signs the prepared
+transaction.
 
 <Warning>
   Deletion is permanent. Start with the dry run in this guide, review every blob ID, and
@@ -52,8 +57,8 @@ The deletion flow uses these endpoints:
 | --- | --- | --- |
 | 1 | `POST /api/security-delete-auth/challenge` | Request a single-use wallet challenge. |
 | 2 | `POST /api/security-delete-auth/verify` | Exchange the signed challenge for a short-lived Bearer token. |
-| 3 | `GET /api/security-deletable-blobs` | List tracked blobs that the wallet can delete. |
-| 4 | `POST /api/security-deletions` | Prepare a sponsored deletion transaction. |
+| 3 | `GET /api/security-deletable-blobs` | List tracked blobs in `scope=current` or `scope=legacy`. |
+| 4 | `POST /api/security-deletions` | Prepare a sponsored single-blob or batch deletion transaction. |
 | 5 | `POST /api/security-deletions/{batchId}/submit` | Submit the wallet signature and execute the deletion. |
 
 ## Before you begin
@@ -62,11 +67,14 @@ You need:
 
 - Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x).
 - The base URL of a MemWal deployment with the Security Delete API enabled.
-- The Sui private key for the wallet that owns the memories.
+- Either a local Sui keypair for unattended CLI automation, or an interactive browser
+  wallet / zkLogin session.
 
-The example uses an Ed25519 key. Keep the key in a secret manager or environment variable;
-never commit it to source control. For an interactive application, use the connected
-wallet's `signPersonalMessage` and `signTransaction` methods instead.
+The CLI example below uses an Ed25519 key stored in an environment variable or secret
+manager (never commit keys to source control). If your account uses **zkLogin** or a
+browser wallet without an exported private key, use the dashboard flow in
+[Delete memories](/guides/delete-old-memories) or call the connected wallet's
+`signPersonalMessage` and `signTransaction` hooks against the same HTTP endpoints.
 
 Create a small Node.js project and install the Sui SDK:
 
@@ -120,6 +128,8 @@ type BatchStatus = {
 
 const baseUrl = requireEnv('MEMWAL_URL').replace(/\/$/, '')
 const privateKey = requireEnv('SUI_PRIVATE_KEY')
+const scope = parseScope(process.env.DELETE_SCOPE ?? 'current')
+const targetBlobId = process.env.TARGET_BLOB_ID?.trim() || null
 const maxAgeDays = positiveNumber(process.env.MEMORY_MAX_AGE_DAYS ?? '90')
 const confirmed = process.env.CONFIRM_DELETE === 'true'
 
@@ -134,6 +144,12 @@ function requireEnv(name: string): string {
   const value = process.env[name]?.trim()
   if (!value) throw new Error(`${name} is required`)
   return value
+}
+
+function parseScope(value: string): 'current' | 'legacy' {
+  const normalized = value.trim()
+  if (normalized === 'current' || normalized === 'legacy') return normalized
+  throw new Error('DELETE_SCOPE must be "current" or "legacy"')
 }
 
 function positiveNumber(value: string): number {
@@ -192,7 +208,7 @@ async function listDeletable(token: string): Promise<{
   let batchMax = 900
 
   do {
-    const query = new URLSearchParams({ state: 'deletable', limit: '200' })
+    const query = new URLSearchParams({ scope, state: 'deletable', limit: '200' })
     if (cursor) query.set('cursor', cursor)
     const page = await api<BlobPage>(
       `/api/security-deletable-blobs?${query.toString()}`,
@@ -211,18 +227,21 @@ async function main() {
   const token = await authenticate()
   const { items, batchMax } = await listDeletable(token)
   const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000)
-  const candidates = items
-    .filter((item) => new Date(item.createdAt) < cutoff)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  const candidates = (
+    targetBlobId
+      ? items.filter((item) => item.blobId === targetBlobId)
+      : items.filter((item) => new Date(item.createdAt) < cutoff)
+  ).sort((a, b) => a.createdAt.localeCompare(b.createdAt))
 
   console.log(`Wallet: ${address}`)
-  console.log(`Cutoff: ${cutoff.toISOString()}`)
+  console.log(`Scope: ${scope}`)
+  console.log(targetBlobId ? `Target blob: ${targetBlobId}` : `Cutoff: ${cutoff.toISOString()}`)
   console.table(
     candidates.map(({ blobId, objectId, createdAt }) => ({ blobId, objectId, createdAt })),
   )
 
   if (candidates.length === 0) {
-    console.log('No deletable memories are older than the cutoff.')
+    console.log('No matching deletable memories found.')
     return
   }
   if (!confirmed) {
@@ -237,7 +256,7 @@ async function main() {
       '/api/security-deletions',
       {
         method: 'POST',
-        body: JSON.stringify({ mode: 'selection', blobIds }),
+        body: JSON.stringify({ mode: 'selection', scope, blobIds }),
       },
       token,
     )
@@ -285,19 +304,23 @@ await main()
 
 ## Run a dry run
 
-Set the API URL, wallet key, and age cutoff. The script only lists candidates unless
-`CONFIRM_DELETE` is exactly `true`.
+Set the API URL, wallet key, scope (`current` for post-migration memories or `legacy` for
+pre-migration records), and either `TARGET_BLOB_ID` (for a single blob) or
+`MEMORY_MAX_AGE_DAYS`. The script only lists candidates unless `CONFIRM_DELETE` is
+exactly `true`.
 
 ```bash
 export MEMWAL_URL="https://your-memwal-deployment.example"
 export SUI_PRIVATE_KEY="suiprivkey1..."
+export DELETE_SCOPE="current"
+export TARGET_BLOB_ID="<optional-single-blob-id>"
 export MEMORY_MAX_AGE_DAYS="90"
 
 npx tsx delete-old-memories.ts
 ```
 
-Review the wallet address, cutoff timestamp, blob IDs, object IDs, and creation dates in
-the output.
+Review the wallet address, scope, target blob or cutoff timestamp, blob IDs, object IDs,
+and creation dates in the output.
 
 ## Delete the reviewed memories
 
@@ -311,14 +334,16 @@ npx tsx delete-old-memories.ts
 The script chunks the selection using the server's `deleteBatchMax` value. Each batch
 requires a newly prepared transaction and wallet signature.
 
-## Verify the deletion
+## Verify the deletion, cache limits, and fallback support
 
 Run the script again without `CONFIRM_DELETE`. Successfully deleted blobs no longer appear
-in the default `deletable` list. To inspect terminal states directly, request them with the
-same Bearer token:
+in the default `deletable` list, their Sui `Blob` objects are destroyed onchain (check
+the logged transaction `digest` in a Sui explorer), and post-migration rows are purged and
+tombstoned in `recall`. To inspect terminal states directly, request them with the same
+Bearer token:
 
 ```http
-GET /api/security-deletable-blobs?state=deleted,deleted_external&limit=200
+GET /api/security-deletable-blobs?scope=current&state=deleted,deleted_external&limit=200
 Authorization: Bearer <token>
 ```
 
@@ -326,5 +351,9 @@ If submitting a batch times out or returns `RPC_UNAVAILABLE`, query
 `GET /api/security-deletions/{batchId}` until it reaches a terminal state. Do not prepare a
 replacement batch for the same blobs while its state is `executing`.
 
-To delete memories through the dashboard instead, see
-[Delete old memories](/guides/delete-old-memories).
+Note that HTTP aggregator or CDN caches may retain recently served ciphertext until cache
+expiry, storage-node sliver reclamation finishes asynchronously across epochs, and copies
+already fetched by MCP clients, SDK callers, or LLM chat histories must be cleared
+separately. If a blob remains in `not_owner` or self-service deletion returns
+`404 FEATURE_DISABLED`, follow the wallet-signed ownership verification and support path
+documented in [Delete memories](/guides/delete-old-memories).
