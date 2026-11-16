@@ -5,7 +5,7 @@ import type { Server } from "node:http";
 import { pathToFileURL } from "node:url";
 import { bcs } from "@mysten/sui/bcs";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
-import { fromBase64, fromHex, toBase64, toHex } from "@mysten/sui/utils";
+import { fromBase64, fromHex, toBase64 } from "@mysten/sui/utils";
 import { SealClient, SessionKey } from "@mysten/seal";
 
 const sealEntryUrl = import.meta.resolve("@mysten/seal");
@@ -386,7 +386,58 @@ test("/seal/decrypt-batch preserves threshold-2 items when a threshold-3 key fet
         );
         assert.deepEqual(directOut.errors.map((e) => e.index), [1, 3]);
 
-        // 4. When all 3 key servers are available, both threshold-2 and threshold-3 items decrypt cleanly.
+        // 4. Pre-warmed threshold-2 session followed by reverse-ordered [threshold-3, threshold-2] under partial outage.
+        resetSealKeyServerTrustForTests();
+        unavailableServerUrl = fixtures[2].url;
+        unavailableStatus = 403;
+        const prewarmResp = await realFetch(`${baseUrl}/seal/decrypt-batch`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-seal-session": exportedSessionHeader,
+            },
+            body: JSON.stringify({
+                items: [items[2]],
+                packageId: PACKAGE_ID,
+                policyPackageId: POLICY_PKG_ID,
+                registryId: REGISTRY_ID,
+                accountId: ACCOUNT_ID,
+                sealAbi: "v1-new",
+            }),
+        });
+        assert.equal(prewarmResp.status, 200);
+        assert.equal(((await prewarmResp.json()) as any).results.length, 1);
+
+        const reverseWarmResp = await realFetch(`${baseUrl}/seal/decrypt-batch`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-seal-session": exportedSessionHeader,
+            },
+            body: JSON.stringify({
+                items: [items[3], items[2]],
+                packageId: PACKAGE_ID,
+                policyPackageId: POLICY_PKG_ID,
+                registryId: REGISTRY_ID,
+                accountId: ACCOUNT_ID,
+                sealAbi: "v1-new",
+            }),
+        });
+        assert.equal(reverseWarmResp.status, 200);
+        const reverseWarmBody = (await reverseWarmResp.json()) as {
+            results: Array<{ index: number; decryptedData: string }>;
+            errors: Array<{ index: number; code: string; error: string }>;
+        };
+        assert.deepEqual(
+            reverseWarmBody.results.map((r) => ({
+                index: r.index,
+                text: Buffer.from(r.decryptedData, "base64").toString("utf8"),
+            })),
+            [{ index: 1, text: "route-shared-threshold-2" }],
+        );
+        assert.deepEqual(reverseWarmBody.errors.map((e) => e.index), [0]);
+
+        // 5. When all 3 key servers are available, both threshold-2 and threshold-3 items decrypt cleanly.
         unavailableServerUrl = null;
         const healthyResp = await realFetch(`${baseUrl}/seal/decrypt-batch`, {
             method: "POST",
