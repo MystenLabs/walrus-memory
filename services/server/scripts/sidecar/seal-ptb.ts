@@ -1,4 +1,4 @@
-import { Transaction, TransactionArgument } from "@mysten/sui/transactions";
+import { Inputs, Transaction, TransactionArgument } from "@mysten/sui/transactions";
 import { normalizeSuiAddress } from "@mysten/sui/utils";
 
 /**
@@ -9,6 +9,11 @@ import { normalizeSuiAddress } from "@mysten/sui/utils";
  *   - "v1-new": current/destination    `seal_approve(id, registry, account, ctx)`
  */
 type SealAbi = "v1" | "v1-new";
+
+export interface SealApproveSharedVersions {
+    registryInitialSharedVersion?: string | number;
+    accountInitialSharedVersion?: string | number;
+}
 
 /**
  * Validate the seal_approve arguments in a decrypt request body: the
@@ -96,6 +101,27 @@ export function sealIdentityPackageError(
     return null;
 }
 
+function sharedOrUnresolvedObjectArg(
+    tx: Transaction,
+    objectId: string,
+    initialSharedVersion?: string | number,
+): TransactionArgument {
+    if (initialSharedVersion !== undefined && /^\d+$/.test(String(initialSharedVersion))) {
+        // Both `&AccountRegistry` and `&MemWalAccount` in `account::seal_approve`
+        // are immutable shared-object references (`mutable: false`). Supplying
+        // their immutable `initialSharedVersion` avoids a live Sui
+        // `SimulateTransaction` round-trip inside `tx.build()`.
+        return tx.object(
+            Inputs.SharedObjectRef({
+                objectId,
+                initialSharedVersion: String(initialSharedVersion),
+                mutable: false,
+            }),
+        );
+    }
+    return tx.object(objectId);
+}
+
 /**
  * Build the `seal_approve` policy PTB — one moveCall per SEAL key id.
  *
@@ -116,6 +142,7 @@ export function buildSealApproveTx(
     registryId: string | undefined,
     accountId: string,
     ids: string[],
+    sharedVersions?: SealApproveSharedVersions,
 ): Transaction {
     const tx = new Transaction();
     for (const id of ids) {
@@ -127,10 +154,17 @@ export function buildSealApproveTx(
         let approveArgs: TransactionArgument[];
         if (registryId) {
             // Current/destination package: [id, registry, account].
-            approveArgs = [idArg, tx.object(registryId), tx.object(accountId)];
+            approveArgs = [
+                idArg,
+                sharedOrUnresolvedObjectArg(tx, registryId, sharedVersions?.registryInitialSharedVersion),
+                sharedOrUnresolvedObjectArg(tx, accountId, sharedVersions?.accountInitialSharedVersion),
+            ];
         } else {
             // Legacy/source package: [id, account].
-            approveArgs = [idArg, tx.object(accountId)];
+            approveArgs = [
+                idArg,
+                sharedOrUnresolvedObjectArg(tx, accountId, sharedVersions?.accountInitialSharedVersion),
+            ];
         }
         tx.moveCall({
             target: `${policyPackageId}::account::seal_approve`,
