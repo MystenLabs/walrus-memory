@@ -335,14 +335,16 @@ function decryptHmac256CtrFast(demKey, hmacPayload) {
     return result;
 }
 
-function validateEncryptionServices(serviceObjectIds, threshold, serverWeights, totalServerWeight) {
+function validateEncryptionServices(serviceObjectIds, threshold, serverWeights, totalServerWeight, derivedKeysCount = 0) {
     if (!Number.isInteger(threshold) || threshold < 1) {
         throw new InvalidThresholdError(`Invalid threshold ${threshold}`);
     }
     if (serverWeights && typeof totalServerWeight === "number") {
+        let matchedConfiguredServers = 0;
         for (const objectId of serviceObjectIds) {
             const configuredWeight = serverWeights.get(objectId) ?? 0;
             if (configuredWeight > 0) {
+                matchedConfiguredServers += 1;
                 let occurrences = 0;
                 for (const candidate of serviceObjectIds) {
                     if (candidate === objectId) occurrences += 1;
@@ -354,8 +356,11 @@ function validateEncryptionServices(serviceObjectIds, threshold, serverWeights, 
                 }
             }
         }
-        if (threshold > totalServerWeight) {
-            throw new InvalidThresholdError(`Invalid threshold ${threshold} for ${totalServerWeight} servers`);
+        const effectiveTotalWeight = matchedConfiguredServers > 0
+            ? totalServerWeight
+            : Math.max(totalServerWeight, derivedKeysCount);
+        if (threshold > effectiveTotalWeight) {
+            throw new InvalidThresholdError(`Invalid threshold ${threshold} for ${effectiveTotalWeight} servers`);
         }
     }
 }
@@ -381,7 +386,13 @@ export function decryptBonehFranklinItem({
     }
 
     const serviceObjectIds = encryptedObject.services.map(([objectId]) => objectId);
-    validateEncryptionServices(serviceObjectIds, encryptedObject.threshold, serverWeights, totalServerWeight);
+    validateEncryptionServices(
+        serviceObjectIds,
+        encryptedObject.threshold,
+        serverWeights,
+        totalServerWeight,
+        derivedKeysByObjectId.size,
+    );
 
     const { fullIdHex, fullIdBytes } = createFullIdHex(encryptedObject.packageId, encryptedObject.id);
     const inKeystore = [];

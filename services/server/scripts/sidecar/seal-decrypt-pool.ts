@@ -1,7 +1,7 @@
 import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { fromHex } from "@mysten/bcs";
-import type { SealClient, SessionKey } from "@mysten/seal";
+import { EncryptedObject, type SealClient, type SessionKey } from "@mysten/seal";
 import { SEAL_SERVER_CONFIGS, SEAL_THRESHOLD } from "./config.js";
 import {
     decryptBonehFranklinItem,
@@ -9,11 +9,16 @@ import {
     type DecryptBonehFranklinSliceOutput,
     type DecryptSliceItem,
 } from "./seal-decrypt-crypto.mjs";
+import { isRetryableRpcError } from "./retry/rpc.js";
 import { hasSealSessionApprovedKeys } from "./seal-session-pool.js";
 import { formattedError } from "./util.js";
 
 const DEFAULT_MAX_WORKERS = 4;
 const EMPTY_TX_BYTES = new Uint8Array(0);
+
+export function sealKeyFetchErrorCode(err: unknown): "SHARED_SERVICE_UNAVAILABLE" | "KEY_FETCH_FAILED" {
+    return isRetryableRpcError(err) ? "SHARED_SERVICE_UNAVAILABLE" : "KEY_FETCH_FAILED";
+}
 
 export function configuredDecryptWorkerCount(): number {
     const raw = process.env.SEAL_DECRYPT_WORKERS?.trim();
@@ -29,6 +34,29 @@ export function configuredDecryptWorkerCount(): number {
 const SERVER_WEIGHTS_ENTRIES: Array<[string, number]> = SEAL_SERVER_CONFIGS.map((s) => [s.objectId, s.weight]);
 const SERVER_WEIGHTS_MAP = new Map<string, number>(SERVER_WEIGHTS_ENTRIES);
 const TOTAL_SERVER_WEIGHT = SEAL_SERVER_CONFIGS.reduce((sum, s) => sum + s.weight, 0);
+
+export function resolveSealItemThreshold(item: {
+    threshold?: unknown;
+    parsedObject?: { threshold?: unknown };
+    encryptedData?: Uint8Array;
+}): number | null {
+    let raw = item.threshold ?? item.parsedObject?.threshold;
+    if (raw === undefined && item.encryptedData) {
+        try {
+            raw = EncryptedObject.parse(item.encryptedData).threshold;
+        } catch {
+            return SEAL_THRESHOLD;
+        }
+    }
+    if (raw === undefined) {
+        return SEAL_THRESHOLD;
+    }
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+        return null;
+    }
+    return parsed;
+}
 
 export function effectiveSealSingleThreshold(rawThreshold: unknown): number {
     const parsed = Number(rawThreshold) || 0;
@@ -51,7 +79,7 @@ export function effectiveSealBatchThreshold(
     return resolved;
 }
 
-function isSealSessionExpiredError(err: unknown): boolean {
+export function isSealSessionExpiredError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
     return (
         err.name === "ExpiredSessionKeyError" ||
@@ -272,7 +300,7 @@ export async function decryptSingleSealItem(params: {
     const { sealClient, encryptedData, parsedObject, fullId, sessionKey, getTxBytes, assertLive } = params;
     assertLive?.();
     const itemId = String(parsedObject?.id ?? fullId);
-    const singleThreshold = effectiveSealSingleThreshold(parsedObject?.threshold);
+    const singleThreshold = resolveSealItemThreshold({ parsedObject, encryptedData }) ?? SEAL_THRESHOLD;
     const rawById = await extractDerivedKeyBytesById(
         sealClient,
         [itemId],
@@ -316,7 +344,9 @@ export async function decryptSingleSealItem(params: {
 
 /**
  * Decrypt up to 25 SEAL-encrypted items in parallel across stateless worker threads.
- * Preserves exact per-item error isolation and session-expiry guards.
+ * Isolates higher-threshold key fetch/extraction failures strictly to affected items
+ * while preserving lower-threshold keys (even for items sharing the same fullId)
+ * and enforcing session-expiry guards.
  */
 export async function decryptBatchSealItems(params: {
     sealClient: SealClient;
@@ -329,94 +359,207 @@ export async function decryptBatchSealItems(params: {
     results: Array<{ index: number; decryptedData: string }>;
     errors: Array<{ index: number; code: string; error: string }>;
 }> {
-    const { sealClient, parsedItems, uniqueIds, sessionKey, getTxBytes, assertLive } = params;
+    const { sealClient, parsedItems, sessionKey, getTxBytes, assertLive } = params;
     if (parsedItems.length === 0) {
         return { results: [], errors: [] };
     }
 
     assertLive?.();
-    const batchThreshold = effectiveSealBatchThreshold(parsedItems);
-    const rawById = await extractDerivedKeyBytesById(
-        sealClient,
-        uniqueIds,
-        sessionKey,
-        getTxBytes,
-        batchThreshold,
-    );
+    const rawById = new Map<string, Array<[string, Uint8Array]>>();
 
     try {
-        assertLive?.();
-        const workerCount = configuredDecryptWorkerCount();
-        let sliceOutputs: DecryptBonehFranklinSliceOutput[];
-
-        if (workerCount <= 1 || parsedItems.length === 1) {
-            sliceOutputs = [
-                decryptBonehFranklinSlice({
-                    items: parsedItems,
-                    derivedKeysById: cloneKeyEntries(rawById),
-                    serverWeightsEntries: SERVER_WEIGHTS_ENTRIES,
-                    totalServerWeight: TOTAL_SERVER_WEIGHT,
-                }),
-            ];
-        } else {
-            const slicesCount = Math.min(workerCount, parsedItems.length);
-            const sliceSize = Math.ceil(parsedItems.length / slicesCount);
-            const promises: Array<Promise<DecryptBonehFranklinSliceOutput>> = [];
-            for (let offset = 0; offset < parsedItems.length; offset += sliceSize) {
-                const sliceItems = parsedItems.slice(offset, offset + sliceSize);
-                const sliceIds = new Set(sliceItems.map((it) => it.fullId));
-                promises.push(
-                    runSliceOnWorker({
-                        items: sliceItems,
-                        derivedKeysById: cloneKeyEntries(rawById, sliceIds),
-                        serverWeightsEntries: SERVER_WEIGHTS_ENTRIES,
-                        totalServerWeight: TOTAL_SERVER_WEIGHT,
-                    }),
-                );
-            }
-            sliceOutputs = await Promise.all(promises);
-        }
-
-        assertLive?.();
-
         const results: Array<{ index: number; decryptedData: string }> = [];
         const errors: Array<{ index: number; code: string; error: string }> = [];
-        const fallbackSet = new Set<number>();
+        const itemThresholds = new Map<number, number>();
+        const extractableItems: DecryptSliceItem[] = [];
 
-        for (const out of sliceOutputs) {
-            results.push(...out.results);
-            errors.push(...out.errors);
-            for (const idx of out.fallbackIndices) fallbackSet.add(idx);
+        for (const item of parsedItems) {
+            const resolved = resolveSealItemThreshold(item);
+            if (resolved === null) {
+                errors.push({
+                    index: item.index,
+                    code: "DECRYPT_FAILED",
+                    error: `decrypt failed: Invalid threshold ${String(item.threshold ?? item.parsedObject?.threshold)}`,
+                });
+                continue;
+            }
+            itemThresholds.set(item.index, resolved);
+            extractableItems.push(item);
         }
 
-        if (fallbackSet.size > 0) {
-            assertLive?.();
-            const txBytes = await getTxBytes();
-            assertLive?.();
-            for (const item of parsedItems) {
-                if (!fallbackSet.has(item.index)) continue;
-                let decrypted: Uint8Array;
+        const tiers = [...new Set(extractableItems.map((it) => itemThresholds.get(it.index)!))].sort(
+            (a, b) => a - b,
+        );
+        const failedItemIndices = new Set<number>();
+        let cachedTxBytes: Uint8Array | undefined;
+        const ensureTxBytes = async () => (cachedTxBytes ??= await getTxBytes());
+
+        for (const threshold of tiers) {
+            const tierItemsAtLeast = extractableItems.filter(
+                (it) => !failedItemIndices.has(it.index) && itemThresholds.get(it.index)! >= threshold,
+            );
+            if (tierItemsAtLeast.length === 0) break;
+
+            if (typeof sealClient.fetchKeys === "function") {
+                const batchIds = [...new Set(tierItemsAtLeast.map((it) => it.fullId))];
+                assertLive?.();
+                if (!hasSealSessionApprovedKeys(sealClient, batchIds, threshold)) {
+                    const txBytes = await ensureTxBytes();
+                    assertLive?.();
+                    try {
+                        await sealClient.fetchKeys({
+                            ids: batchIds,
+                            txBytes,
+                            sessionKey,
+                            threshold,
+                        });
+                    } catch (err) {
+                        assertLive?.();
+                        if (isSealSessionExpiredError(err)) throw err;
+                        const code = sealKeyFetchErrorCode(err);
+                        const message = `fetch_keys failed: ${formattedError(err)}`;
+                        for (const item of tierItemsAtLeast) {
+                            failedItemIndices.add(item.index);
+                            errors.push({
+                                index: item.index,
+                                code,
+                                error: message,
+                            });
+                        }
+                        break;
+                    }
+                    assertLive?.();
+                }
+            }
+
+            const exactTierIds = [
+                ...new Set(
+                    extractableItems
+                        .filter((it) => !failedItemIndices.has(it.index) && itemThresholds.get(it.index) === threshold)
+                        .map((it) => it.fullId),
+                ),
+            ];
+            for (const id of exactTierIds) {
+                assertLive?.();
+                const txBytes = hasSealSessionApprovedKeys(sealClient, [id], threshold)
+                    ? EMPTY_TX_BYTES
+                    : await ensureTxBytes();
+                assertLive?.();
+                let derivedMap: Awaited<ReturnType<SealClient["getDerivedKeys"]>>;
                 try {
-                    decrypted = await sealClient.decrypt({
-                        data: item.encryptedData,
-                        sessionKey,
+                    derivedMap = await sealClient.getDerivedKeys({
+                        id,
                         txBytes,
+                        sessionKey,
+                        threshold,
                     });
                 } catch (err) {
                     assertLive?.();
                     if (isSealSessionExpiredError(err)) throw err;
-                    errors.push({
-                        index: item.index,
-                        code: "DECRYPT_FAILED",
-                        error: `decrypt failed: ${formattedError(err)}`,
-                    });
+                    const code = sealKeyFetchErrorCode(err);
+                    const message = `fetch_keys failed: ${formattedError(err)}`;
+                    for (const item of extractableItems) {
+                        if (
+                            !failedItemIndices.has(item.index) &&
+                            item.fullId === id &&
+                            itemThresholds.get(item.index)! >= threshold
+                        ) {
+                            failedItemIndices.add(item.index);
+                            errors.push({
+                                index: item.index,
+                                code,
+                                error: message,
+                            });
+                        }
+                    }
                     continue;
                 }
                 assertLive?.();
-                results.push({
-                    index: item.index,
-                    decryptedData: Buffer.from(decrypted).toString("base64"),
-                });
+                const prevEntries = rawById.get(id);
+                if (prevEntries) {
+                    for (const [, bytes] of prevEntries) bytes.fill(0);
+                }
+                const entries: Array<[string, Uint8Array]> = [];
+                for (const [objectId, derivedKey] of derivedMap.entries()) {
+                    entries.push([objectId, fromHex(derivedKey.toString())]);
+                }
+                rawById.set(id, entries);
+            }
+        }
+
+        const readyItems = extractableItems.filter((it) => !failedItemIndices.has(it.index));
+        if (readyItems.length > 0) {
+            assertLive?.();
+            const workerCount = configuredDecryptWorkerCount();
+            let sliceOutputs: DecryptBonehFranklinSliceOutput[];
+
+            if (workerCount <= 1 || readyItems.length === 1) {
+                const singleIds = new Set(readyItems.map((it) => it.fullId));
+                sliceOutputs = [
+                    decryptBonehFranklinSlice({
+                        items: readyItems,
+                        derivedKeysById: cloneKeyEntries(rawById, singleIds),
+                        serverWeightsEntries: SERVER_WEIGHTS_ENTRIES,
+                        totalServerWeight: TOTAL_SERVER_WEIGHT,
+                    }),
+                ];
+            } else {
+                const slicesCount = Math.min(workerCount, readyItems.length);
+                const sliceSize = Math.ceil(readyItems.length / slicesCount);
+                const promises: Array<Promise<DecryptBonehFranklinSliceOutput>> = [];
+                for (let offset = 0; offset < readyItems.length; offset += sliceSize) {
+                    const sliceItems = readyItems.slice(offset, offset + sliceSize);
+                    const sliceIds = new Set(sliceItems.map((it) => it.fullId));
+                    promises.push(
+                        runSliceOnWorker({
+                            items: sliceItems,
+                            derivedKeysById: cloneKeyEntries(rawById, sliceIds),
+                            serverWeightsEntries: SERVER_WEIGHTS_ENTRIES,
+                            totalServerWeight: TOTAL_SERVER_WEIGHT,
+                        }),
+                    );
+                }
+                sliceOutputs = await Promise.all(promises);
+            }
+
+            assertLive?.();
+
+            const fallbackSet = new Set<number>();
+            for (const out of sliceOutputs) {
+                results.push(...out.results);
+                errors.push(...out.errors);
+                for (const idx of out.fallbackIndices) fallbackSet.add(idx);
+            }
+
+            if (fallbackSet.size > 0) {
+                assertLive?.();
+                const txBytes = await ensureTxBytes();
+                assertLive?.();
+                for (const item of readyItems) {
+                    if (!fallbackSet.has(item.index)) continue;
+                    let decrypted: Uint8Array;
+                    try {
+                        decrypted = await sealClient.decrypt({
+                            data: item.encryptedData,
+                            sessionKey,
+                            txBytes,
+                        });
+                    } catch (err) {
+                        assertLive?.();
+                        if (isSealSessionExpiredError(err)) throw err;
+                        errors.push({
+                            index: item.index,
+                            code: "DECRYPT_FAILED",
+                            error: `decrypt failed: ${formattedError(err)}`,
+                        });
+                        continue;
+                    }
+                    assertLive?.();
+                    results.push({
+                        index: item.index,
+                        decryptedData: Buffer.from(decrypted).toString("base64"),
+                    });
+                }
             }
         }
 

@@ -556,3 +556,166 @@ test("session expiry during batch fallback or single-item post-check rejects ins
     );
     assert.equal(fallbackDecryptCalls, 0, "post-decrypt session expiry must not enter fallback sealClient.decrypt");
 });
+
+test("decryptBatchSealItems isolates higher-threshold fetch and extraction failures across distinct and shared identities during partial outage", async () => {
+    const committee = makeCommittee([1, 1, 1]);
+    const idDistinct2 = "0101010101010101010101010101010101010101010101010101010101010101";
+    const idDistinct3 = "0202020202020202020202020202020202020202020202020202020202020202";
+    const idShared = "0303030303030303030303030303030303030303030303030303030303030303";
+
+    const keysDistinct2 = committee.deriveUserSecretKeys(idDistinct2).fastKeys;
+    const keysDistinct3 = committee.deriveUserSecretKeys(idDistinct3).fastKeys;
+    const keysShared = committee.deriveUserSecretKeys(idShared).fastKeys;
+
+    const ctDistinct2 = await committee.encryptPayload(idDistinct2, Buffer.from("distinct-t2-plaintext"), 2, "aes");
+    const ctDistinct3 = await committee.encryptPayload(idDistinct3, Buffer.from("distinct-t3-plaintext"), 3, "aes");
+    const ctShared2 = await committee.encryptPayload(idShared, Buffer.from("shared-t2-plaintext"), 2, "hmac");
+    const ctShared3 = await committee.encryptPayload(idShared, Buffer.from("shared-t3-plaintext"), 3, "aes");
+
+    const allKeysById = new Map<string, Map<string, Uint8Array>>([
+        [idDistinct2, keysDistinct2],
+        [idDistinct3, keysDistinct3],
+        [idShared, keysShared],
+    ]);
+
+    // Model server index 2 (3rd server) as unavailable: only 2 of 3 shares can be retrieved.
+    let server3Available = false;
+    const partialOutageClient = {
+        async fetchKeys({ threshold }: { ids: string[]; threshold: number }) {
+            const availableCount = server3Available ? 3 : 2;
+            if (threshold > availableCount) {
+                throw new Error("KeyServer 3 unavailable (503 Service Unavailable)");
+            }
+        },
+        async getDerivedKeys({ id, threshold }: { id: string; threshold: number }) {
+            const availableCount = server3Available ? 3 : 2;
+            if (threshold > availableCount) {
+                throw new Error("KeyServer 3 unavailable (503 Service Unavailable)");
+            }
+            const source = allKeysById.get(id)!;
+            const availableIds = server3Available ? SERVER_IDS : SERVER_IDS.slice(0, 2);
+            return new Map(
+                availableIds.slice(0, threshold).map((objId) => [
+                    objId,
+                    { toString: () => toHex(source.get(objId)!) },
+                ]),
+            );
+        },
+        async decrypt() {
+            throw new Error("worker fast-path should decrypt available threshold-2 items without fallback");
+        },
+    } as unknown as SealClient;
+
+    const mixedBatch = [
+        { index: 0, encryptedData: ctDistinct2, fullId: idDistinct2, threshold: 2 },
+        { index: 1, encryptedData: ctDistinct3, fullId: idDistinct3, threshold: 3 },
+        { index: 2, encryptedData: ctShared2, fullId: idShared, threshold: 2 },
+        { index: 3, encryptedData: ctShared3, fullId: idShared, threshold: 3 },
+    ];
+
+    const partialOut = await decryptBatchSealItems({
+        sealClient: partialOutageClient,
+        parsedItems: mixedBatch,
+        uniqueIds: [idDistinct2, idDistinct3, idShared],
+        sessionKey: {} as SessionKey,
+        getTxBytes: async () => Uint8Array.of(1),
+    });
+
+    assert.deepEqual(
+        partialOut.results.map((r) => ({
+            index: r.index,
+            text: Buffer.from(r.decryptedData, "base64").toString("utf8"),
+        })),
+        [
+            { index: 0, text: "distinct-t2-plaintext" },
+            { index: 2, text: "shared-t2-plaintext" },
+        ],
+    );
+    assert.deepEqual(
+        partialOut.errors.map((e) => e.index),
+        [1, 3],
+    );
+    for (const err of partialOut.errors) {
+        assert.match(err.error, /fetch_keys failed:.*KeyServer 3 unavailable/);
+    }
+
+    // Without fetchKeys on the client (getDerivedKeys-only caller), shared-ID threshold-2 still succeeds.
+    const derivedOnlyClient = {
+        getDerivedKeys: partialOutageClient.getDerivedKeys,
+        decrypt: partialOutageClient.decrypt,
+    } as unknown as SealClient;
+    const derivedOnlyOut = await decryptBatchSealItems({
+        sealClient: derivedOnlyClient,
+        parsedItems: mixedBatch,
+        uniqueIds: [idDistinct2, idDistinct3, idShared],
+        sessionKey: {} as SessionKey,
+        getTxBytes: async () => Uint8Array.of(1),
+    });
+    assert.deepEqual(
+        derivedOnlyOut.results.map((r) => ({
+            index: r.index,
+            text: Buffer.from(r.decryptedData, "base64").toString("utf8"),
+        })),
+        [
+            { index: 0, text: "distinct-t2-plaintext" },
+            { index: 2, text: "shared-t2-plaintext" },
+        ],
+    );
+    assert.deepEqual(derivedOnlyOut.errors.map((e) => e.index), [1, 3]);
+
+    // Session expiry during higher-threshold fetch must still abort the whole batch without leaking threshold-2 plaintext.
+    let expiredOnTier3 = false;
+    const expiringHigherTierClient = {
+        async getDerivedKeys({ id, threshold }: { id: string; threshold: number }) {
+            if (threshold >= 3) {
+                expiredOnTier3 = true;
+                throw new Error("KeyServer 3 unavailable");
+            }
+            const source = allKeysById.get(id)!;
+            return new Map(
+                SERVER_IDS.slice(0, 2).map((objId) => [
+                    objId,
+                    { toString: () => toHex(source.get(objId)!) },
+                ]),
+            );
+        },
+        decrypt: partialOutageClient.decrypt,
+    } as unknown as SealClient;
+    await assert.rejects(
+        () =>
+            decryptBatchSealItems({
+                sealClient: expiringHigherTierClient,
+                parsedItems: mixedBatch,
+                uniqueIds: [idDistinct2, idDistinct3, idShared],
+                sessionKey: {} as SessionKey,
+                getTxBytes: async () => Uint8Array.of(1),
+                assertLive: () => {
+                    if (expiredOnTier3) throw new Error("SEAL session expired");
+                },
+            }),
+        /SEAL session expired/,
+    );
+
+    // Once the 3rd key server recovers, all 4 items decrypt cleanly.
+    server3Available = true;
+    const fullOut = await decryptBatchSealItems({
+        sealClient: partialOutageClient,
+        parsedItems: mixedBatch,
+        uniqueIds: [idDistinct2, idDistinct3, idShared],
+        sessionKey: {} as SessionKey,
+        getTxBytes: async () => Uint8Array.of(1),
+    });
+    assert.equal(fullOut.errors.length, 0);
+    assert.deepEqual(
+        fullOut.results.map((r) => ({
+            index: r.index,
+            text: Buffer.from(r.decryptedData, "base64").toString("utf8"),
+        })),
+        [
+            { index: 0, text: "distinct-t2-plaintext" },
+            { index: 1, text: "distinct-t3-plaintext" },
+            { index: 2, text: "shared-t2-plaintext" },
+            { index: 3, text: "shared-t3-plaintext" },
+        ],
+    );
+});

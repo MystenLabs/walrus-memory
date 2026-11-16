@@ -35,8 +35,10 @@ import { createDecryptSealClient, sealEncryptClient, suiClient, sealSessionCache
 import {
   decryptBatchSealItems,
   decryptSingleSealItem,
-  effectiveSealBatchThreshold,
   effectiveSealSingleThreshold,
+  isSealSessionExpiredError,
+  resolveSealItemThreshold,
+  sealKeyFetchErrorCode,
 } from "../seal-decrypt-pool.js";
 import { buildSealEncryptId, fetchSealEncryptIdentity, type SealEncryptPurpose } from "../seal-identity.js";
 import {
@@ -55,9 +57,7 @@ import { requestIdFor } from "../log.js";
 import { isRetryableRpcError } from "../retry/rpc.js";
 import { errorMessage, errorName, formattedError } from "../util.js";
 
-export function sealKeyFetchErrorCode(err: unknown): "SHARED_SERVICE_UNAVAILABLE" | "KEY_FETCH_FAILED" {
-    return isRetryableRpcError(err) ? "SHARED_SERVICE_UNAVAILABLE" : "KEY_FETCH_FAILED";
-}
+export { sealKeyFetchErrorCode };
 
 // SEAL_REQUIRE_COMMITTEE_IDENTITY=true (or 1/yes/on) makes /seal/encrypt reject
 // requests that omit expectedSealCommitteeIdentity, so migration deployments
@@ -439,7 +439,9 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         };
 
         phase = "fetch_keys";
-        const singleThreshold = effectiveSealSingleThreshold(parsed.threshold);
+        const singleThreshold =
+          resolveSealItemThreshold({ threshold: parsed.threshold }) ??
+          effectiveSealSingleThreshold(parsed.threshold);
         // Fetch keys from key servers with one bounded retry on transient RPC drops.
         // Warm session hits skip building the PTB entirely.
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
@@ -583,13 +585,13 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
 
         const keysStarted = performance.now();
         phase = "fetch_keys";
-        const batchThreshold = effectiveSealBatchThreshold(parsedItems);
-        // ONE fetchKeys call for ALL IDs on cold misses; warm session hits skip PTB
-        // construction and key-server round-trips while still verifying live auth state.
+        // Fetch keys in ascending threshold tiers so a higher-threshold key-server
+        // failure only affects items requiring that higher threshold while preserving
+        // single-call batching for uniform batches and warm session hits.
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
         try {
-          sealClient = await retryTransientSealDecryptRpc(async () => {
-            const client = await createDecryptSealClient({
+          sealClient = await retryTransientSealDecryptRpc(async () =>
+            createDecryptSealClient({
               sessionHeader: typeof req.headers["x-seal-session"] === "string" ? req.headers["x-seal-session"] : undefined,
               session: sessionKey,
               packageId: normalizeSuiAddress(packageId),
@@ -597,23 +599,9 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
               accountId: normalizeSuiAddress(accountId),
               registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
               ids: allIds,
-            });
-            if (!hasSealSessionApprovedKeys(client, allIds, batchThreshold)) {
-              const txBytes = await getTxBytes();
-              await client.fetchKeys({
-                ids: allIds,
-                txBytes,
-                sessionKey,
-                threshold: batchThreshold,
-              });
-            }
-            return client;
-          });
+            }),
+          );
         } catch (err: any) {
-          if (err instanceof PtbBuildFailure) {
-            phase = "build_ptb";
-            throw err.cause;
-          }
           const traceId = randomUUID();
           const message = formattedError(err);
           const error = `fetch_keys failed: ${message} (traceId=${traceId}, timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS})`;
@@ -621,17 +609,87 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
             `[seal/decrypt-batch] [${traceId}] phase=fetch_keys items=${parsedItems.length} uniqueIds=${allIds.length} timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS} error: ${message}`,
             err
           );
+          const allErrors = [
+            ...errors,
+            ...parsedItems.map((item) => ({
+              index: item.index,
+              code: sealKeyFetchErrorCode(err),
+              error,
+            })),
+          ].sort((a, b) => a.index - b.index);
           return res.json({
             results: [],
-            errors: [
-              ...errors,
-              ...parsedItems.map((item) => ({
-                index: item.index,
-                code: sealKeyFetchErrorCode(err),
-                error,
-              })),
-            ],
+            errors: allErrors,
           });
+        }
+
+        const itemThresholds = new Map<number, number>();
+        let remainingItems: typeof parsedItems = [];
+        for (const item of parsedItems) {
+          const resolved = resolveSealItemThreshold(item);
+          if (resolved === null) {
+            errors.push({
+              index: item.index,
+              code: "DECRYPT_FAILED",
+              error: `decrypt failed: Invalid threshold ${String(item.threshold)}`,
+            });
+            continue;
+          }
+          itemThresholds.set(item.index, resolved);
+          remainingItems.push(item);
+        }
+
+        const thresholdTiers = [...new Set(remainingItems.map((it) => itemThresholds.get(it.index)!))].sort(
+          (a, b) => a - b,
+        );
+        for (const tierThreshold of thresholdTiers) {
+          const tierItems = remainingItems.filter((it) => itemThresholds.get(it.index)! >= tierThreshold);
+          if (tierItems.length === 0) break;
+          const tierIds = [...new Set(tierItems.map((it) => it.fullId))];
+          try {
+            await retryTransientSealDecryptRpc(async () => {
+              if (!hasSealSessionApprovedKeys(sealClient, tierIds, tierThreshold)) {
+                const txBytes = await getTxBytes();
+                await sealClient.fetchKeys({
+                  ids: tierIds,
+                  txBytes,
+                  sessionKey,
+                  threshold: tierThreshold,
+                });
+              }
+            });
+          } catch (err: any) {
+            if (err instanceof PtbBuildFailure) {
+              phase = "build_ptb";
+              throw err.cause;
+            }
+            const lowerItems = remainingItems.filter((it) => itemThresholds.get(it.index)! < tierThreshold);
+            if (lowerItems.length > 0 && (sessionKey.isExpired() || isSealSessionExpiredError(err))) {
+              throw err;
+            }
+            const traceId = randomUUID();
+            const message = formattedError(err);
+            const error = `fetch_keys failed: ${message} (traceId=${traceId}, timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS})`;
+            console.error(
+              `[seal/decrypt-batch] [${traceId}] phase=fetch_keys threshold=${tierThreshold} items=${tierItems.length} uniqueIds=${tierIds.length} timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS} error: ${message}`,
+              err
+            );
+            const code = sealKeyFetchErrorCode(err);
+            for (const item of tierItems) {
+              errors.push({
+                index: item.index,
+                code,
+                error,
+              });
+            }
+            remainingItems = lowerItems;
+            break;
+          }
+        }
+
+        if (remainingItems.length === 0) {
+          errors.sort((a, b) => a.index - b.index);
+          return res.json({ results: [], errors });
         }
 
         const keysMs = Math.max(0, performance.now() - keysStarted - buildMs);
@@ -641,10 +699,11 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           if (sessionKey.isExpired()) throw new Error("SEAL session expired");
           assertSealSessionClientLive(sealClient);
         };
+        const remainingIds = [...new Set(remainingItems.map((p) => p.fullId))];
         const batchOut = await decryptBatchSealItems({
           sealClient,
-          parsedItems,
-          uniqueIds: allIds,
+          parsedItems: remainingItems,
+          uniqueIds: remainingIds,
           sessionKey,
           getTxBytes: async () => {
             try {
@@ -657,6 +716,7 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
         });
         const results = batchOut.results;
         errors.push(...batchOut.errors);
+        errors.sort((a, b) => a.index - b.index);
 
             console.log(JSON.stringify({ event: "seal_decrypt_batch", request_id: requestIdFor(req),
                 items: items.length, unique_ids: allIds.length, results: results.length, errors: errors.length,
