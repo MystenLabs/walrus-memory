@@ -1,0 +1,22 @@
+{
+  "formatVersion": 1,
+  "hashAlgorithm": "sha256",
+  "assets": {
+    "README.md": "8d671e3bb165c9a923e3d5366ee4a7948ffc6d1704abd1852e21f2732eeb4f3b",
+    "artifact-manifest-existing.sql": "37330e72db553ddf9d40584050350ad8f5872a8a4869ab15d8791b306f893200",
+    "artifact-manifest.sql": "2dd61d8a2d767e0df9e634380d9ca9b0e82acec5a88025a97c39fa52a73e941c",
+    "audit.mjs": "34df7759b5b6b6abcdc618acbcfdcd012a5cf469995e1a3d610fa3082bb339f1",
+    "compare-snapshots.py": "156bc24241f30718651af2d2edcaa2cff1e970f40054ac2fca5af862cde4f5f4",
+    "cost-audit.mjs": "f341d6a8e0fa0770b257be395a15ae4730e94e9c0b4c1812809b657399f3bdb1",
+    "metadata-checkpoint-audit.mjs": "28f41814b215160d0a1d2f5dcd25ecdcc280b147248c5a44e65c69a4ea7896ba",
+    "snapshot-existing.sql": "1c6dbd36355d83166b04c263c1e5aeabe7c1a39a068a0c02bc4d98607567356a",
+    "snapshot.sql": "5f8d8c8ff3e8c4bbb6c691c94d0c4bc7c72575d06bc117c0bd448f4a9f746e46",
+    "source-verify-existing.sql": "e53377e24c90d76fe3664c91f7a6b182cc9dd2456bc7973fb8bcd2759daa3bd3",
+    "source-verify.sql": "a1ae416237e40638389abcbb486c4375d1c3650a83c553097c13f315c272f522",
+    "verify-artifacts.py": "a73a421cc95b163b827d16915bbcd1596ef0eb849a56c493e035726f0851d415",
+    "verify-existing.sql": "9c8d8bdfce952c9637484624368c1095b77bf94ce9a3418b7a4267012823c7a1",
+    "verify.sql": "eb73e7df077f990e52440b3d11f0fd3d0016032749e3ead8a5b780685f7dc637"
+  },
+  "aggregateMethod": "sha256 of assets JSON with sorted keys and compact separators",
+  "aggregateSha256": "b33bd23193be0a63a67e6e9261f0f99fd384cd78296b9e7f503e3c0da9b34343"
+}

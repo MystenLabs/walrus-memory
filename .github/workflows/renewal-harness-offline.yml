@@ -1,0 +1,51 @@
+name: Renewal Harness Offline
+
+on:
+  push:
+    branches:
+      - "codex/renewal-*"
+    paths:
+      - "tools/renewal-testnet/**"
+      - "run-renewal-testnet.command"
+      - ".github/workflows/renewal-harness-offline.yml"
+  pull_request:
+    paths:
+      - "tools/renewal-testnet/**"
+      - "run-renewal-testnet.command"
+      - ".github/workflows/renewal-harness-offline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MEMWAL_RENEWAL_TEST_DEPENDENCIES: ${{ github.workspace }}/tools/renewal-testnet/runtime/node_modules
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned runtime dependencies without lifecycle scripts
+        run: npm ci --prefix tools/renewal-testnet/runtime --ignore-scripts --no-audit --no-fund
+      - name: Offline option, resume and operator checks
+        run: |
+          python3 -B -m unittest discover -s tools/renewal-testnet/tests -v
+          ./run-renewal-testnet.command --self-test
+          ./run-renewal-testnet.command --plan --count 6
+      - name: Offline cache, adapter and audit checks
+        run: |
+          node --import ./tools/renewal-testnet/runtime/node_modules/tsx/dist/loader.mjs tools/renewal-testnet/tests/test-metadata-cache.mjs
+          node tools/renewal-testnet/tests/test-explicit-flow.mjs
+          node tools/renewal-testnet/audit/audit.mjs --deps "$MEMWAL_RENEWAL_TEST_DEPENDENCIES" --self-test
+          node tools/renewal-testnet/audit/cost-audit.mjs --deps "$MEMWAL_RENEWAL_TEST_DEPENDENCIES" --self-test
+          node tools/renewal-testnet/audit/metadata-checkpoint-audit.mjs --deps "$MEMWAL_RENEWAL_TEST_DEPENDENCIES" --self-test

@@ -142,6 +142,11 @@ temp/
 # Devstack local state (private keys, docker/container state — never commit)
 .devstack/
 
+# Local migration runs and evidence: credentials, fixture keys, DB/cache state
+.grok/
+tools/renewal-testnet/**/__pycache__/
+tools/renewal-testnet/**/*.pyc
+
 # Python bytecode
 __pycache__/
 
