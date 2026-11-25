@@ -111,7 +111,7 @@ describe('MCP sign-in hand-off', () => {
         expect(await screen.findByText(/MCP client connected/i)).toBeInTheDocument()
         expect(screen.getByText(/Required: one-time setup/i)).toBeInTheDocument()
         expect(screen.getByText(/without asking for confirmation/i)).toBeInTheDocument()
-        expect(screen.getByText(/Instructions for Claude/i)).toBeInTheDocument()
+        expect(screen.getByText(/Settings → Your Claude → Instructions/i)).toBeInTheDocument()
         expect(screen.getByText(/CLAUDE.md/)).toBeInTheDocument()
         expect(screen.getByText(/AGENTS.md/)).toBeInTheDocument()
         expect(screen.getByText(/\.cursor\/rules/)).toBeInTheDocument()
