@@ -167,7 +167,7 @@ pub(super) async fn set_pending<'e>(
         .map_err(|_| AppError::Internal("Marketing consent encryption failed".into()))?;
     let hash = crypto::address_hash(&config.hash_key, email);
     let start = Instant::now();
-    observe("marketing_consent.set_pending", start, sqlx::query(
+    let result = observe("marketing_consent.set_pending", start, sqlx::query(
         "INSERT INTO marketing_consent
             (owner, status, address_ciphertext, address_hash, consented_at, policy_version, source_surface,
              account_id, account_version)
@@ -178,10 +178,16 @@ pub(super) async fn set_pending<'e>(
             policy_version = EXCLUDED.policy_version, source_surface = EXCLUDED.source_surface,
             account_id = EXCLUDED.account_id, account_version = EXCLUDED.account_version,
             verified_at = NULL, withdrawn_at = NULL, withdrawal_reason = NULL,
-            sendgrid_synced_at = NULL, sendgrid_contact_id = NULL, updated_at = now()")
+            sendgrid_synced_at = NULL, sendgrid_contact_id = NULL, updated_at = now()
+         WHERE marketing_consent.account_id IS DISTINCT FROM EXCLUDED.account_id
+            OR marketing_consent.account_version <= EXCLUDED.account_version
+            OR EXCLUDED.account_version IS NULL")
         .bind(owner).bind(ciphertext).bind(&hash).bind(policy_version).bind(surface)
         .bind(account.map(|account| account.id.as_str())).bind(account.map(|account| account.version))
         .execute(db).await)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("stale_account_revision".into()));
+    }
     Ok(hash)
 }
 

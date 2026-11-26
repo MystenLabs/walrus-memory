@@ -115,6 +115,7 @@ Create under Alerts. Suggested PoC thresholds (tune per environment):
 | 5xx error-rate spike | `sum(rate(memwal_http_requests_total{status=~"5.."}[5m])) / sum(rate(memwal_http_requests_total[5m])) > 0.05` for 5m |
 | p95 latency breach | `histogram_quantile(0.95, sum by (le) (rate(memwal_http_request_duration_seconds_bucket[5m]))) > 2` for 10m |
 | Sidecar / Walrus failure | `sum(rate(memwal_sidecar_failures_total[5m])) > 0` |
+| Verification email failure | `sum(rate(memwal_email_sends_total{outcome=~"failed_.*|rate_limited"}[5m])) > 0` |
 | No telemetry received | `absent(memwal_http_requests_total)` for 5m |
 
 ## Production / staging rollout notes

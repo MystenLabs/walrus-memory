@@ -25,3 +25,15 @@ curl --fail-with-body -H 'x-admin-api-key: <admin-key>' \
 curl --fail-with-body -X DELETE -H 'x-admin-api-key: <admin-key>' \
   'https://<relayer-host>/api/admin/marketing-consent/<owner>'
 ```
+
+## Owner verification
+
+With `ENABLE_MARKETING_CONSENT=true`, the dashboard requests a challenge at `POST /v1/owner-sessions/marketing-consent/challenge` with `{ "address": "<owner>" }`. Sign the UTF-8 `challenge` as a Sui personal message and submit `address`, `challenge_id`, and the base64 `signature` to `POST /v1/owner-sessions/marketing-consent/verify`. A challenge expires in five minutes and can be submitted once. The returned bearer authorizes marketing consent for that owner for 15 minutes. Configure `SUI_GRPC_URL` for zkLogin signature verification and include the dashboard origin in `ALLOWED_ORIGINS`.
+
+Send `email`, `policy_version`, and `source_surface` (`prompt` or `settings`) in the JSON body of `POST /v1/owners/{owner}/marketing-consent/verification`, with the bearer in `Authorization`. The relayer checks the active account and returns HTTP 202 with the masked address and timing. Submit the six-digit `code` to the same path with `/confirm` appended. Confirm returns `opted_in` on success. A code expires in 15 minutes or locks after three incorrect guesses. Resending replaces the code. On HTTP 429, wait for the seconds in `Retry-After` before retrying.
+
+`EMAIL_DELIVERY_MODE=disabled` returns HTTP 503 from the verification endpoints. `log` logs the masked address and code on non-mainnet networks. `provider` uses SendGrid Mail Send. Set `EMAIL_PROVIDER_API_KEY` to a relayer-specific Mail Send key from the shared SendGrid account and `EMAIL_FROM_ADDRESS` to an address on Console's verified sending domain. Store the key in the environment's Walrus Memory 1Password vault. `EMAIL_API_BASE` defaults to `https://api.sendgrid.com` and accepts an HTTPS origin. `EMAIL_FROM_NAME` defaults to `Walrus Memory`.
+
+The relayer commits the pending record and its code before sending. A delivery failure returns HTTP 503 and the pending record remains eligible for resend after the cooldown. `memwal_email_sends_total` reports delivery outcomes. Slack alerts are deduplicated by network and failure outcome. Provider response bodies never enter relayer logs.
+
+On dev, run the challenge, signature, request, receive, and confirm flow with a testnet owner and a test inbox on the configured delivery mode. Verify `opted_in` and `verified_at` using the admin export. In log mode, retrieve the code from the relayer log and check for the masked address. Search the logs for the full test inbox address and confirm it does not appear.

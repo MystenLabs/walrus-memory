@@ -3067,6 +3067,7 @@ mod tests {
             allowed_origins: String::new(),
             benchmark_mode: false,
             marketing_consent: None,
+            email_delivery: Default::default(),
             writes_paused: false,
             enable_memory_deletion: false,
             enable_security_delete: false,

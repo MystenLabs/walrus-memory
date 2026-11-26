@@ -6,6 +6,9 @@ mod engine;
 mod jobs;
 mod jobs_security_delete;
 mod marketing_consent;
+#[cfg(test)]
+#[path = "marketing_consent/http_tests.rs"]
+mod marketing_consent_http_tests;
 mod mcp_proxy;
 mod oauth;
 mod observability;
@@ -618,7 +621,7 @@ mod mcp_rate_limit_tests {
         }
     }
 
-    async fn denying_redis() -> redis::aio::ConnectionManager {
+    pub(crate) async fn denying_redis() -> redis::aio::ConnectionManager {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -677,6 +680,7 @@ mod mcp_rate_limit_tests {
             allowed_origins: String::new(),
             benchmark_mode: false,
             marketing_consent: None,
+            email_delivery: Default::default(),
             writes_paused: false,
             enable_memory_deletion: false,
             enable_security_delete: false,
@@ -720,10 +724,23 @@ mod mcp_rate_limit_tests {
     async fn test_state(redis: redis::aio::ConnectionManager) -> Arc<AppState> {
         let pool = sqlx::postgres::PgPool::connect_lazy("postgres://memwal@127.0.0.1/memwal")
             .expect("lazy pool");
+        test_state_with(redis, pool, rate_limit_test_config())
+    }
+
+    pub(crate) fn test_state_with(
+        redis: redis::aio::ConnectionManager,
+        pool: sqlx::PgPool,
+        config: Config,
+    ) -> Arc<AppState> {
         let db = Arc::new(VectorDb::from_pool(pool.clone()));
         let http_client = reqwest::Client::new();
-        let config = Arc::new(rate_limit_test_config());
-        let alerts = Arc::new(AlertManager::from_env(http_client.clone()));
+        let config = Arc::new(config);
+        let alerts = Arc::new(AlertManager::from_webhook_value(http_client.clone(), None));
+        let email_sender = config.email_delivery.build(
+            http_client.clone(),
+            Arc::clone(&alerts),
+            &config.sui_network,
+        );
         Arc::new(AppState {
             db: Arc::clone(&db),
             owner_policies: Arc::new(owner_rate_limits::OwnerPolicyStore::new()),
@@ -741,6 +758,7 @@ mod mcp_rate_limit_tests {
             security_delete_execution_gate: Arc::new(types::SecurityDeleteExecutionGate::new(1)),
             config: Arc::clone(&config),
             http_client: http_client.clone(),
+            email_sender,
             sui_grpc_client: None,
             delegate_keys_cache: storage::sui::new_delegate_keys_cache(),
             delegate_verify_cache: storage::sui::new_delegate_verify_cache(),
@@ -1314,6 +1332,7 @@ mod owner_token_active_check_tests {
             security_delete_execution_gate: Arc::new(types::SecurityDeleteExecutionGate::new(1)),
             config: Arc::clone(&config),
             http_client: http_client.clone(),
+            email_sender: None,
             sui_grpc_client: None,
             delegate_keys_cache: storage::sui::new_delegate_keys_cache(),
             delegate_verify_cache: storage::sui::new_delegate_verify_cache(),
@@ -2739,6 +2758,11 @@ async fn main() {
         .await
         .expect("initial owner policy snapshot unavailable");
 
+    let email_sender = config.email_delivery.build(
+        http_client.clone(),
+        Arc::clone(&alerts),
+        &config.sui_network,
+    );
     let state = Arc::new(AppState {
         owner_policies,
         db,
@@ -2752,6 +2776,7 @@ async fn main() {
         security_delete_execution_gate,
         config: Arc::clone(&config),
         http_client,
+        email_sender,
         sui_grpc_client,
         delegate_keys_cache: crate::storage::sui::new_delegate_keys_cache(),
         delegate_verify_cache: crate::storage::sui::new_delegate_verify_cache(),
@@ -3755,6 +3780,7 @@ async fn main() {
         // this deployment explicitly trusts.
         .merge(owner_token_routes)
         .merge(owner_token_probe_routes)
+        .merge(marketing_consent::owner_routes(state.clone()))
         .merge(admin_dashboard_routes)
         .layer(cors)
         // Merge after applying the deployment-wide CORS layer so its

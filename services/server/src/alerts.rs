@@ -110,6 +110,7 @@ pub struct AlertManager {
     /// Keyed per network so a revoked or exhausted `OPENAI_API_KEY` pages once
     /// per dedup window instead of spamming on every recall/embed/remember call.
     embedding_provider_dedup: AlertDedup,
+    email_send_failed_dedup: AlertDedup,
 }
 
 impl AlertManager {
@@ -150,6 +151,10 @@ impl AlertManager {
             postgres_storage_dedup: AlertDedup::new(dedup_window_from_env(
                 POSTGRES_STORAGE_ALERT_DEDUP_SECS_ENV,
                 POSTGRES_STORAGE_ALERT_DEDUP_DEFAULT,
+            )),
+            email_send_failed_dedup: AlertDedup::new(dedup_window_from_env(
+                "ALERT_EMAIL_SEND_FAILED_DEDUP_SECS",
+                Duration::from_secs(600),
             )),
             embedding_provider_dedup: AlertDedup::new(dedup_window_from_env(
                 EMBEDDING_PROVIDER_ALERT_DEDUP_SECS_ENV,
@@ -325,6 +330,25 @@ impl AlertManager {
         )
         .await
         .map_err(|_| AlertError::Transport("embedding provider alert delivery timed out".into()))?
+    }
+
+    pub async fn notify_email_send_failed(
+        &self,
+        alert: EmailSendFailedAlert<'_>,
+    ) -> Result<(), AlertError> {
+        let Some(slack) = &self.slack else {
+            return Ok(());
+        };
+        if self
+            .email_send_failed_dedup
+            .should_suppress((alert.sui_network.into(), alert.outcome.into()))
+        {
+            return Ok(());
+        }
+        let payload = SlackPayload::for_email_send_failed(&alert);
+        tokio::time::timeout(Duration::from_secs(1), slack.send_payload(&payload))
+            .await
+            .map_err(|_| AlertError::Transport("email alert delivery timed out".into()))?
     }
 
     fn should_suppress_wallet_balance_low(&self, alert: &WalletBalanceLowAlert) -> bool {
@@ -615,6 +639,12 @@ impl std::fmt::Display for AlertError {
 }
 
 impl std::error::Error for AlertError {}
+
+pub struct EmailSendFailedAlert<'a> {
+    pub sui_network: &'a str,
+    pub tag: &'static str,
+    pub outcome: &'static str,
+}
 
 #[derive(Serialize)]
 struct SlackPayload {
@@ -1018,6 +1048,19 @@ This is not a per-user storage quota and is not a Walrus/SUI/WAL funding issue."
                     text: mrkdwn(details),
                 },
             ],
+        }
+    }
+
+    fn for_email_send_failed(alert: &EmailSendFailedAlert<'_>) -> Self {
+        let summary = format!(
+            "MemWal email delivery failed on {} ({}, {}).",
+            alert.sui_network, alert.tag, alert.outcome
+        );
+        Self {
+            text: summary.clone(),
+            blocks: vec![SlackBlock::Section {
+                text: plain_text(summary),
+            }],
         }
     }
 

@@ -169,11 +169,19 @@ pub trait NonceStore: Send + Sync {
 
 pub struct RedisNonceStore {
     connection: ConnectionManager,
+    prefix: &'static str,
 }
 
 impl RedisNonceStore {
     pub fn new(connection: ConnectionManager) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            prefix: "sd_nonce",
+        }
+    }
+
+    pub fn namespaced(connection: ConnectionManager, prefix: &'static str) -> Self {
+        Self { connection, prefix }
     }
 }
 
@@ -182,7 +190,7 @@ impl NonceStore for RedisNonceStore {
     async fn issue(&self, id: &str, record_json: &str, ttl_secs: u64) -> Result<(), SdError> {
         let mut connection = self.connection.clone();
         let result: Option<String> = redis::cmd("SET")
-            .arg(format!("sd_nonce:{id}"))
+            .arg(format!("{}:{id}", self.prefix))
             .arg(record_json)
             .arg("NX")
             .arg("EX")
@@ -204,7 +212,7 @@ impl NonceStore for RedisNonceStore {
     async fn take(&self, id: &str) -> Result<Option<String>, SdError> {
         let mut connection = self.connection.clone();
         redis::cmd("GETDEL")
-            .arg(format!("sd_nonce:{id}"))
+            .arg(format!("{}:{id}", self.prefix))
             .query_async(&mut connection)
             .await
             .map_err(|error| SdError::internal(AppError::Internal(format!("nonce take: {error}"))))

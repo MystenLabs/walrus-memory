@@ -36,12 +36,10 @@ pub(crate) struct MarketingConsentConfig {
     pub(super) encryption_key: SecretKey32,
     pub(super) hash_key: SecretKey32,
     pub(super) erasure_interval: Duration,
+    pub(super) send_limits: crate::rate_limit::VerificationSendLimits,
 }
 
 impl MarketingConsentConfig {
-    pub(super) fn hash_key_bytes(&self) -> &[u8] {
-        self.hash_key.0.as_ref()
-    }
     pub(crate) fn from_env(enabled: bool) -> Option<Self> {
         enabled.then(|| {
             let encryption_key = SecretKey32::load("MARKETING_CONSENT_ENCRYPTION_KEY");
@@ -61,16 +59,18 @@ impl MarketingConsentConfig {
                 encryption_key,
                 hash_key,
                 erasure_interval: Duration::from_secs(erasure_secs.into()),
+                send_limits: crate::rate_limit::VerificationSendLimits::from_env(),
             }
         })
     }
 
     #[cfg(test)]
-    pub(super) fn for_test() -> Self {
+    pub(crate) fn for_test() -> Self {
         Self {
             encryption_key: SecretKey32(Zeroizing::new([1; 32])),
             hash_key: SecretKey32(Zeroizing::new([2; 32])),
             erasure_interval: Duration::from_secs(3600),
+            send_limits: Default::default(),
         }
     }
 }

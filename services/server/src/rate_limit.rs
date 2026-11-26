@@ -2374,6 +2374,120 @@ pub async fn check_owner_token_owner_rate_limit(
     Ok(SponsorRlResult::Allowed)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct VerificationSendLimits {
+    pub resend_secs: u64,
+    pub per_owner_hour: u32,
+    pub per_address_day: u32,
+    pub global_minute: u32,
+}
+
+impl Default for VerificationSendLimits {
+    fn default() -> Self {
+        Self {
+            resend_secs: 60,
+            per_owner_hour: 5,
+            per_address_day: 5,
+            global_minute: 60,
+        }
+    }
+}
+
+impl VerificationSendLimits {
+    pub(crate) fn from_env() -> Self {
+        fn positive(name: &str, default: u32) -> u32 {
+            std::env::var(name)
+                .map(|value| {
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or_else(|| panic!("{name} must be a positive integer"))
+                })
+                .unwrap_or(default)
+        }
+        let defaults = Self::default();
+        Self {
+            resend_secs: u64::from(positive(
+                "MARKETING_CONSENT_CODE_RESEND_SECS",
+                defaults.resend_secs as u32,
+            )),
+            per_owner_hour: positive(
+                "MARKETING_CONSENT_CODE_SENDS_PER_HOUR",
+                defaults.per_owner_hour,
+            ),
+            per_address_day: positive(
+                "MARKETING_CONSENT_CODE_SENDS_PER_ADDRESS_PER_DAY",
+                defaults.per_address_day,
+            ),
+            global_minute: positive(
+                "MARKETING_CONSENT_CODE_GLOBAL_SENDS_PER_MINUTE",
+                defaults.global_minute,
+            ),
+        }
+    }
+}
+
+const VERIFICATION_WINDOWS_LUA: &str = r#"
+local time = redis.call('TIME')
+local now = time[1] * 1000 + math.floor(time[2] / 1000)
+local retry_ms = 0
+for i, key in ipairs(KEYS) do
+    local window = tonumber(ARGV[2 * i]) * 1000
+    local limit = tonumber(ARGV[2 * i + 1])
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+    local count = redis.call('ZCARD', key)
+    if count >= limit then
+        local release = redis.call('ZRANGE', key, count - limit, count - limit, 'WITHSCORES')
+        retry_ms = math.max(retry_ms, tonumber(release[2]) + window - now)
+    end
+end
+if retry_ms > 0 then return math.ceil(retry_ms / 1000) end
+for i, key in ipairs(KEYS) do
+    redis.call('ZADD', key, now, ARGV[1])
+    redis.call('EXPIRE', key, ARGV[2 * i])
+end
+return 0
+"#;
+
+pub(crate) async fn check_verification_send_limits(
+    redis: &redis::aio::ConnectionManager,
+    limits: &VerificationSendLimits,
+    owner: &str,
+    address_hash: &str,
+) -> Result<u64, redis::RedisError> {
+    // Reserve all four windows together so denied requests cannot spend another bucket.
+    redis::Script::new(VERIFICATION_WINDOWS_LUA)
+        .key(format!("rate:marketing_consent:cooldown:{owner}"))
+        .key(format!("rate:marketing_consent:owner:{owner}"))
+        .key(format!("rate:marketing_consent:address:{address_hash}"))
+        .key("rate:marketing_consent:global")
+        .arg(Uuid::new_v4().to_string())
+        .arg(limits.resend_secs)
+        .arg(1)
+        .arg(3600)
+        .arg(limits.per_owner_hour)
+        .arg(86400)
+        .arg(limits.per_address_day)
+        .arg(60)
+        .arg(limits.global_minute)
+        .invoke_async(&mut redis.clone())
+        .await
+}
+
+pub(crate) async fn check_owner_session_rate_limit(
+    redis: &redis::aio::ConnectionManager,
+    ip: &str,
+) -> Result<u64, redis::RedisError> {
+    redis::Script::new(VERIFICATION_WINDOWS_LUA)
+        .key(format!("rate:owner_session:marketing_consent:{ip}"))
+        .arg(Uuid::new_v4().to_string())
+        .arg(60)
+        .arg(20)
+        .invoke_async(&mut redis.clone())
+        .await
+}
+
 // ============================================================
 // Unit Tests
 // ============================================================

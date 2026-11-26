@@ -18,7 +18,7 @@ use super::{
 
 const ADDRESS: &str = "consent-test-unique@example.test";
 
-pub(super) struct TestDb {
+pub(crate) struct TestDb {
     pub pool: PgPool,
     setup: PgPool,
     schema: String,
@@ -58,6 +58,12 @@ impl TestDb {
                 .execute(&pool)
                 .await
                 .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../migrations/029_marketing_consent_verification.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         Some(Self {
             pool,
@@ -77,7 +83,7 @@ impl TestDb {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct Logs(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Logs {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -89,7 +95,7 @@ impl io::Write for Logs {
 }
 
 impl Logs {
-    pub(super) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+    pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
         let writer = self.clone();
         tracing_subscriber::fmt()
             .with_ansi(false)
@@ -98,7 +104,7 @@ impl Logs {
             .finish()
     }
 
-    pub(super) fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
