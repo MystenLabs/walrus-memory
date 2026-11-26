@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 pub(crate) struct EmailAddress(Zeroizing<String>);
 
 impl EmailAddress {
-    pub(super) fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let normalized = Zeroizing::new(raw.trim().to_lowercase());
         let (local, domain) = normalized.split_once('@')?;
         if normalized.len() > 254

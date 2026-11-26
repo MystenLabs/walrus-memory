@@ -196,6 +196,7 @@ pub struct AppState {
     /// `Arc` so the engine + handlers share one immutable config.
     pub config: Arc<Config>,
     pub http_client: reqwest::Client,
+    pub email_sender: Option<Arc<dyn crate::services::email::EmailSender>>,
     /// Shared Sui gRPC client for onchain delegate-key verification, built
     /// once at startup. This client is intentionally independent of security
     /// deletion's quota gate.
@@ -534,6 +535,7 @@ pub struct Config {
     /// set `BENCHMARK_MODE=true` to enable. Surfaced via `GET /health`.
     pub benchmark_mode: bool,
     pub marketing_consent: Option<crate::marketing_consent::MarketingConsentConfig>,
+    pub email_delivery: crate::services::email::EmailDelivery,
     /// Operator write-pause flag from `WRITES_PAUSED`. When true, write
     /// routes reject with HTTP 503 and `/health` reports `writes: "paused"`
     /// while staying HTTP 200. Distinct from sidecar liveness (`write_ready`).
@@ -1104,6 +1106,7 @@ impl Config {
             marketing_consent: crate::marketing_consent::MarketingConsentConfig::from_env(
                 env_bool("ENABLE_MARKETING_CONSENT"),
             ),
+            email_delivery: crate::services::email::EmailDelivery::from_env(&network),
             writes_paused: env_bool("WRITES_PAUSED"),
             enable_memory_deletion: env_bool("ENABLE_MEMORY_DELETION"),
             enable_security_delete: env_bool("ENABLE_SECURITY_DELETE"),
@@ -3318,6 +3321,7 @@ mod tests {
             allowed_origins: String::new(),
             benchmark_mode: false,
             marketing_consent: None,
+            email_delivery: Default::default(),
             writes_paused: false,
             enable_memory_deletion: false,
             enable_security_delete: false,

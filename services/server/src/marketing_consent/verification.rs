@@ -3,12 +3,10 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool};
 
 use super::{crypto, email::EmailAddress, store, MarketingConsentConfig};
-use crate::{oauth::constant_time_eq, observability::observe_db, types::AppError};
-
-const CODE_TTL_MINUTES: i64 = 15;
+use crate::{oauth::constant_time_eq, types::AppError};
 
 #[derive(FromRow)]
 struct CodeRow {
@@ -28,7 +26,7 @@ pub(super) struct PendingVerification {
     pub resend_after_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct ConfirmRequest {
     pub code: String,
 }
@@ -63,36 +61,56 @@ pub(super) async fn issue(
     email: &EmailAddress,
     policy_version: &str,
     surface: super::SourceSurface,
+    account: &store::AccountRevision,
 ) -> Result<(PendingVerification, String), AppError> {
     let owner = store::owner_address(owner)?;
-    let address_hash =
-        store::set_pending(pool, config, &owner, email, policy_version, surface, None).await?;
+    let mut tx = store::observe(
+        "marketing_consent.begin_issue",
+        Instant::now(),
+        pool.begin().await,
+    )?;
+    let address_hash = store::set_pending(
+        &mut *tx,
+        config,
+        &owner,
+        email,
+        policy_version,
+        surface,
+        Some(account),
+    )
+    .await?;
     let code = new_code();
     let hash = code_hash(&config.hash_key, &owner, &address_hash, &code);
     let start = Instant::now();
     let result = sqlx::query(
         "INSERT INTO marketing_consent_verification (owner, address_hash, code_hash, expires_at, attempts, consumed_at)
-         VALUES ($1, $2, $3, now() + ($4 || ' minutes')::interval, 0, NULL)
+         VALUES ($1, $2, $3, now() + interval '15 minutes', 0, NULL)
          ON CONFLICT (owner) DO UPDATE SET address_hash = EXCLUDED.address_hash,
              code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at,
              attempts = 0, consumed_at = NULL, sent_at = now()")
-        .bind(&owner).bind(&address_hash).bind(&hash).bind(CODE_TTL_MINUTES)
-        .execute(pool).await;
-    observe_db(
-        "marketing_consent.issue_code",
-        if result.is_ok() { "ok" } else { "error" },
-        start.elapsed(),
-    );
-    result.map_err(|_| AppError::Internal("Marketing consent verification unavailable".into()))?;
+        .bind(&owner).bind(&address_hash).bind(&hash)
+        .execute(&mut *tx).await;
+    store::observe("marketing_consent.issue_code", start, result)?;
+    store::observe(
+        "marketing_consent.commit_issue",
+        Instant::now(),
+        tx.commit().await,
+    )?;
     Ok((
         PendingVerification {
             status: "pending_verification",
             masked_address: email.masked(),
             expires_in_secs: 900,
-            resend_after_secs: 60,
+            resend_after_secs: config.send_limits.resend_secs,
         },
         code,
     ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ConfirmOutcome {
+    Verified,
+    InvalidCode { attempts_left: i16 },
 }
 
 pub(super) async fn confirm(
@@ -100,7 +118,7 @@ pub(super) async fn confirm(
     config: &MarketingConsentConfig,
     owner: &str,
     code: &str,
-) -> Result<(), AppError> {
+) -> Result<ConfirmOutcome, AppError> {
     if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(AppError::BadRequest("invalid_code".into()));
     }
@@ -136,14 +154,9 @@ pub(super) async fn confirm(
         tx.commit()
             .await
             .map_err(|_| AppError::Internal("Marketing consent verification unavailable".into()))?;
-        return Err(AppError::BadRequest(
-            if row.attempts == 2 {
-                "code_locked"
-            } else {
-                "invalid_code"
-            }
-            .into(),
-        ));
+        return Ok(ConfirmOutcome::InvalidCode {
+            attempts_left: 2 - row.attempts,
+        });
     }
     sqlx::query("UPDATE marketing_consent_verification SET consumed_at = now() WHERE owner = $1")
         .bind(&owner)
@@ -156,5 +169,8 @@ pub(super) async fn confirm(
     tx.commit()
         .await
         .map_err(|_| AppError::Internal("Marketing consent verification unavailable".into()))?;
-    Ok(())
+    Ok(ConfirmOutcome::Verified)
 }
+
+#[cfg(test)]
+mod tests;

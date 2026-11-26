@@ -262,6 +262,19 @@ static MARKETING_CONSENT_SWEEP_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .expect("register memwal_marketing_consent_sweep_errors_total")
 });
 
+static EMAIL_SENDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "memwal_email_sends_total",
+        "Verification emails by delivery outcome",
+        &["tag", "outcome"]
+    )
+    .expect("register memwal_email_sends_total")
+});
+
+pub fn record_email_send(tag: &'static str, outcome: &'static str) {
+    EMAIL_SENDS_TOTAL.with_label_values(&[tag, outcome]).inc();
+}
+
 pub fn record_marketing_consent_erasure(trigger: &'static str) {
     MARKETING_CONSENT_ERASURES_TOTAL
         .with_label_values(&[trigger])
@@ -906,6 +919,18 @@ fn route_label(path: &str) -> String {
         "/api/mcp/sse" => "/api/mcp/sse".to_string(),
         "/api/mcp/messages" => "/api/mcp/messages".to_string(),
         "/api/mcp" => "/api/mcp".to_string(),
+        "/v1/owner-sessions/marketing-consent/challenge"
+        | "/v1/owner-sessions/marketing-consent/verify" => path.to_string(),
+        _ if path.starts_with("/v1/owners/")
+            && path.ends_with("/marketing-consent/verification") =>
+        {
+            crate::marketing_consent::OWNER_PATH.to_string()
+        }
+        _ if path.starts_with("/v1/owners/")
+            && path.ends_with("/marketing-consent/verification/confirm") =>
+        {
+            crate::marketing_consent::CONFIRM_PATH.to_string()
+        }
         _ if path
             .strip_prefix("/api/admin/marketing-consent/")
             .is_some_and(|owner| !owner.is_empty() && !owner.contains('/')) =>
