@@ -1106,6 +1106,7 @@ pub struct OnchainDelegateKeyPublic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerAccountOnchain {
     pub account_id: String,
+    pub object_version: Option<u64>,
     pub active: bool,
     pub admin_quarantined: bool,
     pub keys: Vec<OnchainDelegateKeyPublic>,
@@ -1513,7 +1514,11 @@ async fn grpc_get_object(
     let address = parse_object_id(account_object_id)?;
     let mut request = sui_rpc::proto::sui::rpc::v2::GetObjectRequest::new(&address);
     request.read_mask = Some(prost_types::FieldMask {
-        paths: vec!["json".to_string(), "object_type".to_string()],
+        paths: vec![
+            "json".to_string(),
+            "object_type".to_string(),
+            "version".to_string(),
+        ],
     });
 
     with_get_object_retry(attempts, || {
@@ -1553,12 +1558,17 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     }
 }
 
+type MoveFields = (
+    Option<String>,
+    serde_json::Map<String, serde_json::Value>,
+    Option<u64>,
+);
+
 async fn json_rpc_get_move_fields(
     http_client: &reqwest::Client,
     rpc_url: &str,
     object_id: &str,
-) -> Result<Option<(Option<String>, serde_json::Map<String, serde_json::Value>)>, OnchainVerifyError>
-{
+) -> Result<Option<MoveFields>, OnchainVerifyError> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1608,17 +1618,20 @@ async fn json_rpc_get_move_fields(
     {
         return Ok(None);
     }
-    let Some(content) = rpc_response
-        .result
-        .and_then(|result| result.data)
-        .and_then(|data| data.content)
-    else {
+    let Some(data) = rpc_response.result.and_then(|result| result.data) else {
+        return Ok(None);
+    };
+    let Some(content) = data.content else {
         return Ok(None);
     };
     let fields = content
         .fields
         .ok_or_else(|| OnchainVerifyError::RpcError("Object has no fields".into()))?;
-    Ok(Some((content.object_type, fields)))
+    Ok(Some((
+        content.object_type,
+        fields,
+        data.version.and_then(|version| version.parse().ok()),
+    )))
 }
 
 async fn get_move_fields(
@@ -1626,8 +1639,7 @@ async fn get_move_fields(
     rpc_url: &str,
     grpc_client: Option<&sui_rpc::Client>,
     object_id: &str,
-) -> Result<Option<(Option<String>, serde_json::Map<String, serde_json::Value>)>, OnchainVerifyError>
-{
+) -> Result<Option<MoveFields>, OnchainVerifyError> {
     let Some(grpc_client) = grpc_client else {
         return json_rpc_get_move_fields(http_client, rpc_url, object_id).await;
     };
@@ -1640,7 +1652,7 @@ async fn get_move_fields(
             let fields = value.as_object().cloned().ok_or_else(|| {
                 OnchainVerifyError::RpcError("Object json is not an object".into())
             })?;
-            Ok(Some((object.object_type, fields)))
+            Ok(Some((object.object_type, fields, object.version)))
         }
         Err(OnchainVerifyError::NotFound(_)) => Ok(None),
         Err(error) => Err(error),
@@ -1670,7 +1682,7 @@ pub async fn load_owner_account_onchain(
         if let Some(table_id) = cached {
             table_id
         } else {
-            let Some((_, registry_fields)) =
+            let Some((_, registry_fields, _)) =
                 get_move_fields(http_client, rpc_url, grpc_client, registry_id).await?
             else {
                 return Err(OnchainVerifyError::NotFound(
@@ -1690,7 +1702,7 @@ pub async fn load_owner_account_onchain(
     let parent = parse_object_id(&table_id)?;
     let key = parse_object_id(owner)?;
     let field_id = address_hex(&derive_address_dynamic_field_id(&parent, &key));
-    let Some((_, field_fields)) =
+    let Some((_, field_fields, _)) =
         get_move_fields(http_client, rpc_url, grpc_client, &field_id).await?
     else {
         return Ok(None);
@@ -1699,7 +1711,7 @@ pub async fn load_owner_account_onchain(
         OnchainVerifyError::RpcError("registry dynamic field has no account id".into())
     })?;
 
-    let Some((object_type, account_fields)) =
+    let Some((object_type, account_fields, object_version)) =
         get_move_fields(http_client, rpc_url, grpc_client, &account_id).await?
     else {
         return Err(OnchainVerifyError::NotFound(format!(
@@ -1714,6 +1726,7 @@ pub async fn load_owner_account_onchain(
     let (active, admin_quarantined, keys) = parse_owner_account_fields(&account_fields)?;
     Ok(Some(OwnerAccountOnchain {
         account_id,
+        object_version,
         active,
         admin_quarantined,
         keys,
@@ -2036,6 +2049,7 @@ fn require_get_object_content(result: RpcResult) -> Result<ObjectContent, Onchai
 
 #[derive(Debug, Deserialize)]
 struct ObjectData {
+    version: Option<String>,
     content: Option<ObjectContent>,
 }
 

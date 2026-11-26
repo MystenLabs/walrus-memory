@@ -5,6 +5,7 @@ mod compatibility;
 mod engine;
 mod jobs;
 mod jobs_security_delete;
+mod marketing_consent;
 mod mcp_proxy;
 mod oauth;
 mod observability;
@@ -675,6 +676,7 @@ mod mcp_rate_limit_tests {
             trusted_proxy_hops: 0,
             allowed_origins: String::new(),
             benchmark_mode: false,
+            marketing_consent: None,
             writes_paused: false,
             enable_memory_deletion: false,
             enable_security_delete: false,
@@ -2774,6 +2776,7 @@ async fn main() {
 
     jobs_security_delete::spawn_reconciler(Arc::clone(&state));
     jobs_security_delete::spawn_object_resolver(Arc::clone(&state));
+    marketing_consent::spawn_erasure_sweep(Arc::clone(&state));
 
     tracing::info!(
         "  alerts: Slack {} via ALERT_TO_SLACK",
@@ -3577,7 +3580,11 @@ async fn main() {
             get(routes::list_unblock_requests).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .layer(middleware::from_fn(auth::verify_admin_key))
-        .merge(owner_rate_limit_routes());
+        .merge(owner_rate_limit_routes())
+        .merge(marketing_consent::admin_routes(
+            state.db.pool(),
+            config.marketing_consent.as_ref(),
+        ));
 
     // Public routes
     // /health and /config accept no body — cap at 16 KiB to reject

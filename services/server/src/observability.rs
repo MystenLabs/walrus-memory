@@ -244,6 +244,36 @@ static SIDECAR_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register memwal_sidecar_failures_total")
 });
 
+static MARKETING_CONSENT_ERASURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "memwal_marketing_consent_erasures_total",
+        "Marketing consent records erased by trigger.",
+        &["trigger"]
+    )
+    .expect("register memwal_marketing_consent_erasures_total")
+});
+
+static MARKETING_CONSENT_SWEEP_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "memwal_marketing_consent_sweep_errors_total",
+        "Marketing consent erasure sweep errors by reason.",
+        &["reason"]
+    )
+    .expect("register memwal_marketing_consent_sweep_errors_total")
+});
+
+pub fn record_marketing_consent_erasure(trigger: &'static str) {
+    MARKETING_CONSENT_ERASURES_TOTAL
+        .with_label_values(&[trigger])
+        .inc();
+}
+
+pub fn record_marketing_consent_sweep_error(reason: &'static str) {
+    MARKETING_CONSENT_SWEEP_ERRORS_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
 static DB_QUERY_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     prometheus::register_histogram_vec!(
         HistogramOpts::new(
@@ -876,6 +906,12 @@ fn route_label(path: &str) -> String {
         "/api/mcp/sse" => "/api/mcp/sse".to_string(),
         "/api/mcp/messages" => "/api/mcp/messages".to_string(),
         "/api/mcp" => "/api/mcp".to_string(),
+        _ if path
+            .strip_prefix("/api/admin/marketing-consent/")
+            .is_some_and(|owner| !owner.is_empty() && !owner.contains('/')) =>
+        {
+            crate::marketing_consent::ADMIN_PATH.to_string()
+        }
         _ if path.starts_with("/api/remember/") => "/api/remember/{job_id}".to_string(),
         // Owner-scoped read API — {owner} is a variable Sui address path
         // segment, so these three fall back to prefix/suffix matching the

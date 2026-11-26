@@ -167,6 +167,8 @@ const MIGRATIONS_AFTER_INDEX_RECOVERY: &[Migration] = &[
     // Drop the legacy account-wide idempotency index (#1170, #1225, #1312).
     migration!("026_drop_owner_idempotency_key_index.sql"),
     migration!("027_owner_rate_limits.sql"),
+    migration!("028_marketing_consent.sql"),
+    migration!("029_marketing_consent_verification.sql"),
 ];
 
 /// Every migration the pipeline applies, in the order it applies them.
@@ -352,7 +354,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{oauth_rows, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK, VectorDb, VectorInsert};
+    use super::{oauth_rows, VectorDb, VectorInsert, DB_SETUP_LOCK as VECTOR_SCHEMA_SETUP_LOCK};
 
     /// Looks a migration up in the pipeline by file name.
     ///

@@ -1,6 +1,6 @@
 //! Walrus Memory indexer — wires `AccountPipeline` into a `sui-indexer-alt-framework`
 //! `IndexerCluster`. The framework owns checkpoint ingestion, watermarks, batching, and
-//! shutdown; this binary configures the cluster and registers the one pipeline.
+//! shutdown; this binary configures the cluster and registers the account pipelines.
 //!
 //! Ingestion source + checkpoint range come from CLI flags (`--remote-store-url`,
 //! `--first-checkpoint`); package id + DATABASE_URL come from the environment.
@@ -11,6 +11,7 @@ use sui_indexer_alt_framework::cluster::{Args, IndexerCluster};
 use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
 
 mod handler;
+mod owner_deactivations;
 mod schema;
 
 use handler::AccountPipeline;
@@ -40,6 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
     cluster
         .concurrent_pipeline(AccountPipeline { package }, ConcurrentConfig::default())
+        .await?;
+
+    cluster
+        .concurrent_pipeline(
+            owner_deactivations::OwnerDeactivationPipeline { package },
+            ConcurrentConfig::default(),
+        )
         .await?;
 
     cluster.run().await?.join().await?;
