@@ -7,6 +7,22 @@ on:
       - dev
   workflow_dispatch:
     inputs:
+      session_recall:
+        description: Deployed recall sessions (remember_runs seeds isolated bench-session-* namespace; 0 is read-only)
+        type: boolean
+        default: false
+      expected_server_commit:
+        description: Required deployment SHA for session recall (optional)
+        type: string
+        default: ''
+      seal_ab:
+        description: Read-only live SEAL source A/B instead of deployed HTTP API benchmark (manual only)
+        type: boolean
+        default: false
+      baseline_ref:
+        description: Trusted baseline commit or branch for SEAL A/B
+        type: string
+        default: dev
       target_environment:
         description: GitHub benchmark environment to use
         required: true
@@ -59,6 +75,7 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 jobs:
   memory-api:
     name: Memory API Latency
+    if: github.event_name != 'workflow_dispatch' || !inputs.seal_ab
     runs-on: ubuntu-latest
     environment:
       name: benchmark-${{ github.event_name == 'workflow_dispatch' && inputs.target_environment || (github.ref_name == 'staging' && 'staging' || 'dev') }}
@@ -76,6 +93,8 @@ jobs:
       cancel-in-progress: false
 
     env:
+      SESSION_RECALL: ${{ inputs.session_recall || false }}
+      EXPECTED_SERVER_COMMIT: ${{ inputs.expected_server_commit || '' }}
       SERVER_URL: ${{ github.event.inputs.server_url || vars.BENCH_SERVER_URL }}
       NAMESPACE: ${{ github.event.inputs.namespace || 'benchmark' }}
       REMEMBER_TEXT: ${{ github.event.inputs.remember_text || 'benchmark memory' }}
@@ -127,6 +146,13 @@ jobs:
           fi
 
           mkdir -p benchmark-results
+          if [ "$SESSION_RECALL" = "true" ]; then
+            services/server/scripts/node_modules/.bin/tsx services/server/scripts/bench-recall-session-live.ts \
+              --server-url "$SERVER_URL" --namespace "$NAMESPACE" --query "$QUERY" \
+              --limit "$LIMIT" --runs "$WARM_RUNS" --seed-count "$REMEMBER_RUNS" --expected-commit "$EXPECTED_SERVER_COMMIT" \
+              --output benchmark-results/memory-api.json
+            exit 0
+          fi
           services/server/scripts/node_modules/.bin/tsx services/server/scripts/bench-recall-latency.ts \
             --server-url "$SERVER_URL" \
             --delegate-key "$BENCH_DELEGATE_KEY" \
@@ -166,5 +192,90 @@ jobs:
         with:
           name: benchmark-results-${{ github.run_id }}
           path: benchmark-results/memory-api.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  seal-session-ab:
+    name: Live SEAL session source A/B
+    if: github.event_name == 'workflow_dispatch' && inputs.seal_ab
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    environment:
+      name: benchmark-${{ inputs.target_environment }}
+    concurrency:
+      group: bench-account-${{ inputs.target_environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout candidate source
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+      - name: Checkout baseline source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          path: baseline
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            candidate/services/server/scripts/package-lock.json
+            baseline/services/server/scripts/package-lock.json
+      - name: Install candidate dependencies
+        working-directory: candidate/services/server/scripts
+        run: npm ci
+      - name: Install baseline dependencies
+        working-directory: baseline/services/server/scripts
+        run: npm ci
+      - name: Run read-only live SEAL A/B
+        working-directory: candidate/services/server/scripts
+        env:
+          BENCH_SERVER_URL: ${{ inputs.server_url || vars.BENCH_SERVER_URL }}
+          BENCH_ACCOUNT_ID: ${{ secrets.BENCH_ACCOUNT_ID }}
+          BENCH_DELEGATE_KEY: ${{ secrets.BENCH_DELEGATE_KEY }}
+          MEMWAL_SEAL_POLICY_PACKAGE_ID: ${{ vars.MEMWAL_SEAL_POLICY_PACKAGE_ID }}
+        run: |
+          node --import tsx bench-seal-session-live.ts \
+            --baseline-root "$GITHUB_WORKSPACE/baseline" \
+            --candidate-root "$GITHUB_WORKSPACE/candidate" \
+            --rounds 4 --warm-runs 5 \
+            --output "$GITHUB_WORKSPACE/benchmark-results/seal-session-ab.json"
+      - name: Write live A/B summary
+        if: always()
+        shell: bash
+        run: |
+          node <<'NODE' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('node:fs');
+          const file = 'benchmark-results/seal-session-ab.json';
+          if (!fs.existsSync(file)) {
+            console.log('Live SEAL A/B did not produce results. No speedup is established.');
+            process.exit(0);
+          }
+          const r = JSON.parse(fs.readFileSync(file, 'utf8'));
+          console.log('## Live SEAL source A/B');
+          console.log(`Baseline: ${r.baselineCommit}; candidate: ${r.candidateCommit}`);
+          console.log('');
+          console.log(r.scope);
+          console.log('');
+          if (!r.completed) {
+            console.log('Benchmark incomplete. No speedup is established.');
+            process.exit(0);
+          }
+          console.log('| Results | Session | Baseline p50 ms | Candidate p50 ms | Reduction |');
+          console.log('|---|---|---:|---:|---:|');
+          for (const c of r.comparisons) console.log(`| ${c.limit} | ${c.phase} | ${c.baseline.p50.toFixed(0)} | ${c.candidate.p50.toFixed(0)} | ${c.p50ReductionPercent.toFixed(1)}% |`);
+          console.log('');
+          console.log('Cold = fresh session with public metadata prewarmed. Real Sui, PTB, SEAL key fetch and decrypt; synthetic ciphertexts, no transactions or Walrus writes. This is not end-to-end recall latency.');
+          NODE
+      - name: Upload live SEAL A/B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-session-ab-${{ github.run_id }}
+          path: benchmark-results/seal-session-ab.json
           if-no-files-found: warn
           retention-days: 14

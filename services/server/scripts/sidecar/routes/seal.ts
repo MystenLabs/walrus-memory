@@ -31,7 +31,15 @@ import {
   SIDECAR_ENABLE_MIGRATION_SEAL_ROUTE,
 } from "../config.js";
 import { sealCommitteeIdentityMatches, type SealCommitteeIdentity } from "../../seal-config.js";
-import { createDecryptSealClient, sealEncryptClient, suiClient } from "../clients.js";
+import { createDecryptSealClient, sealEncryptClient, suiClient, sealSessionCacheMetrics } from "../clients.js";
+import {
+  decryptBatchSealItems,
+  decryptSingleSealItem,
+  effectiveSealSingleThreshold,
+  isSealSessionExpiredError,
+  resolveSealItemThreshold,
+  sealKeyFetchErrorCode,
+} from "../seal-decrypt-pool.js";
 import { buildSealEncryptId, fetchSealEncryptIdentity, type SealEncryptPurpose } from "../seal-identity.js";
 import {
   buildSealApproveTx,
@@ -39,13 +47,17 @@ import {
   sealIdentityPackageError,
   sealApprovePackageId,
 } from "../seal-ptb.js";
+import {
+  assertSealSessionClientLive,
+  getCachedInitialSharedVersion,
+  hasSealSessionApprovedKeys,
+  readSealAuthorizationVersions,
+} from "../seal-session-pool.js";
 import { requestIdFor } from "../log.js";
 import { isRetryableRpcError } from "../retry/rpc.js";
 import { errorMessage, errorName, formattedError } from "../util.js";
 
-export function sealKeyFetchErrorCode(err: unknown): "SHARED_SERVICE_UNAVAILABLE" | "KEY_FETCH_FAILED" {
-    return isRetryableRpcError(err) ? "SHARED_SERVICE_UNAVAILABLE" : "KEY_FETCH_FAILED";
-}
+export { sealKeyFetchErrorCode };
 
 // SEAL_REQUIRE_COMMITTEE_IDENTITY=true (or 1/yes/on) makes /seal/encrypt reject
 // requests that omit expectedSealCommitteeIdentity, so migration deployments
@@ -231,6 +243,7 @@ export function parseSealDecryptBatchItems(items: unknown[], packageId: string) 
     index: number;
     encryptedData: Uint8Array;
     fullId: string;
+    threshold: number;
   }[] = [];
   const errors: { index: number; code: string; error: string }[] = [];
 
@@ -246,7 +259,7 @@ export function parseSealDecryptBatchItems(items: unknown[], packageId: string) 
         });
         continue;
       }
-      parsedItems.push({ index: i, encryptedData, fullId: parsed.id });
+      parsedItems.push({ index: i, encryptedData, fullId: parsed.id, threshold: parsed.threshold });
     } catch (err: any) {
       errors.push({
         index: i,
@@ -259,18 +272,55 @@ export function parseSealDecryptBatchItems(items: unknown[], packageId: string) 
   return { parsedItems, errors };
 }
 
-/** Build the seal_approve PTB for a set of SEAL key IDs. */
+/**
+ * Build the seal_approve PTB for a set of SEAL key IDs.
+ * Uses cached immutable `initialSharedVersion` values from `readSealAuthorizationVersions`
+ * when available so `tx.build({ onlyTransactionKind: true })` encodes locally in <0.1ms
+ * without a redundant Sui `SimulateTransaction` RPC.
+ */
 async function buildSealApproveTxBytes(
-  packageId: string,
+  policyPackageId: string,
   registryId: string | undefined,
   accountId: string,
   ids: string[]
 ): Promise<Uint8Array> {
-  const tx = buildSealApproveTx(packageId, registryId, accountId, ids);
-  return await tx.build({
-    client: suiClient as any,
-    onlyTransactionKind: true,
-  });
+  let accountInitialSharedVersion = getCachedInitialSharedVersion(accountId);
+  let registryInitialSharedVersion = registryId ? getCachedInitialSharedVersion(registryId) : undefined;
+  if (
+    registryId !== undefined &&
+    (accountInitialSharedVersion === undefined || registryInitialSharedVersion === undefined)
+  ) {
+    try {
+      await readSealAuthorizationVersions(suiClient, accountId, registryId);
+      accountInitialSharedVersion = getCachedInitialSharedVersion(accountId);
+      registryInitialSharedVersion = getCachedInitialSharedVersion(registryId);
+    } catch {
+      // Fall back to client-backed tx.build below to preserve exact RPC error reporting.
+    }
+  }
+
+  const canBuildLocally =
+    accountInitialSharedVersion !== undefined &&
+    (registryId === undefined || registryInitialSharedVersion !== undefined);
+  const tx = buildSealApproveTx(
+    policyPackageId,
+    registryId,
+    accountId,
+    ids,
+    canBuildLocally
+      ? { registryInitialSharedVersion, accountInitialSharedVersion }
+      : undefined,
+  );
+  return canBuildLocally
+    ? await tx.build({ onlyTransactionKind: true })
+    : await tx.build({
+        client: suiClient as any,
+        onlyTransactionKind: true,
+      });
+}
+
+class PtbBuildFailure {
+  constructor(public readonly cause: unknown) {}
 }
 
 export type SealRoutePolicy = {
@@ -286,6 +336,8 @@ const DEFAULT_SEAL_ROUTE_POLICY: SealRoutePolicy = {
 };
 
 export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POLICY): void {
+    // Protected by the sidecar's existing shared-secret middleware.
+    app.get("/metrics/seal", (_req, res) => res.type("text/plain").send(sealSessionCacheMetrics()));
   // /seal/encrypt receives the full plaintext for SEAL encryption. Must
   // accept up to PROTECTED_BODY_LIMIT_BYTES (1.5 MiB) of plaintext plus
   // base64 + JSON framing overhead.
@@ -374,30 +426,74 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           return res.status(400).json({ error: identityError });
         }
 
-        phase = "build_ptb";
-            const txBytes = await buildSealApproveTxBytes(sealApprovePackageId(req.body, policy.sealPolicyPackageId)!, registryId, accountId, [
-                fullId,
-            ]);
+        const policyPkgId = sealApprovePackageId(req.body, policy.sealPolicyPackageId)!;
+        let cachedTxBytesPromise: Promise<Uint8Array> | undefined;
+        const getTxBytes = () => {
+          cachedTxBytesPromise ??= buildSealApproveTxBytes(policyPkgId, registryId, accountId, [fullId]).catch(
+            (err) => {
+              cachedTxBytesPromise = undefined;
+              throw new PtbBuildFailure(err);
+            },
+          );
+          return cachedTxBytesPromise;
+        };
 
         phase = "fetch_keys";
-        // Fetch keys from key servers with one bounded retry on transient RPC drops
-        const sealClient = await retryTransientSealDecryptRpc(async () => {
-          const client = await createDecryptSealClient();
-          await client.fetchKeys({
-            ids: [fullId],
-            txBytes,
-            sessionKey,
-            threshold: SEAL_THRESHOLD,
+        const singleThreshold =
+          resolveSealItemThreshold({ threshold: parsed.threshold }) ??
+          effectiveSealSingleThreshold(parsed.threshold);
+        // Fetch keys from key servers with one bounded retry on transient RPC drops.
+        // Warm session hits skip building the PTB entirely.
+        let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
+        try {
+          sealClient = await retryTransientSealDecryptRpc(async () => {
+            const client = await createDecryptSealClient({
+              sessionHeader: typeof req.headers["x-seal-session"] === "string" ? req.headers["x-seal-session"] : undefined,
+              session: sessionKey,
+              packageId: normalizeSuiAddress(packageId),
+              policyPackageId: policyPkgId,
+              accountId: normalizeSuiAddress(accountId),
+              registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
+              ids: [fullId],
+            });
+            if (!hasSealSessionApprovedKeys(client, [fullId], singleThreshold)) {
+              const txBytes = await getTxBytes();
+              await client.fetchKeys({
+                ids: [fullId],
+                txBytes,
+                sessionKey,
+                threshold: singleThreshold,
+              });
+            }
+            return client;
           });
-          return client;
-        });
+        } catch (err) {
+          if (err instanceof PtbBuildFailure) {
+            phase = "build_ptb";
+            throw err.cause;
+          }
+          throw err;
+        }
 
         phase = "decrypt";
-        // Decrypt locally
-        const decrypted = await sealClient.decrypt({
-          data: encryptedData,
+        const assertLive = () => {
+          if (sessionKey.isExpired()) throw new Error("SEAL session expired");
+          assertSealSessionClientLive(sealClient);
+        };
+        const decrypted = await decryptSingleSealItem({
+          sealClient,
+          encryptedData,
+          parsedObject: parsed,
+          fullId,
           sessionKey,
-          txBytes,
+          getTxBytes: async () => {
+            try {
+              return await getTxBytes();
+            } catch (err) {
+              throw err instanceof PtbBuildFailure ? err.cause : err;
+            }
+          },
+          assertLive,
         });
 
         const decryptedBase64 = Buffer.from(decrypted).toString("base64");
@@ -461,30 +557,50 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
           return res.json({ results: [], errors });
         }
 
-        phase = "build_ptb";
-        // Build ONE PTB with seal_approve for ALL unique IDs
         const allIds = [...new Set(parsedItems.map((p) => p.fullId))];
-        const txBytes = await buildSealApproveTxBytes(
-          sealApprovePackageId(req.body, policy.sealPolicyPackageId)!,
-          registryId,
-          accountId,
-          allIds
-        );
+        const policyPkgId = sealApprovePackageId(req.body, policy.sealPolicyPackageId)!;
+        let buildMs = 0;
+        let cachedTxBytesPromise: Promise<Uint8Array> | undefined;
+        const getTxBytes = () => {
+          if (!cachedTxBytesPromise) {
+            const buildStarted = performance.now();
+            cachedTxBytesPromise = buildSealApproveTxBytes(
+              policyPkgId,
+              registryId,
+              accountId,
+              allIds,
+            )
+              .then((bytes) => {
+                buildMs += performance.now() - buildStarted;
+                return bytes;
+              })
+              .catch((err) => {
+                buildMs += performance.now() - buildStarted;
+                cachedTxBytesPromise = undefined;
+                throw new PtbBuildFailure(err);
+              });
+          }
+          return cachedTxBytesPromise;
+        };
 
+        const keysStarted = performance.now();
         phase = "fetch_keys";
-        // ONE fetchKeys call for ALL IDs, retrying once on transient RPC failure
+        // Fetch keys in ascending threshold tiers so a higher-threshold key-server
+        // failure only affects items requiring that higher threshold while preserving
+        // single-call batching for uniform batches and warm session hits.
         let sealClient: Awaited<ReturnType<typeof createDecryptSealClient>>;
         try {
-          sealClient = await retryTransientSealDecryptRpc(async () => {
-            const client = await createDecryptSealClient();
-            await client.fetchKeys({
+          sealClient = await retryTransientSealDecryptRpc(async () =>
+            createDecryptSealClient({
+              sessionHeader: typeof req.headers["x-seal-session"] === "string" ? req.headers["x-seal-session"] : undefined,
+              session: sessionKey,
+              packageId: normalizeSuiAddress(packageId),
+              policyPackageId: policyPkgId,
+              accountId: normalizeSuiAddress(accountId),
+              registryId: registryId ? normalizeSuiAddress(registryId) : undefined,
               ids: allIds,
-              txBytes,
-              sessionKey,
-              threshold: SEAL_THRESHOLD,
-            });
-            return client;
-          });
+            }),
+          );
         } catch (err: any) {
           const traceId = randomUUID();
           const message = formattedError(err);
@@ -493,44 +609,119 @@ export function registerSealRoutes(app: Express, policy = DEFAULT_SEAL_ROUTE_POL
             `[seal/decrypt-batch] [${traceId}] phase=fetch_keys items=${parsedItems.length} uniqueIds=${allIds.length} timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS} error: ${message}`,
             err
           );
+          const allErrors = [
+            ...errors,
+            ...parsedItems.map((item) => ({
+              index: item.index,
+              code: sealKeyFetchErrorCode(err),
+              error,
+            })),
+          ].sort((a, b) => a.index - b.index);
           return res.json({
             results: [],
-            errors: [
-              ...errors,
-              ...parsedItems.map((item) => ({
-                index: item.index,
-                code: sealKeyFetchErrorCode(err),
-                error,
-              })),
-            ],
+            errors: allErrors,
           });
         }
 
-        phase = "decrypt";
-        // Decrypt each blob using the shared sessionKey
-        const results: { index: number; decryptedData: string }[] = [];
-
+        const itemThresholds = new Map<number, number>();
+        let remainingItems: typeof parsedItems = [];
         for (const item of parsedItems) {
-          try {
-            const decrypted = await sealClient.decrypt({
-              data: item.encryptedData,
-              sessionKey,
-              txBytes,
-            });
-            results.push({
-              index: item.index,
-              decryptedData: Buffer.from(decrypted).toString("base64"),
-            });
-          } catch (err: any) {
+          const resolved = resolveSealItemThreshold(item);
+          if (resolved === null) {
             errors.push({
               index: item.index,
               code: "DECRYPT_FAILED",
-              error: `decrypt failed: ${formattedError(err)}`,
+              error: `decrypt failed: Invalid threshold ${String(item.threshold)}`,
             });
+            continue;
+          }
+          itemThresholds.set(item.index, resolved);
+          remainingItems.push(item);
+        }
+
+        const thresholdTiers = [...new Set(remainingItems.map((it) => itemThresholds.get(it.index)!))].sort(
+          (a, b) => a - b,
+        );
+        for (const tierThreshold of thresholdTiers) {
+          const tierItems = remainingItems.filter((it) => itemThresholds.get(it.index)! >= tierThreshold);
+          if (tierItems.length === 0) break;
+          const tierIds = [...new Set(tierItems.map((it) => it.fullId))];
+          try {
+            await retryTransientSealDecryptRpc(async () => {
+              if (!hasSealSessionApprovedKeys(sealClient, tierIds, tierThreshold)) {
+                const txBytes = await getTxBytes();
+                await sealClient.fetchKeys({
+                  ids: tierIds,
+                  txBytes,
+                  sessionKey,
+                  threshold: tierThreshold,
+                });
+              }
+            });
+          } catch (err: any) {
+            if (err instanceof PtbBuildFailure) {
+              phase = "build_ptb";
+              throw err.cause;
+            }
+            const lowerItems = remainingItems.filter((it) => itemThresholds.get(it.index)! < tierThreshold);
+            if (lowerItems.length > 0 && (sessionKey.isExpired() || isSealSessionExpiredError(err))) {
+              throw err;
+            }
+            const traceId = randomUUID();
+            const message = formattedError(err);
+            const error = `fetch_keys failed: ${message} (traceId=${traceId}, timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS})`;
+            console.error(
+              `[seal/decrypt-batch] [${traceId}] phase=fetch_keys threshold=${tierThreshold} items=${tierItems.length} uniqueIds=${tierIds.length} timeoutMs=${SEAL_KEY_SERVER_TIMEOUT_MS} error: ${message}`,
+              err
+            );
+            const code = sealKeyFetchErrorCode(err);
+            for (const item of tierItems) {
+              errors.push({
+                index: item.index,
+                code,
+                error,
+              });
+            }
+            remainingItems = lowerItems;
+            break;
           }
         }
 
-            console.log(`[seal/decrypt-batch] ${results.length}/${items.length} decrypted ok, ${errors.length} errors`);
+        if (remainingItems.length === 0) {
+          errors.sort((a, b) => a.index - b.index);
+          return res.json({ results: [], errors });
+        }
+
+        const keysMs = Math.max(0, performance.now() - keysStarted - buildMs);
+        const decryptStarted = performance.now();
+        phase = "decrypt";
+        const assertLive = () => {
+          if (sessionKey.isExpired()) throw new Error("SEAL session expired");
+          assertSealSessionClientLive(sealClient);
+        };
+        const remainingIds = [...new Set(remainingItems.map((p) => p.fullId))];
+        const batchOut = await decryptBatchSealItems({
+          sealClient,
+          parsedItems: remainingItems,
+          uniqueIds: remainingIds,
+          sessionKey,
+          getTxBytes: async () => {
+            try {
+              return await getTxBytes();
+            } catch (err) {
+              throw err instanceof PtbBuildFailure ? err.cause : err;
+            }
+          },
+          assertLive,
+        });
+        const results = batchOut.results;
+        errors.push(...batchOut.errors);
+        errors.sort((a, b) => a.index - b.index);
+
+            console.log(JSON.stringify({ event: "seal_decrypt_batch", request_id: requestIdFor(req),
+                items: items.length, unique_ids: allIds.length, results: results.length, errors: errors.length,
+                build_ptb_ms: Math.round(buildMs), fetch_keys_ms: Math.round(keysMs),
+                decrypt_ms: Math.round(performance.now() - decryptStarted) }));
         res.json({ results, errors });
       } catch (err: any) {
             sendSealFailure(res, "seal/decrypt-batch", phase, err, requestIdFor(req));
