@@ -97,7 +97,8 @@ jobs:
 
   chatbot-e2e:
     name: Chatbot / Playwright E2E
-    runs-on: ubuntu-latest
+    # Playwright 1.58.x does not support ubuntu-26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
 
     services:
@@ -158,7 +159,8 @@ jobs:
 
   researcher-e2e:
     name: Researcher / Unit + Playwright E2E
-    runs-on: ubuntu-latest
+    # Playwright 1.58.x does not support ubuntu-26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
 
     services:
@@ -222,7 +224,8 @@ jobs:
 
   noter-e2e:
     name: Noter / Playwright E2E
-    runs-on: ubuntu-latest
+    # Playwright 1.58.x does not support ubuntu-26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
 
     services:
