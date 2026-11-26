@@ -493,7 +493,7 @@ Do not save passwords, payment details, API keys, or government identifiers.
 
 Where to paste:
 
-- Claude Desktop / Claude.ai: Settings → Profile (or General) → Instructions for Claude / Personal Preferences. Paste the block. Start a new chat.
+- Claude Desktop / Claude.ai: Settings → Your Claude → Instructions. Paste the block. Start a new chat.
 - Claude Code (MCP-only fallback): merge `~/.claude/CLAUDE.md` as described above and present the native-memory choice.
 - Codex (MCP-only fallback): paste into `AGENTS.md` or Codex custom instructions.
 - Cursor (MCP-only fallback): a rule file under `.cursor/rules`, or Cursor user rules.
