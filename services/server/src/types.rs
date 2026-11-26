@@ -533,6 +533,7 @@ pub struct Config {
     /// bypassing SEAL + Walrus. **Not for production.** Off by default;
     /// set `BENCHMARK_MODE=true` to enable. Surfaced via `GET /health`.
     pub benchmark_mode: bool,
+    pub marketing_consent: Option<crate::marketing_consent::MarketingConsentConfig>,
     /// Operator write-pause flag from `WRITES_PAUSED`. When true, write
     /// routes reject with HTTP 503 and `/health` reports `writes: "paused"`
     /// while staying HTTP 200. Distinct from sidecar liveness (`write_ready`).
@@ -1100,6 +1101,9 @@ impl Config {
             benchmark_mode: std::env::var("BENCHMARK_MODE")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            marketing_consent: crate::marketing_consent::MarketingConsentConfig::from_env(
+                env_bool("ENABLE_MARKETING_CONSENT"),
+            ),
             writes_paused: env_bool("WRITES_PAUSED"),
             enable_memory_deletion: env_bool("ENABLE_MEMORY_DELETION"),
             enable_security_delete: env_bool("ENABLE_SECURITY_DELETE"),
@@ -3313,6 +3317,7 @@ mod tests {
             trusted_proxy_hops: 0,
             allowed_origins: String::new(),
             benchmark_mode: false,
+            marketing_consent: None,
             writes_paused: false,
             enable_memory_deletion: false,
             enable_security_delete: false,

@@ -23,7 +23,8 @@
 //!   [`consolidator`] modules are reserved namespace, doc-only until a
 //!   real caller exists (the AI-improvement track).
 
-pub mod embedder;
+pub mod email;
+pub(crate) mod embedder;
 pub mod extractor;
 pub mod llm_chat;
 pub mod ranker;
