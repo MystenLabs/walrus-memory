@@ -72,6 +72,9 @@ pub enum WalletOperation {
         /// Storage epochs for Walrus upload.
         #[serde(default = "default_epochs")]
         epochs: u32,
+        /// Tracked rate limit charge for refunding on terminal infrastructure failure.
+        #[serde(default)]
+        rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
     },
     /// Legacy metadata+transfer operation for rows created before `/walrus/upload`
     /// started doing metadata+transfer atomically.
@@ -120,6 +123,9 @@ pub enum WalletOperation {
         /// behavior) rather than failing.
         #[serde(default)]
         end_epoch: Option<i32>,
+        /// Tracked rate limit charge for refunding on terminal infrastructure failure.
+        #[serde(default)]
+        rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
     },
     /// Finish a partially recovered upload after metadata+transfer has already
     /// succeeded. This keeps DB/vector retries from repeating an on-chain
@@ -203,22 +209,21 @@ pub(crate) async fn update_remember_job_after_wallet_error(
     error: &WalletJobError,
     msg: &str,
     attempt_info: Option<WalletJobAttemptInfo>,
-) {
+) -> bool {
     let Some(jid) = remember_job_id else {
-        return;
+        return false;
     };
 
     // Aborting errors (Permanent or ObjectLockedUntilEpoch) get no further
-    // retries, so the row is terminal — mark it failed rather than leaving it
+    // retries, so the row is terminal: mark it failed rather than leaving it
     // stuck on `running` forever. Retryable errors stay `running` for the next
-    // attempt — UNLESS this was already the final attempt. Exhausted retries
+    // attempt, unless this was already the final attempt. Exhausted retries
     // used to stay `running` with an error_msg until the 10-minute stale
     // sweeper force-failed them, so clients polling GET /api/remember/:job_id
     // reported "still uploading" for minutes after every wallet attempt had
-    // already died (dev 2026-09-17 upload-slot investigation). Pass
-    // `attempt_info` only from the attempt that actually failed the upload;
-    // lock-contention Defer callers pass None so a loser cannot mark failed
-    // while a winner is still working.
+    // already died. Pass `attempt_info` only from the attempt that actually
+    // failed the upload; lock-contention Defer callers pass None so a loser
+    // cannot mark failed while a winner is still working.
     let exhausted = attempt_info.is_some_and(|info| info.retries_exhausted(error));
     let terminal = error.aborts_retries() || exhausted;
     let status = if terminal { "failed" } else { "running" };
@@ -233,59 +238,79 @@ pub(crate) async fn update_remember_job_after_wallet_error(
     // release is a delete by id, so a second call is a no-op.
     if terminal {
         crate::storage::db::release_storage_reservations_with_pool(pool, &[jid.to_string()]).await;
-    }
+        let res = sqlx::query(
+            "UPDATE remember_jobs
+             SET status = 'failed',
+                 error_msg = $1,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND status NOT IN ('uploaded', 'done', 'failed')
+               AND COALESCE(error_msg, '') <> $3
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )",
+        )
+        .bind(msg)
+        .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(pool)
+        .await;
 
-    // Guard against downgrading a row a concurrent attempt already finished or
-    // that `delete_by_namespace` already fenced as forgotten.
-    // Every pre-existing caller only runs while holding the per-job upload
-    // lock (JobUploadLock), so it was never the current status writer's own
-    // race to lose — but LockOutcome::Defer calls this specifically when it
-    // does NOT hold the lock, i.e. exactly while another attempt of the same
-    // job may be concurrently writing 'uploaded'/'done' via
-    // persist_uploaded_state or insert_vector_and_mark_remember_done. Without
-    // this guard, a loser's write landing after the winner's can clobber a
-    // genuinely-succeeding row back to 'running' with a stale
-    // lock-contention error_msg — status/error_msg only, blob_id/
-    // blob_object_id are untouched, so no data loss, but a client polling
-    // GET /api/remember/:job_id (routes/remember.rs) would see a
-    // misleadingly stuck row until the unrelated staleness sweep.
-    // Likewise, once `delete_by_namespace` marks an in-flight job failed with
-    // `FORGOTTEN_IN_FLIGHT_JOB_ERROR` (or records its tombstone), that state
-    // is terminal: an in-flight attempt erroring out must never flip `status`
-    // back to `running` or overwrite the cancellation marker, which would let
-    // the next Apalis retry see `UploadResume::Upload` and re-upload/index into
-    // the forgotten namespace.
-    let _ = sqlx::query(
-        "UPDATE remember_jobs
-         SET status = $1,
-             error_msg = $2,
-             updated_at = NOW()
-         WHERE id = $3
-           AND status NOT IN ('uploaded', 'done')
-           AND COALESCE(error_msg, '') <> $4
-           AND NOT EXISTS (
-               SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
-           )",
-    )
-    .bind(status)
-    .bind(msg)
-    .bind(jid)
-    .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
-    .execute(pool)
-    .await;
+        matches!(res, Ok(r) if r.rows_affected() == 1)
+    } else {
+        // Guard against downgrading a row a concurrent attempt already finished, marked failed, or
+        // that `delete_by_namespace` already fenced as forgotten.
+        // Every pre-existing caller only runs while holding the per-job upload
+        // lock (JobUploadLock), so it was never the current status writer's own
+        // race to lose — but LockOutcome::Defer calls this specifically when it
+        // does NOT hold the lock, i.e. exactly while another attempt of the same
+        // job may be concurrently writing 'uploaded'/'done' via
+        // persist_uploaded_state or insert_vector_and_mark_remember_done. Without
+        // this guard, a loser's write landing after the winner's can clobber a
+        // genuinely-succeeding row back to 'running' with a stale
+        // lock-contention error_msg — status/error_msg only, blob_id/
+        // blob_object_id are untouched, so no data loss, but a client polling
+        // GET /api/remember/:job_id (routes/remember.rs) would see a
+        // misleadingly stuck row until the unrelated staleness sweep.
+        // Likewise, once `delete_by_namespace` marks an in-flight job failed with
+        // `FORGOTTEN_IN_FLIGHT_JOB_ERROR` (or records its tombstone), that state
+        // is terminal: an in-flight attempt erroring out must never flip `status`
+        // back to `running` or overwrite the cancellation marker, which would let
+        // the next Apalis retry see `UploadResume::Upload` and re-upload/index into
+        // the forgotten namespace.
+        let _ = sqlx::query(
+            "UPDATE remember_jobs
+             SET status = $1,
+                 error_msg = $2,
+                 updated_at = NOW()
+             WHERE id = $3
+               AND status NOT IN ('uploaded', 'done', 'failed')
+               AND COALESCE(error_msg, '') <> $4
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_tombstones WHERE memory_id = remember_jobs.id::text
+               )",
+        )
+        .bind(status)
+        .bind(msg)
+        .bind(jid)
+        .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
+        .execute(pool)
+        .await;
+        false
+    }
 }
 
 /// Record a metadata failure only while `status = 'uploaded'`, so the other
-/// helper still cannot clobber a winner or a forgotten job.
+/// helper still cannot clobber a winner or a forgotten job. Returns true if this call transitioned the row to failed.
 async fn record_uploaded_metadata_error(
     pool: &sqlx::PgPool,
     remember_job_id: Option<&str>,
     error: &WalletJobError,
     msg: &str,
     attempt_info: WalletJobAttemptInfo,
-) {
+) -> bool {
     let Some(jid) = remember_job_id else {
-        return;
+        return false;
     };
     let terminal = error.aborts_retries() || attempt_info.retries_exhausted(error);
     if terminal {
@@ -314,8 +339,9 @@ async fn record_uploaded_metadata_error(
         if updated > 0 {
             crate::storage::db::release_storage_reservations_with_pool(pool, &[jid.to_string()])
                 .await;
+            return true;
         }
-        return;
+        return false;
     }
     let _ = sqlx::query(
         "UPDATE remember_jobs
@@ -333,6 +359,100 @@ async fn record_uploaded_metadata_error(
     .bind(crate::storage::db::FORGOTTEN_IN_FLIGHT_JOB_ERROR)
     .execute(pool)
     .await;
+    false
+}
+
+/// True if an error is caused by relayer infrastructure (funding shortages,
+/// Walrus publisher or sidecar unavailability, upstream inference errors)
+/// rather than client validation, bad parameters, or caller quota exhaustion.
+pub fn is_upstream_inference_job_error(msg: &str) -> bool {
+    msg.starts_with("Embedding Provider Unavailable:")
+        || msg.starts_with("Upstream Unavailable: Embedding API")
+        || msg.starts_with("Internal Error: Embedding API")
+        || msg.starts_with("Upstream Unavailable: Summarization API")
+        || msg.starts_with("Internal Error: Summarization API")
+        || msg.starts_with("Upstream Unavailable: Failed to parse embedding response")
+        || msg.starts_with("Upstream Unavailable: Embedding response contained no vectors")
+        || msg.starts_with("Upstream Unavailable: Failed to parse summarization response")
+        || msg.starts_with("Upstream Unavailable: Summarization returned empty result")
+        || msg.contains(crate::types::EMBEDDING_PROVIDER_UNAVAILABLE_CODE)
+}
+
+pub fn is_upstream_inference_job_error_msg(msg: &str) -> bool {
+    is_upstream_inference_job_error(msg)
+}
+
+pub(crate) fn is_infrastructure_job_failure(error_msg: &str) -> bool {
+    let lower = error_msg.to_ascii_lowercase();
+
+    // Client errors never qualify for rate limit refund
+    if lower.contains("quota exceeded")
+        || lower.contains("storage quota exceeded")
+        || lower.contains("text cannot be empty")
+        || lower.contains("text exceeds maximum length")
+        || lower.contains("invalid namespace")
+        || lower.contains("idempotency key conflict")
+        || lower.contains("invalid embedding vector")
+        || lower.contains("invalid base64")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("bad request")
+        || lower.contains("conflict")
+    {
+        return false;
+    }
+
+    if WalletJobError::is_infrastructure_funding_error(error_msg)
+        || WalletJobError::is_shared_upload_service_error(error_msg)
+        || is_upstream_inference_job_error_msg(error_msg)
+        || lower.contains("embedding provider temporarily unavailable")
+        || lower.contains("memory encryption backend is unavailable")
+        || lower.contains("seal encrypt failed")
+        || lower.contains("seal sidecar")
+        || lower.contains("no sui keys configured")
+        || lower.contains("circuit breaker")
+        || lower.contains("connection refused")
+        || lower.contains("gateway timeout")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("502 bad gateway")
+        || lower.contains("503 service unavailable")
+        || lower.contains("504 gateway timeout")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Record wallet job failure, transitioning terminal errors to failed status.
+///
+/// If this transition is the first to mark the job failed and the failure was
+/// caused by infrastructure rather than client error, refunds the delegate key rate limit.
+pub(crate) async fn record_wallet_job_failure(
+    state: &AppState,
+    remember_job_id: Option<&str>,
+    error: &WalletJobError,
+    msg: &str,
+    attempt_info: Option<WalletJobAttemptInfo>,
+    charge: Option<&crate::rate_limit::RateLimitCharge>,
+) -> bool {
+    let transitioned_failed = update_remember_job_after_wallet_error(
+        state.db.pool(),
+        remember_job_id,
+        error,
+        msg,
+        attempt_info,
+    )
+    .await;
+
+    if transitioned_failed && is_infrastructure_job_failure(msg) {
+        if let Some(c) = charge {
+            crate::rate_limit::refund_delegate_key_rate_limit(state, c).await;
+        }
+    }
+
+    transitioned_failed
 }
 
 /// Persist a failed metadata attempt, then pause before Apalis polls again.
@@ -347,6 +467,7 @@ async fn finish_metadata_attempt_error(
     wallet_index: usize,
     err: WalletJobError,
     attempt_info: WalletJobAttemptInfo,
+    charge: Option<&crate::rate_limit::RateLimitCharge>,
 ) -> WalletJobError {
     let err = escalate_if_gas_pool_exhausted(err, attempt_info.current, attempt_info.max, 1);
     let msg = err.to_string();
@@ -360,7 +481,7 @@ async fn finish_metadata_attempt_error(
         &msg,
     )
     .await;
-    update_remember_job_after_wallet_error(
+    let transitioned1 = update_remember_job_after_wallet_error(
         state.db.pool(),
         remember_job_id,
         &err,
@@ -368,8 +489,14 @@ async fn finish_metadata_attempt_error(
         Some(attempt_info),
     )
     .await;
-    record_uploaded_metadata_error(state.db.pool(), remember_job_id, &err, &msg, attempt_info)
-        .await;
+    let transitioned2 =
+        record_uploaded_metadata_error(state.db.pool(), remember_job_id, &err, &msg, attempt_info)
+            .await;
+    if (transitioned1 || transitioned2) && is_infrastructure_job_failure(&msg) {
+        if let Some(c) = charge {
+            crate::rate_limit::refund_delegate_key_rate_limit(state, c).await;
+        }
+    }
     tracing::error!(
         "[wallet-job:set-metadata] job_id={} {} classification={} retryable={}",
         remember_job_id.unwrap_or("-"),
@@ -426,6 +553,7 @@ fn metadata_congestion_retry_job(
     account_id: Option<&str>,
     policy_package_id: Option<&str>,
     end_epoch: Option<i32>,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> WalletJob {
     WalletJob {
         wallet_index,
@@ -445,6 +573,7 @@ fn metadata_congestion_retry_job(
             account_id: account_id.map(str::to_string),
             policy_package_id: policy_package_id.map(str::to_string),
             end_epoch,
+            rate_limit_charge,
         },
     }
 }
@@ -472,6 +601,7 @@ async fn schedule_metadata_congestion_retry(
     account_id: Option<&str>,
     policy_package_id: Option<&str>,
     end_epoch: Option<i32>,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Option<Result<(), Error>> {
     if !matches!(err, WalletJobError::UploadSlotCongestion(_))
         || congestion_requeues >= MAX_CONGESTION_REQUEUES
@@ -516,6 +646,7 @@ async fn schedule_metadata_congestion_retry(
         account_id,
         policy_package_id,
         end_epoch,
+        rate_limit_charge,
     );
     let mut storage = wallet_job_queue(state, &retry.operation);
     match storage
@@ -1271,6 +1402,7 @@ pub(crate) async fn execute_wallet_job(
             remember_job_id,
             prepare_claim_token,
             epochs,
+            rate_limit_charge,
         } => {
             let mut wallet_index = if congestion_requeues > 0 {
                 // The requeue already chose the signer. Do not walk the attempt
@@ -1399,6 +1531,7 @@ pub(crate) async fn execute_wallet_job(
                 epochs,
                 congestion_requeues,
                 attempt_info,
+                rate_limit_charge,
             )
             .await
         }
@@ -1417,6 +1550,7 @@ pub(crate) async fn execute_wallet_job(
             account_id,
             policy_package_id,
             end_epoch,
+            rate_limit_charge,
         } => {
             // Mark the wallet busy for least-loaded assignment. This job signs
             // on the key that owns the blob, but it must not hold the upload
@@ -1535,6 +1669,7 @@ pub(crate) async fn execute_wallet_job(
                         account_id.as_deref(),
                         policy_package_id.as_deref(),
                         end_epoch,
+                        rate_limit_charge.clone(),
                     )
                     .await
                     {
@@ -1550,6 +1685,7 @@ pub(crate) async fn execute_wallet_job(
                         enqueued_wallet_index,
                         err,
                         attempt_info,
+                        rate_limit_charge.as_ref(),
                     )
                     .await)
                 }
@@ -2187,6 +2323,7 @@ fn build_resume_transfer_job(
     blob_size_bytes: i64,
     importance: f32,
     seal_policy_package_id: &str,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> WalletJob {
     WalletJob {
         wallet_index,
@@ -2210,6 +2347,7 @@ fn build_resume_transfer_job(
             // re-verification sweep backfills it on its next pass, same as
             // any other row that starts out with an unknown expiry.
             end_epoch: None,
+            rate_limit_charge,
         },
     }
 }
@@ -2235,6 +2373,7 @@ async fn resume_metadata_and_transfer(
     vector: &[f32],
     blob_size_bytes: i64,
     importance: f32,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     let job = build_resume_transfer_job(
         wallet_index,
@@ -2251,13 +2390,15 @@ async fn resume_metadata_and_transfer(
         blob_size_bytes,
         importance,
         &state.config.seal_policy_package_id,
+        rate_limit_charge.clone(),
     );
     let mut storage = wallet_job_queue(state, &job.operation);
     if let Err(e) = storage.push_request(wallet_job_request(job)).await {
+        let err_msg = format!("failed to enqueue metadata/transfer recovery job: {}", e);
         let classified = classify_wallet_remember_handoff_failure(
             state.db.pool(),
             Some(remember_job_id),
-            format!("failed to enqueue metadata/transfer recovery job: {}", e),
+            err_msg.clone(),
         )
         .await;
         tracing::error!(
@@ -2265,6 +2406,13 @@ async fn resume_metadata_and_transfer(
             remember_job_id,
             classified,
         );
+        if matches!(classified, WalletJobError::Permanent(_))
+            && is_infrastructure_job_failure(&err_msg)
+        {
+            if let Some(ref c) = rate_limit_charge {
+                crate::rate_limit::refund_delegate_key_rate_limit(state, c).await;
+            }
+        }
         return Err(classified);
     }
     tracing::info!(
@@ -2353,6 +2501,7 @@ async fn execute_durable_upload(
     agent_public_key: Option<&str>,
     remember_job_id: &str,
     epochs: u32,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     let mut journal =
         load_upload_journal(state.db.pool(), remember_job_id, fallback_wallet_index).await?;
@@ -2526,6 +2675,7 @@ async fn execute_durable_upload(
                     vector,
                     encrypted.len() as i64,
                     importance,
+                    rate_limit_charge,
                 )
                 .await;
             }
@@ -2669,6 +2819,7 @@ async fn execute_upload_and_transfer(
     epochs: u32,
     congestion_requeues: u32,
     attempt_info: WalletJobAttemptInfo,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     // Guard-read + mint + persist must be atomic per job: Apalis can run two
     // attempts of the same job, and both would mint. The permit is taken
@@ -2686,12 +2837,13 @@ async fn execute_upload_and_transfer(
         Err(error) => {
             // Admission failed before any paid side effect. Do not leave a
             // spent queue attempt reported as running until the stale sweep.
-            update_remember_job_after_wallet_error(
-                state.db.pool(),
+            record_wallet_job_failure(
+                state,
                 remember_job_id.as_deref(),
                 &error,
                 error.message(),
                 Some(attempt_info),
+                rate_limit_charge.as_ref(),
             )
             .await;
             if let Some(delay) = upload_retry_backoff(&error, attempt_info) {
@@ -2766,6 +2918,7 @@ async fn execute_upload_and_transfer(
                                 remember_job_id,
                                 prepare_claim_token,
                                 epochs,
+                                rate_limit_charge: rate_limit_charge.clone(),
                             },
                         }),
                         run_at,
@@ -2838,6 +2991,7 @@ async fn execute_upload_and_transfer(
         congestion_requeues,
         attempt_info,
         admission,
+        rate_limit_charge,
     )
     .await;
 
@@ -2865,6 +3019,7 @@ async fn execute_upload_and_transfer_locked(
     congestion_requeues: u32,
     attempt_info: WalletJobAttemptInfo,
     mut admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 ) -> Result<(), WalletJobError> {
     // ── Idempotency guard ──────────────────────────────────────
     // `upload_blob` mints a paid on-chain Walrus Blob. On a retry (Apalis
@@ -2928,6 +3083,7 @@ async fn execute_upload_and_transfer_locked(
                     &vector,
                     blob_size_bytes,
                     importance,
+                    rate_limit_charge,
                 )
                 .await;
             }
@@ -3062,6 +3218,7 @@ async fn execute_upload_and_transfer_locked(
             agent_public_key.as_deref(),
             jid,
             epochs,
+            rate_limit_charge.clone(),
         )
         .await
         {
@@ -3116,6 +3273,7 @@ async fn execute_upload_and_transfer_locked(
                                     remember_job_id,
                                     prepare_claim_token,
                                     epochs,
+                                    rate_limit_charge: rate_limit_charge.clone(),
                                 },
                             }),
                             run_at,
@@ -3157,12 +3315,13 @@ async fn execute_upload_and_transfer_locked(
                     &msg,
                 )
                 .await;
-                update_remember_job_after_wallet_error(
-                    state.db.pool(),
+                record_wallet_job_failure(
+                    state,
                     Some(jid.as_str()),
                     &err,
                     &msg,
                     Some(attempt_info),
+                    rate_limit_charge.as_ref(),
                 )
                 .await;
                 tracing::error!(
@@ -3263,6 +3422,7 @@ async fn execute_upload_and_transfer_locked(
                         account_id: Some(account_id.clone()),
                         policy_package_id: Some(state.config.seal_policy_package_id.clone()),
                         end_epoch,
+                        rate_limit_charge: rate_limit_charge.clone(),
                     },
                 }))
                 .await
@@ -3346,6 +3506,7 @@ async fn execute_upload_and_transfer_locked(
                                 remember_job_id,
                                 prepare_claim_token,
                                 epochs,
+                                rate_limit_charge: rate_limit_charge.clone(),
                             },
                         }),
                         run_at,
@@ -3430,12 +3591,13 @@ async fn execute_upload_and_transfer_locked(
                 &msg,
             )
             .await;
-            update_remember_job_after_wallet_error(
-                state.db.pool(),
+            record_wallet_job_failure(
+                state,
                 remember_job_id.as_deref(),
                 &classified,
                 &msg,
                 Some(attempt_info),
+                rate_limit_charge.as_ref(),
             )
             .await;
             tracing::error!(
@@ -4349,6 +4511,8 @@ pub struct BulkRememberJob {
     pub items: Vec<BulkRememberItem>,
     #[serde(default = "default_epochs")]
     pub epochs: u32,
+    #[serde(default)]
+    pub rate_limit_charge: Option<crate::rate_limit::RateLimitCharge>,
 }
 
 /// Type alias for the BulkRememberJob Apalis storage.
@@ -4394,6 +4558,10 @@ pub async fn execute_bulk_remember(
     }
 
     let items_total = job.items.len();
+    let child_charges = match job.rate_limit_charge.as_ref() {
+        Some(c) => c.partition_across(items_total),
+        None => vec![None; items_total],
+    };
 
     tracing::info!(
         "[bulk-remember] start: {} items owner={} epochs={}",
@@ -4404,7 +4572,7 @@ pub async fn execute_bulk_remember(
 
     let mut storage = state.wallet_storage.clone();
     let mut enqueued_count = 0usize;
-    for item in job.items {
+    for (item, child_charge) in job.items.into_iter().zip(child_charges) {
         let job_id = item.job_id.clone();
         let namespace = item.namespace.clone();
         let wallet_index = item.wallet_index;
@@ -4424,6 +4592,7 @@ pub async fn execute_bulk_remember(
                     remember_job_id: Some(job_id.clone()),
                     prepare_claim_token: None,
                     epochs: job.epochs,
+                    rate_limit_charge: child_charge,
                 },
             }))
             .await
@@ -4457,7 +4626,8 @@ mod tests {
         backoff_duration, build_resume_transfer_job, classify_wallet_remember_handoff_failure,
         congestion_backoff_secs, congestion_resume_wallet, congestion_wait_message,
         consume_preparation_claim, durable_step_field, escalate_if_gas_pool_exhausted,
-        gas_pool_exhaustion_threshold, is_walrus_package_version_mismatch, load_upload_journal,
+        gas_pool_exhaustion_threshold, is_infrastructure_job_failure,
+        is_upstream_inference_job_error, is_walrus_package_version_mismatch, load_upload_journal,
         lock_outcome, mark_remember_job_failed, metadata_congestion_retry_job,
         parse_locked_object_info, parse_wal_balance_alert_info, persist_upload_journal,
         persist_uploaded_state, pin_journal_wallet, record_uploaded_metadata_error,
@@ -5656,6 +5826,7 @@ the checkpoint it replied about",
                 remember_job_id: None,
                 prepare_claim_token: None,
                 epochs: 1,
+                rate_limit_charge: None,
             },
         };
         let metadata_job = metadata_congestion_retry_job(
@@ -5671,6 +5842,7 @@ the checkpoint it replied about",
             None,
             Some(1),
             0.5,
+            None,
             None,
             None,
             None,
@@ -6500,6 +6672,7 @@ the checkpoint it replied about",
             Some("0xacct"),
             Some("0xpolicy"),
             Some(12),
+            None,
         );
         assert_eq!(job.wallet_index, 4);
         assert_eq!(job.congestion_requeues, 3);
@@ -6629,10 +6802,19 @@ the checkpoint it replied about",
     }
 
     // RC-4: an uploaded-but-pending resume must route to the TRANSFER recovery op
-    // (carrying the stored object id), NOT to an index/done finalize — otherwise a
+    // (carrying the stored object id and rate_limit_charge), NOT to an index/done finalize — otherwise a
     // never-transferred blob is prematurely marked done.
     #[test]
     fn resume_builds_a_set_metadata_and_transfer_job_with_object_id() {
+        let charge = crate::rate_limit::RateLimitCharge {
+            request_id: "req-resume".into(),
+            public_key: "pk-resume".into(),
+            owner: "0xowner".into(),
+            weight: 1,
+            member_offset: 0,
+            backend: crate::rate_limit::RateLimitBackend::Fallback,
+            delegate_key_capacity: 30,
+        };
         let job = build_resume_transfer_job(
             3,
             "job-abc",
@@ -6648,6 +6830,7 @@ the checkpoint it replied about",
             123,
             0.5,
             "0xpolicy",
+            Some(charge.clone()),
         );
         match job.operation {
             WalletOperation::SetMetadataAndTransfer {
@@ -6655,6 +6838,7 @@ the checkpoint it replied about",
                 blob_id,
                 remember_job_id,
                 encrypted_b64,
+                rate_limit_charge,
                 ..
             } => {
                 assert_eq!(
@@ -6668,6 +6852,7 @@ the checkpoint it replied about",
                     Some("ciphertext-b64"),
                     "ciphertext needed for SEAL persistence"
                 );
+                assert_eq!(rate_limit_charge, Some(charge));
             }
             other => panic!("resume must build SetMetadataAndTransfer, got {other:?}"),
         }
@@ -6911,6 +7096,235 @@ the checkpoint it replied about",
 
         let _ = sqlx::query("DELETE FROM remember_jobs WHERE owner = $1")
             .bind(&owner)
+            .execute(&pool)
+            .await;
+    }
+
+    #[test]
+    fn test_is_infrastructure_job_failure_classification() {
+        // Infrastructure funding failures
+        assert!(is_infrastructure_job_failure("insufficient balance in 0x2::wal::WAL"));
+        assert!(is_infrastructure_job_failure("gas selection: insufficient gas"));
+        assert!(is_infrastructure_job_failure("insufficient sui balance"));
+        assert!(is_infrastructure_job_failure("No Sui keys configured"));
+
+        // Walrus and sidecar failures
+        assert!(is_infrastructure_job_failure("walrus upload failed: connection refused"));
+        assert!(is_infrastructure_job_failure("walrus upload failed: 502 Bad Gateway"));
+        assert!(is_infrastructure_job_failure("walrus upload failed: 503 Service Unavailable"));
+        assert!(is_infrastructure_job_failure("walrus upload failed: 504 Gateway Timeout"));
+        assert!(is_infrastructure_job_failure("walrus upload failed: circuit breaker open"));
+        assert!(is_infrastructure_job_failure("memory encryption backend is unavailable"));
+        assert!(is_infrastructure_job_failure("seal sidecar request timed out"));
+
+        // Upstream inference errors
+        assert!(is_infrastructure_job_failure("Embedding Provider Unavailable: status 503"));
+        assert!(is_infrastructure_job_failure("Upstream Unavailable: Embedding API failed"));
+        assert!(is_infrastructure_job_failure("Embedding provider temporarily unavailable (code=EMBEDDING_PROVIDER_UNAVAILABLE)"));
+
+        // Client and validation errors must NOT qualify as infrastructure failures
+        assert!(!is_infrastructure_job_failure("Quota exceeded: 120 requests/minute"));
+        assert!(!is_infrastructure_job_failure("Storage quota exceeded for owner 0x123"));
+        assert!(!is_infrastructure_job_failure("text cannot be empty"));
+        assert!(!is_infrastructure_job_failure("text exceeds maximum length"));
+        assert!(!is_infrastructure_job_failure("invalid namespace format"));
+        assert!(!is_infrastructure_job_failure("idempotency key conflict"));
+        assert!(!is_infrastructure_job_failure("unauthorized signature"));
+        assert!(!is_infrastructure_job_failure("forbidden: owner mismatch"));
+        assert!(!is_infrastructure_job_failure("bad request: json parse failed"));
+    }
+
+    #[test]
+    fn test_is_upstream_inference_job_error_patterns() {
+        assert!(is_upstream_inference_job_error("Embedding Provider Unavailable: code 500"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Embedding API unreachable"));
+        assert!(is_upstream_inference_job_error("Internal Error: Embedding API failed"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Summarization API down"));
+        assert!(is_upstream_inference_job_error("Internal Error: Summarization API failed"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Failed to parse embedding response"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Embedding response contained no vectors"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Failed to parse summarization response"));
+        assert!(is_upstream_inference_job_error("Upstream Unavailable: Summarization returned empty result"));
+        assert!(is_upstream_inference_job_error("error with EMBEDDING_PROVIDER_UNAVAILABLE in text"));
+
+        assert!(!is_upstream_inference_job_error("invalid delegate signature"));
+        assert!(!is_upstream_inference_job_error("database connection error"));
+    }
+
+    #[tokio::test]
+    async fn wallet_error_terminal_transition_returns_true_only_once() {
+        let pool = test_pool().await;
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        insert_job_with_status(&pool, &job_id, "running", None).await;
+
+        let err = WalletJobError::Permanent("walrus upload failed: connection refused".into());
+
+        // First transition to terminal failed: must return true
+        let transitioned1 = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &err,
+            "walrus upload failed: connection refused",
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(transitioned1, "first terminal failure transition must return true");
+
+        // Second transition call on the already-failed row: must return false (at-most-once guard)
+        let transitioned2 = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &err,
+            "walrus upload failed: connection refused",
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(!transitioned2, "repeat transition on already failed row must return false");
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
+            .bind(&job_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wallet_error_retryable_attempt_does_not_transition_to_failed() {
+        let pool = test_pool().await;
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        insert_job_with_status(&pool, &job_id, "running", None).await;
+
+        let err = WalletJobError::Transient("walrus upload failed: 503 service unavailable".into());
+
+        // Attempt 2 of 5: retryable, must return false
+        let transitioned = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &err,
+            "walrus upload failed: 503 service unavailable",
+            Some(WalletJobAttemptInfo { current: 2, max: 5 }),
+        )
+        .await;
+        assert!(!transitioned, "retryable transient error must not transition to failed");
+
+        let row: (String,) = sqlx::query_as("SELECT status FROM remember_jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, "running", "row stays running during retries");
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
+            .bind(&job_id)
+            .execute(&pool)
+            .await;
+    }
+    #[tokio::test]
+    async fn wallet_error_nonterminal_attempt_does_not_resurrect_failed_job() {
+        let pool = test_pool().await;
+        let job_id = format!("remember-job-{}", uuid::Uuid::new_v4());
+        insert_job_with_status(&pool, &job_id, "running", None).await;
+
+        let terminal_err =
+            WalletJobError::Permanent("walrus upload failed: connection refused".into());
+        let terminal_msg = "walrus upload failed: connection refused";
+
+        // Step 1: terminal failure transitions the job to 'failed'
+        let transitioned = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &terminal_err,
+            terminal_msg,
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(
+            transitioned,
+            "initial terminal failure must transition to failed"
+        );
+
+        // Verify status is 'failed' and error_msg is recorded
+        let (status, err_msg): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(err_msg.as_deref(), Some(terminal_msg));
+
+        // Step 2: concurrent or delayed lock-losing attempt arrives with attempt_info = None
+        let retryable_err =
+            WalletJobError::Transient("another attempt of upload job is in progress".into());
+        let retryable_msg = "another attempt of upload job is in progress";
+        let nonterminal_transitioned = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &retryable_err,
+            retryable_msg,
+            None,
+        )
+        .await;
+        assert!(
+            !nonterminal_transitioned,
+            "nonterminal attempt must return false"
+        );
+
+        // Status MUST NOT have been resurrected back to 'running', and error_msg must be preserved
+        let (status2, err_msg2): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status2, "failed",
+            "lock-losing nonterminal attempt must not resurrect failed row back to running"
+        );
+        assert_eq!(
+            err_msg2.as_deref(),
+            Some(terminal_msg),
+            "terminal error message must not be overwritten"
+        );
+
+        // Step 3: another retryable attempt (e.g. attempt 2 of 5) arrives
+        let nonterminal_retry = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &retryable_err,
+            retryable_msg,
+            Some(WalletJobAttemptInfo { current: 2, max: 5 }),
+        )
+        .await;
+        assert!(!nonterminal_retry, "retryable attempt must return false");
+
+        let (status3, err_msg3): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_msg FROM remember_jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status3, "failed",
+            "retryable attempt must not resurrect failed row back to running"
+        );
+        assert_eq!(err_msg3.as_deref(), Some(terminal_msg));
+
+        // Step 4: subsequent terminal failure cannot trigger a second refund or transition
+        let repeat_terminal = update_remember_job_after_wallet_error(
+            &pool,
+            Some(job_id.as_str()),
+            &terminal_err,
+            terminal_msg,
+            Some(WalletJobAttemptInfo { current: 5, max: 5 }),
+        )
+        .await;
+        assert!(
+            !repeat_terminal,
+            "repeat terminal failure must return false (no double refund)"
+        );
+
+        let _ = sqlx::query("DELETE FROM remember_jobs WHERE id = $1")
+            .bind(&job_id)
             .execute(&pool)
             .await;
     }

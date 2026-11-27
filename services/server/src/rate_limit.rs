@@ -5,6 +5,7 @@ use axum::{
     response::Response,
 };
 use percent_encoding::percent_decode_str;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,72 @@ pub enum SponsorRlResult {
     HourLimitExceeded,
     /// Per-day cumulative bucket exhausted.
     DayLimitExceeded,
+}
+
+// ============================================================
+// Write-Path Rate Limit Charge Extension
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitBackend {
+    #[default]
+    Redis,
+    Fallback,
+}
+
+/// Represents an authenticated write path rate limit charge carried from
+/// rate_limit_middleware into write handlers. When an async job fails
+/// terminally due to an upstream infrastructure error, this charge can be
+/// refunded back to the delegate key bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitCharge {
+    pub request_id: String,
+    pub public_key: String,
+    pub owner: String,
+    pub weight: i64,
+    #[serde(default)]
+    pub member_offset: i64,
+    #[serde(default)]
+    pub backend: RateLimitBackend,
+    #[serde(default)]
+    pub delegate_key_capacity: i64,
+}
+
+impl RateLimitCharge {
+    /// Partition this charge across `item_count` children.
+    ///
+    /// Preserves exact integer conservation: total child weights sum to
+    /// `self.weight` (never dropping remainder and never exceeding `self.weight`),
+    /// and `[member_offset .. member_offset + weight)` ranges are pairwise disjoint.
+    pub fn partition_across(&self, item_count: usize) -> Vec<Option<RateLimitCharge>> {
+        if item_count == 0 || self.weight <= 0 {
+            return vec![None; item_count];
+        }
+
+        let n = item_count as i64;
+        let base = self.weight / n;
+        let rem = (self.weight % n) as usize;
+
+        let mut offset = self.member_offset;
+        let mut result = Vec::with_capacity(item_count);
+
+        for idx in 0..item_count {
+            let child_weight = base + i64::from(idx < rem);
+            if child_weight <= 0 {
+                result.push(None);
+            } else {
+                result.push(Some(RateLimitCharge {
+                    member_offset: offset,
+                    weight: child_weight,
+                    ..self.clone()
+                }));
+                offset += child_weight;
+            }
+        }
+
+        result
+    }
 }
 
 // ============================================================
@@ -316,9 +383,35 @@ where
     }
 }
 
+/// Remove `weight` ZSET members in the range `[member_offset .. member_offset + weight)`
+/// (`{request_id}:{member_offset} .. {request_id}:{member_offset + weight - 1}`)
+/// previously recorded in `key`.
+pub(crate) async fn rollback_window_entries_range<C>(
+    redis: &mut C,
+    key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+) -> Result<(), redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+{
+    if weight <= 0 || member_offset < 0 {
+        return Ok(());
+    }
+    let mut cmd = redis::cmd("ZREM");
+    cmd.arg(key);
+    for i in member_offset..(member_offset + weight) {
+        cmd.arg(format!("{request_id}:{i}"));
+    }
+    let _: i64 = cmd.query_async(redis).await?;
+    Ok(())
+}
+
 /// Remove the `weight` ZSET members (`{request_id}:0 .. {request_id}:{weight-1}`)
-/// previously recorded in `key` when a subsequent rate-limit layer denies or errors.
-async fn rollback_window_entries<C>(
+/// previously recorded in `key` when a subsequent rate-limit layer denies or errors,
+/// or when an infrastructure failure refunds delegate-key rate limit.
+pub(crate) async fn rollback_window_entries<C>(
     redis: &mut C,
     key: &str,
     request_id: &str,
@@ -327,16 +420,7 @@ async fn rollback_window_entries<C>(
 where
     C: redis::aio::ConnectionLike,
 {
-    if weight <= 0 {
-        return Ok(());
-    }
-    let mut cmd = redis::cmd("ZREM");
-    cmd.arg(key);
-    for i in 0..weight {
-        cmd.arg(format!("{request_id}:{i}"));
-    }
-    let _: i64 = cmd.query_async(redis).await?;
-    Ok(())
+    rollback_window_entries_range(redis, key, request_id, 0, weight).await
 }
 
 // ============================================================
@@ -344,9 +428,184 @@ where
 // ============================================================
 
 #[derive(Default)]
-pub struct InMemoryFallback {
+struct FallbackOriginRegistry {
+    instances: std::collections::HashMap<u64, std::sync::Weak<std::sync::Mutex<FallbackInner>>>,
+    request_origins: std::collections::HashMap<(String, String), u64>,
+}
+
+static NEXT_FALLBACK_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static FALLBACK_ORIGIN_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FallbackOriginRegistry>> =
+    std::sync::OnceLock::new();
+
+fn fallback_origin_registry() -> &'static std::sync::Mutex<FallbackOriginRegistry> {
+    FALLBACK_ORIGIN_REGISTRY
+        .get_or_init(|| std::sync::Mutex::new(FallbackOriginRegistry::default()))
+}
+
+struct FallbackOriginGuard(u64);
+
+impl Drop for FallbackOriginGuard {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            reg.instances.remove(&self.0);
+            let id = self.0;
+            reg.request_origins.retain(|_, origin_id| *origin_id != id);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct FallbackInner {
     pub buckets: std::collections::HashMap<String, TokenBucket>,
+}
+
+impl FallbackInner {
+    pub fn can_consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.can_consume_at(weight, capacity, refill_rate, now)
+    }
+
+    pub fn consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        if let Some(bucket) = self.buckets.get_mut(key) {
+            bucket.consume_at(weight, capacity, refill_rate, now);
+        }
+    }
+
+    pub fn consume_tracked_at(
+        &mut self,
+        key: &str,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.consume_tracked_at(request_id, weight, capacity, refill_rate, now);
+    }
+
+    pub fn refund_tracked_local_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        let refill_rate = capacity / refill_duration_secs;
+        if let Some(bucket) = self.buckets.get_mut(key) {
+            bucket.refund_tracked_at(
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_rate,
+                now,
+            )
+        } else {
+            0.0
+        }
+    }
+
+    pub fn refund_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        let refill_rate = capacity / refill_duration_secs;
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new_at(capacity, now));
+        bucket.refund_at(weight, capacity, refill_rate, now);
+    }
+
+    pub fn cleanup_stale(&mut self, now: std::time::Instant) {
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
+    }
+}
+
+#[derive(Clone)]
+pub struct FallbackBucketsRef {
+    inner: std::sync::Arc<std::sync::Mutex<FallbackInner>>,
+}
+
+impl FallbackBucketsRef {
+    pub fn get(&self, key: &str) -> Option<TokenBucket> {
+        self.inner.lock().unwrap().buckets.get(key).cloned()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.lock().unwrap().buckets.contains_key(key)
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().buckets.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().buckets.is_empty()
+    }
+}
+
+pub struct InMemoryFallback {
+    inner: std::sync::Arc<std::sync::Mutex<FallbackInner>>,
+    pub buckets: FallbackBucketsRef,
     pub cleanup_counter: usize,
+    origin_guard: FallbackOriginGuard,
+}
+
+impl Default for InMemoryFallback {
+    fn default() -> Self {
+        let instance_id =
+            NEXT_FALLBACK_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(FallbackInner::default()));
+        let buckets = FallbackBucketsRef {
+            inner: std::sync::Arc::clone(&inner),
+        };
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            reg.instances
+                .insert(instance_id, std::sync::Arc::downgrade(&inner));
+        }
+        Self {
+            inner,
+            buckets,
+            cleanup_counter: 0,
+            origin_guard: FallbackOriginGuard(instance_id),
+        }
+    }
 }
 
 impl InMemoryFallback {
@@ -357,56 +616,716 @@ impl InMemoryFallback {
         capacity: f64,
         refill_duration_secs: f64,
     ) -> bool {
-        let refill_rate = capacity / refill_duration_secs;
-        let bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(capacity));
-        bucket.peek(weight, capacity, refill_rate)
+        self.can_consume_at(
+            key,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn can_consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .can_consume_at(key, weight, capacity, refill_duration_secs, now)
     }
 
     pub fn consume(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
-        let refill_rate = capacity / refill_duration_secs;
-        if let Some(bucket) = self.buckets.get_mut(key) {
-            bucket.consume(weight, capacity, refill_rate);
+        self.consume_at(
+            key,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub fn consume_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .consume_at(key, weight, capacity, refill_duration_secs, now);
+
+        self.cleanup_counter += 1;
+        if self.cleanup_counter >= 1000 {
+            self.cleanup_counter = 0;
+            self.inner.lock().unwrap().cleanup_stale(now);
+        }
+    }
+
+    pub fn consume_tracked(
+        &mut self,
+        key: &str,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) {
+        self.consume_tracked_at(
+            key,
+            request_id,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub fn consume_tracked_at(
+        &mut self,
+        key: &str,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        self.inner.lock().unwrap().consume_tracked_at(
+            key,
+            request_id,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        );
+
+        if let Some(req_id) = request_id {
+            if weight > 0 {
+                let instance_id = self.origin_guard.0;
+                if let Ok(mut reg) = fallback_origin_registry().lock() {
+                    if reg.request_origins.len() >= 10_000 {
+                        reg.request_origins.clear();
+                    }
+                    reg.request_origins
+                        .insert((key.to_string(), req_id.to_string()), instance_id);
+                }
+            }
         }
 
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 1000 {
             self.cleanup_counter = 0;
-            let now = std::time::Instant::now();
-            self.buckets
-                .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < 7200.0);
+            self.inner.lock().unwrap().cleanup_stale(now);
         }
+    }
+
+    pub fn refund_tracked(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) -> f64 {
+        self.refund_tracked_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        )
+    }
+
+    fn refund_tracked_local_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.inner.lock().unwrap().refund_tracked_local_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
+    pub fn has_tracked_origin(&self, key: &str, request_id: &str) -> bool {
+        let has_local = self
+            .inner
+            .lock()
+            .unwrap()
+            .buckets
+            .get(key)
+            .is_some_and(|bucket| {
+                bucket
+                    .outstanding_units
+                    .iter()
+                    .any(|u| u.request_id == request_id)
+            });
+        if has_local {
+            return true;
+        }
+        if let Ok(reg) = fallback_origin_registry().lock() {
+            if let Some(&origin_id) = reg
+                .request_origins
+                .get(&(key.to_string(), request_id.to_string()))
+            {
+                return reg
+                    .instances
+                    .get(&origin_id)
+                    .is_some_and(|weak| weak.strong_count() > 0);
+            }
+        }
+        false
+    }
+
+    pub fn outstanding_request_ids(&self, key: &str) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        let Some(bucket) = inner.buckets.get(key) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for unit in &bucket.outstanding_units {
+            if !ids.contains(&unit.request_id) {
+                ids.push(unit.request_id.clone());
+            }
+        }
+        ids
+    }
+
+    #[cfg(test)]
+    pub fn detach_from_process_registry(&self) {
+        let instance_id = self.origin_guard.0;
+        if let Ok(mut reg) = fallback_origin_registry().lock() {
+            reg.instances.remove(&instance_id);
+            reg.request_origins
+                .retain(|_, origin_id| *origin_id != instance_id);
+        }
+    }
+
+    pub fn refund_tracked_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        let has_local_unit = {
+            let inner = self.inner.lock().unwrap();
+            inner.buckets.get(key).is_some_and(|bucket| {
+                bucket
+                    .outstanding_units
+                    .iter()
+                    .any(|u| u.request_id == request_id)
+            })
+        };
+        if has_local_unit {
+            return self.refund_tracked_local_at(
+                key,
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_duration_secs,
+                now,
+            );
+        }
+
+        let instance_id = self.origin_guard.0;
+        let origin_target = {
+            if let Ok(reg) = fallback_origin_registry().lock() {
+                if let Some(&origin_id) = reg
+                    .request_origins
+                    .get(&(key.to_string(), request_id.to_string()))
+                {
+                    if origin_id != instance_id {
+                        reg.instances.get(&origin_id).and_then(|weak| weak.upgrade())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(origin_arc) = origin_target {
+            let mut origin = origin_arc.lock().unwrap();
+            return origin.refund_tracked_local_at(
+                key,
+                request_id,
+                member_offset,
+                weight,
+                capacity,
+                refill_duration_secs,
+                now,
+            );
+        }
+
+        self.refund_tracked_local_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
+    pub fn settle_fallback_job_quota_charge(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn settle_fallback_job_quota_charge_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.refund_tracked_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
+    pub fn refund_fallback_job_quota_charge(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn refund_fallback_job_quota_charge_at(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        self.settle_fallback_job_quota_charge_at(
+            key,
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn refund(&mut self, key: &str, weight: f64, capacity: f64, refill_duration_secs: f64) {
+        self.refund_at(
+            key,
+            weight,
+            capacity,
+            refill_duration_secs,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub fn refund_at(
+        &mut self,
+        key: &str,
+        weight: f64,
+        capacity: f64,
+        refill_duration_secs: f64,
+        now: std::time::Instant,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .refund_at(key, weight, capacity, refill_duration_secs, now);
     }
 }
 
+pub fn settle_fallback_job_quota_charge(
+    fallback: &mut InMemoryFallback,
+    key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+    capacity: f64,
+    refill_duration_secs: f64,
+) -> f64 {
+    fallback.settle_fallback_job_quota_charge(
+        key,
+        request_id,
+        member_offset,
+        weight,
+        capacity,
+        refill_duration_secs,
+    )
+}
+
+pub fn refund_fallback_job_quota_charge(
+    fallback: &mut InMemoryFallback,
+    key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+    capacity: f64,
+    refill_duration_secs: f64,
+) -> f64 {
+    fallback.refund_fallback_job_quota_charge(
+        key,
+        request_id,
+        member_offset,
+        weight,
+        capacity,
+        refill_duration_secs,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutstandingFallbackUnit {
+    pub request_id: String,
+    pub unit_index: i64,
+    pub unreplenished: f64,
+}
+
+#[derive(Clone, Debug)]
 pub struct TokenBucket {
     pub tokens: f64,
+    pub capacity: f64,
+    pub refill_rate_per_sec: f64,
     pub last_update: std::time::Instant,
+    pub outstanding_units: std::collections::VecDeque<OutstandingFallbackUnit>,
 }
 
 impl TokenBucket {
     pub fn new(capacity: f64) -> Self {
         Self {
             tokens: capacity,
+            capacity,
+            refill_rate_per_sec: capacity / 60.0,
             last_update: std::time::Instant::now(),
+            outstanding_units: std::collections::VecDeque::new(),
         }
     }
 
+    pub fn new_at(capacity: f64, now: std::time::Instant) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_rate_per_sec: capacity / 60.0,
+            last_update: now,
+            outstanding_units: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn apply_policy_capacity(&mut self, capacity: f64, refill_rate_per_sec: f64) {
+        if self.capacity > 0.0 && capacity > self.capacity {
+            self.tokens = (self.tokens + (capacity - self.capacity)).min(capacity);
+        }
+        if capacity > 0.0 {
+            self.capacity = capacity;
+        }
+        if refill_rate_per_sec > 0.0 {
+            self.refill_rate_per_sec = refill_rate_per_sec;
+        }
+    }
+
+    fn advance_to(&mut self, now: std::time::Instant, capacity: f64, refill_rate_per_sec: f64) {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        let mut refill = elapsed * refill_rate_per_sec;
+        while let Some(front) = self.outstanding_units.front_mut() {
+            if refill <= 0.0 {
+                break;
+            }
+            if refill >= front.unreplenished - 1e-9 {
+                refill -= front.unreplenished;
+                self.outstanding_units.pop_front();
+            } else {
+                front.unreplenished -= refill;
+                break;
+            }
+        }
+        if self.tokens < capacity {
+            self.tokens = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
+        }
+        self.last_update = now;
+    }
+
+    pub fn can_consume_at(
+        &mut self,
+        weight: f64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
+        self.advance_to(now, capacity, refill_rate_per_sec);
+        self.tokens >= weight
+    }
+
     pub fn peek(&self, weight: f64, capacity: f64, refill_rate_per_sec: f64) -> bool {
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        let projected = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
+        self.peek_at(
+            weight,
+            capacity,
+            refill_rate_per_sec,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn peek_at(
+        &self,
+        weight: f64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        let base_tokens = if self.capacity > 0.0 && capacity > self.capacity {
+            (self.tokens + (capacity - self.capacity)).min(capacity)
+        } else {
+            self.tokens
+        };
+        let projected = if base_tokens < capacity {
+            (base_tokens + elapsed * refill_rate_per_sec).min(capacity)
+        } else {
+            base_tokens
+        };
         projected >= weight
     }
 
     pub fn consume(&mut self, weight: f64, capacity: f64, refill_rate_per_sec: f64) {
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        let projected = (self.tokens + elapsed * refill_rate_per_sec).min(capacity);
-        self.tokens = projected - weight;
-        self.last_update = now;
+        self.consume_at(
+            weight,
+            capacity,
+            refill_rate_per_sec,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub fn consume_at(
+        &mut self,
+        weight: f64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
+        self.advance_to(now, capacity, refill_rate_per_sec);
+        self.tokens -= weight;
+    }
+
+    #[allow(dead_code)]
+    pub fn consume_tracked(
+        &mut self,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+    ) {
+        self.consume_tracked_at(
+            request_id,
+            weight,
+            capacity,
+            refill_rate_per_sec,
+            std::time::Instant::now(),
+        );
+    }
+
+    pub fn consume_tracked_at(
+        &mut self,
+        request_id: Option<&str>,
+        weight: i64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) {
+        self.apply_policy_capacity(capacity, refill_rate_per_sec);
+        self.advance_to(now, capacity, refill_rate_per_sec);
+        self.tokens -= weight as f64;
+        if let Some(req_id) = request_id {
+            if weight > 0 {
+                for i in 0..weight {
+                    self.outstanding_units.push_back(OutstandingFallbackUnit {
+                        request_id: req_id.to_string(),
+                        unit_index: i,
+                        unreplenished: 1.0,
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn refund_tracked(
+        &mut self,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+    ) -> f64 {
+        self.refund_tracked_at(
+            request_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_rate_per_sec,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn refund_tracked_at(
+        &mut self,
+        request_id: &str,
+        member_offset: i64,
+        weight: i64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) -> f64 {
+        let effective_capacity = if self.capacity > 0.0 {
+            self.capacity.max(capacity)
+        } else {
+            capacity
+        };
+        let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
+            if effective_capacity > self.capacity {
+                effective_capacity / 60.0
+            } else {
+                self.refill_rate_per_sec
+            }
+        } else {
+            refill_rate_per_sec
+        };
+        if effective_capacity > self.capacity {
+            self.apply_policy_capacity(effective_capacity, effective_refill_rate);
+        }
+        self.advance_to(now, self.capacity, self.refill_rate_per_sec);
+        if weight <= 0 || member_offset < 0 {
+            return 0.0;
+        }
+        let end_offset = member_offset + weight;
+        let mut refundable = 0.0;
+        self.outstanding_units.retain(|u| {
+            if u.request_id == request_id
+                && u.unit_index >= member_offset
+                && u.unit_index < end_offset
+            {
+                refundable += u.unreplenished;
+                false
+            } else {
+                true
+            }
+        });
+        if refundable > 0.0 && self.tokens < self.capacity {
+            self.tokens = (self.tokens + refundable).min(self.capacity);
+        }
+        refundable
+    }
+
+    #[allow(dead_code)]
+    pub fn refund(&mut self, weight: f64, capacity: f64, refill_rate_per_sec: f64) {
+        self.refund_at(
+            weight,
+            capacity,
+            refill_rate_per_sec,
+            std::time::Instant::now(),
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn refund_at(
+        &mut self,
+        weight: f64,
+        capacity: f64,
+        refill_rate_per_sec: f64,
+        now: std::time::Instant,
+    ) {
+        let effective_capacity = if self.capacity > 0.0 {
+            self.capacity.max(capacity)
+        } else {
+            capacity
+        };
+        let effective_refill_rate = if self.refill_rate_per_sec > 0.0 {
+            if effective_capacity > self.capacity {
+                effective_capacity / 60.0
+            } else {
+                self.refill_rate_per_sec
+            }
+        } else {
+            refill_rate_per_sec
+        };
+        if effective_capacity > self.capacity {
+            self.apply_policy_capacity(effective_capacity, effective_refill_rate);
+        }
+        self.advance_to(now, self.capacity, self.refill_rate_per_sec);
+        if self.tokens < self.capacity {
+            self.tokens = (self.tokens + weight.max(0.0)).min(self.capacity);
+        }
     }
 }
 
@@ -508,6 +1427,7 @@ pub(crate) enum WriteRateLimitDenial {
 /// (`rate:dk:{public_key}`, `rate:{owner}`, `rate:hr:{owner}`), rolling back
 /// any earlier layer's recorded ZSET members via `ZREM` if a later layer
 /// denies or encounters a Redis error.
+#[allow(dead_code)]
 pub(crate) async fn check_write_rate_limit_windows<C, B>(
     redis: &mut C,
     dk_key: &str,
@@ -521,9 +1441,38 @@ where
     C: redis::aio::ConnectionLike,
     B: Into<RequestBudgets>,
 {
+    let request_id = Uuid::new_v4().to_string();
+    check_write_rate_limit_windows_with_id(
+        redis,
+        dk_key,
+        burst_key,
+        hourly_key,
+        now,
+        budgets,
+        weight,
+        &request_id,
+    )
+    .await
+}
+
+/// Check and record across all three write-path sliding windows with a
+/// caller-supplied request ID so entries can be tracked and refunded if needed.
+pub(crate) async fn check_write_rate_limit_windows_with_id<C, B>(
+    redis: &mut C,
+    dk_key: &str,
+    burst_key: &str,
+    hourly_key: &str,
+    now: f64,
+    budgets: B,
+    weight: i64,
+    request_id: &str,
+) -> Result<Option<WriteRateLimitDenial>, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike,
+    B: Into<RequestBudgets>,
+{
     let budgets = budgets.into();
     let (dk_window_start, burst_window_start, hourly_window_start) = sliding_window_starts(now);
-    let request_id = Uuid::new_v4().to_string();
 
     // Layer 1: Per-delegate-key (burst) — atomic check + record
     match check_and_record_window_with_id(
@@ -534,7 +1483,7 @@ where
         budgets.max_requests_per_delegate_key,
         weight,
         120, // TTL 2 min
-        &request_id,
+        request_id,
     )
     .await
     {
@@ -555,14 +1504,14 @@ where
         budgets.max_requests_per_minute,
         weight,
         120, // TTL 2 min
-        &request_id,
+        request_id,
     )
     .await
     {
         Ok(WindowCheckResult::Denied) => {
             // Roll back the delegate-key window entries recorded by Layer 1 so
             // an account-burst denial never spends per-delegate-key budget.
-            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, dk_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [burst] rollback of delegate-key entry failed: {}",
                     e
@@ -572,7 +1521,7 @@ where
         }
         Err(e) => {
             tracing::warn!("rate limit [burst] Redis error: {}", e);
-            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
+            let _ = rollback_window_entries(redis, dk_key, request_id, weight).await;
             return Err(e);
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -587,20 +1536,20 @@ where
         budgets.max_requests_per_hour,
         weight,
         3700, // TTL ~1hr + buffer
-        &request_id,
+        request_id,
     )
     .await
     {
         Ok(WindowCheckResult::Denied) => {
             // Roll back both the delegate-key and account-burst entries recorded
             // by Layers 1 and 2 so an hourly denial never spends minute budgets.
-            if let Err(e) = rollback_window_entries(redis, dk_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, dk_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [sustained] rollback of delegate-key entry failed: {}",
                     e
                 );
             }
-            if let Err(e) = rollback_window_entries(redis, burst_key, &request_id, weight).await {
+            if let Err(e) = rollback_window_entries(redis, burst_key, request_id, weight).await {
                 tracing::warn!(
                     "rate limit [sustained] rollback of account-burst entry failed: {}",
                     e
@@ -610,8 +1559,8 @@ where
         }
         Err(e) => {
             tracing::warn!("rate limit [sustained] Redis error: {}", e);
-            let _ = rollback_window_entries(redis, dk_key, &request_id, weight).await;
-            let _ = rollback_window_entries(redis, burst_key, &request_id, weight).await;
+            let _ = rollback_window_entries(redis, dk_key, request_id, weight).await;
+            let _ = rollback_window_entries(redis, burst_key, request_id, weight).await;
             return Err(e);
         }
         Ok(WindowCheckResult::Allowed) => {}
@@ -645,7 +1594,7 @@ where
 /// Normalizes trailing slash in path before cost weight lookup.
 pub async fn rate_limit_middleware(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // RATE_LIMIT_DISABLED=1 — see RateLimitConfig::bench_bypass_enabled.
@@ -680,6 +1629,7 @@ pub async fn rate_limit_middleware(
 
     // Determine cost weight based on endpoint; path is normalized inside endpoint_weight.
     let weight = endpoint_weight(request.uri().path());
+    let req_id = Uuid::new_v4().to_string();
 
     // --- Key definitions for all three rate-limit buckets ---
     let dk_key = format!("rate:dk:{}", auth.public_key);
@@ -692,7 +1642,7 @@ pub async fn rate_limit_middleware(
     // errors. If Redis is unavailable, we fall through to the in-memory
     // token-bucket fallback.
 
-    let redis_down = match check_write_rate_limit_windows(
+    let redis_down = match check_write_rate_limit_windows_with_id(
         &mut redis,
         &dk_key,
         &burst_key,
@@ -700,6 +1650,7 @@ pub async fn rate_limit_middleware(
         now,
         config,
         weight,
+        &req_id,
     )
     .await
     {
@@ -745,6 +1696,15 @@ pub async fn rate_limit_middleware(
     if redis_down {
         tracing::warn!("rate limit: Redis is unreachable, using in-memory fallback");
         crate::observability::record_rate_limit_fallback("authenticated");
+        drain_cross_process_fallback_refunds(
+            state.db.pool(),
+            &state.fallback_rate_limit,
+            &dk_key,
+            config.max_requests_per_delegate_key as f64,
+            60.0,
+        )
+        .await;
+
         let mut fallback = state.fallback_rate_limit.lock().await;
 
         if !fallback.can_consume(
@@ -782,9 +1742,10 @@ pub async fn rate_limit_middleware(
             );
         }
 
-        fallback.consume(
+        fallback.consume_tracked(
             &dk_key,
-            weight as f64,
+            Some(&req_id),
+            weight,
             config.max_requests_per_delegate_key as f64,
             60.0,
         );
@@ -801,10 +1762,243 @@ pub async fn rate_limit_middleware(
             3600.0,
         );
 
+        if weight > 0 {
+            request.extensions_mut().insert(RateLimitCharge {
+                request_id: req_id,
+                public_key: auth.public_key,
+                owner: auth.owner,
+                weight,
+                member_offset: 0,
+                backend: RateLimitBackend::Fallback,
+                delegate_key_capacity: config.max_requests_per_delegate_key,
+            });
+        }
+
         return next.run(request).await;
     }
 
+    if weight > 0 {
+        request.extensions_mut().insert(RateLimitCharge {
+            request_id: req_id,
+            public_key: auth.public_key,
+            owner: auth.owner,
+            weight,
+            member_offset: 0,
+            backend: RateLimitBackend::Redis,
+            delegate_key_capacity: config.max_requests_per_delegate_key,
+        });
+    }
+
     next.run(request).await
+}
+
+pub async fn enqueue_cross_process_fallback_refund(
+    pool: &sqlx::PgPool,
+    dk_key: &str,
+    request_id: &str,
+    member_offset: i64,
+    weight: i64,
+) {
+    if weight <= 0 || dk_key.is_empty() || request_id.is_empty() {
+        return;
+    }
+    let cleanup = sqlx::query(
+        "DELETE FROM rate_limit_fallback_refunds WHERE created_at < NOW() - INTERVAL '5 minutes'",
+    )
+    .execute(pool);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cleanup).await;
+
+    let insert = sqlx::query(
+        "INSERT INTO rate_limit_fallback_refunds (rate_key, request_id, member_offset, weight)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (rate_key, request_id, member_offset) DO NOTHING",
+    )
+    .bind(dk_key)
+    .bind(request_id)
+    .bind(member_offset)
+    .bind(weight)
+    .execute(pool);
+
+    match tokio::time::timeout(std::time::Duration::from_millis(500), insert).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "rate limit: failed to enqueue cross-process fallback refund: {}",
+                e
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                "rate limit: timed out enqueuing cross-process fallback refund after 500ms"
+            );
+        }
+    }
+}
+
+pub async fn drain_cross_process_fallback_refunds(
+    pool: &sqlx::PgPool,
+    fallback_mutex: &tokio::sync::Mutex<InMemoryFallback>,
+    dk_key: &str,
+    capacity: f64,
+    refill_duration_secs: f64,
+) -> f64 {
+    // 1. Acquire fallback mutex only long enough to extract pending request IDs, then drop it
+    // before any DB I/O so other requests never suffer latency spikes or lock contention.
+    let pending_req_ids = {
+        let fallback = fallback_mutex.lock().await;
+        fallback.outstanding_request_ids(dk_key)
+    };
+    if pending_req_ids.is_empty() {
+        return 0.0;
+    }
+
+    // 2. Perform DB deletion outside the lock with a bounded timeout for delayed/unavailable DB
+    let delete_fut = sqlx::query_as::<_, (String, i64, i64)>(
+        "DELETE FROM rate_limit_fallback_refunds
+         WHERE rate_key = $1 AND request_id = ANY($2)
+         RETURNING request_id, member_offset, weight",
+    )
+    .bind(dk_key)
+    .bind(&pending_req_ids)
+    .fetch_all(pool);
+
+    let rows: Vec<(String, i64, i64)> = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        delete_fut,
+    )
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "rate limit: failed to drain cross-process fallback refunds: {}",
+                e
+            );
+            return 0.0;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "rate limit: timed out draining cross-process fallback refunds after 500ms"
+            );
+            return 0.0;
+        }
+    };
+
+    if rows.is_empty() {
+        return 0.0;
+    }
+
+    // 3. Re-acquire fallback mutex briefly only to credit the returned rows
+    let mut fallback = fallback_mutex.lock().await;
+    let now = std::time::Instant::now();
+    let mut total_refunded = 0.0;
+    for (req_id, member_offset, weight) in rows {
+        total_refunded += fallback.refund_tracked_local_at(
+            dk_key,
+            &req_id,
+            member_offset,
+            weight,
+            capacity,
+            refill_duration_secs,
+            now,
+        );
+    }
+    total_refunded
+}
+
+pub async fn sync_fallback_rate_limit_refunds(
+    state: &AppState,
+    public_key: &str,
+    owner: &str,
+) -> f64 {
+    if public_key.is_empty() || state.config.rate_limit.bench_bypass_enabled {
+        return 0.0;
+    }
+    let dk_key = format!("rate:dk:{}", public_key);
+    let now = chrono::Utc::now();
+    let policy = state.owner_policies.policy_for(owner).ok().flatten();
+    let capacity = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now)
+        .max_requests_per_delegate_key;
+    drain_cross_process_fallback_refunds(
+        state.db.pool(),
+        &state.fallback_rate_limit,
+        &dk_key,
+        capacity as f64,
+        60.0,
+    )
+    .await
+}
+
+/// Refund delegate key rate limit charge after an infrastructure failure.
+///
+/// Credits the delegate key sliding window entry in Redis (using the recorded
+/// request ID members) or the in-memory fallback token bucket depending on which
+/// backend recorded the original charge.
+pub async fn refund_delegate_key_rate_limit(state: &AppState, charge: &RateLimitCharge) {
+    if charge.weight <= 0
+        || charge.public_key.is_empty()
+        || state.config.rate_limit.bench_bypass_enabled
+    {
+        return;
+    }
+
+    let dk_key = format!("rate:dk:{}", charge.public_key);
+
+    let now = chrono::Utc::now();
+    let policy = state
+        .owner_policies
+        .policy_for(&charge.owner)
+        .ok()
+        .flatten();
+    let current_capacity = effective_owner_budgets(&state.config.rate_limit, policy.as_ref(), now)
+        .max_requests_per_delegate_key;
+    let capacity = if charge.delegate_key_capacity > 0 {
+        current_capacity.max(charge.delegate_key_capacity)
+    } else {
+        current_capacity
+    };
+
+    match charge.backend {
+        RateLimitBackend::Redis => {
+            let mut redis = state.redis.clone();
+            if let Err(e) = rollback_window_entries_range(
+                &mut redis,
+                &dk_key,
+                &charge.request_id,
+                charge.member_offset,
+                charge.weight,
+            )
+            .await
+            {
+                tracing::warn!("failed to rollback delegate key rate limit in redis: {}", e);
+            }
+        }
+        RateLimitBackend::Fallback => {
+            let settled_in_process = {
+                let mut fallback = state.fallback_rate_limit.lock().await;
+                let known_in_process = fallback.has_tracked_origin(&dk_key, &charge.request_id);
+                fallback.refund_tracked(
+                    &dk_key,
+                    &charge.request_id,
+                    charge.member_offset,
+                    charge.weight,
+                    capacity as f64,
+                    60.0,
+                );
+                known_in_process
+            };
+            if !settled_in_process {
+                enqueue_cross_process_fallback_refund(
+                    state.db.pool(),
+                    &dk_key,
+                    &charge.request_id,
+                    charge.member_offset,
+                    charge.weight,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -2444,6 +3638,633 @@ mod tests {
     }
 
     #[test]
+    fn token_bucket_refund_restores_tokens_capped_at_capacity() {
+        let mut bucket = TokenBucket::new(10.0);
+        assert!(bucket.peek(6.0, 10.0, 1.0));
+        bucket.consume(6.0, 10.0, 1.0);
+        assert!(
+            bucket.tokens <= 4.05,
+            "tokens after deduction: {}",
+            bucket.tokens
+        );
+
+        bucket.refund(3.0, 10.0, 1.0);
+        assert!(
+            (6.95..=7.05).contains(&bucket.tokens),
+            "tokens after 3 refund: {}",
+            bucket.tokens
+        );
+
+        // Refunding more than capacity must cap at capacity
+        bucket.refund(10.0, 10.0, 1.0);
+        assert!(
+            (bucket.tokens - 10.0).abs() < 1e-4,
+            "tokens capped at capacity: {}",
+            bucket.tokens
+        );
+    }
+
+    #[test]
+    fn test_token_bucket_tracked_consume_and_refund() {
+        let mut bucket = TokenBucket::new(30.0);
+        bucket.consume_tracked(Some("req-tb"), 10, 30.0, 0.5);
+        assert!((bucket.tokens - 20.0).abs() < 1e-4);
+        assert_eq!(bucket.outstanding_units.len(), 10);
+
+        let refunded = bucket.refund_tracked("req-tb", 0, 5, 30.0, 0.5);
+        assert!((refunded - 5.0).abs() < 1e-4, "refunded={refunded}");
+        assert!((bucket.tokens - 25.0).abs() < 1e-4);
+        assert_eq!(bucket.outstanding_units.len(), 5);
+    }
+
+    #[test]
+    fn in_memory_fallback_refund_refills_and_caps() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:0x999";
+        let capacity = 60.0;
+        let refill_duration_secs = 60.0;
+
+        // Take 20 tokens
+        assert!(fallback.can_consume(key, 20.0, capacity, refill_duration_secs));
+        fallback.consume(key, 20.0, capacity, refill_duration_secs);
+
+        let initial_remaining = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            initial_remaining <= 40.05,
+            "initial remaining: {}",
+            initial_remaining
+        );
+
+        // Refund 10 tokens
+        fallback.refund(key, 10.0, capacity, refill_duration_secs);
+        let tokens_after_first = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            (49.9..=50.1).contains(&tokens_after_first),
+            "tokens after refund: {}",
+            tokens_after_first
+        );
+
+        // Refund 100 tokens: must not exceed 60.0
+        fallback.refund(key, 100.0, capacity, refill_duration_secs);
+        let tokens_capped = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            (tokens_capped - capacity).abs() < 1e-4,
+            "tokens capped at capacity: {}",
+            tokens_capped
+        );
+    }
+
+    #[test]
+    fn rate_limit_charge_serialization_roundtrip() {
+        let charge = RateLimitCharge {
+            request_id: "req-123".to_string(),
+            public_key: "0xpk".to_string(),
+            owner: "0xowner".to_string(),
+            weight: 5,
+            member_offset: 2,
+            backend: RateLimitBackend::Fallback,
+            delegate_key_capacity: 30,
+        };
+        let json = serde_json::to_string(&charge).expect("serialize charge");
+        let deserialized: RateLimitCharge =
+            serde_json::from_str(&json).expect("deserialize charge");
+        assert_eq!(charge, deserialized);
+
+        // Backward compatibility: missing new fields default cleanly
+        let legacy_json =
+            r#"{"request_id":"req-456","public_key":"0xpk2","owner":"0xowner2","weight":3}"#;
+        let legacy: RateLimitCharge =
+            serde_json::from_str(legacy_json).expect("deserialize legacy charge");
+        assert_eq!(legacy.request_id, "req-456");
+        assert_eq!(legacy.public_key, "0xpk2");
+        assert_eq!(legacy.owner, "0xowner2");
+        assert_eq!(legacy.weight, 3);
+        assert_eq!(legacy.member_offset, 0);
+        assert_eq!(legacy.backend, RateLimitBackend::Redis);
+        assert_eq!(legacy.delegate_key_capacity, 0);
+    }
+
+    #[test]
+    fn test_rate_limit_charge_partition_across() {
+        let charge = RateLimitCharge {
+            request_id: "req-xyz".to_string(),
+            public_key: "0xpk".to_string(),
+            owner: "0xowner".to_string(),
+            weight: 10,
+            member_offset: 0,
+            backend: RateLimitBackend::Redis,
+            delegate_key_capacity: 30,
+        };
+
+        // 10 weight / 2 items -> [5 (offset 0), 5 (offset 5)]
+        let p2 = charge.partition_across(2);
+        assert_eq!(p2.len(), 2);
+        let c0 = p2[0].as_ref().unwrap();
+        let c1 = p2[1].as_ref().unwrap();
+        assert_eq!(c0.weight, 5);
+        assert_eq!(c0.member_offset, 0);
+        assert_eq!(c1.weight, 5);
+        assert_eq!(c1.member_offset, 5);
+        assert_eq!(c0.member_offset + c0.weight, 5);
+        assert_eq!(c1.member_offset + c1.weight, 10);
+
+        // 10 weight / 3 items -> [4 (offset 0), 3 (offset 4), 3 (offset 7)] (sum = 10, zero dropped remainder)
+        let p3 = charge.partition_across(3);
+        assert_eq!(p3.len(), 3);
+        assert_eq!(p3[0].as_ref().unwrap().weight, 4);
+        assert_eq!(p3[0].as_ref().unwrap().member_offset, 0);
+        assert_eq!(p3[1].as_ref().unwrap().weight, 3);
+        assert_eq!(p3[1].as_ref().unwrap().member_offset, 4);
+        assert_eq!(p3[2].as_ref().unwrap().weight, 3);
+        assert_eq!(p3[2].as_ref().unwrap().member_offset, 7);
+        let sum3: i64 = p3.iter().map(|c| c.as_ref().unwrap().weight).sum();
+        assert_eq!(sum3, 10);
+
+        // 10 weight / 15 items -> first 10 get 1 (offset 0..9), last 5 get None (sum = 10, never > 10)
+        let p15 = charge.partition_across(15);
+        assert_eq!(p15.len(), 15);
+        for i in 0..10 {
+            let c = p15[i].as_ref().unwrap();
+            assert_eq!(c.weight, 1);
+            assert_eq!(c.member_offset, i as i64);
+        }
+        for i in 10..15 {
+            assert!(p15[i].is_none());
+        }
+        let sum15: i64 = p15
+            .iter()
+            .filter_map(|c| c.as_ref().map(|x| x.weight))
+            .sum();
+        assert_eq!(sum15, 10);
+
+        // Non-zero starting member_offset is preserved and offsets advance from it
+        let offset_charge = RateLimitCharge {
+            member_offset: 10,
+            weight: 7,
+            ..charge.clone()
+        };
+        let po = offset_charge.partition_across(2);
+        assert_eq!(po.len(), 2);
+        assert_eq!(po[0].as_ref().unwrap().member_offset, 10);
+        assert_eq!(po[0].as_ref().unwrap().weight, 4);
+        assert_eq!(po[1].as_ref().unwrap().member_offset, 14);
+        assert_eq!(po[1].as_ref().unwrap().weight, 3);
+
+        // 0 items -> empty vec
+        assert_eq!(
+            charge.partition_across(0),
+            Vec::<Option<RateLimitCharge>>::new()
+        );
+
+        // 0 weight -> all None
+        let zero_charge = RateLimitCharge {
+            weight: 0,
+            ..charge.clone()
+        };
+        assert_eq!(zero_charge.partition_across(3), vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_in_memory_fallback_expired_charge_does_not_refund() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_expired";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 5-unit charge at t=0
+        fallback.consume_tracked_at(key, Some("req-1"), 5, capacity, refill_duration_secs, t0);
+        let tokens_at_t0 = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_at_t0 - 25.0).abs() < 1e-4);
+
+        // Advance to t=65s: naturally refilled back to full capacity 30.0
+        let t65 = t0 + std::time::Duration::from_secs(65);
+        // Newer request consumes 20 units at t=65s
+        fallback.consume_tracked_at(key, Some("req-2"), 20, capacity, refill_duration_secs, t65);
+        let tokens_at_t65 = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            (tokens_at_t65 - 10.0).abs() < 1e-4,
+            "tokens after req-2: {}",
+            tokens_at_t65
+        );
+
+        // Late failure of t=0 charge (req-1) arrives at t=65s
+        let refunded =
+            fallback.refund_tracked_at(key, "req-1", 0, 5, capacity, refill_duration_secs, t65);
+        assert_eq!(refunded, 0.0, "expired charge must refund 0.0");
+        let tokens_after_late_refund = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            (tokens_after_late_refund - 10.0).abs() < 1e-4,
+            "bucket must stay at 10.0, not 15.0"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_fallback_partial_refill_and_duplicate_refund() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_partial";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0; // 0.5 tokens/sec
+        let t0 = std::time::Instant::now();
+
+        // 15-unit charge at t=0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-part"),
+            15,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        let tokens_at_t0 = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_at_t0 - 15.0).abs() < 1e-4);
+
+        // At t=10s: 10s * 0.5 = 5 tokens refilled naturally.
+        // Failure arrives at t=10s. Should refund only the remaining 10 unreplenished tokens.
+        let t10 = t0 + std::time::Duration::from_secs(10);
+        let refunded =
+            fallback.refund_tracked_at(key, "req-part", 0, 15, capacity, refill_duration_secs, t10);
+        assert!(
+            (refunded - 10.0).abs() < 1e-4,
+            "only unreplenished 10 tokens refunded, got: {}",
+            refunded
+        );
+
+        let tokens_after_refund = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            (tokens_after_refund - 30.0).abs() < 1e-4,
+            "bucket back to capacity 30.0, got: {}",
+            tokens_after_refund
+        );
+
+        // Duplicate refund at t=10s must return 0.0 and leave bucket at 30.0
+        let duplicate_refund =
+            fallback.refund_tracked_at(key, "req-part", 0, 15, capacity, refill_duration_secs, t10);
+        assert_eq!(duplicate_refund, 0.0, "duplicate refund must return 0.0");
+        let tokens_after_dup = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_after_dup - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_in_memory_fallback_disjoint_partitioned_refunds() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_partitioned";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 10-unit charge at t=0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-bulk"),
+            10,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key).unwrap().tokens - 20.0).abs() < 1e-4);
+
+        // Child 1 (units 0..5) fails at t=0 -> refunds 5 units
+        let r1 =
+            fallback.refund_tracked_at(key, "req-bulk", 0, 5, capacity, refill_duration_secs, t0);
+        assert_eq!(r1, 5.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // Duplicate refund of Child 1 -> 0.0
+        let r1_dup =
+            fallback.refund_tracked_at(key, "req-bulk", 0, 5, capacity, refill_duration_secs, t0);
+        assert_eq!(r1_dup, 0.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // Child 2 (units 5..10) fails at t=0 -> refunds 5 units
+        let r2 =
+            fallback.refund_tracked_at(key, "req-bulk", 5, 5, capacity, refill_duration_secs, t0);
+        assert_eq!(r2, 5.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_in_memory_fallback_owner_override_capacity_preserved_on_refund() {
+        let mut fallback = InMemoryFallback::default();
+        let key_high = "rate:dk:pk_high_cap";
+        let high_capacity = 60.0; // owner override higher than global 30
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // Bucket starts with capacity 60
+        fallback.can_consume_at(key_high, 10.0, high_capacity, refill_duration_secs, t0);
+        fallback.consume_tracked_at(
+            key_high,
+            Some("req-high"),
+            10,
+            high_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        let tokens_after_consume = fallback.buckets.get(key_high).unwrap().tokens;
+        assert!((tokens_after_consume - 50.0).abs() < 1e-4);
+
+        // Refund 5 units with high_capacity=60.0 must raise to 55.0, NOT clamped to global 30.0
+        let refunded = fallback.refund_tracked_at(
+            key_high,
+            "req-high",
+            0,
+            5,
+            high_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        let tokens_after_refund = fallback.buckets.get(key_high).unwrap().tokens;
+        assert!(
+            (tokens_after_refund - 55.0).abs() < 1e-4,
+            "must be 55.0 and NOT clamped to 30.0"
+        );
+
+        // Lower owner override: capacity 10.0
+        let key_low = "rate:dk:pk_low_cap";
+        let low_capacity = 10.0;
+        fallback.can_consume_at(key_low, 5.0, low_capacity, refill_duration_secs, t0);
+        fallback.consume_tracked_at(
+            key_low,
+            Some("req-low"),
+            5,
+            low_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key_low).unwrap().tokens - 5.0).abs() < 1e-4);
+
+        // Refund 5 units with low_capacity=10.0 -> clamped to 10.0
+        let refunded_low = fallback.refund_tracked_at(
+            key_low,
+            "req-low",
+            0,
+            5,
+            low_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded_low, 5.0);
+        let tokens_low = fallback.buckets.get(key_low).unwrap().tokens;
+        assert!((tokens_low - 10.0).abs() < 1e-4, "must be clamped to 10.0");
+    }
+
+    #[test]
+    fn test_in_memory_fallback_policy_capacity_change_avoids_bucket_truncation() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_policy_change";
+        let initial_capacity = 60.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Consume 5 units under 60.0 capacity -> 55.0 tokens remaining
+        fallback.consume_tracked_at(key, Some("req-1"), 5, initial_capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 55.0).abs() < 1e-4);
+
+        // 2. Policy decreases to 30.0 while job is in-flight.
+        // Refund arriving with settled policy must NOT truncate the 55.0 tokens down to 30.0.
+        let decreased_capacity = 30.0;
+        let refunded = fallback.refund_tracked_at(
+            key,
+            "req-1",
+            0,
+            5,
+            decreased_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        let tokens_after = fallback.buckets.get(key).unwrap().tokens;
+        assert!(
+            tokens_after >= 55.0,
+            "tokens must not be truncated to 30.0 when bucket holds 55.0 tokens; got {}",
+            tokens_after
+        );
+    }
+
+    #[test]
+    fn test_in_memory_fallback_refund_missing_bucket_returns_zero_without_inserting() {
+        let mut fallback = InMemoryFallback::default();
+        let refunded =
+            fallback.refund_tracked("rate:dk:pk_nonexistent", "req-none", 0, 5, 30.0, 60.0);
+        assert_eq!(refunded, 0.0);
+        assert!(!fallback.buckets.contains_key("rate:dk:pk_nonexistent"));
+    }
+
+    #[test]
+    fn test_in_memory_fallback_expired_lower_policy_override_preserves_current_capacity_and_outstanding() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_expired_override";
+        let override_capacity = 10.0;
+        let restored_capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Async job admitted while owner override lowered budget to 10.0 -> 9.0/10.0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-old"),
+            1,
+            override_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key).unwrap().tokens - 9.0).abs() < 1e-4);
+
+        // 2. Override expires back to 30.0 and a subsequent request consumes 1 unit -> 28.0/30.0
+        fallback.consume_tracked_at(
+            key,
+            Some("req-new"),
+            1,
+            restored_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert!((fallback.buckets.get(key).unwrap().tokens - 28.0).abs() < 1e-4);
+
+        // 3. Older job fails on infrastructure and settles with historical override_capacity (10.0).
+        // Must credit 1.0 back to 29.0/30.0 without clamping to 10.0 or clearing `req-new`.
+        let refunded_old = fallback.refund_tracked_at(
+            key,
+            "req-old",
+            0,
+            1,
+            override_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded_old, 1.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 29.0).abs() < 1e-4);
+
+        // 4. Newer request's outstanding unit is still intact and refunds to 30.0/30.0.
+        let refunded_new = fallback.refund_tracked_at(
+            key,
+            "req-new",
+            0,
+            1,
+            restored_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded_new, 1.0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_in_memory_fallback_routes_cross_instance_refund_to_admitting_instance() {
+        let mut instance_a = InMemoryFallback::default();
+        let mut instance_b = InMemoryFallback::default();
+        let key = "rate:dk:pk_cross_instance";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // Instance A admits the request under fallback -> 25.0/30.0
+        instance_a.consume_tracked_at(key, Some("req-cross-1"), 5, capacity, refill_duration_secs, t0);
+        assert!((instance_a.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // Worker on Instance B claims the wallet_job and refunds the charge
+        let refunded = instance_b.refund_tracked_at(
+            key,
+            "req-cross-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        assert!(
+            !instance_b.buckets.contains_key(key),
+            "Instance B must not create a phantom bucket when routing to Instance A"
+        );
+        assert!(
+            (instance_a.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4,
+            "Instance A must be restored to 30.0/30.0"
+        );
+    }
+
+    #[test]
+    fn test_settle_fallback_job_quota_charge_older_charge_does_not_clobber_newer_window() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_settle_older";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Admit older charge (req-1) consuming 5 units at t0 -> 25.0/30.0
+        fallback.consume_tracked_at(key, Some("req-1"), 5, capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+
+        // 2. Window elapses to t0 + 65s: req-1 has replenished, bucket refills to 30.0
+        let t_new = t0 + std::time::Duration::from_secs(65);
+
+        // 3. Newer active request (req-2) consumes 10 units at t_new -> 20.0/30.0
+        fallback.consume_tracked_at(key, Some("req-2"), 10, capacity, refill_duration_secs, t_new);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 20.0).abs() < 1e-4);
+
+        // 4. Settle older charge (req-1) at t_new + 5s.
+        // It must NOT clobber the newer active bucket or grant extra tokens beyond 20.0.
+        let t_settle = t_new + std::time::Duration::from_secs(5);
+        let settled_old = fallback.settle_fallback_job_quota_charge_at(
+            key,
+            "req-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t_settle,
+        );
+        assert_eq!(settled_old, 0.0, "replenished older charge must yield 0.0 refund");
+        // Only 5 seconds elapsed since t_new, adding 5 * 0.5 = 2.5 tokens: tokens must be 22.5, NOT overwritten by req-1's 5.0
+        let tokens_after_old_settle = fallback.buckets.get(key).unwrap().tokens;
+        assert!((tokens_after_old_settle - 22.5).abs() < 1e-4);
+
+        // 5. Duplicate settlement of req-1 must also be a safe no-op
+        let duplicate_settle = settle_fallback_job_quota_charge(
+            &mut fallback,
+            key,
+            "req-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+        );
+        assert_eq!(duplicate_settle, 0.0, "duplicate settlement must yield 0.0");
+
+        // 6. Newer request (req-2) was not clobbered: settling req-2 properly refunds remaining unreplenished units
+        let refunded_new = refund_fallback_job_quota_charge(
+            &mut fallback,
+            key,
+            "req-2",
+            0,
+            10,
+            capacity,
+            refill_duration_secs,
+        );
+        assert!(refunded_new > 0.0, "req-2 unreplenished units must be refundable");
+        assert!((fallback.buckets.get(key).unwrap().tokens - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_settle_fallback_job_quota_charge_preserves_and_adjusts_active_capacity() {
+        let mut fallback = InMemoryFallback::default();
+        let key = "rate:dk:pk_adjust_capacity";
+        let low_capacity = 10.0;
+        let high_capacity = 40.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        // 1. Consume 5 units under temporary low capacity (10.0) -> 5.0/10.0
+        fallback.consume_tracked_at(key, Some("req-low"), 5, low_capacity, refill_duration_secs, t0);
+        assert!((fallback.buckets.get(key).unwrap().tokens - 5.0).abs() < 1e-4);
+
+        // 2. Settle the charge after policy expands to 40.0 without clamping
+        let refunded = fallback.settle_fallback_job_quota_charge_at(
+            key,
+            "req-low",
+            0,
+            5,
+            high_capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 5.0);
+        // Capacity adjusted to 40.0, so tokens restored to 40.0
+        assert!((fallback.buckets.get(key).unwrap().tokens - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_safe_fallback_registry_handles_dropped_origin_gracefully() {
+        let mut instance_b = InMemoryFallback::default();
+        let key = "rate:dk:pk_dropped_origin";
+        let capacity = 30.0;
+        let refill_duration_secs = 60.0;
+        let t0 = std::time::Instant::now();
+
+        {
+            let mut instance_a = InMemoryFallback::default();
+            instance_a.consume_tracked_at(key, Some("req-drop-1"), 5, capacity, refill_duration_secs, t0);
+            assert!((instance_a.buckets.get(key).unwrap().tokens - 25.0).abs() < 1e-4);
+            // instance_a is dropped at end of block
+        }
+
+        // Instance B attempts to settle request from dropped Instance A:
+        // Must safely return 0.0 with zero unsafe dereferences or panics
+        let refunded = instance_b.refund_tracked_at(
+            key,
+            "req-drop-1",
+            0,
+            5,
+            capacity,
+            refill_duration_secs,
+            t0,
+        );
+        assert_eq!(refunded, 0.0);
+    }
+
+    #[test]
     fn test_endpoint_weight_owner_scoped_read_api_routes() {
         // Previously these three fell through to the default `1`
         // implicitly (no explicit entry) — now explicit, and /agents is
@@ -2865,7 +4686,7 @@ mod tests {
     fn test_fallback_token_bucket_consume_reduces_tokens() {
         let mut bucket = TokenBucket::new(10.0);
         bucket.consume(3.0, 10.0, 1.0); // consume 3 of 10
-                                        // tokens should be ~7.0 (with tiny time delta adding a fraction)
+        // tokens should be ~7.0 (with tiny time delta adding a fraction)
         assert!(
             bucket.tokens < 8.0,
             "tokens should be around 7, got {}",
@@ -2893,7 +4714,7 @@ mod tests {
     fn test_fallback_token_bucket_rejects_when_empty() {
         let mut bucket = TokenBucket::new(5.0);
         bucket.consume(5.0, 5.0, 0.0); // consume all, no refill
-                                       // With 0 refill rate and ~0 elapsed time, no tokens available
+        // With 0 refill rate and ~0 elapsed time, no tokens available
         assert!(!bucket.peek(1.0, 5.0, 0.0));
     }
 
@@ -3263,8 +5084,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_preauth_ceiling_caps_rotating_invalid_legacy_delegates_while_isolating_tenant_quotas(
-    ) {
+    async fn mcp_preauth_ceiling_caps_rotating_invalid_legacy_delegates_while_isolating_tenant_quotas()
+     {
         use std::collections::HashMap;
         use std::sync::Mutex;
 

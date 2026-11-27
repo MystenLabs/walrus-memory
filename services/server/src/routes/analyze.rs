@@ -944,6 +944,7 @@ pub async fn analyze(
                 remember_job_id: Some(upload_job_id.clone()),
                 prepare_claim_token: None,
                 epochs: state.config.walrus_storage_epochs,
+                rate_limit_charge: None,
             },
         )
         .await
