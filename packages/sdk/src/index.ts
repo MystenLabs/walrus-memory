@@ -106,4 +106,7 @@ export type {
     DeletedMemorySummary,
     MemoriesResult,
     ListMemoriesOptions,
+    MemoryEventType,
+    MemoryEvent,
+    SubscribeEventsOptions,
 } from "./types.js";

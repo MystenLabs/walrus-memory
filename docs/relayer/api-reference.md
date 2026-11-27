@@ -652,6 +652,23 @@ Return the memory count and stored byte total for one namespace, scoped to the a
 }
 ```
 
+### `GET /api/events`
+
+Open a Server-Sent Events (`text/event-stream`) subscription for real-time memory lifecycle events scoped strictly to the authenticated `owner`. Authenticates via Ed25519 signed headers or an owner bearer token.
+
+**Query parameters:**
+
+1. `namespace` (optional): Filter events to a single namespace. When omitted, streams events across all namespaces owned by the authenticated account.
+2. `types` (optional): Comma-separated list of event types to receive (`memory.remember.accepted`, `memory.remember.completed`, `memory.remember.failed`, `memory.forget`, `memory.restore.completed`).
+
+**SSE frame example:**
+
+```text
+id: 9b2d8e14-4d3a-4f1b-9c2e-1a5f8c7d6e4f
+event: memory.remember.completed
+data: {"id":"9b2d8e14-4d3a-4f1b-9c2e-1a5f8c7d6e4f","type":"memory.remember.completed","owner":"0x...","namespace":"default","timestamp":"2026-11-03T06:00:00Z","job_id":"...","blob_id":"...","count":1}
+```
+
 ## MCP transports
 
 The relayer also proxies Model Context Protocol traffic to its Node sidecar. `GET`, `POST`, `DELETE`, and `OPTIONS` on `/api/mcp` serve the Streamable HTTP transport, and `GET /api/mcp/sse` plus `POST /api/mcp/messages` serve the legacy SSE transport. These routes use bearer authentication instead of signed headers. See [Reference](/mcp/reference) for transport details and client configuration.

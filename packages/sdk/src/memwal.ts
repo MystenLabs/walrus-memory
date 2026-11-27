@@ -62,6 +62,8 @@ import type {
     RememberBulkStatusItem,
     RememberBulkItemResult,
     RelayerVersionMetadata,
+    MemoryEvent,
+    SubscribeEventsOptions,
 } from "./types.js";
 import {
     sha256hex,
@@ -1695,6 +1697,124 @@ export class MemWal {
     }
 
     /**
+     * Subscribe to real-time memory lifecycle events via SSE.
+     */
+    async *subscribeEvents(
+        options: SubscribeEventsOptions = {},
+    ): AsyncGenerator<MemoryEvent, void, unknown> {
+        if (this.destroyed) throw destroyedClientError();
+        options.signal?.throwIfAborted();
+        await this.ensureCompatibleRelayer();
+        options.signal?.throwIfAborted();
+
+        const params = new URLSearchParams();
+        if (options.namespace) {
+            params.set("namespace", options.namespace);
+        }
+        if (options.types && options.types.length > 0) {
+            params.set("types", options.types.join(","));
+        }
+        const qs = params.toString() ? `?${params.toString()}` : "";
+        const path = `/api/events${qs}`;
+        const url = `${this.serverUrl}${path}`;
+
+        const signedHeaders = await this.buildSignedHeaders(new Uint8Array(0), "GET", path);
+        const headers: Record<string, string> = {
+            ...signedHeaders,
+            Accept: "text/event-stream",
+        };
+
+        const res = await fetch(url, {
+            method: "GET",
+            headers,
+            signal: options.signal,
+        });
+
+        if (!res.ok) {
+            const errorText = await res.text().catch(() => "");
+            throw new Error(`MemWal events stream failed with status ${res.status}: ${errorText}`);
+        }
+        if (!res.body) {
+            throw new Error("MemWal events stream response body is null");
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let streamCompleted = false;
+
+        const onAbort = () => {
+            reader.cancel().catch(() => {});
+        };
+        if (options.signal) {
+            options.signal.addEventListener("abort", onAbort, { once: true });
+        }
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                const parts = buffer.split(/\r?\n\r?\n/);
+                buffer = parts.pop() ?? "";
+
+                for (const part of parts) {
+                    const lines = part.split(/\r?\n/);
+                    let dataText = "";
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (trimmed.startsWith(":") || trimmed === "") {
+                            continue;
+                        }
+                        if (line.startsWith("data:")) {
+                            const dataContent = line.slice(5).trim();
+                            dataText += (dataText ? "\n" : "") + dataContent;
+                        }
+                    }
+                    if (dataText) {
+                        try {
+                            const event = JSON.parse(dataText) as MemoryEvent;
+                            yield event;
+                        } catch {
+                            // Ignore non-json frames
+                        }
+                    }
+                }
+            }
+
+            if (buffer.trim()) {
+                const lines = buffer.split(/\r?\n/);
+                let dataText = "";
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (trimmed.startsWith(":") || trimmed === "") continue;
+                    if (line.startsWith("data:")) {
+                        dataText += (dataText ? "\n" : "") + line.slice(5).trim();
+                    }
+                }
+                if (dataText) {
+                    try {
+                        const event = JSON.parse(dataText) as MemoryEvent;
+                        yield event;
+                    } catch {
+                        // Ignore non-json frames
+                    }
+                }
+            }
+            streamCompleted = true;
+        } finally {
+            if (options.signal) {
+                options.signal.removeEventListener("abort", onAbort);
+            }
+            if (!streamCompleted) {
+                await reader.cancel().catch(() => {});
+            }
+            reader.releaseLock();
+        }
+    }
+
+    /**
      * Resolve this account's owner address, memoised for the client's life.
      *
      * The owner-scoped read routes take the address in the path and reject a
@@ -2155,6 +2275,33 @@ export class MemWal {
         } finally {
             deadline.dispose();
         }
+    }
+
+    private async buildSignedHeaders(
+        body: Uint8Array | string = new Uint8Array(0),
+        method = "GET",
+        path = "/api/events",
+    ): Promise<Record<string, string>> {
+        if (this.destroyed) throw destroyedClientError();
+        const ed = await getEd();
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const bodyStr = typeof body === "string" ? body : new TextDecoder().decode(body);
+        const bodySha256 = await sha256hex(bodyStr);
+        const nonce = crypto.randomUUID();
+        const message = `${timestamp}.${method}.${path}.${bodySha256}.${nonce}.${this.accountId}`;
+        const msgBytes = new TextEncoder().encode(message);
+        if (this.destroyed) throw destroyedClientError();
+        const signature = await ed.signAsync(msgBytes, this.privateKey);
+        if (this.destroyed) throw destroyedClientError();
+        const publicKey = await this.getPublicKey();
+        if (this.destroyed) throw destroyedClientError();
+        return {
+            "x-public-key": bytesToHex(publicKey),
+            "x-signature": bytesToHex(signature),
+            "x-timestamp": timestamp,
+            "x-nonce": nonce,
+            "x-account-id": this.accountId,
+        };
     }
 
     private async signedRequest<T>(

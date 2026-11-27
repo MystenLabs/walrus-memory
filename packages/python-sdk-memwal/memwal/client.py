@@ -37,7 +37,19 @@ import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 from urllib.parse import ParseResult, urlencode, urlparse
 
 import httpx
@@ -53,6 +65,7 @@ from .types import (
     EmbedResult,
     ForgetResult,
     HealthResult,
+    MemoryEvent,
     MemWalConfig,
     NamespacesResult,
     NamespaceSummary,
@@ -1651,6 +1664,104 @@ class MemWal:
             raise _destroyed_client_error()
         return await self._ensure_compatible_relayer()
 
+    async def subscribe_events(
+        self,
+        *,
+        namespace: Optional[str] = None,
+        types: Optional[Sequence[str]] = None,
+    ) -> AsyncIterator[MemoryEvent]:
+        """Subscribe to real-time memory lifecycle events via SSE stream.
+
+        Connects to GET /api/events with signed authentication headers.
+        Yields MemoryEvent objects as they arrive from the server.
+
+        Args:
+            namespace: Optional namespace filter. When omitted, events across
+                all namespaces owned by the account are received.
+            types: Optional sequence of event type strings to subscribe to.
+                When omitted, all event types are received.
+
+        Yields:
+            MemoryEvent instances parsed from incoming SSE frames.
+        """
+        if self._destroyed:
+            raise _destroyed_client_error()
+
+        query_parts: List[Tuple[str, str]] = []
+        if namespace is not None:
+            if not isinstance(namespace, str) or not namespace.strip():
+                raise ValueError("namespace must be a non-empty string when provided")
+            query_parts.append(("namespace", namespace))
+        if types is not None:
+            if (
+                isinstance(types, str)
+                or not isinstance(types, (list, tuple, set))
+                or len(types) == 0
+            ):
+                raise ValueError("types must be a non-empty sequence of strings when provided")
+            for t in types:
+                if not isinstance(t, str) or not t.strip():
+                    raise ValueError("each event type in types must be a non-empty string")
+            query_parts.append(("types", ",".join(types)))
+
+        await self._ensure_compatible_relayer()
+        if self._destroyed:
+            raise _destroyed_client_error()
+
+        qs = urlencode(query_parts) if query_parts else ""
+        path = f"/api/events{f'?{qs}' if qs else ''}"
+        url = f"{self._server_url}{path}"
+
+        headers = self._build_signed_headers("GET", path)
+        headers["Accept"] = "text/event-stream"
+
+        timeout = httpx.Timeout(connect=60.0, read=None, write=60.0, pool=None)
+        async with self._http.stream("GET", url, headers=headers, timeout=timeout) as response:
+            if response.status_code != 200:
+                err_text = (await response.aread()).decode("utf-8", errors="replace")
+                if response.status_code == 426:
+                    detail = err_text[:300] or "upgrade required"
+                    raise MemWalCompatibilityError(
+                        "Walrus Memory relayer rejected this SDK as unsupported "
+                        f"(HTTP 426 Upgrade Required). Relayer response: {detail}"
+                    )
+                if response.headers.get("x-auth-error") == "ERR_TIMESTAMP_OUT_OF_BOUNDS":
+                    raise MemWalClockDriftError(
+                        f"Timestamp out of bounds (clock drift). Server response: {err_text}"
+                    )
+                if response.status_code == 429:
+                    raise MemWalRateLimited(f"Rate limited by server: {err_text}")
+                raise MemWalError(f"HTTP {response.status_code}: {err_text}")
+
+            data_lines: List[str] = []
+            async for line in response.aiter_lines():
+                line_stripped = line.strip()
+                if not line_stripped:
+                    if data_lines:
+                        payload = "\n".join(data_lines)
+                        data_lines = []
+                        try:
+                            yield MemoryEvent.from_dict(json.loads(payload))
+                        except Exception as exc:
+                            logger.debug(
+                                "Ignoring malformed SSE event payload: %s",
+                                payload,
+                                exc_info=exc,
+                            )
+                    continue
+                if line_stripped.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+
+            if data_lines:
+                payload = "\n".join(data_lines)
+                try:
+                    yield MemoryEvent.from_dict(json.loads(payload))
+                except Exception as exc:
+                    logger.debug("Ignoring malformed SSE event payload: %s", payload, exc_info=exc)
+
+
     # ============================================================
     # Manual API (user handles SEAL + embedding + Walrus)
     # ============================================================
@@ -2021,6 +2132,35 @@ class MemWal:
             raise _destroyed_client_error()
         return result
 
+    def _build_signed_headers(
+        self, method: str, path: str, body_str: str = ""
+    ) -> Dict[str, str]:
+        if self._destroyed or self._signing_key is None:
+            raise _destroyed_client_error()
+
+        method_upper = method.upper()
+        timestamp = str(int(time.time()))
+        body_hash = sha256_hex(body_str)
+        nonce = str(uuid.uuid4())
+
+        message = build_signature_message(
+            timestamp,
+            method_upper,
+            path,
+            body_hash,
+            nonce=nonce,
+            account_id=self._account_id,
+        )
+        signature_hex, public_key_hex = sign_message(message, self._signing_key)
+
+        return {
+            "x-public-key": public_key_hex,
+            "x-signature": signature_hex,
+            "x-timestamp": timestamp,
+            "x-nonce": nonce,
+            "x-account-id": self._account_id,
+        }
+
     async def _signed_request(
         self,
         method: str,
@@ -2057,35 +2197,12 @@ class MemWal:
             raise _destroyed_client_error()
 
         method_upper = method.upper()
-        timestamp = str(int(time.time()))
         body_str = "" if method_upper == "GET" else json.dumps(
             body, separators=(",", ":"), allow_nan=False
         )
-        body_hash = sha256_hex(body_str)
-        # MED-1 / LOW-23: nonce + account_id are part of the canonical signed
-        # message. Server rejects the request as "unsupported legacy SDK"
-        # (HTTP 426) if x-nonce is missing or not UUID-formatted.
-        nonce = str(uuid.uuid4())
-
-        message = build_signature_message(
-            timestamp,
-            method_upper,
-            path,
-            body_hash,
-            nonce=nonce,
-            account_id=self._account_id,
-        )
-        signature_hex, public_key_hex = sign_message(message, self._signing_key)
-
         url = f"{self._server_url}{path}"
-        headers = {
-            "Content-Type": "application/json",
-            "x-public-key": public_key_hex,
-            "x-signature": signature_hex,
-            "x-timestamp": timestamp,
-            "x-nonce": nonce,
-            "x-account-id": self._account_id,
-        }
+        headers = self._build_signed_headers(method_upper, path, body_str)
+        headers["Content-Type"] = "application/json"
         if include_seal_session:
             headers["x-seal-session"] = await self._build_seal_session()
             if self._destroyed or self._signing_key is None:
@@ -2285,17 +2402,28 @@ class MemWalRateLimited(MemWalError):
     included, so none of its writes could be confirmed (GH #967). Status reads
     count against the same delegate-key budget as writes."""
 
-    def __init__(self, job_ids: Sequence[str], retry_after: Optional[str] = None) -> None:
-        wait = f" after ~{retry_after}s" if retry_after else ""
-        super().__init__(
-            f"Walrus Memory rate-limited every status read for this batch, so none of its "
-            f"{len(job_ids)} writes could be confirmed. Do not treat them as stored: check them "
-            f"with get_remember_bulk_status(job_ids){wait}. Status reads count against the same "
-            "delegate-key budget as writes."
-        )
-        self.status = 429
-        self.job_ids = list(job_ids)
-        self.retry_after = retry_after
+    def __init__(
+        self,
+        message_or_job_ids: Union[str, Sequence[str]],
+        retry_after: Optional[str] = None,
+    ) -> None:
+        if isinstance(message_or_job_ids, str):
+            super().__init__(message_or_job_ids)
+            self.status = 429
+            self.job_ids: List[str] = []
+            self.retry_after = retry_after
+        else:
+            wait = f" after ~{retry_after}s" if retry_after else ""
+            super().__init__(
+                "Walrus Memory rate-limited every status read for this batch, so none of its "
+                f"{len(message_or_job_ids)} writes could be confirmed. "
+                "Do not treat them as stored: check them "
+                f"with get_remember_bulk_status(job_ids){wait}. Status reads count against "
+                "the same delegate-key budget as writes."
+            )
+            self.status = 429
+            self.job_ids = list(message_or_job_ids)
+            self.retry_after = retry_after
 
 
 class MemWalRememberJobTimeout(MemWalError):
@@ -2630,6 +2758,96 @@ class MemWalSync:
     def compatibility(self) -> Dict[str, Any]:
         """Synchronous version of :meth:`MemWal.compatibility`."""
         return self._run(self._inner.compatibility())
+
+    def subscribe_events(
+        self,
+        *,
+        namespace: Optional[str] = None,
+        types: Optional[Sequence[str]] = None,
+    ) -> Iterator[MemoryEvent]:
+        """Synchronous version of :meth:`MemWal.subscribe_events`."""
+        if self._inner._destroyed:
+            raise _destroyed_client_error()
+
+        query_parts: List[Tuple[str, str]] = []
+        if namespace is not None:
+            if not isinstance(namespace, str) or not namespace.strip():
+                raise ValueError("namespace must be a non-empty string when provided")
+            query_parts.append(("namespace", namespace))
+        if types is not None:
+            if (
+                isinstance(types, str)
+                or not isinstance(types, (list, tuple, set))
+                or len(types) == 0
+            ):
+                raise ValueError("types must be a non-empty sequence of strings when provided")
+            for t in types:
+                if not isinstance(t, str) or not t.strip():
+                    raise ValueError("each event type in types must be a non-empty string")
+            query_parts.append(("types", ",".join(types)))
+
+        self._run(self._inner._ensure_compatible_relayer())
+        if self._inner._destroyed:
+            raise _destroyed_client_error()
+
+        qs = urlencode(query_parts) if query_parts else ""
+        path = f"/api/events{f'?{qs}' if qs else ''}"
+        url = f"{self._inner._server_url}{path}"
+
+        headers = self._inner._build_signed_headers("GET", path)
+        headers["Accept"] = "text/event-stream"
+
+        timeout = httpx.Timeout(connect=60.0, read=None, write=60.0, pool=None)
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
+                    err_text = response.read().decode("utf-8", errors="replace")
+                    if response.status_code == 426:
+                        detail = err_text[:300] or "upgrade required"
+                        raise MemWalCompatibilityError(
+                            "Walrus Memory relayer rejected this SDK as unsupported "
+                            f"(HTTP 426 Upgrade Required). Relayer response: {detail}"
+                        )
+                    if response.headers.get("x-auth-error") == "ERR_TIMESTAMP_OUT_OF_BOUNDS":
+                        raise MemWalClockDriftError(
+                            f"Timestamp out of bounds (clock drift). Server response: {err_text}"
+                        )
+                    if response.status_code == 429:
+                        raise MemWalRateLimited(f"Rate limited by server: {err_text}")
+                    raise MemWalError(f"HTTP {response.status_code}: {err_text}")
+
+                data_lines: List[str] = []
+                for line in response.iter_lines():
+                    line_stripped = line.strip()
+                    if not line_stripped:
+                        if data_lines:
+                            payload = "\n".join(data_lines)
+                            data_lines = []
+                            try:
+                                yield MemoryEvent.from_dict(json.loads(payload))
+                            except Exception as exc:
+                                logger.debug(
+                                    "Ignoring malformed SSE event payload: %s",
+                                    payload,
+                                    exc_info=exc,
+                                )
+                        continue
+                    if line_stripped.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].strip())
+
+                if data_lines:
+                    payload = "\n".join(data_lines)
+                    try:
+                        yield MemoryEvent.from_dict(json.loads(payload))
+                    except Exception as exc:
+                        logger.debug(
+                            "Ignoring malformed SSE event payload: %s",
+                            payload,
+                            exc_info=exc,
+                        )
+
 
     def remember_manual(self, opts: RememberManualOptions) -> RememberManualResult:
         """Synchronous version of :meth:`MemWal.remember_manual`."""

@@ -12,18 +12,24 @@
 //! here is private and exists only because `sui`'s dependency closure
 //! (`crate::...` references reachable from it) needs them to resolve.
 mod alerts;
+mod auth;
 mod client_ip;
 mod compatibility;
 mod engine;
+pub mod events;
 mod jobs;
+mod jobs_security_delete;
+mod mcp_proxy;
 mod oauth;
 mod observability;
 mod owner_rate_limits;
 mod owner_token_auth;
 mod rate_limit;
+pub mod routes;
 mod security_delete_auth;
 mod security_delete_error;
 mod services;
+mod sidecar_saturation;
 mod storage;
 pub mod sui;
 mod types;

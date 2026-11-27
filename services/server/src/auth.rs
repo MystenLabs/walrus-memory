@@ -101,6 +101,9 @@ pub(crate) fn upstream_unavailable() -> Response {
         .into_response()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AuthSessionExpiry(pub i64);
+
 /// WALM-429: an RPC failure must not evict the cache row *and* must not
 /// authenticate from it.
 #[derive(Debug)]
@@ -715,10 +718,14 @@ pub async fn verify_read_api_auth(
         }
     }
 
+    let token_exp = claims.expires_at;
     let mut request = request;
     request
         .extensions_mut()
         .insert(owner_token_to_auth_info(claims, account_id));
+    request
+        .extensions_mut()
+        .insert(AuthSessionExpiry(token_exp));
     Ok(next.run(request).await)
 }
 

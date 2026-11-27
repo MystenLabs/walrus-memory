@@ -502,3 +502,54 @@ class AnalyzeWaitResult:
     timed_out: int
     facts: List[AnalyzedFact]
     owner: str
+
+
+# ============================================================
+# Events
+# ============================================================
+
+
+@dataclass
+class MemoryEvent:
+    """A real-time memory lifecycle event received from the event stream."""
+
+    id: str
+    type: str
+    owner: str
+    namespace: str
+    timestamp: str
+    job_id: Optional[str] = None
+    blob_id: Optional[str] = None
+    count: Optional[int] = None
+    error: Optional[str] = None
+    skipped: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MemoryEvent":
+        """Instantiate MemoryEvent from server JSON payload."""
+        if data.get("type") == "system.lagged":
+            return cls(
+                id=data.get("id", ""),
+                type="system.lagged",
+                owner=data.get("owner", ""),
+                namespace=data.get("namespace", ""),
+                timestamp=data.get("timestamp", ""),
+                job_id=data.get("job_id"),
+                blob_id=data.get("blob_id"),
+                count=data.get("count"),
+                error=data.get("error"),
+                skipped=data.get("skipped"),
+            )
+        return cls(
+            id=data["id"],
+            type=data["type"],
+            owner=data["owner"],
+            namespace=data["namespace"],
+            timestamp=data["timestamp"],
+            job_id=data.get("job_id"),
+            blob_id=data.get("blob_id"),
+            count=data.get("count"),
+            error=data.get("error"),
+            skipped=data.get("skipped"),
+        )
+
