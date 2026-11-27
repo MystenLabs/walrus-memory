@@ -107,12 +107,16 @@ pub(crate) fn upstream_unavailable() -> Response {
 enum CacheReverifyAction {
     Authenticate { owner: String },
     UnavailableKeepCache { reason: String },
+    ConcurrencyLimitKeepCache { reason: String },
     Evict { reason: String },
 }
 
 fn cache_reverify_action(result: Result<String, OnchainVerifyError>) -> CacheReverifyAction {
     match result {
         Ok(owner) => CacheReverifyAction::Authenticate { owner },
+        Err(OnchainVerifyError::ConcurrencyLimitReached(reason)) => {
+            CacheReverifyAction::ConcurrencyLimitKeepCache { reason }
+        }
         Err(e) if e.is_unavailable() => CacheReverifyAction::UnavailableKeepCache {
             reason: e.to_string(),
         },
@@ -128,12 +132,16 @@ enum AccountResolveError {
     Unauthorized(String),
     /// On-chain lookup could not be completed. Maps to 503 — retryable.
     Unavailable(String),
+    /// Local RPC semaphore saturation on cold on-chain lookups. Maps to 503 — retryable.
+    ConcurrencyLimit(String),
 }
 
 impl std::fmt::Display for AccountResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unauthorized(msg) | Self::Unavailable(msg) => write!(f, "{msg}"),
+            Self::Unauthorized(msg) | Self::Unavailable(msg) | Self::ConcurrencyLimit(msg) => {
+                write!(f, "{msg}")
+            }
         }
     }
 }
@@ -398,6 +406,11 @@ pub async fn verify_signature(
     let (account_id, owner) =
         match resolve_account(&state, &public_key_hex, &pk_array, account_id_hint).await {
             Ok(pair) => pair,
+            Err(AccountResolveError::ConcurrencyLimit(e)) => {
+                tracing::warn!("Account resolution concurrency limit reached: {}", e);
+                crate::observability::record_app_error("auth_rpc_concurrency_limit");
+                return Ok(upstream_unavailable());
+            }
             Err(AccountResolveError::Unavailable(e)) => {
                 tracing::warn!("Account resolution unavailable: {}", e);
                 return Ok(upstream_unavailable());
@@ -523,6 +536,18 @@ async fn resolve_account(
                 tracing::debug!("account resolved from cache: {}", cached_account_id);
                 return Ok((cached_account_id, owner));
             }
+            CacheReverifyAction::ConcurrencyLimitKeepCache { reason } => {
+                tracing::warn!(
+                    "on-chain re-verify concurrency limit reached for key {} on account {} ({}); keeping cached mapping, not authenticating from it",
+                    public_key_hex,
+                    cached_account_id,
+                    reason
+                );
+                return Err(AccountResolveError::ConcurrencyLimit(format!(
+                    "on-chain re-verify concurrency limit reached for cached account {}: {}",
+                    cached_account_id, reason
+                )));
+            }
             CacheReverifyAction::UnavailableKeepCache { reason } => {
                 tracing::warn!(
                     "on-chain re-verify unavailable for key {} on account {} ({}); keeping cached mapping, not authenticating from it",
@@ -577,6 +602,12 @@ async fn resolve_account(
                     exact_account_id
                 );
                 return Ok((exact_account_id.to_string(), owner));
+            }
+            Err(OnchainVerifyError::ConcurrencyLimitReached(e)) => {
+                return Err(AccountResolveError::ConcurrencyLimit(format!(
+                    "exact account {} verification concurrency limit reached: {}",
+                    exact_account_id, e
+                )));
             }
             Err(e) if e.is_unavailable() => {
                 return Err(AccountResolveError::Unavailable(format!(
@@ -693,6 +724,16 @@ pub async fn verify_read_api_auth(
                 state.delegate_keys_cache.write().await.remove(&account_id);
                 return Err(StatusCode::UNAUTHORIZED);
             }
+        }
+        Err(OnchainVerifyError::ConcurrencyLimitReached(e)) => {
+            tracing::warn!(
+                account_id = %account_id,
+                owner = %claims.owner_address,
+                error = %e,
+                "owner token account active verification concurrency limit reached"
+            );
+            crate::observability::record_app_error("auth_rpc_concurrency_limit");
+            return Ok(upstream_unavailable());
         }
         Err(e) if e.is_unavailable() => {
             tracing::warn!(
@@ -1051,6 +1092,17 @@ mod tests {
         assert!(matches!(
             action,
             CacheReverifyAction::UnavailableKeepCache { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_account_cache_hit_concurrency_limit_keeps_row_without_authenticating() {
+        let action = cache_reverify_action(Err(OnchainVerifyError::ConcurrencyLimitReached(
+            "delegate verification RPC concurrency limit reached".into(),
+        )));
+        assert!(matches!(
+            action,
+            CacheReverifyAction::ConcurrencyLimitKeepCache { .. }
         ));
     }
 

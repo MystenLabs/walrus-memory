@@ -889,6 +889,108 @@ mod mcp_rate_limit_tests {
             assert!(json.get("tools").is_none());
         }
     }
+
+    #[tokio::test]
+    async fn signed_preauth_ipv4_mapped_ipv6_loopback_bypasses_ip_limiter() {
+        let state = test_state(denying_redis().await).await;
+        let app = Router::new()
+            .route("/restricted", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit::signed_preauth_rate_limit_middleware,
+            ))
+            .with_state(state);
+
+        // IPv4-mapped IPv6 loopback: [::ffff:127.0.0.1]:12345
+        let mapped_loopback: std::net::SocketAddr =
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1], 12345));
+
+        for _ in 0..5 {
+            let mut req = Request::builder()
+                .uri("/restricted")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(mapped_loopback));
+
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "IPv4-mapped IPv6 loopback must bypass signed preauth limiter"
+            );
+        }
+
+        // An external IP on the same denying redis must be rejected with 429
+        let external_peer: std::net::SocketAddr = "203.0.113.19:12345".parse().unwrap();
+        let mut ext_req = Request::builder()
+            .uri("/restricted")
+            .body(Body::empty())
+            .unwrap();
+        ext_req
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(external_peer));
+
+        let ext_response = app.oneshot(ext_req).await.unwrap();
+        assert_eq!(ext_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn signed_preauth_valid_console_bearer_bypasses_ip_limiter() {
+        let state = test_state(denying_redis().await).await;
+        let app = Router::new()
+            .route("/restricted", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit::signed_preauth_rate_limit_middleware,
+            ))
+            .with_state(state.clone());
+
+        // External IP that would normally be denied
+        let external_peer: std::net::SocketAddr = "203.0.113.20:12345".parse().unwrap();
+
+        // Mint a valid owner token with memories.read permission
+        let token = owner_token_auth::mint_token(
+            state.config.owner_token_secret.as_bytes(),
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            300,
+            chrono::Utc::now().timestamp(),
+        );
+
+        // Request with valid Bearer token bypasses signed preauth limiter
+        let mut req = Request::builder()
+            .uri("/restricted")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(external_peer));
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "valid console bearer token must bypass signed preauth limiter"
+        );
+
+        // Invalid bearer token from same external IP is NOT exempted and gets 429
+        let mut bad_req = Request::builder()
+            .uri("/restricted")
+            .header(header::AUTHORIZATION, "Bearer invalid-garbage-token")
+            .body(Body::empty())
+            .unwrap();
+        bad_req
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(external_peer));
+
+        let bad_response = app.oneshot(bad_req).await.unwrap();
+        assert_eq!(
+            bad_response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "invalid bearer token must not bypass signed preauth limiter"
+        );
+    }
+
     #[tokio::test]
     async fn owner_policy_admin_requires_operator_key_on_every_method() {
         let state = test_state(denying_redis().await).await;
@@ -3395,7 +3497,9 @@ async fn main() {
         // /api/accounts/{owner}/exists route. See routes::whoami.
         .route("/api/whoami", get(routes::whoami))
         // Router::layer runs middleware bottom-to-top (last added runs first).
-        // Keep auth outer so AuthInfo is in request extensions before rate limiting reads it.
+        // Keep auth outer so AuthInfo is in request extensions before rate limiting reads it,
+        // and place `signed_preauth_rate_limit_middleware` outermost so source-IP
+        // floods are rejected before body buffering and Sui RPC lookup.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit::rate_limit_middleware,
@@ -3404,9 +3508,13 @@ async fn main() {
             state.clone(),
             auth::verify_signature,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::signed_preauth_rate_limit_middleware,
+        ))
         .layer(DefaultBodyLimit::max(auth::PROTECTED_BODY_LIMIT_BYTES));
 
-    // Owner-scoped read API — split out of `protected_routes` so
+    // Owner-scoped read API: split out of `protected_routes` so
     // these 3 GET endpoints stop spending the write path's 30/min
     // per-delegate-key budget (that budget exists to bound Walrus
     // upload/LLM/gas spend-risk; plain reads carry none of that risk and a
@@ -3415,11 +3523,13 @@ async fn main() {
     // accepts either the existing Ed25519 signed-request scheme
     // (SDK/dashboard delegate-key callers, unmodified) or an owner-scoped
     // bearer token (Console, which structurally can never
-    // produce an Ed25519 signature — see `owner_token_auth`'s module doc).
+    // produce an Ed25519 signature: see `owner_token_auth` module doc).
     // Both paths populate the same `AuthInfo` extension, so the handlers
     // themselves don't need to know which scheme authenticated the request.
-    // `read_api_rate_limit_middleware` (not the shared `rate_limit_middleware`)
-    // so this budget can never contend with writes.
+    // Outermost `signed_preauth_rate_limit_middleware` bounds pre-auth IP
+    // admission for signed requests before Sui RPC lookups, while verified
+    // Bearer token callers (Console) bypass pre-auth IP admission because
+    // their HMAC verification is stateless and local.
     let read_api_routes = Router::new()
         .route(
             "/v1/owners/{owner}/namespaces",
@@ -3437,6 +3547,10 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::verify_read_api_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::signed_preauth_rate_limit_middleware,
         ))
         .layer(DefaultBodyLimit::max(auth::PROTECTED_BODY_LIMIT_BYTES));
 

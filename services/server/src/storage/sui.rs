@@ -483,6 +483,15 @@ impl<'a> std::borrow::Borrow<dyn DelegateAccountKey + 'a> for (String, Vec<u8>) 
     }
 }
 
+/// Maximum concurrent cold on-chain `verify_delegate_key_onchain` RPC calls.
+///
+/// Warm cache hits (`DELEGATE_VERIFY_CACHE_TTL`) and negative reject-cache hits
+/// (`DELEGATE_REJECT_CACHE_TTL`) resolve before touching this semaphore, so
+/// legitimate repeat callers retain full throughput even if distinct unregistered
+/// `(account, key)` probes saturate all cold RPC verification slots.
+pub const MAX_INFLIGHT_DELEGATE_RPC_VERIFICATIONS: usize = 32;
+pub const DELEGATE_VERIFY_SEMAPHORE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct DelegateVerifyCacheState {
     pub entries:
         tokio::sync::RwLock<std::collections::HashMap<(String, Vec<u8>), TimedVerifiedOwner>>,
@@ -495,14 +504,33 @@ pub struct DelegateVerifyCacheState {
     /// already gone. An insert refuses when the generation moved under it, so
     /// the revoke wins and the next caller reads the chain again.
     pub evictions: std::sync::atomic::AtomicU64,
+    /// Bounds concurrent cold on-chain delegate verification RPC calls.
+    pub rpc_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    pub semaphore_wait: std::time::Duration,
 }
 
 pub type DelegateVerifyCache = std::sync::Arc<DelegateVerifyCacheState>;
 
 pub fn new_delegate_verify_cache() -> DelegateVerifyCache {
+    new_delegate_verify_cache_with_concurrency(MAX_INFLIGHT_DELEGATE_RPC_VERIFICATIONS)
+}
+
+pub fn new_delegate_verify_cache_with_concurrency(max_inflight: usize) -> DelegateVerifyCache {
+    new_delegate_verify_cache_with_concurrency_and_wait(
+        max_inflight,
+        DELEGATE_VERIFY_SEMAPHORE_WAIT,
+    )
+}
+
+pub fn new_delegate_verify_cache_with_concurrency_and_wait(
+    max_inflight: usize,
+    semaphore_wait: std::time::Duration,
+) -> DelegateVerifyCache {
     std::sync::Arc::new(DelegateVerifyCacheState {
         entries: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         evictions: std::sync::atomic::AtomicU64::new(0),
+        rpc_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
+        semaphore_wait,
     })
 }
 
@@ -678,17 +706,31 @@ async fn verify_delegate_key_cached_inner(
         )));
     }
 
-    match verify_delegate_key_onchain(
-        http_client,
-        rpc_url,
-        grpc_client,
-        account_object_id,
-        public_key_bytes,
-        expected_type_origin_package_id,
-        get_object_attempts,
-    )
-    .await
-    {
+    let permit = match tokio::time::timeout(cache.semaphore_wait, cache.rpc_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return Err(OnchainVerifyError::ConcurrencyLimitReached(
+                "delegate verification RPC concurrency limit reached".to_string(),
+            ));
+        }
+    };
+
+    let onchain_result = {
+        let res = verify_delegate_key_onchain(
+            http_client,
+            rpc_url,
+            grpc_client,
+            account_object_id,
+            public_key_bytes,
+            expected_type_origin_package_id,
+            get_object_attempts,
+        )
+        .await;
+        drop(permit);
+        res
+    };
+
+    match onchain_result {
         Ok(owner) => {
             let key = (account_object_id.to_string(), public_key_bytes.to_vec());
             // The unconditional `reject_cache.remove` that used to stand here
@@ -774,6 +816,10 @@ async fn verify_delegate_key_cached_inner(
             }
             // Refresh must not mint from a positive past the 30s TTL.
             if for_refresh {
+                return Err(err);
+            }
+            // Local RPC semaphore saturation must NOT serve stale grace.
+            if matches!(err, OnchainVerifyError::ConcurrencyLimitReached(_)) {
                 return Err(err);
             }
             // Unavailable: the chain proved nothing about this key, so a
@@ -917,16 +963,30 @@ async fn verify_account_active_cached_inner(
         )));
     }
 
-    match verify_account_active_onchain(
-        http_client,
-        rpc_url,
-        grpc_client,
-        account_object_id,
-        expected_type_origin_package_id,
-        get_object_attempts,
-    )
-    .await
-    {
+    let permit = match tokio::time::timeout(cache.semaphore_wait, cache.rpc_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return Err(OnchainVerifyError::ConcurrencyLimitReached(
+                "account active verification RPC concurrency limit reached".to_string(),
+            ));
+        }
+    };
+
+    let onchain_result = {
+        let res = verify_account_active_onchain(
+            http_client,
+            rpc_url,
+            grpc_client,
+            account_object_id,
+            expected_type_origin_package_id,
+            get_object_attempts,
+        )
+        .await;
+        drop(permit);
+        res
+    };
+
+    match onchain_result {
         Ok(owner) => {
             let key = (
                 account_object_id.to_string(),
@@ -974,6 +1034,10 @@ async fn verify_account_active_cached_inner(
                 return Err(err);
             }
             if for_issuance {
+                return Err(err);
+            }
+            // Local RPC semaphore saturation must NOT serve stale grace.
+            if matches!(err, OnchainVerifyError::ConcurrencyLimitReached(_)) {
                 return Err(err);
             }
             let stale = cache
@@ -1032,10 +1096,10 @@ pub fn may_store_verification(generation_before: u64, generation_now: u64) -> bo
 }
 
 pub fn verify_cache_miss_action(err: &OnchainVerifyError) -> VerifyCacheMissAction {
-    if err.is_unavailable() {
-        VerifyCacheMissAction::Keep
-    } else {
-        VerifyCacheMissAction::Evict
+    match err {
+        OnchainVerifyError::ConcurrencyLimitReached(_) => VerifyCacheMissAction::Keep,
+        err if err.is_unavailable() => VerifyCacheMissAction::Keep,
+        _ => VerifyCacheMissAction::Evict,
     }
 }
 
@@ -2070,6 +2134,10 @@ pub enum OnchainVerifyError {
     /// Still "unavailable", not a definitive miss, so a caller must not
     /// treat it as a revoke.
     ScanCapExceeded(String),
+    /// Local RPC semaphore saturation on cold on-chain lookups.
+    /// Distinct from upstream Sui RPC outage: does NOT serve stale revocation
+    /// grace entries and does NOT evict or record negative cache entries.
+    ConcurrencyLimitReached(String),
 }
 
 impl std::fmt::Display for OnchainVerifyError {
@@ -2086,6 +2154,9 @@ impl std::fmt::Display for OnchainVerifyError {
             }
             OnchainVerifyError::ScanCapExceeded(msg) => {
                 write!(f, "Registry scan cap exceeded: {}", msg)
+            }
+            OnchainVerifyError::ConcurrencyLimitReached(msg) => {
+                write!(f, "Delegate verification RPC concurrency limit reached: {}", msg)
             }
         }
     }
@@ -2105,7 +2176,8 @@ impl OnchainVerifyError {
     pub fn is_unavailable(&self) -> bool {
         match self {
             Self::RpcError(_) | Self::ScanCapExceeded(_) => true,
-            Self::NotFound(_)
+            Self::ConcurrencyLimitReached(_)
+            | Self::NotFound(_)
             | Self::KeyNotFound(_)
             | Self::AccountDeactivated(_)
             | Self::WrongObjectType(_) => false,
@@ -2132,7 +2204,10 @@ impl OnchainVerifyError {
                     || msg == "sui_getObject notExists"
                     || msg == "sui_getObject deleted"
             }
-            Self::RpcError(_) | Self::ScanCapExceeded(_) | Self::WrongObjectType(_) => false,
+            Self::RpcError(_)
+            | Self::ScanCapExceeded(_)
+            | Self::WrongObjectType(_)
+            | Self::ConcurrencyLimitReached(_) => false,
         }
     }
 }
@@ -3546,6 +3621,146 @@ mod tests {
         assert!(
             cache.entries.read().await.is_empty(),
             "a failed verification must leave no entry behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_delegate_key_cached_bounds_inflight_rpc_and_rejects_expired_keys_on_timeout() {
+        let cache = new_delegate_verify_cache_with_concurrency_and_wait(
+            2,
+            std::time::Duration::from_millis(20),
+        );
+        let reject_cache = new_delegate_reject_cache();
+        let client = reqwest::Client::new();
+
+        // Seed a fresh positive entry and an expired positive entry (past 30s TTL).
+        let fresh_account = "0xaccount-fresh";
+        let fresh_pk = sample_pk();
+        let fresh_owner =
+            seed_verify_cache(&cache, fresh_account, &fresh_pk, std::time::Duration::ZERO).await;
+
+        let expired_account = "0xaccount-expired";
+        let expired_pk = vec![9u8; 32];
+        let _expired_owner = seed_verify_cache(
+            &cache,
+            expired_account,
+            &expired_pk,
+            DELEGATE_VERIFY_CACHE_TTL + std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        // Saturate both in-flight RPC slots with two held permits.
+        let permit_a = cache.rpc_semaphore.try_acquire().unwrap();
+        let permit_b = cache.rpc_semaphore.try_acquire().unwrap();
+
+        // 1. Cold probe wait times out and returns ConcurrencyLimitReached (not RpcError).
+        let cold_err = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            "0xunregistered-probe",
+            &[42u8; 32],
+            "0xpkg",
+        )
+        .await
+        .expect_err("saturated cold RPC slots must timeout and reject unregistered probe");
+        assert!(
+            matches!(
+                &cold_err,
+                OnchainVerifyError::ConcurrencyLimitReached(msg)
+                    if msg.contains("delegate verification RPC concurrency limit reached")
+            ),
+            "unexpected error: {cold_err:?}"
+        );
+        assert!(!cold_err.is_unavailable(), "concurrency limit must not report as unavailable");
+
+        // 2. Fresh cached caller resolves immediately from memory without needing an RPC permit.
+        let resolved_fresh = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            fresh_account,
+            &fresh_pk,
+            "0xpkg",
+        )
+        .await
+        .expect("fresh cached caller must succeed while RPC semaphore is saturated");
+        assert_eq!(resolved_fresh, fresh_owner);
+
+        // 3. Expired cached key must NOT be served via stale grace when the semaphore wait times out!
+        // It must return ConcurrencyLimitReached so attackers saturating the semaphore cannot keep
+        // a revoked key authenticating during the 600s stale grace window.
+        let expired_err = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            expired_account,
+            &expired_pk,
+            "0xpkg",
+        )
+        .await
+        .expect_err("expired key must NOT serve stale grace on concurrency limit timeout");
+        assert!(
+            matches!(
+                &expired_err,
+                OnchainVerifyError::ConcurrencyLimitReached(_)
+            ),
+            "expected ConcurrencyLimitReached, got {expired_err:?}"
+        );
+
+        // Also verify the expired entry is NOT evicted by ConcurrencyLimitReached.
+        assert!(
+            cache.entries.read().await.contains_key(&(expired_account, &expired_pk[..]) as &dyn DelegateAccountKey),
+            "concurrency limit error must NOT evict cache entry"
+        );
+
+        drop(permit_a);
+        drop(permit_b);
+    }
+
+    #[tokio::test]
+    async fn verify_delegate_key_cached_short_wait_succeeds_when_permit_released() {
+        let cache = new_delegate_verify_cache_with_concurrency_and_wait(
+            1,
+            std::time::Duration::from_millis(200),
+        );
+        let reject_cache = new_delegate_reject_cache();
+        let client = reqwest::Client::new();
+
+        // Hold the single permit
+        let permit = cache.rpc_semaphore.clone().try_acquire_owned().unwrap();
+
+        // Release the permit after 20ms in the background
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(permit);
+        });
+
+        // The caller waits up to 200ms, acquires the released permit, and attempts on-chain verify.
+        // It should reach verify_delegate_key_onchain and fail with RpcError (unreachable RPC),
+        // NOT ConcurrencyLimitReached!
+        let err = verify_delegate_key_cached(
+            &cache,
+            &reject_cache,
+            &client,
+            unreachable_rpc_url(),
+            None,
+            "0xaccount-wait",
+            &sample_pk(),
+            "0xpkg",
+        )
+        .await
+        .expect_err("should acquire permit and fail with RpcError on unreachable url");
+
+        assert!(
+            matches!(&err, OnchainVerifyError::RpcError(_)),
+            "must acquire released permit and attempt RPC, got: {err:?}"
         );
     }
 

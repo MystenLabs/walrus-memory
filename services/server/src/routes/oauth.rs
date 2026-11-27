@@ -1364,6 +1364,9 @@ pub async fn token(
             )
             .await;
             if let Err(err) = &verified {
+                if matches!(err, OnchainVerifyError::ConcurrencyLimitReached(_)) {
+                    crate::observability::record_app_error("auth_rpc_concurrency_limit");
+                }
                 tracing::warn!(
                     account_id = %preview.account_id,
                     error = %err,
