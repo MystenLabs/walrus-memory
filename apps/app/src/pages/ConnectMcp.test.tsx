@@ -36,7 +36,7 @@ vi.mock('../utils/analytics', () => ({
     getAnalyticsErrorType: () => 'unknown',
 }))
 
-import ConnectMcp from './ConnectMcp'
+import ConnectMcp, { mcpCliLoginCommand } from './ConnectMcp'
 
 const PORT = '38291'
 const PUBLIC_KEY = 'a'.repeat(64)
@@ -219,7 +219,7 @@ describe('MCP sign-in hand-off', () => {
         expect(screen.queryByText(/Sign in again and open the new link straight away/i)).not.toBeInTheDocument()
     })
 
-    it('explains an expired link when preflight cannot reach the listener', async () => {
+    it('explains an expired link, remote host, and credential transfer when preflight cannot reach the listener', async () => {
         vi.stubGlobal(
             'fetch',
             vi.fn(async (input: RequestInfo | URL) => {
@@ -236,8 +236,70 @@ describe('MCP sign-in hand-off', () => {
         )
 
         expect(await screen.findByText(/opened too late/i)).toBeInTheDocument()
+        expect(screen.getByText(/remote host or bot/i)).toBeInTheDocument()
+        expect(screen.getByText(/blocks localhost requests/i)).toBeInTheDocument()
+        expect(screen.getByText(/~\/\.memwal\/credentials\.json/i)).toBeInTheDocument()
+        expect(
+            screen.getByRole('link', { name: /remote setup and troubleshooting/i }),
+        ).toHaveAttribute(
+            'href',
+            'https://docs.test/troubleshooting/overview#sign-in-page-says-nothing-answered-on-your-computer',
+        )
         expect(screen.getByText(/Something went wrong/i)).toBeInTheDocument()
         expect(screen.queryByText(/Almost there/i)).not.toBeInTheDocument()
+    })
+
+    it('retains the selected environment in the remote CLI login command when preflight fails', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                const url = String(input)
+                if (url.endsWith('/preflight')) throw new TypeError('Failed to fetch')
+                throw new Error(`unexpected fetch: ${url}`)
+            }),
+        )
+        const query = `?port=${PORT}&publicKey=${PUBLIC_KEY}&relayer=${encodeURIComponent('https://relayer.dev.memwal.ai')}&connectState=${STATE}`
+        render(
+            <MemoryRouter initialEntries={[`/connect/mcp${query}`]}>
+                <ConnectMcp />
+            </MemoryRouter>,
+        )
+
+        expect(await screen.findByText(/npx -y @mysten-incubation\/memwal-mcp login --dev/i)).toBeInTheDocument()
+    })
+
+    it('quotes custom relayer and web overrides and rejects shell metacharacters in the remote CLI command', async () => {
+        expect(mcpCliLoginCommand('https://staging.relayer.example')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://staging.relayer.example'",
+        )
+        expect(mcpCliLoginCommand('https://relayer.dev.memwal.ai', 'https://custom.dashboard.example')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://relayer.dev.memwal.ai' --web-url 'https://custom.dashboard.example'",
+        )
+        expect(mcpCliLoginCommand('http://[::1]:8000', 'http://[::1]:5173')).toBe(
+            "npx -y @mysten-incubation/memwal-mcp login --relayer 'http://[::1]:8000' --web-url 'http://[::1]:5173'",
+        )
+        expect(mcpCliLoginCommand('https://relayer.example; echo SYNTHETIC_COMMAND')).toBe(
+            'npx -y @mysten-incubation/memwal-mcp login',
+        )
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                const url = String(input)
+                if (url.endsWith('/preflight')) throw new TypeError('Failed to fetch')
+                throw new Error(`unexpected fetch: ${url}`)
+            }),
+        )
+        const injectedRelayer = 'https://relayer.example; echo SYNTHETIC_COMMAND'
+        const query = `?port=${PORT}&publicKey=${PUBLIC_KEY}&relayer=${encodeURIComponent(injectedRelayer)}&connectState=${STATE}`
+        render(
+            <MemoryRouter initialEntries={[`/connect/mcp${query}`]}>
+                <ConnectMcp />
+            </MemoryRouter>,
+        )
+
+        expect(await screen.findByText(/npx -y @mysten-incubation\/memwal-mcp login/i)).toBeInTheDocument()
+        expect(screen.queryByText(/SYNTHETIC_COMMAND/)).not.toBeInTheDocument()
     })
 
     it('tells a refused hand-off apart from an absent one', async () => {

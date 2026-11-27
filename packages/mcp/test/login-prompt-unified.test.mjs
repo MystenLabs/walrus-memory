@@ -14,7 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const { loginPrompt } = await import("../dist/messages.js");
+const { loginPrompt, remoteLoginCommand } = await import("../dist/messages.js");
 
 const URL_ = "https://memory.example/connect/mcp?port=1&publicKey=ab&connectState=cd";
 const CREDS = "/tmp/sandbox/.memwal/credentials.json";
@@ -90,4 +90,98 @@ test("the two prompts differ ONLY in that warning", () => {
             .join("\n")
             .replace(/\n{3,}/g, "\n\n");
     assert.equal(strip(signedOut), strip(signedIn));
+});
+
+test("both modes state the same-machine browser requirement and remote host credential transfer", () => {
+    for (const [name, text] of [["signed out", signedOut], ["signed in", signedIn]]) {
+        assert.match(text, /same machine running this MCP server/i, `${name}: same-machine browser requirement`);
+        assert.match(text, /remote host or bot/i, `${name}: remote host guidance`);
+        assert.ok(text.includes(CREDS), `${name}: remote credential target path`);
+    }
+});
+
+test("remote fallback retains environment presets and explicit relayer flags", () => {
+    // Default prod URL
+    assert.equal(
+        remoteLoginCommand({ url: "https://memory.walrus.xyz/connect/mcp?port=1" }),
+        "npx -y @mysten-incubation/memwal-mcp login",
+    );
+    // Dev preset from relayer query param
+    assert.equal(
+        remoteLoginCommand({
+            url: "https://dev.memwal.ai/connect/mcp?port=1&relayer=https%3A%2F%2Frelayer.dev.memwal.ai",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --dev",
+    );
+    // Dev preset from environment field
+    assert.equal(
+        remoteLoginCommand({ url: URL_, environment: "dev" }),
+        "npx -y @mysten-incubation/memwal-mcp login --dev",
+    );
+    // Local preset from relayer query param
+    assert.equal(
+        remoteLoginCommand({
+            url: "http://localhost:5173/connect/mcp?port=1&relayer=http%3A%2F%2F127.0.0.1%3A8000",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --local",
+    );
+    // Staging preset via explicit environment field only
+    assert.equal(
+        remoteLoginCommand({ url: URL_, environment: "staging" }),
+        "npx -y @mysten-incubation/memwal-mcp login --staging",
+    );
+    // Custom relayer containing "staging" must not redirect to --staging preset
+    assert.equal(
+        remoteLoginCommand({
+            url: "https://memory.walrus.xyz/connect/mcp?port=1&relayer=https%3A%2F%2Fstaging.relayer.example",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://staging.relayer.example'",
+    );
+    // Custom relayer and custom web URL
+    assert.equal(
+        remoteLoginCommand({
+            url: "https://memory.example/connect/mcp?port=1&relayer=https%3A%2F%2Fcustom.relayer",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://custom.relayer' --web-url 'https://memory.example'",
+    );
+    // Explicit relayerUrl + webUrl (used by auth-required url_not_ready fallback)
+    assert.equal(
+        remoteLoginCommand({
+            url: "https://custom.dashboard.example",
+            relayerUrl: "https://staging.relayer.example",
+            webUrl: "https://custom.dashboard.example",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://staging.relayer.example' --web-url 'https://custom.dashboard.example'",
+    );
+    // Dev relayer paired with custom web URL emits explicit flags instead of --dev
+    assert.equal(
+        remoteLoginCommand({
+            relayerUrl: "https://relayer.dev.memwal.ai",
+            webUrl: "https://custom.dashboard.example",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'https://relayer.dev.memwal.ai' --web-url 'https://custom.dashboard.example'",
+    );
+    // Valid bracketed IPv6 relayer and web URLs are preserved and shell-quoted
+    assert.equal(
+        remoteLoginCommand({
+            relayerUrl: "http://[::1]:8000",
+            webUrl: "http://[::1]:5173",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login --relayer 'http://[::1]:8000' --web-url 'http://[::1]:5173'",
+    );
+    // Unverified relayer with shell metacharacters is rejected
+    assert.equal(
+        remoteLoginCommand({
+            url: "https://memory.walrus.xyz/connect/mcp?port=1&relayer=https%3A%2F%2Frelayer.example%3B%20echo%20SYNTHETIC_COMMAND",
+        }),
+        "npx -y @mysten-incubation/memwal-mcp login",
+    );
+
+    // Prompt includes the --dev flag when dev URL is provided
+    const devPrompt = loginPrompt({
+        url: "https://dev.memwal.ai/connect/mcp?port=1&publicKey=ab&relayer=https%3A%2F%2Frelayer.dev.memwal.ai&connectState=cd",
+        credentialsPath: CREDS,
+        signedIn: false,
+    });
+    assert.match(devPrompt, /login --dev/, "prompt fallback preserves --dev flag");
 });
