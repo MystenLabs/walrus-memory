@@ -32,11 +32,12 @@ pnpm add @mysten/sui @mysten/seal @mysten/walrus ai zod
 import { MemWal } from "@mysten-incubation/memwal";
 
 const memwal = MemWal.create({
-  key: "your-delegate-key-hex",
-  accountId: "your-walrus-memory-account-id",
-  serverUrl: "https://your-relayer-url.com",
+  key: process.env.MEMWAL_KEY ?? "<your-ed25519-private-key>",
+  accountId: process.env.MEMWAL_ACCOUNT_ID ?? "<your-memwal-account-id>",
+  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.memory.walrus.xyz", // or "https://relayer.dev.memwal.ai" for testnet/dev
   namespace: "demo",
 });
+// Get credentials at https://memory.walrus.xyz (mainnet) or https://dev.memwal.ai (testnet/dev)
 
 const job = await memwal.remember("User prefers dark mode and uses TypeScript.");
 await memwal.waitForRememberJob(job.job_id);

@@ -79,6 +79,10 @@ yarn add @mysten/walrus
 **Version compatibility:** `@mysten/seal` and `@mysten/walrus` must both accept the same `@mysten/sui` major. Known-good versions: `@mysten/sui@^2.16.2`, `@mysten/seal@^1.1.3`, `@mysten/walrus@^1.1.7`. Avoid `@mysten/walrus@0.x` — it bundles `@mysten/sui@1.x` and conflicts with `@mysten/seal@1.x`. If installation fails with `ERESOLVE` on `@mysten/sui`, upgrade `@mysten/walrus` and run `npm why @mysten/sui` to find which dependency still pins sui v1.
 </Note>
 
+<Warning>
+**Do not pass pre-encrypted ciphertext to `remember()`**: In the default `MemWal` client, the relayer generates embeddings from the `text` you pass before encrypting it with Seal. Passing client-encrypted ciphertext to `remember(text)` causes the relayer to embed ciphertext bytes, which silently breaks semantic `recall()`. Always pass plaintext to `remember()`, or use [`MemWalManual`](/sdk/usage/memwal-manual) (`rememberManual` / `recallManual`) when you need client-side encryption and client-computed embeddings.
+</Warning>
+
 For `withMemWal`, you also need:
 
 <CodeGroup>
@@ -131,7 +135,7 @@ const memwal = MemWal.create({
   // Load your own credentials from the environment; never hardcode a shared example ID.
   key: process.env.MEMWAL_KEY ?? "<your-ed25519-private-key>",
   accountId: process.env.MEMWAL_ACCOUNT_ID ?? "<your-memwal-account-id>",
-  serverUrl: "https://your-relayer-url.com",
+  serverUrl: process.env.MEMWAL_SERVER_URL ?? "https://relayer.memory.walrus.xyz", // or "https://relayer.dev.memwal.ai" for testnet/dev
   namespace: "demo",
 });
 
@@ -146,4 +150,5 @@ console.log(result.results);
 ## Next Steps
 
 - [Usage](/sdk/usage) — all three clients in detail, namespace rules, and restore
+- [Ownership & Delegates](/fundamentals/concepts/ownership-and-access#delegate-key-vs-on-chain-sender) — how `accountId`, delegate keys, and onchain transaction senders relate
 - [API Reference](/sdk/api-reference) — full method signatures and config fields
