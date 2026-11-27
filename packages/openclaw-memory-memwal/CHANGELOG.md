@@ -6,6 +6,8 @@
 
 - Keep sub-agent memory separate from the main agent when the derived namespace or legacy alias would collide with `defaultNamespace`. Colliding derived namespaces use a deterministic hashed namespace, and `memory_search` and `memory_store` reject explicit requests for the main namespace from sub-agent sessions.
 - When a sub-agent's derived namespace previously equaled `defaultNamespace`, it now uses the hashed namespace. Memories already stored under `defaultNamespace` remain there and are no longer automatically recalled by that sub-agent.
+- Skip automatic capture for conversational opt-out directives (`do not remember`, `don't save`, `off the record`, `forget this`, `[no-save]`, `#nosave`) and suppress trailing assistant replies on opted-out user turns so echoed topics never reach `analyze()`.
+- Exclude turns containing inline credentials, vendor API keys, PEM private keys, labelled 64-hex keys, seed phrases, and `key=value` or `key: value` secret assignments from automatic capture while keeping ordinary developer prose (`We never log request bodies in production`, `Our api_key is configured via Railway`) capturable.
 
 ### Changed
 

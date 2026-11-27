@@ -8,10 +8,11 @@
 
 import type { MemWal } from "@mysten-incubation/memwal";
 import { resolveAgent } from "../config.js";
-import { shouldCapture } from "../capture.js";
+import { hasCaptureOptOut, looksLikeSecret, shouldCapture } from "../capture.js";
 import {
   extractMessages,
   parseMessageTimestamp,
+  stripMemoryTags,
   withRetry,
   withTimeout,
   type ExtractedMessage,
@@ -48,6 +49,45 @@ function rememberBoundedKey<T>(setOrMap: Set<string> | Map<string, T>, key: stri
     }
     setOrMap.set(key, value as T);
   }
+}
+
+function rawMessageText(msg: any): string {
+  let text = "";
+  if (typeof msg?.content === "string") {
+    text = msg.content;
+  } else if (Array.isArray(msg?.content)) {
+    for (const block of msg.content) {
+      if (block?.type === "text" && typeof block.text === "string") {
+        text += block.text + "\n";
+      }
+    }
+  }
+  return stripMemoryTags(text).trim();
+}
+
+/**
+ * Drop opted-out user turns and their trailing non-user replies before
+ * individual message filtering so assistant acknowledgements echoing an
+ * opted-out topic are never forwarded to `analyze()`.
+ */
+function extractNonOptedOutMessages(messages: any[], maxCount: number): ExtractedMessage[] {
+  const windowStart = Math.max(0, messages.length - maxCount);
+  let optOutActive = false;
+  const allowed: any[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role === "user") {
+      const text = rawMessageText(msg);
+      optOutActive = hasCaptureOptOut(text) || looksLikeSecret(text);
+    }
+    if (i >= windowStart && !optOutActive) {
+      allowed.push(msg);
+    }
+  }
+
+  return extractMessages(allowed, maxCount);
 }
 
 /** Register the agent_end hook for auto-capture. */
@@ -115,7 +155,7 @@ export function registerCaptureHook(api: any, client: MemWal, config: PluginConf
       // Extract both user and assistant messages — the server LLM on analyze()
       // decides what's worth keeping. Assistant messages can contain user
       // commitments, decisions, and summaries that are valuable as memories.
-      const extracted = extractMessages(
+      const extracted = extractNonOptedOutMessages(
         event.messages,
         config.captureMaxMessages,
       );
