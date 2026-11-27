@@ -3,13 +3,14 @@
  * Production-safe negative synthetic for COMG-715.
  *
  * Asserts that an identity from MemWal account A cannot authorize account B's
- * SEAL key (and the reverse). Read-only: `sui_devInspectTransactionBlock` of
+ * SEAL key (and the reverse). Read-only: a gRPC `simulateTransaction` (with
+ * checks disabled, the gRPC equivalent of the retired JSON-RPC devInspect) of
  * `account::seal_approve` only. Does not remember, decrypt, fetch SEAL keys,
  * or execute a transaction.
  *
  * Exit 0  — required secrets unset (skip) or deny as expected.
  * Exit 1  — SYNTHETIC_SEAL_CROSS_ACCOUNT_FAIL (page: A authorized B).
- * Exit 2  — misconfiguration or RPC failure (check is not valid).
+ * Exit 2  — misconfiguration or Sui gRPC failure (check is not valid).
  *
  *   node scripts/synthetic-seal-cross-account.mjs
  *   node scripts/synthetic-seal-cross-account.mjs --help
@@ -53,13 +54,16 @@ Skip (exit 0) when the two account ids and two delegate keys are unset.
 Required to run:
   SEAL_CROSS_ACCOUNT_A_ID / SEAL_CROSS_ACCOUNT_B_ID
   SEAL_CROSS_ACCOUNT_A_KEY / SEAL_CROSS_ACCOUNT_B_KEY
-  SUI_RPC_URL and MEMWAL_PACKAGE_ID
+  SUI_GRPC_URL and MEMWAL_PACKAGE_ID
     (or MEMWAL_SERVER_URL / MEMWAL_RELAYER_URL — GET /config fills both)
+    SUI_RPC_URL is still read as a fallback for SUI_GRPC_URL, but it must be a
+    fullnode that serves gRPC (for example https://fullnode.mainnet.sui.io:443).
+    JSON-RPC-only endpoints no longer work.
 
 Also used when set:
   MEMWAL_REGISTRY_ID          AccountRegistry object id
   MEMWAL_SEAL_POLICY_PACKAGE_ID   seal_approve package (defaults to MEMWAL_PACKAGE_ID)
-  SUI_NETWORK                 mainnet|testnet (inferred from the RPC URL when omitted)
+  SUI_NETWORK                 mainnet|testnet (inferred from the gRPC URL when omitted)
 
 Expected: ENoAccess / deny. If A can authorize B: exit 1 ${FAIL_TOKEN}.
 `);
@@ -116,26 +120,6 @@ function missingSecrets(presence) {
     return presence.filter((p) => !p.value).map((p) => p.label);
 }
 
-async function rpc(url, method, params, timeoutMs = 30_000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const res = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-            signal: controller.signal,
-        });
-        const json = await res.json();
-        if (json.error) {
-            throw new Error(`${method}: ${json.error.message || JSON.stringify(json.error)}`);
-        }
-        return json.result;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 async function getRelayerConfig(serverUrl) {
     const url = `${serverUrl.replace(/\/$/, "")}/config`;
     const controller = new AbortController();
@@ -149,9 +133,9 @@ async function getRelayerConfig(serverUrl) {
     }
 }
 
-function inferNetwork(rpcUrl, explicit) {
+function inferNetwork(url, explicit) {
     if (explicit === "mainnet" || explicit === "testnet") return explicit;
-    const u = (rpcUrl || "").toLowerCase();
+    const u = (url || "").toLowerCase();
     if (u.includes("testnet")) return "testnet";
     if (u.includes("devnet")) return "devnet";
     if (u.includes("mainnet")) return "mainnet";
@@ -178,7 +162,8 @@ function keypairFromDelegateKey(Ed25519Keypair, decodeSuiPrivateKey, raw) {
 }
 
 function parseAccountObject(objectId, result, packageId) {
-    const data = result?.data ?? result?.object ?? result;
+    // gRPC core getObject returns { object: { type, json } }.
+    const data = result?.object ?? result?.data ?? result;
     const content = data?.content ?? {};
     const fields = data?.json ?? content?.fields ?? data?.fields;
     const objectType =
@@ -234,7 +219,27 @@ function roleOnAccount(address, account) {
     return null;
 }
 
+function grpcAbortCode(failed) {
+    const error = failed?.status?.error;
+    const text = typeof error?.message === "string" ? error.message : JSON.stringify(error ?? failed);
+    if (error?.$kind === "MoveAbort" && error.MoveAbort?.abortCode !== undefined) {
+        return { outcome: "abort", code: Number(error.MoveAbort.abortCode), detail: text };
+    }
+    return { outcome: "failure", detail: text };
+}
+
 export function extractAbortCode(inspect) {
+    // gRPC core simulateTransaction result: { $kind, Transaction | FailedTransaction }.
+    if (inspect?.$kind === "Transaction" && inspect.Transaction) {
+        return inspect.Transaction.status?.success === false
+            ? grpcAbortCode(inspect.Transaction)
+            : { outcome: "success", detail: "success" };
+    }
+    if (inspect?.$kind === "FailedTransaction" && inspect.FailedTransaction) {
+        return grpcAbortCode(inspect.FailedTransaction);
+    }
+
+    // Legacy JSON-RPC devInspect shapes, kept so recorded outputs still parse.
     const effects = inspect?.effects ?? inspect?.transactionEffects ?? inspect;
     const status = effects?.status ?? inspect?.status;
     if (!status) return { outcome: "unknown", detail: JSON.stringify(inspect).slice(0, 500) };
@@ -326,7 +331,7 @@ async function inspectSealApprove({
     idBytes,
 }) {
     const tx = new Transaction();
-    tx.setSenderIfNotSet?.(sender);
+    tx.setSender(sender);
     tx.moveCall({
         target: `${policyPackageId}::account::seal_approve`,
         arguments: [
@@ -336,23 +341,9 @@ async function inspectSealApprove({
         ],
     });
 
-    if (typeof client.devInspectTransactionBlock === "function") {
-        return client.devInspectTransactionBlock({
-            sender,
-            transactionBlock: tx,
-        });
-    }
-    if (typeof client.core?.simulateTransaction === "function") {
-        return client.core.simulateTransaction({ sender, transaction: tx });
-    }
-
-    const bytes = await tx.build({ client, onlyTransactionKind: true });
-    const b64 = Buffer.from(bytes).toString("base64");
-    const url = client.transport?.url ?? client.url;
-    if (!url) {
-        throw new Error("Sui client has no JSON-RPC URL for sui_devInspectTransactionBlock");
-    }
-    return rpc(url, "sui_devInspectTransactionBlock", [sender, b64, null, null]);
+    // checksEnabled: false mirrors devInspect: no gas payment or signature is
+    // needed, and the node simulates with a mocked gas coin. Nothing executes.
+    return client.core.simulateTransaction({ transaction: tx, checksEnabled: false });
 }
 
 function failSecurity(message) {
@@ -394,45 +385,47 @@ async function run() {
     }
 
     let packageId = firstEnv(["MEMWAL_PACKAGE_ID", "PACKAGE_ID"]);
-    let rpcUrl = firstEnv(["SUI_RPC_URL"]);
+    // SUI_RPC_URL is a backward-compatible fallback; it must point at a
+    // fullnode that serves gRPC.
+    let grpcUrl = firstEnv(["SUI_GRPC_URL", "SUI_RPC_URL"]);
     let network = env("SUI_NETWORK");
     const serverUrl = firstEnv(["MEMWAL_SERVER_URL", "MEMWAL_RELAYER_URL"]);
 
-    if ((!packageId || !rpcUrl) && serverUrl) {
+    if ((!packageId || !grpcUrl) && serverUrl) {
         const cfg = await getRelayerConfig(serverUrl);
         packageId = packageId || cfg.packageId || "";
-        rpcUrl = rpcUrl || cfg.suiRpcUrl || "";
+        grpcUrl = grpcUrl || cfg.suiGrpcUrl || cfg.suiRpcUrl || "";
         network = network || cfg.network || "";
         console.log(`loaded GET ${serverUrl.replace(/\/$/, "")}/config`);
     }
     if (!packageId) failMisconfig("MEMWAL_PACKAGE_ID unset (or GET /config)");
-    if (!rpcUrl) failMisconfig("SUI_RPC_URL unset (or GET /config)");
-    network = inferNetwork(rpcUrl, network);
+    if (!grpcUrl) failMisconfig("SUI_GRPC_URL unset (or SUI_RPC_URL, or GET /config)");
+    network = inferNetwork(grpcUrl, network);
 
     let suiMod;
     try {
-        const [jsonRpc, txMod, keysMod, cryptoMod] = await Promise.all([
-            import("@mysten/sui/jsonRpc"),
+        const [grpc, txMod, keysMod, cryptoMod] = await Promise.all([
+            import("@mysten/sui/grpc"),
             import("@mysten/sui/transactions"),
             import("@mysten/sui/keypairs/ed25519"),
             import("@mysten/sui/cryptography"),
         ]);
-        suiMod = { jsonRpc, txMod, keysMod, cryptoMod };
+        suiMod = { grpc, txMod, keysMod, cryptoMod };
     } catch (err) {
         failMisconfig(
             `cannot import @mysten/sui (${err instanceof Error ? err.message : err}). From repo root: pnpm install --frozen-lockfile`,
         );
     }
 
-    const { SuiJsonRpcClient } = suiMod.jsonRpc;
+    const { SuiGrpcClient } = suiMod.grpc;
     const { Transaction } = suiMod.txMod;
     const { Ed25519Keypair } = suiMod.keysMod;
     const { decodeSuiPrivateKey } = suiMod.cryptoMod;
-    if (typeof SuiJsonRpcClient !== "function" || typeof Transaction !== "function") {
-        failMisconfig("@mysten/sui JSON-RPC client or Transaction missing");
+    if (typeof SuiGrpcClient !== "function" || typeof Transaction !== "function") {
+        failMisconfig("@mysten/sui gRPC client or Transaction missing");
     }
 
-    const client = new SuiJsonRpcClient({ url: rpcUrl, network });
+    const client = new SuiGrpcClient({ network, baseUrl: grpcUrl });
     const keypairA = keypairFromDelegateKey(Ed25519Keypair, decodeSuiPrivateKey, keyA);
     const keypairB = keypairFromDelegateKey(Ed25519Keypair, decodeSuiPrivateKey, keyB);
     const addrA = normalizeHexAddress(keypairA.getPublicKey().toSuiAddress());
@@ -442,17 +435,7 @@ async function run() {
     }
 
     const readAccount = async (id) => {
-        let result;
-        if (typeof client.getObject === "function") {
-            result = await client.getObject({
-                objectId: id,
-                id,
-                include: { json: true, type: true },
-                options: { showContent: true, showType: true },
-            });
-        } else {
-            result = await rpc(rpcUrl, "sui_getObject", [id, { showContent: true, showType: true }]);
-        }
+        const result = await client.core.getObject({ objectId: id, include: { json: true } });
         return parseAccountObject(id, result, packageId);
     };
 
