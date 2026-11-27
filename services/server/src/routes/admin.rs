@@ -750,14 +750,12 @@ async fn call_ask_llm_inner(
             || status == reqwest::StatusCode::FORBIDDEN
         {
             let _ = alerts
-                .notify_embedding_provider_auth_failed(
-                    crate::alerts::EmbeddingProviderAuthAlert {
-                        sui_network: sui_network.to_string(),
-                        status: status.as_u16(),
-                        api_base: openai_api_base.to_string(),
-                        error: body_text.clone(),
-                    },
-                )
+                .notify_embedding_provider_auth_failed(crate::alerts::EmbeddingProviderAuthAlert {
+                    sui_network: sui_network.to_string(),
+                    status: status.as_u16(),
+                    api_base: openai_api_base.to_string(),
+                    error: body_text.clone(),
+                })
                 .await;
             return Err(AppError::EmbeddingProviderUnavailable(format!(
                 "LLM API upstream error ({}): {}",
@@ -904,6 +902,25 @@ fn restore_truncated_after_page(
     truncated || (restored == 0 && newly_failed == 0 && transient_unresolved > 0)
 }
 
+/// Resolve the original write timestamp for a restored blob (#1060).
+///
+/// Priority order:
+/// 1. Exact retained `vector_entries.created_at` from `forgotten_blob_timestamps`
+///    (or `vector_entries` in another namespace), falling back to `remember_jobs.created_at`
+///    as a legacy enqueue-time estimate.
+/// 2. Archival creation timestamp reported on-chain by the sidecar query.
+/// 3. None, which defaults to `NOW()` upon insertion.
+fn resolve_restored_created_at(
+    blob_id: &str,
+    db_created_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    on_chain_created_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    db_created_at
+        .get(blob_id)
+        .copied()
+        .or_else(|| on_chain_created_at.get(blob_id).copied())
+}
+
 enum RestoreDecrypt {
     Ok(String, String),
     PermanentFail,
@@ -1036,6 +1053,11 @@ async fn restore_unbounded(
                     (b.agent_id.clone(), b.package_id.clone()),
                 )
             })
+            .collect();
+    let on_chain_created_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        on_chain_blobs
+            .iter()
+            .filter_map(|b| b.created_at.map(|ts| (b.blob_id.clone(), ts)))
             .collect();
 
     if total == 0 {
@@ -1361,7 +1383,18 @@ async fn restore_unbounded(
         restore_truncated_after_page(truncated, restored, newly_failed, transient_unresolved);
     // Owned per-row values first: `VectorInsert` borrows them, so they must
     // outlive the batch slice built below.
-    let row_values: Vec<(String, i64, Option<String>, String)> = results
+    let db_created_at = state
+        .db
+        .lookup_original_blob_created_at(owner, namespace, &missing_blob_ids)
+        .await?;
+    #[allow(clippy::type_complexity)]
+    let row_values: Vec<(
+        String,
+        i64,
+        Option<String>,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = results
         .iter()
         .map(|(blob_id, _)| {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1382,7 +1415,9 @@ async fn restore_unbounded(
             // Some(""), not None. Normalize both provenance fields the same way
             // so a blob with no known agent gets a real SQL NULL, not "".
             let agent_id = agent_id.filter(|s| !s.is_empty());
-            (id, blob_size, agent_id, package_id)
+            let created_at =
+                resolve_restored_created_at(blob_id, &db_created_at, &on_chain_created_at);
+            (id, blob_size, agent_id, package_id, created_at)
         })
         .collect();
 
@@ -1390,7 +1425,7 @@ async fn restore_unbounded(
         .iter()
         .zip(row_values.iter())
         .map(
-            |((blob_id, vector), (id, blob_size, agent_id, package_id))| VectorInsert {
+            |((blob_id, vector), (id, blob_size, agent_id, package_id, created_at))| VectorInsert {
                 id,
                 owner,
                 namespace,
@@ -1410,6 +1445,7 @@ async fn restore_unbounded(
                     Some(package_id.as_str())
                 },
                 end_epoch: None,
+                created_at: *created_at,
             },
         )
         .collect();
@@ -1848,6 +1884,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_restored_created_at_prefers_db_then_on_chain_then_none() {
+        let ts_old_db = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:23:16.416599Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_new_db = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:24:07.559558Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts_chain = chrono::DateTime::parse_from_rfc3339("2026-09-30T07:23:15.000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut db_created_at = std::collections::HashMap::new();
+        db_created_at.insert("blob-old".to_string(), ts_old_db);
+        db_created_at.insert("blob-new".to_string(), ts_new_db);
+
+        let mut on_chain_created_at = std::collections::HashMap::new();
+        on_chain_created_at.insert("blob-old".to_string(), ts_chain);
+        on_chain_created_at.insert("blob-chain-only".to_string(), ts_chain);
+
+        assert_eq!(
+            super::resolve_restored_created_at("blob-old", &db_created_at, &on_chain_created_at),
+            Some(ts_old_db),
+            "database timestamp must take precedence over on-chain timestamp"
+        );
+        assert_eq!(
+            super::resolve_restored_created_at("blob-new", &db_created_at, &on_chain_created_at),
+            Some(ts_new_db)
+        );
+        assert_eq!(
+            super::resolve_restored_created_at(
+                "blob-chain-only",
+                &db_created_at,
+                &on_chain_created_at
+            ),
+            Some(ts_chain),
+            "blobs without a local database timestamp must fall back to on-chain creation timestamp"
+        );
+        assert_eq!(
+            super::resolve_restored_created_at(
+                "blob-unknown",
+                &db_created_at,
+                &on_chain_created_at
+            ),
+            None
+        );
+    }
+
     // ── /api/forget + /api/stats empty-namespace validation ─────────────
     //
     // Both handlers reject an empty namespace with `AppError::BadRequest`
@@ -2012,8 +2096,14 @@ mod tests {
         );
 
         for (status, body) in [
-            (401u16, r#"{"error":{"message":"User not found.","code":401}}"#),
-            (402u16, r#"{"error":{"message":"Insufficient credits","code":402}}"#),
+            (
+                401u16,
+                r#"{"error":{"message":"User not found.","code":401}}"#,
+            ),
+            (
+                402u16,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+            ),
             (403u16, r#"{"error":{"message":"Key disabled","code":403}}"#),
         ] {
             let app = axum::Router::new().route(

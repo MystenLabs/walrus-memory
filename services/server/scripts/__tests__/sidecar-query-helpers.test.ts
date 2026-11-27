@@ -9,9 +9,14 @@ import {
     blobIdFromRaw,
     blobIdMatchesRequested,
     blobObjectMatchesRegistration,
+    cacheBlobProvenance,
     chainBlobIdFromRaw,
+    clearBlobProvenanceCacheForTests,
     filterTrustedBlobCandidates,
+    findBlobCreationProvenance,
     findBlobCreationSender,
+    getCachedBlobCreationProvenance,
+    getCachedBlobCreationTimestamp,
     isSourceCapped,
     isWalrusBlobObjectType,
     isVerifiedNonexistentSource,
@@ -24,6 +29,7 @@ import { assertSuccessfulMetadataTransfer, extractBlobObjectId } from "../sideca
 import {
     ENOKI_FALLBACK_TO_DIRECT_SIGN,
     parseDurableWalrusEpochs,
+    SERVER_SUI_ADDRESS_SET,
     SUI_TYPE,
     WALRUS_PACKAGE_ID,
 } from "../sidecar/config.js";
@@ -1050,6 +1056,7 @@ test("blob provenance uses the archival creation transaction, not the latest tra
     const objectId = `0x${"1".repeat(64)}`;
     const trusted = `0x${"2".repeat(64)}`;
     const attacker = `0x${"3".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T07:23:16.416Z";
     const client = {
         async getCreationTransaction() {
             return "create-tx";
@@ -1059,12 +1066,16 @@ test("blob provenance uses the archival creation transaction, not the latest tra
             return {
                 status: { success: true },
                 transaction: { sender: trusted },
-                effects: { changedObjects: [{ objectId, idOperation: "Created" }] },
+                effects: {
+                    timestamp: createdTimestamp,
+                    changedObjects: [{ objectId, idOperation: "Created" }],
+                },
             };
         },
     };
 
     assert.equal(await findBlobCreationSender({ objectId, previousTransaction: "attacker-transfer-tx" }, client), trusted);
+    assert.equal(getCachedBlobCreationTimestamp(objectId), createdTimestamp);
     assert.deepEqual(
         await trustedBlobCandidate(
             { objectId, owner: { AddressOwner: attacker }, previousTransaction: "transfer-tx" },
@@ -1074,6 +1085,136 @@ test("blob provenance uses the archival creation transaction, not the latest tra
         ),
         { trusted: true, reason: "trusted", uploader: trusted }
     );
+});
+
+test("provenance LRU cache hit-refresh retains sender and timestamp across 10,000-entry eviction", () => {
+    clearBlobProvenanceCacheForTests();
+    const targetId = "target-object-id";
+    const targetSender = "0xtargetsender";
+    const targetCreatedAt = "2026-09-30T07:23:16.416Z";
+
+    cacheBlobProvenance(targetId, { sender: targetSender, createdAt: targetCreatedAt });
+    assert.deepEqual(getCachedBlobCreationProvenance(targetId), {
+        sender: targetSender,
+        createdAt: targetCreatedAt,
+    });
+
+    for (let i = 0; i < 9_999; i++) {
+        cacheBlobProvenance(`obj-${i}`, { sender: `sender-${i}`, createdAt: `ts-${i}` });
+    }
+
+    cacheBlobProvenance(targetId, { sender: targetSender });
+
+    cacheBlobProvenance("overflow-obj", { sender: "overflow-sender", createdAt: "overflow-ts" });
+
+    assert.equal(getCachedBlobCreationProvenance("obj-0"), null);
+
+    assert.deepEqual(getCachedBlobCreationProvenance(targetId), {
+        sender: targetSender,
+        createdAt: targetCreatedAt,
+    });
+    assert.equal(getCachedBlobCreationTimestamp(targetId), targetCreatedAt);
+});
+
+test("filterTrustedBlobCandidates retains createdAt on candidate objects even after cache eviction", async () => {
+    clearBlobProvenanceCacheForTests();
+    const objectId = `0x${"4".repeat(64)}`;
+    const recipient = `0x${"5".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T07:23:16.416Z";
+    const testServer = `0x${"6".repeat(64)}`;
+
+    (SERVER_SUI_ADDRESS_SET as Set<string>).add(testServer);
+
+    try {
+        cacheBlobProvenance(objectId, { sender: testServer, createdAt: createdTimestamp });
+
+        const blob = {
+            objectId,
+            owner: { AddressOwner: recipient },
+            previousTransaction: "create-tx",
+        };
+
+        const trusted = await filterTrustedBlobCandidates(
+            [blob],
+            recipient,
+            "req-test",
+            async () => testServer
+        );
+
+        assert.equal(trusted.length, 1);
+        assert.equal(trusted[0].createdAt, createdTimestamp);
+
+        for (let i = 0; i < 10_001; i++) {
+            cacheBlobProvenance(`evict-${i}`, { sender: `sender-${i}`, createdAt: `ts-${i}` });
+        }
+        assert.equal(getCachedBlobCreationProvenance(objectId), null);
+
+        assert.equal(trusted[0].createdAt, createdTimestamp);
+    } finally {
+        (SERVER_SUI_ADDRESS_SET as Set<string>).delete(testServer);
+    }
+});
+
+test("findBlobCreationProvenance extracts timestamp from transaction root when effects timestamp is missing", async () => {
+    const objectId = `0x${"7".repeat(64)}`;
+    const trusted = `0x${"8".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T08:00:00.000Z";
+    const client = {
+        async getCreationTransaction() {
+            return "root-tx";
+        },
+        async getTransaction(digest: string) {
+            assert.equal(digest, "root-tx");
+            return {
+                status: { success: true },
+                transaction: { sender: trusted },
+                timestamp: createdTimestamp,
+                effects: {
+                    changedObjects: [{ objectId, idOperation: "Created" }],
+                },
+            };
+        },
+    };
+
+    const prov = await findBlobCreationProvenance({ objectId, previousTransaction: "any-tx" }, client);
+    assert.equal(prov.sender, trusted);
+    assert.equal(prov.createdAt, createdTimestamp);
+    assert.equal(getCachedBlobCreationTimestamp(objectId), createdTimestamp);
+});
+
+test("findBlobCreationProvenance preserves createdAt when cache is evicted during getTransaction", async () => {
+    clearBlobProvenanceCacheForTests();
+    const objectId = `0x${"e".repeat(64)}`;
+    const trusted = `0x${"f".repeat(64)}`;
+    const createdTimestamp = "2026-09-30T09:15:00.000Z";
+    const client = {
+        async getCreationTransaction() {
+            return {
+                digest: "eviction-test-tx",
+                createdAt: createdTimestamp,
+            };
+        },
+        async getTransaction(digest: string) {
+            assert.equal(digest, "eviction-test-tx");
+            // Simulate 10,001 other blobs processed during async getTransaction,
+            // completely evicting objectId from the LRU cache.
+            for (let i = 0; i < 10_001; i++) {
+                cacheBlobProvenance(`evict-tx-${i}`, { sender: `s-${i}`, createdAt: `ts-${i}` });
+            }
+            assert.equal(getCachedBlobCreationTimestamp(objectId), null);
+            return {
+                status: { success: true },
+                transaction: { sender: trusted },
+                effects: {
+                    changedObjects: [{ objectId, idOperation: "Created" }],
+                },
+            };
+        },
+    };
+
+    const prov = await findBlobCreationProvenance({ objectId, previousTransaction: "any-tx" }, client);
+    assert.equal(prov.sender, trusted);
+    assert.equal(prov.createdAt, createdTimestamp);
 });
 
 test("blob provenance excludes external creators and fails closed on incomplete history", async () => {
