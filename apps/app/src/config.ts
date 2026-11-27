@@ -5,6 +5,12 @@ import { requiredMemwalIds } from './requiredMemwalIds'
 
 const DEFAULT_ANALYTICS_ALLOWED_HOSTS = 'walrus.xyz,www.walrus.xyz'
 
+export interface SealServerConfigEntry {
+    objectId: string
+    weight: number
+    aggregatorUrl?: string
+}
+
 function parseCsv(value: string | undefined, fallback = '') {
     return (value || fallback)
         .split(',')
@@ -12,10 +18,39 @@ function parseCsv(value: string | undefined, fallback = '') {
         .filter(Boolean)
 }
 
+function parseSealServerConfigs(value: string | undefined): SealServerConfigEntry[] {
+    const trimmed = value?.trim()
+    if (!trimmed) return []
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!Array.isArray(parsed)) {
+        throw new Error('VITE_SEAL_SERVER_CONFIGS must be a JSON array')
+    }
+    return parsed.map((raw, index) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            throw new Error(`VITE_SEAL_SERVER_CONFIGS[${index}] must be an object`)
+        }
+        const entry = raw as Record<string, unknown>
+        const objectId = typeof entry.objectId === 'string' ? entry.objectId.trim() : ''
+        if (!objectId) {
+            throw new Error(`VITE_SEAL_SERVER_CONFIGS[${index}].objectId is required`)
+        }
+        const weight = entry.weight === undefined ? 1 : Number(entry.weight)
+        if (!Number.isSafeInteger(weight) || weight < 1) {
+            throw new Error(`VITE_SEAL_SERVER_CONFIGS[${index}].weight must be a positive integer`)
+        }
+        const aggregatorUrl = typeof entry.aggregatorUrl === 'string' && entry.aggregatorUrl.trim()
+            ? entry.aggregatorUrl.trim()
+            : undefined
+        return aggregatorUrl ? { objectId, weight, aggregatorUrl } : { objectId, weight }
+    })
+}
+
 const { memwalPackageId, memwalRegistryId } = requiredMemwalIds({
     VITE_MEMWAL_PACKAGE_ID: import.meta.env.VITE_MEMWAL_PACKAGE_ID as string | undefined,
     VITE_MEMWAL_REGISTRY_ID: import.meta.env.VITE_MEMWAL_REGISTRY_ID as string | undefined,
 })
+const sealServerConfigs = parseSealServerConfigs(import.meta.env.VITE_SEAL_SERVER_CONFIGS as string | undefined)
+const legacySealServerConfigs = parseSealServerConfigs(import.meta.env.VITE_LEGACY_SEAL_SERVER_CONFIGS as string | undefined)
 const sealKeyServers = parseCsv(import.meta.env.VITE_SEAL_KEY_SERVERS as string)
 const legacySealKeyServers = parseCsv(import.meta.env.VITE_LEGACY_SEAL_KEY_SERVERS as string)
 const localE2eJsonRpc = import.meta.env.DEV &&
@@ -25,6 +60,7 @@ export const config = {
     enokiApiKey: import.meta.env.VITE_ENOKI_API_KEY as string || '',
     googleClientId: import.meta.env.VITE_GOOGLE_CLIENT_ID as string || '',
     memwalPackageId,
+    memwalSealPolicyPackageId: import.meta.env.VITE_MEMWAL_SEAL_POLICY_PACKAGE_ID as string || memwalPackageId,
     memwalRegistryId,
     // Legacy-deployment ids for the security-delete surface. The exposed
     // blobs were Seal-encrypted under the PRE-cutover package, and Seal
@@ -56,6 +92,8 @@ export const config = {
     localE2eJsonRpc,
     // gRPC endpoint used by the security-delete subsystem's dedicated client.
     suiGrpcUrl: import.meta.env.VITE_SUI_GRPC_URL as string || '',
+    sealServerConfigs,
+    legacySealServerConfigs: legacySealServerConfigs.length > 0 ? legacySealServerConfigs : sealServerConfigs,
     sealKeyServers,
     // Same cutover rationale as legacyMemwalPackageId: legacy blobs were
     // encrypted against the pre-cutover key-server committee. Unset falls

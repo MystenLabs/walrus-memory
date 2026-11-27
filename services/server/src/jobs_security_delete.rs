@@ -617,6 +617,15 @@ fn sui_error(error: SuiErr) -> AppError {
     AppError::UpstreamUnavailable(format!("security-delete Sui RPC: {error}"))
 }
 
+fn background_deletion_pools(state: &AppState) -> Vec<(&'static str, &PgPool)> {
+    let mut pools = Vec::with_capacity(2);
+    if let Some(legacy_db) = state.legacy_db.as_deref() {
+        pools.push(("legacy", legacy_db.pool()));
+    }
+    pools.push(("current", state.db.pool()));
+    pools
+}
+
 pub fn spawn_reconciler(state: Arc<AppState>) {
     if !state.config.deletion_reconciler_enabled {
         return;
@@ -628,11 +637,15 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
             if !state.config.deletion_reconciler_enabled {
                 continue;
             }
-            let (Some(db), Some(sui)) = (&state.legacy_db, &state.security_delete_background_sui)
-            else {
+            let Some(sui) = &state.security_delete_background_sui else {
                 tracing::error!("security-delete reconciler dependencies unavailable");
                 continue;
             };
+            let pools = background_deletion_pools(&state);
+            if pools.is_empty() {
+                tracing::error!("security-delete reconciler has no configured database pools");
+                continue;
+            }
             let sponsor_address = state.config.sponsor_private_key.as_deref().and_then(|key| {
                 crate::sui::tx_build::sponsor_address(key)
                     .map_err(|error| tracing::error!(%error, "invalid security-delete sponsor key"))
@@ -646,16 +659,22 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                 sponsor_address,
                 sponsor_min_balance: state.config.sponsor_min_balance_alert,
             };
-            match run_reconciler_tick(
-                db.pool(),
-                sui.as_ref(),
-                state.security_delete_execution_gate.as_ref(),
-                &cfg,
-            )
-            .await
-            {
-                Ok(report) => tracing::info!(?report, "security-delete reconciler tick completed"),
-                Err(error) => tracing::error!(%error, "security-delete reconciler tick failed"),
+            for (scope, pool) in pools {
+                match run_reconciler_tick(
+                    pool,
+                    sui.as_ref(),
+                    state.security_delete_execution_gate.as_ref(),
+                    &cfg,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        tracing::info!(scope, ?report, "security-delete reconciler tick completed")
+                    }
+                    Err(error) => {
+                        tracing::error!(scope, %error, "security-delete reconciler tick failed")
+                    }
+                }
             }
         }
     });
@@ -672,14 +691,24 @@ pub fn spawn_object_resolver(state: Arc<AppState>) {
             if !state.config.deletion_object_resolver_enabled {
                 continue;
             }
-            let (Some(db), Some(sui)) = (&state.legacy_db, &state.security_delete_background_sui)
-            else {
+            let Some(sui) = &state.security_delete_background_sui else {
                 tracing::error!("security-delete resolver dependencies unavailable");
                 continue;
             };
-            match run_resolver_tick(db.pool(), sui.as_ref(), 25).await {
-                Ok(report) => tracing::info!(?report, "security-delete resolver tick completed"),
-                Err(error) => tracing::error!(%error, "security-delete resolver tick failed"),
+            let pools = background_deletion_pools(&state);
+            if pools.is_empty() {
+                tracing::error!("security-delete resolver has no configured database pools");
+                continue;
+            }
+            for (scope, pool) in pools {
+                match run_resolver_tick(pool, sui.as_ref(), 25).await {
+                    Ok(report) => {
+                        tracing::info!(scope, ?report, "security-delete resolver tick completed")
+                    }
+                    Err(error) => {
+                        tracing::error!(scope, %error, "security-delete resolver tick failed")
+                    }
+                }
             }
         }
     });
@@ -976,9 +1005,16 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, batch, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            batch,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE deletion_batches SET claimed_at=NOW()-INTERVAL '2 minutes' WHERE id=$1",
         )
@@ -1024,9 +1060,16 @@ mod tests {
                 .into_iter()
                 .enumerate()
         {
-            store::create_batch_and_claim_selection(legacy.pool(), OWNER, id, &[blob.into()], 16)
-                .await
-                .unwrap();
+            store::create_batch_and_claim_selection(
+                legacy.pool(),
+                OWNER,
+                "legacy",
+                id,
+                &[blob.into()],
+                16,
+            )
+            .await
+            .unwrap();
             store::set_batch_prepared(
                 legacy.pool(),
                 id,
@@ -1098,9 +1141,16 @@ mod tests {
         };
         seed(legacy.pool(), "retry", Some("0x1")).await;
         let batch = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, batch, &["retry".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            batch,
+            &["retry".into()],
+            16,
+        )
+        .await
+        .unwrap();
         let (built, object) = prepared_blob_tx("retry", "0x1");
         store::set_batch_prepared(
             legacy.pool(),
@@ -1173,6 +1223,7 @@ mod tests {
         store::create_batch_and_claim_selection(
             legacy.pool(),
             OWNER,
+            "legacy",
             batch,
             &["missing".into()],
             16,
@@ -1392,9 +1443,16 @@ mod tests {
         };
         seed(legacy.pool(), "a", Some("0x1")).await;
         let old = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, old, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            old,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         store::set_batch_prepared(
             legacy.pool(),
             old,
@@ -1459,9 +1517,16 @@ mod tests {
         .await
         .unwrap());
         let new = Uuid::new_v4();
-        store::create_batch_and_claim_selection(legacy.pool(), OWNER, new, &["a".into()], 16)
-            .await
-            .unwrap();
+        store::create_batch_and_claim_selection(
+            legacy.pool(),
+            OWNER,
+            "legacy",
+            new,
+            &["a".into()],
+            16,
+        )
+        .await
+        .unwrap();
         resume.notify_one();
         let report = task.await.unwrap();
         assert_eq!(report.failed, 0, "old batch CAS must lose");

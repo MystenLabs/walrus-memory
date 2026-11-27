@@ -1,31 +1,97 @@
 import { normalizeSuiAddress } from '@mysten/sui/utils'
 import { Transaction } from '@mysten/sui/transactions'
 import { EncryptedObject, SealClient, SessionKey } from '@mysten/seal'
-import { config } from '../config'
+import { config, type SealServerConfigEntry } from '../config'
 import { getWalrusClient } from './walrusBlobs'
 import type { SignPersonalMessage } from './securityDeleteAuth'
+import type { DeletionScope } from './securityDeleteApi'
 
 type SuiClientLike = Parameters<typeof getWalrusClient>[0]
-const DEFAULT_SERVERS: Record<'testnet' | 'mainnet', string[]> = {
+const DEFAULT_SERVERS: Record<'testnet' | 'mainnet', SealServerConfigEntry[]> = {
     testnet: [
-        '0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75',
-        '0xf5d14a81a982144ae441cd7d64b09027f116a468bd36e7eca494f750591623c8',
+        { objectId: '0x73d05d62c18d9374e3ea529e8e0ed6161da1a141a94d3f76ae3fe4e99356db75', weight: 1 },
+        { objectId: '0xf5d14a81a982144ae441cd7d64b09027f116a468bd36e7eca494f750591623c8', weight: 1 },
     ],
     mainnet: [
-        '0x145540d931f182fef76467dd8074c9839aea126852d90d18e1556fcbbd1208b6',
-        '0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10',
+        { objectId: '0x145540d931f182fef76467dd8074c9839aea126852d90d18e1556fcbbd1208b6', weight: 1 },
+        { objectId: '0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10', weight: 1 },
     ],
+}
+
+// Mysten's official testnet committee aggregator used by post-migration
+// testnet relayers. Selected only when a ciphertext header references this
+// committee object id and no explicit server override is configured.
+const DEFAULT_COMMITTEE_SERVERS: Record<'testnet' | 'mainnet', SealServerConfigEntry[]> = {
+    testnet: [
+        {
+            objectId: '0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98',
+            weight: 1,
+            aggregatorUrl: 'https://seal-aggregator-testnet.mystenlabs.com',
+        },
+    ],
+    mainnet: [],
+}
+
+const toConfiguredEntries = (
+    jsonConfigs: readonly SealServerConfigEntry[] | undefined,
+    csvIds: readonly string[],
+): SealServerConfigEntry[] => {
+    if (jsonConfigs && jsonConfigs.length > 0) {
+        return jsonConfigs.map(entry => ({ ...entry, objectId: normalizeSuiAddress(entry.objectId) }))
+    }
+    return csvIds.map(objectId => ({ objectId: normalizeSuiAddress(objectId), weight: 1 }))
+}
+
+const resolvePreviewPolicy = (scope: DeletionScope = 'legacy') => (
+    scope === 'current'
+        ? {
+            packageId: config.memwalPackageId,
+            policyPackageId: config.memwalSealPolicyPackageId || config.memwalPackageId,
+            registryId: config.memwalRegistryId,
+            configuredServers: toConfiguredEntries(config.sealServerConfigs, config.sealKeyServers),
+        }
+        : {
+            packageId: config.legacyMemwalPackageId,
+            policyPackageId: config.legacyMemwalPackageId,
+            registryId: undefined,
+            configuredServers: toConfiguredEntries(config.legacySealServerConfigs, config.legacySealKeyServers),
+        }
+)
+
+function selectServerConfigs(
+    configured: readonly SealServerConfigEntry[],
+    network: 'testnet' | 'mainnet',
+    services: readonly (readonly [string, number])[] | undefined,
+): SealServerConfigEntry[] {
+    const fallback = configured.length > 0 ? [...configured] : DEFAULT_SERVERS[network]
+    if (!Array.isArray(services) || services.length === 0) {
+        return fallback
+    }
+    const counts = new Map<string, number>()
+    for (const [serviceId] of services) {
+        const normalized = normalizeSuiAddress(serviceId)
+        counts.set(normalized, (counts.get(normalized) ?? 0) + 1)
+    }
+    const candidates = configured.length > 0
+        ? configured
+        : [...DEFAULT_SERVERS[network], ...DEFAULT_COMMITTEE_SERVERS[network]]
+    const matched = candidates
+        .map(entry => ({ ...entry, objectId: normalizeSuiAddress(entry.objectId) }))
+        .filter(entry => counts.has(entry.objectId))
+        .map(entry => ({ ...entry, weight: counts.get(entry.objectId)! }))
+    return matched.length > 0 ? matched : fallback
 }
 
 const sessions = new Map<string, Promise<SessionKey>>()
 const activeReads = new Set<AbortController>()
 let previewGeneration = 0
-const sessionKeyFor = (address: string, accountObjectId: string) =>
-    `${normalizeSuiAddress(address)}:${normalizeSuiAddress(accountObjectId)}:${config.suiNetwork}:${config.legacyMemwalPackageId}`
+const sessionKeyFor = (address: string, accountObjectId: string, packageId: string) =>
+    `${normalizeSuiAddress(address)}:${normalizeSuiAddress(accountObjectId)}:${config.suiNetwork}:${packageId}`
 
 async function createSession(
     suiClient: SuiClientLike,
     address: string,
+    packageId: string,
     signPersonalMessage: SignPersonalMessage,
 ): Promise<SessionKey> {
     const normalizedAddress = normalizeSuiAddress(address)
@@ -37,11 +103,10 @@ async function createSession(
     }
     const session = await SessionKey.create({
         address: normalizedAddress,
-        // Legacy package on purpose: the at-risk blobs were Seal-encrypted
-        // under the pre-cutover deployment, and SessionKey certificates,
-        // the seal_approve policy, and the Account object type are all
-        // bound to THAT package (see config.legacyMemwalPackageId).
-        packageId: config.legacyMemwalPackageId,
+        // Match the package under which the blob was Seal-encrypted:
+        // pre-migration (`legacy`) uses legacyMemwalPackageId, while
+        // post-migration (`current`) uses memwalPackageId.
+        packageId,
         ttlMin: 5,
         // SessionKey only consumes getPublicKey/toSuiAddress and
         // signPersonalMessage for this certificate flow. A connected wallet
@@ -56,16 +121,17 @@ async function getSession(opts: {
     suiClient: SuiClientLike
     address: string
     accountObjectId: string
+    packageId: string
     signPersonalMessage: SignPersonalMessage
 }): Promise<SessionKey> {
-    const key = sessionKeyFor(opts.address, opts.accountObjectId)
+    const key = sessionKeyFor(opts.address, opts.accountObjectId, opts.packageId)
     const existing = sessions.get(key)
     if (existing) {
         const session = await existing
         if (!session.isExpired()) return session
         sessions.delete(key)
     }
-    const promise = createSession(opts.suiClient, opts.address, opts.signPersonalMessage)
+    const promise = createSession(opts.suiClient, opts.address, opts.packageId, opts.signPersonalMessage)
     sessions.set(key, promise)
     try { return await promise } catch (error) {
         if (sessions.get(key) === promise) sessions.delete(key)
@@ -120,28 +186,33 @@ export async function fetchAndDecryptBlob(opts: {
     address: string
     accountObjectId: string
     signPersonalMessage: SignPersonalMessage
+    scope?: DeletionScope
 }): Promise<string> {
+    const { packageId, policyPackageId, registryId, configuredServers } = resolvePreviewPolicy(opts.scope)
     const generation = previewGeneration
     const controller = new AbortController()
     activeReads.add(controller)
     try {
         const [data, sessionKey] = await Promise.all([
             fetchBlobBytes({ suiClient: opts.suiClient, blobId: opts.blobId, signal: controller.signal }),
-            getSession(opts),
+            getSession({ ...opts, packageId }),
         ])
         if (generation !== previewGeneration) throw new DOMException('Preview cancelled', 'AbortError')
         const parsed = EncryptedObject.parse(data)
         const idBytes = Array.from(Uint8Array.from(parsed.id.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))))
         const transaction = new Transaction()
+        const approveArgs = registryId
+            ? [transaction.pure('vector<u8>', idBytes), transaction.object(registryId), transaction.object(opts.accountObjectId)]
+            : [transaction.pure('vector<u8>', idBytes), transaction.object(opts.accountObjectId)]
         transaction.moveCall({
-            target: `${config.legacyMemwalPackageId}::account::seal_approve`,
-            arguments: [transaction.pure('vector<u8>', idBytes), transaction.object(opts.accountObjectId)],
+            target: `${policyPackageId}::account::seal_approve`,
+            arguments: approveArgs,
         })
         const txBytes = await transaction.build({ client: opts.suiClient as never, onlyTransactionKind: true })
-        const serverIds = config.legacySealKeyServers.length ? [...config.legacySealKeyServers] : DEFAULT_SERVERS[config.suiNetwork]
+        const serverConfigs = selectServerConfigs(configuredServers, config.suiNetwork, parsed.services)
         const client = new SealClient({
             suiClient: opts.suiClient as never,
-            serverConfigs: serverIds.map(objectId => ({ objectId, weight: 1 })),
+            serverConfigs,
             verifyKeyServers: true,
         })
         const plaintext = await client.decrypt({ data, sessionKey, txBytes })

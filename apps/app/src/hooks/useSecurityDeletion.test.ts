@@ -128,4 +128,19 @@ describe('useSecurityDeletion', () => {
         expect(api.submitDeletion).not.toHaveBeenCalled()
         expect(result.current.phase.kind).toBe('idle')
     })
+
+    it('forwards post-migration scope and records lastDigest on single-blob deletion', async () => {
+        api.prepareDeletion.mockResolvedValueOnce({ ...batch, included: 1 })
+        api.submitDeletion.mockResolvedValueOnce({ state: 'completed', deleted: 1, digest: '5xDigest123' })
+        const changed = vi.fn()
+        const { result } = renderHook(() => useSecurityDeletion({ onStateChanged: changed, scope: 'current' }))
+        await act(() => result.current.deleteSelection(['post-blob-1'], 900))
+        expect(api.prepareDeletion).toHaveBeenCalledWith('tok', {
+            mode: 'selection',
+            blobIds: ['post-blob-1'],
+            scope: 'current',
+        })
+        expect(result.current.phase).toEqual({ kind: 'done', deletedBlobs: 1 })
+        expect(result.current.lastDigest).toBe('5xDigest123')
+    })
 })

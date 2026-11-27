@@ -81,13 +81,13 @@ Renew before the expiry epoch, not after. Once a blob lapses, you cannot recover
 
 ## Delete memories
 
-Deletion permanently removes a memory from Walrus Memory. You cannot undo it, so preview a memory before you delete it. Delete from the dashboard or from code:
+Deletion permanently destroys the owned Walrus `Blob` object on Sui and removes the memory from MemWal's search index. You cannot undo it, so preview a memory before you delete it. Delete a single post-migration blob or a batch of older memories from the dashboard or from code:
 
-1. **Dashboard:** Review and delete stored memories from the dashboard delete flow. See [Delete old memories](/guides/delete-old-memories).
-2. **Programmatic:** The Security Delete API finds memories older than a cutoff, prepares a sponsored transaction, and deletes them in batches after a dry run. See [Delete memories programmatically](/guides/delete-memories-programmatically).
+1. **Dashboard (browser wallets and zkLogin):** Open the **Delete memories** panel at `/dashboard`, keep **Post-migration** selected (or switch to **Pre-migration** for older records), preview and check a single blob or multiple rows, and sign the sponsored Sui transaction in your connected wallet or zkLogin session without exporting a private key. See [Delete memories](/guides/delete-old-memories) for verification steps, cache and copy limits, and the fallback support path.
+2. **Programmatic:** Use the Security Delete API (`scope=current` or `scope=legacy`) to list tracked blobs, prepare a single-blob or batch sponsored transaction, and submit the wallet signature after a dry run. See [Delete memories programmatically](/guides/delete-memories-programmatically).
 
 <Warning>
-Both deletion paths are permanent. Start with a preview in the dashboard or a dry run in the API, review every blob ID, and only then delete.
+Both deletion paths are permanent onchain actions, though HTTP aggregator caches and any plaintext copies previously read by clients remain subject to their own retention windows. Start with a preview in the dashboard or a dry run in the API, review every blob ID, and only then delete.
 </Warning>
 
 ## Rebuild the index

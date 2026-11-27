@@ -2,7 +2,20 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ address: '0x1', securityDeleteEnabled: true, phase: { kind: 'idle' } as { kind: string; batch?: number; totalBatches?: number | null }, onStateChanged: () => {}, listBlobs: vi.fn(), deleteSelection: vi.fn(), deleteAll: vi.fn(), cancelActive: vi.fn(), fetchPreview: vi.fn(), clearSealSession: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+    address: '0x1',
+    securityDeleteEnabled: true,
+    phase: { kind: 'idle' } as { kind: string; batch?: number; totalBatches?: number | null; deletedBlobs?: number },
+    lastDigest: null as string | null,
+    scope: 'current' as string | undefined,
+    onStateChanged: () => {},
+    listBlobs: vi.fn(),
+    deleteSelection: vi.fn(),
+    deleteAll: vi.fn(),
+    cancelActive: vi.fn(),
+    fetchPreview: vi.fn(),
+    clearSealSession: vi.fn(),
+}))
 vi.mock('../config', () => ({ config: {
     get securityDeleteEnabled() { return mocks.securityDeleteEnabled },
     memwalServerUrl: 'http://test',
@@ -17,9 +30,16 @@ vi.mock('@mysten/dapp-kit', () => ({
     useSuiClient: () => ({}),
     useSignPersonalMessage: () => ({ mutateAsync: vi.fn() }),
 }))
-vi.mock('../hooks/useSecurityDeletion', () => ({ useSecurityDeletion: ({ onStateChanged }: { onStateChanged: () => void }) => {
+vi.mock('../hooks/useSecurityDeletion', () => ({ useSecurityDeletion: ({ onStateChanged, scope }: { onStateChanged: () => void; scope?: string }) => {
     mocks.onStateChanged = onStateChanged
-    return { phase: mocks.phase, deleteSelection: mocks.deleteSelection, deleteAll: mocks.deleteAll, cancelActive: mocks.cancelActive }
+    mocks.scope = scope
+    return {
+        phase: mocks.phase,
+        lastDigest: mocks.lastDigest,
+        deleteSelection: mocks.deleteSelection,
+        deleteAll: mocks.deleteAll,
+        cancelActive: mocks.cancelActive,
+    }
 } }))
 vi.mock('../utils/securityDeleteAuth', () => ({
     withAuth: (_address: string, _sign: unknown, call: (token: string) => unknown) => call('token'),
@@ -45,19 +65,48 @@ beforeEach(() => {
     mocks.address = '0x1'
     mocks.securityDeleteEnabled = true
     mocks.phase = { kind: 'idle' }
+    mocks.lastDigest = null
+    mocks.scope = 'current'
     mocks.listBlobs.mockResolvedValue({ items: risk, counts, limits: { deleteBatchMax: 900 }, nextCursor: null })
     mocks.fetchPreview.mockResolvedValue('owner secret')
 })
 
-it('shows the migration notice and cleanup guide in the delete module', () => {
-    render(<SecurityDeleteSection accountObjectId="0x99" />)
-    expect(screen.getByText('Delete pre-migration memories')).toBeInTheDocument()
-    expect(screen.getByText('Applies only to memories written before July 30, 2026')).toBeInTheDocument()
-    expect(screen.getByText(/On July 30, 2026 all existing memories were migrated/)).toBeInTheDocument()
+it('defaults to post-migration scope and switches cleanly to pre-migration notice', async () => {
+    const user = userEvent.setup()
+    render(<SecurityDeleteSection accountObjectId="0xlegacy" currentAccountObjectId="0xcurrent" />)
+    expect(screen.getByText('Delete memories')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Post-migration' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pre-migration' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText(/Select one or more post-migration memory blobs below/)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'here' })).toHaveAttribute(
         'href',
         'https://docs.wal.app/walrus-memory/guides/delete-old-memories',
     )
+
+    await user.click(screen.getByRole('button', { name: 'Pre-migration' }))
+    expect(screen.getByRole('button', { name: 'Pre-migration' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText(/On July 30, 2026 all existing memories were migrated/)).toBeInTheDocument()
+})
+
+it('uses scope-matched account objects for preview and shows single-blob confirmation copy', async () => {
+    const user = userEvent.setup()
+    render(<SecurityDeleteSection accountObjectId={null} currentAccountObjectId="0xcurrent99" />)
+    await loadMemories(user)
+    expect(mocks.listBlobs).toHaveBeenCalledWith('token', expect.objectContaining({ scope: 'current', state: 'deletable' }))
+
+    await user.click(await screen.findByRole('button', { name: 'Preview blob-one-long-identifier' }))
+    expect(mocks.fetchPreview).toHaveBeenCalledWith(expect.objectContaining({
+        blobId: 'blob-one-long-identifier',
+        accountObjectId: '0xcurrent99',
+        scope: 'current',
+    }))
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+
+    await user.click(screen.getByLabelText('Select blob-one-long-identifier'))
+    await user.click(screen.getByRole('button', { name: /Delete selected/ }))
+    expect(screen.getByText(/blob-one-long-identifier/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Delete forever' }))
+    expect(mocks.deleteSelection).toHaveBeenCalledWith(['blob-one-long-identifier'], 900)
 })
 
 it('waits for explicit user intent before loading affected rows', async () => {

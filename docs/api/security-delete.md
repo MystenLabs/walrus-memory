@@ -1,13 +1,26 @@
 ## Security Delete API
 
-The Security Delete API permanently deletes legacy Walrus Blob objects that
-were tracked in MemWal's old-V1 database. The server selects and verifies the
-objects, builds and sponsors the Sui transaction, and executes it. The client
-only authenticates its wallet and signs the returned `TransactionData`.
+The Security Delete API permanently deletes Walrus `Blob` objects owned by an
+authenticated Sui wallet or zkLogin account across two isolated scopes:
 
-This API never enrolls caller-supplied blobs into the legacy tracking set and
-never deletes `vector_entries` directly. Existing recall cleanup removes stale
-index rows after the corresponding Walrus object is gone.
+- `scope=current`: post-migration memory blobs tracked in MemWal's primary
+  database (`DATABASE_URL`).
+- `scope=legacy` (default when `scope` is omitted): pre-migration memory blobs
+  tracked in `LEGACY_DB_URL`.
+
+The server selects and verifies the objects, builds and sponsors the
+`walrus::system::delete_blob` Sui transaction, and executes it. The client only
+authenticates its wallet (including browser wallets and zkLogin sessions, with
+no private key export required) and signs the returned `TransactionData`.
+
+This API never enrolls caller-supplied arbitrary blob IDs. In `scope=legacy` it
+operates strictly on pre-seeded legacy tracking rows, and in `scope=current` it
+synchronizes only the authenticated owner's own indexed post-migration blobs
+from `vector_entries` and `remember_jobs`. When a deletion transaction commits
+on Sui, finalization atomically deletes matching `vector_entries` rows, records
+tombstones in `memory_tombstones` (when present) so deleted blobs are excluded
+from `recall` and `restore`, and clears `remember_jobs.idempotency_key` so
+re-saving identical content later is not blocked by a stale idempotency hit.
 
 ## Availability and feature flags
 
@@ -28,10 +41,16 @@ response. This feature gate runs before authentication, query parsing, and
 body extraction, so an unauthenticated or malformed request does not reveal a
 disabled deployment.
 
-Enabling the API also requires `LEGACY_DB_URL`, `SUI_GRPC_URL`,
-`WALRUS_PACKAGE_ID`, `WALRUS_SYSTEM_OBJECT_ID`, `DELETION_TOKEN_SECRET`, and a
-base64-encoded 32-byte `SPONSOR_PRIVATE_KEY`. Configuration changes require a
-restart or rolling deployment.
+Enabling the API requires `DATABASE_URL`, `SUI_GRPC_URL`, `WALRUS_PACKAGE_ID`,
+`WALRUS_SYSTEM_OBJECT_ID`, `DELETION_TOKEN_SECRET`, and a base64-encoded
+32-byte `SPONSOR_PRIVATE_KEY`. `LEGACY_DB_URL` is optional: when configured,
+it must reference a dedicated pre-migration database distinct from `DATABASE_URL`
+(pointing `LEGACY_DB_URL` at the primary database is rejected at boot because
+pre-existing `vector_entries` rows lack unambiguous scope provenance).
+When configured, both `scope=current` and `scope=legacy` are served against their
+respective databases; when `LEGACY_DB_URL` is unset, `scope=current` operates
+normally and requests with `scope=legacy` return `404 FEATURE_DISABLED`.
+Configuration changes require a restart or rolling deployment.
 
 The API supports browser requests from any origin. Cross-origin preflight
 requests allow `GET`, `POST`, and `DELETE`, plus the `Content-Type` and
@@ -41,9 +60,10 @@ authorization checks still apply to cross-origin callers.
 The background selectors are independent of route exposure:
 `DELETION_OBJECT_RESOLVER_ENABLED` might run with both route flags off, and
 `DELETION_RECONCILER_ENABLED` might reconcile existing batches while routes are
-off. Either job still requires the legacy database and Sui gRPC configuration;
-the reconciler additionally requires the sponsor key. Enabling a background
-job does not make any HTTP endpoint reachable.
+off. Either job requires the primary database (plus `LEGACY_DB_URL` if legacy
+reconciliation is used) and Sui gRPC configuration; the reconciler additionally
+requires the sponsor key. Enabling a background job does not make any HTTP
+endpoint reachable.
 
 ## Authentication
 
@@ -108,7 +128,7 @@ Malformed, tampered, and expired tokens intentionally share
 ## List tracked blobs
 
 ```http
-GET /api/security-deletable-blobs?state=deletable&limit=100&cursor=<opaque>
+GET /api/security-deletable-blobs?scope=current&state=deletable&limit=100&cursor=<opaque>
 Authorization: Bearer <token>
 ```
 
@@ -118,7 +138,7 @@ Authorization: Bearer <token>
     {
       "blobId": "X4...",
       "objectId": "0x123...",
-      "createdAt": "2026-07-11T08:15:30.123456+00:00",
+      "createdAt": "2026-08-11T08:15:30.123456+00:00",
       "state": "deletable"
     }
   ],
@@ -136,6 +156,15 @@ Authorization: Bearer <token>
 }
 ```
 
+`scope` selects which tracking pool to query:
+
+- `scope=current`: synchronizes the authenticated owner's post-migration blobs
+  from `vector_entries` and `remember_jobs` in `DATABASE_URL` and lists their
+  tracking states.
+- `scope=legacy` (default when `scope` is omitted): lists pre-migration blobs in
+  `LEGACY_DB_URL` (returns `404 FEATURE_DISABLED` if `LEGACY_DB_URL` is unset).
+- Any other `scope` value returns `400 INVALID_REQUEST`.
+
 The default state is `deletable`. `state` accepts one or more comma-separated
 values from:
 
@@ -146,7 +175,7 @@ deletable,deleting,deleted,deleted_external,not_owner,expired
 Results use keyset ordering by `(createdAt, blobId)`. Cursors are opaque and
 versioned; an invalid cursor never silently restarts at the first page. `limit`
 must be between 1 and 200. Counts always cover all states for the authenticated
-owner, regardless of the current filter.
+owner within the selected `scope`, regardless of the current `state` filter.
 
 `limits.deleteBatchMax` is authoritative. It defaults to and is hard-capped at
 900 because the measured 1,000-object Sui transaction exceeds the protocol's
@@ -154,22 +183,25 @@ owner, regardless of the current filter.
 
 ## Prepare a deletion
 
-Delete up to 900 currently deletable blobs selected by the backend:
+Delete up to 900 currently deletable blobs selected by the backend in the
+requested scope (`"legacy"` when `scope` is omitted, or `"current"` for
+post-migration memories):
 
 ```http
 POST /api/security-deletions
 Authorization: Bearer <token>
 Content-Type: application/json
 
-{"mode":"all"}
+{"mode":"all","scope":"current"}
 ```
 
-Or request an exact tracked selection:
+Or request an exact single-blob or multi-blob tracked selection:
 
 ```json
 {
   "mode": "selection",
-  "blobIds": ["blob-a", "blob-b"]
+  "scope": "current",
+  "blobIds": ["blob-a"]
 }
 ```
 
@@ -206,11 +238,13 @@ If nothing remains after validation, preparation succeeds without a batch:
 Preparation is strict:
 
 - `mode` must be exactly `all` or `selection`.
+- `scope` is optional and must be `"legacy"` (default) or `"current"`.
 - `all` must not include `blobIds`.
-- `selection` must contain 1–900 unique, non-empty IDs.
-- Every selected ID must already exist in the authenticated owner's legacy
-  tracking set and be `deletable`. One conflict rejects the entire selection;
-  no row is partially claimed and no untracked blob is inserted.
+- `selection` must contain 1 to 900 unique, non-empty IDs.
+- Every selected ID must already exist in the authenticated owner's tracking set
+  for the requested `scope` and be `deletable`. One conflict rejects the entire
+  selection; no row is partially claimed and no arbitrary untracked blob is
+  inserted.
 - Objects are re-read from Sui before the transaction is built. Missing,
   transferred, and near-expiry objects are removed from the batch and reported
   as `already_deleted`, `not_owner`, or `expired`.
@@ -366,11 +400,11 @@ curl -sS "$MEMWAL_URL/api/security-delete-auth/verify" \
   -H 'content-type: application/json' \
   -d '{"challengeId":"<id>","address":"0xabc","signature":"<personal-signature>"}'
 
-# 3. Prepare one backend-selected batch.
+# 3. Prepare a single-blob post-migration deletion (or use "scope":"legacy" / "mode":"all").
 curl -sS "$MEMWAL_URL/api/security-deletions" \
   -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"mode":"all"}'
+  -d '{"mode":"selection","scope":"current","blobIds":["<blob-id>"]}'
 
 # 4. Sign decoded txBytes as Sui TransactionData, then submit.
 curl -sS "$MEMWAL_URL/api/security-deletions/$BATCH_ID/submit" \
@@ -383,11 +417,32 @@ curl -sS "$MEMWAL_URL/api/security-deletions/$BATCH_ID" \
   -H "authorization: Bearer $TOKEN"
 ```
 
+## Verification, cache limits, and fallback support
+
+- **Verify deletion**: Confirm `state: "completed"` and a non-null Sui `digest`
+  from submit or batch status, inspect `GET /api/security-deletable-blobs?scope=current&state=deleted`
+  to see the blob in `deleted` state, verify on Sui that the `Blob` object ID no
+  longer exists as a live object, and verify via `POST /api/recall` that the
+  memory is absent from search results.
+- **Caches and copies**: Destroying the onchain `Blob` object and purging the
+  relayer index does not immediately evict ciphertext cached by HTTP aggregators
+  or CDNs before TTL expiry, physical storage-node sliver reclamation completes
+  asynchronously across Walrus epochs, and any plaintext already delivered to
+  MCP clients, SDK callers, logs, or LLM chat histories remains outside Walrus
+  Memory.
+- **Fallback support**: When a newly stored blob has not yet completed ownership
+  transfer (`not_owner`), or when self-service deletion routes return
+  `404 FEATURE_DISABLED` on a deployment, owners can request verification and
+  deletion support via [GitHub Issues](https://github.com/MystenLabs/MemWal/issues)
+  or the official Walrus Discord by providing their public owner Sui address,
+  target `blobId`, and a wallet-signed ownership message (never an exported
+  private key).
+
 ## Concurrency and safety guarantees
 
 - Owner identity always comes from the verified Bearer, never a request body.
-- Selection claims update existing legacy tracking rows only and are
-  all-or-nothing.
+- Selection claims update existing tracking rows for the requested `scope` only
+  and are all-or-nothing.
 - Active-cap checking, batch creation, and row claiming share one transaction
   under an owner-scoped advisory lock.
 - Every batch transition compares the expected state.
