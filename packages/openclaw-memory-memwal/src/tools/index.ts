@@ -11,6 +11,9 @@ import { registerSearchTool } from "./search.js";
 import { registerStoreTool } from "./store.js";
 import type { PluginConfig } from "../types.js";
 
+export { registerSearchTool } from "./search.js";
+export { registerStoreTool } from "./store.js";
+
 /** Register all agent-callable tools. */
 export function registerTools(api: any, client: MemWal, config: PluginConfig): void {
   registerSearchTool(api, client, config);
