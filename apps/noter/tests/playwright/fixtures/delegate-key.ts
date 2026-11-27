@@ -1,11 +1,11 @@
 /**
- * Delegate-key auth helpers.
+ * Delegate key auth helpers.
  *
- * `connectDelegateKey` calls `assertDelegateAccountBinding`, which verifies
- * the derived public key is registered on the claimed account — on real
+ * connectDelegateKey calls assertDelegateAccountBinding, which verifies
+ * the derived public key is registered on the claimed account on real
  * chain data outside tests, and against the shared fixture pool
- * (`package/feature/auth/lib/delegate-fixtures.ts`) when isTestEnvironment
- * is set (playwright.config.ts / test:e2e pass PLAYWRIGHT=True).
+ * (package/feature/auth/lib/delegate-fixtures.ts) when isTestEnvironment
+ * is set (playwright.config.ts and test:e2e pass PLAYWRIGHT=True).
  *
  * Identities come from that single pool so the mock and this fixture cannot
  * drift. The allocator throws when the pool is exhausted rather than wrapping
@@ -13,10 +13,12 @@
  *
  * A fixture key is NOT enough to write to Walrus Memory: isTestEnvironment
  * is true for every Playwright-started server, so the binding check only
- * ever consults the fixture pool. There's no live-write path in this suite
+ * ever consults the fixture pool. There is no live-write path in this suite
  * by design; see the note in e2e/memory.test.ts.
  */
-import { test, type Page } from "@playwright/test";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import type { Page } from "@playwright/test";
 import {
   DELEGATE_FIXTURE_COUNT,
   delegateFixtureAt,
@@ -27,27 +29,48 @@ export type DelegateCredentials = {
   accountId: string;
 };
 
-// Module-scoped counter, one instance per Playwright worker PROCESS (workers:
-// 2 spawns separate processes, not just separate async contexts — a plain
-// counter alone would restart at 0 in each, so two workers' first calls would
-// both claim fixture 0). Interleave by test.info().parallelIndex so worker 0
-// claims 0, 2, 4, ... and worker 1 claims 1, 3, 5, ...
-let localCallCount = 0;
+export function getDelegateClaimsDir(): string {
+  return (
+    process.env.NOTER_DELEGATE_CLAIMS_DIR ||
+    path.resolve(__dirname, "../../../test-results/.delegate-fixture-claims")
+  );
+}
 
-/** A never-yet-used fixture identity from the pool this worker owns exclusively. */
-export function nextDelegateCredentials(): DelegateCredentials {
-  const parallelIndex = test.info().parallelIndex;
-  const workerCount = Number(test.info().config.workers);
-  const i = localCallCount * workerCount + parallelIndex;
-  if (i >= DELEGATE_FIXTURE_COUNT) {
-    throw new Error(
-      `Delegate fixture pool exhausted (need index ${i}, have ${DELEGATE_FIXTURE_COUNT}). ` +
-        `Bump DELEGATE_FIXTURE_COUNT in package/feature/auth/lib/delegate-fixtures.ts.`
-    );
+/**
+ * A never-yet-used fixture identity from the pool.
+ *
+ * Claims are allocated via atomic directory creation in a shared claims
+ * directory across all worker processes. On retry, respawned workers see
+ * existing claims on disk and allocate fresh fixtures without colliding with
+ * prior workers.
+ */
+export function nextDelegateCredentials(claimsDirOverride?: string): DelegateCredentials {
+  const claimsDir = claimsDirOverride || getDelegateClaimsDir();
+  mkdirSync(claimsDir, { recursive: true });
+
+  for (let i = 0; i < DELEGATE_FIXTURE_COUNT; i += 1) {
+    const claimPath = path.join(claimsDir, String(i));
+    try {
+      mkdirSync(claimPath);
+      const fixture = delegateFixtureAt(i);
+      return { accountId: fixture.accountId, privateKey: fixture.privateKey };
+    } catch (err: unknown) {
+      if (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code: string }).code === "EEXIST"
+      ) {
+        continue;
+      }
+      throw err;
+    }
   }
-  localCallCount += 1;
-  const fixture = delegateFixtureAt(i);
-  return { accountId: fixture.accountId, privateKey: fixture.privateKey };
+
+  throw new Error(
+    `Delegate fixture pool exhausted (need index ${DELEGATE_FIXTURE_COUNT}, have ${DELEGATE_FIXTURE_COUNT}). ` +
+      `Bump DELEGATE_FIXTURE_COUNT in package/feature/auth/lib/delegate-fixtures.ts.`
+  );
 }
 
 /** Open the collapsed "Sign in with delegate key" form on the landing page. */
@@ -73,8 +96,8 @@ export async function signInWithDelegateKey(
 
   // The form hard-navigates with window.location.href = "/note"; wait for that
   // full page load to land. If the sessionAtom-hydration regression (guarded
-  // by auth.test.ts) ever comes back, this — and every test that depends on
-  // it — fails loudly instead of silently working around the bounce.
+  // by auth.test.ts) ever comes back, this, and every test that depends on
+  // it, fails loudly instead of silently working around the bounce.
   await page.waitForURL(/\/note(\/|$)/);
   return credentials;
 }

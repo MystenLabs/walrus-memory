@@ -3,14 +3,14 @@
  *
  * Shared by the server-side gRPC mock (`delegate-account.mock.ts`) and the
  * Playwright fixture (`tests/playwright/fixtures/delegate-key.ts`) so the
- * two cannot drift. Index N → accountId byte `N` repeated, owner byte
+ * two cannot drift. Index N: accountId byte `N` repeated, owner byte
  * `N + 0x80` repeated, privateKey byte `N + 0x40` repeated.
  *
  * Sized as a pool (not a pair) because noter authenticates a fresh identity
- * per test: with 2 workers and ~15 login call sites, two shared identities
+ * per test: with 2 workers and retried test runs, two shared identities
  * would collide on each other's notes.
  */
-export const DELEGATE_FIXTURE_COUNT = 24;
+export const DELEGATE_FIXTURE_COUNT = 128;
 
 export type DelegateFixture = {
   accountId: string;

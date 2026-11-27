@@ -38,7 +38,9 @@ test.describe("App shell", () => {
   });
 
   test("memory health endpoint answers with a structured status", async ({ request }) => {
-    const response = await request.get("/api/memory/health");
+    const response = await request.get("/api/memory/health", {
+      headers: { connection: "close" },
+    });
 
     // 200 when a server-side MEMWAL key is configured, 503 when it isn't.
     expect([200, 503]).toContain(response.status());
