@@ -22,6 +22,8 @@ import respx
 from memwal.client import (
     IDEMPOTENCY_BUCKET_MS,
     MemWal,
+    MemWalRememberJobFailed,
+    MemWalRememberJobNotFound,
     MemWalRememberJobTimeout,
     MemWalSync,
     _derived_idempotency_key,
@@ -248,3 +250,97 @@ def test_sync_client_uses_derived_key():
     assert len(posted_bodies) == 2
     assert posted_bodies[0]["idempotency_key"] == posted_bodies[1]["idempotency_key"]
     assert posted_bodies[0]["idempotency_key"].startswith("r1-")
+
+
+# ------------------------------------------------------------------
+# Regression tests for GH #1001: terminal job failure must pop the
+# pending key so a future retry with the same text derives a fresh
+# idempotency key instead of re-sending the poisoned one.
+# ------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_remember_and_wait_pops_key_on_terminal_job_failure():
+    """_pending_remember_keys is cleaned up when the job fails terminally,
+    and a subsequent retry of the same text sends a fresh idempotency key.
+    """
+    _mock_version_and_config()
+    posted_bodies = []
+
+    def handle_remember(request: httpx.Request) -> httpx.Response:
+        posted_bodies.append(json.loads(request.content))
+        job_id = "job-fail" if len(posted_bodies) == 1 else "job-ok"
+        return httpx.Response(202, json={"job_id": job_id, "status": "pending"})
+
+    respx.post(f"{_TEST_SERVER}/api/remember").mock(side_effect=handle_remember)
+    respx.get(f"{_TEST_SERVER}/api/remember/job-fail").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "job_id": "job-fail",
+                "status": "failed",
+                "error": "Walrus upload rejected",
+            },
+        )
+    )
+    respx.get(f"{_TEST_SERVER}/api/remember/job-ok").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "job_id": "job-ok",
+                "status": "done",
+                "blob_id": "blob-ok",
+                "owner": _TEST_ACCOUNT_ID,
+                "namespace": "default",
+            },
+        )
+    )
+
+    client = _make_client()
+    request_identity = "default\0doomed fact"
+
+    with pytest.raises(MemWalRememberJobFailed, match="Walrus upload rejected"):
+        await client.remember_and_wait("doomed fact")
+
+    # The pending key must have been popped despite the exception.
+    assert request_identity not in client._pending_remember_keys
+    assert len(client._pending_remember_keys) == 0
+
+    # Retrying the same text and namespace sends a fresh idempotency key and succeeds.
+    result = await client.remember_and_wait("doomed fact")
+    assert result.blob_id == "blob-ok"
+    assert len(posted_bodies) == 2
+    assert posted_bodies[0]["idempotency_key"] != posted_bodies[1]["idempotency_key"]
+    assert posted_bodies[1]["idempotency_key"].startswith("r1-")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_remember_and_wait_pops_key_on_job_not_found():
+    """_pending_remember_keys is cleaned up when the job is not found.
+
+    MemWalRememberJobNotFound is also terminal: the relayer lost track of
+    the job so keeping the key around only blocks fresh retries.
+    """
+    _mock_version_and_config()
+
+    respx.post(f"{_TEST_SERVER}/api/remember").mock(
+        return_value=httpx.Response(
+            202, json={"job_id": "job-gone", "status": "pending"}
+        )
+    )
+    respx.get(f"{_TEST_SERVER}/api/remember/job-gone").mock(
+        return_value=httpx.Response(
+            200,
+            json={"job_id": "job-gone", "status": "not_found"},
+        )
+    )
+
+    client = _make_client()
+    request_identity = "default\0vanished fact"
+
+    with pytest.raises(MemWalRememberJobNotFound):
+        await client.remember_and_wait("vanished fact")
+
+    assert request_identity not in client._pending_remember_keys

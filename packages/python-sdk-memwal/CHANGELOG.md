@@ -7,6 +7,10 @@
 - `RecallResult` gains `degraded: bool = False`, set to `True` whenever one or more vector matches were dropped, and `recall()` returns the degraded result (`results=[]`, `degraded=True`, `dropped_count`) by default when all matches fail to download or decrypt. (#1036, #1070)
 - `recall()` and `RecallParams` accept `on_dropped: str = "ignore"` (`"ignore"` or `"throw"`) across `MemWal`, `MemWalSync`, `MemWalMock`, and `MemWalMockSync`. Passing `on_dropped="throw"` raises `MemWalRecallAllDropped` (`code = "RECALL_ALL_DROPPED"`, exposing `total`, `dropped_count`, and `namespace`) when all vector search matches are dropped during Walrus blob download or SEAL decryption. (#1036, #1070)
 
+### Fixed
+
+- `remember_and_wait` removes `_pending_remember_keys` and salts `_failed_remember_keys` on terminal job failures (`MemWalRememberJobFailed` and `MemWalRememberJobNotFound`) while preserving pending keys across polling timeouts. (#1001)
+
 ## 0.2.2
 
 Unreleased.
