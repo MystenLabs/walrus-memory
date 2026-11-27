@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Bound SessionKey.create during SEAL session construction to preflightTimeoutMs with classified MemWalRequestTimeout (504, phase: "preflight SessionKey.create"), preventing recall() and relayer calls from hanging indefinitely when a Sui RPC or gRPC endpoint stalls. (#1367)
 - `MemWal` and `MemWalMock` share input validation on `remember*`, `rememberBulk*`, `analyze*`, `embed`, `recall`, `restore`, and `listNamespaces`, rejecting invalid `idempotencyKey` values before signing and rejecting `limit: 0` consistently. On read paths (`recall`, `recallManual`, `restore`, and `listMemories`), empty string `""` is rejected while whitespace namespaces remain readable to match the server's namespace validation. (Refs #978)
 
 ## 0.1.12

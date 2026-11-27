@@ -1981,24 +1981,65 @@ export class MemWal {
         // SessionKey accepts either transport through the shared core client
         // interface. Candidates are ordered by the server's preferred
         // transport, with JSON-RPC retained as a compatibility fallback.
-        let session: any = undefined;
-        let lastClientError: unknown;
-        for (const candidate of clientCandidates) {
-            try {
-                session = await SessionKey.create({
-                    address: keypair.getPublicKey().toSuiAddress(),
-                    packageId: cfg.packageId,
-                    ttlMin: SEAL_SESSION_TTL_MIN,
-                    signer: keypair,
-                    suiClient: candidate.client as any,
-                });
-                break;
-            } catch (err) {
-                lastClientError = err;
+        // Bound the Sui read by this.preflightTimeoutMs so a stalled endpoint
+        // cannot block recall or relayer-mode calls indefinitely (#1367).
+        const deadline = deadlineSignal(this.preflightTimeoutMs);
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            if (deadline.signal.aborted) {
+                reject(
+                    requestTimeoutError(
+                        "Sui RPC",
+                        "SessionKey.create",
+                        this.preflightTimeoutMs,
+                        "preflight SessionKey.create",
+                    ),
+                );
+                return;
             }
-        }
-        if (!session) {
-            throw lastClientError;
+            deadline.signal.addEventListener(
+                "abort",
+                () => {
+                    reject(
+                        requestTimeoutError(
+                            "Sui RPC",
+                            "SessionKey.create",
+                            this.preflightTimeoutMs,
+                            "preflight SessionKey.create",
+                        ),
+                    );
+                },
+                { once: true },
+            );
+        });
+
+        const buildSessionPromise = (async () => {
+            let s: any = undefined;
+            let lastErr: unknown;
+            for (const candidate of clientCandidates) {
+                try {
+                    s = await SessionKey.create({
+                        address: keypair.getPublicKey().toSuiAddress(),
+                        packageId: cfg.packageId,
+                        ttlMin: SEAL_SESSION_TTL_MIN,
+                        signer: keypair,
+                        suiClient: candidate.client as any,
+                    });
+                    break;
+                } catch (err) {
+                    lastErr = err;
+                }
+            }
+            if (!s) {
+                throw lastErr;
+            }
+            return s;
+        })();
+
+        let session: any;
+        try {
+            session = await Promise.race([buildSessionPromise, timeoutPromise]);
+        } finally {
+            deadline.dispose();
         }
 
         if (this.destroyed) throw destroyedClientError();

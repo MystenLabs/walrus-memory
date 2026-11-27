@@ -747,13 +747,16 @@ export function deadlineSignal(
 /**
  * The error a request deadline produces.
  */
-export function requestTimeoutError(method: string, path: string, ms: number): Error {
+export function requestTimeoutError(method: string, path: string, ms: number, phase?: string): Error {
+    const stage = phase ?? `${method} ${path}`;
     const err = new Error(
-        `Walrus Memory request timed out after ${ms}ms (${method} ${path}). The relayer ` +
+        `Walrus Memory request timed out after ${ms}ms during ${stage}. The relayer ` +
             `accepted the connection but did not answer in time.`,
     );
     err.name = "MemWalRequestTimeout";
-    (err as Error & { status?: number }).status = 504;
+    (err as Error & { status?: number; phase?: string; timeoutMs?: number }).status = 504;
+    (err as Error & { phase?: string }).phase = stage;
+    (err as Error & { timeoutMs?: number }).timeoutMs = ms;
     return err;
 }
 

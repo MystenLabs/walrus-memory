@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { MemWal } from "../dist/memwal.js";
+import { MemWalManual } from "../dist/manual.js";
+import { SessionKey } from "@mysten/seal";
 import { fetchWithDeadline, isTimeoutError, DEFAULT_RECALL_TIMEOUT_MS } from "../dist/utils.js";
 
 // The shipped deadline contract (WALM-648): name `MemWalRequestTimeout`, status
@@ -26,9 +28,11 @@ const isRequestTimeout = (err) =>
 // their own independent deadlines.
 
 const originalFetch = globalThis.fetch;
+const originalSessionKeyCreate = SessionKey.create;
 
 test.afterEach(() => {
     globalThis.fetch = originalFetch;
+    SessionKey.create = originalSessionKeyCreate;
 });
 
 /**
@@ -333,6 +337,124 @@ test("a short recall budget is sent whole instead of floored at 1", async () => 
     };
     await client().recall({ query: "x", timeoutMs: 400 });
     assert.equal(body.deadline_ms, 400);
+});
+
+test("a stalled SessionKey.create rejects within preflightTimeoutMs with classified MemWalRequestTimeout (#1367)", async () => {
+    const seen = [];
+    globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        seen.push(path);
+        if (path === "/version") return Response.json(VERSION_BODY);
+        if (path === "/config") {
+            return Response.json({
+                packageId: "0x123",
+                network: "testnet",
+                suiGrpcUrl: "http://127.0.0.1:9999",
+                suiTransport: "grpc",
+            });
+        }
+        if (path === "/api/recall") {
+            return Response.json({ results: [], total: 0 });
+        }
+        throw new Error(path);
+    };
+
+    SessionKey.create = () => new Promise((resolve) => setTimeout(resolve, 500));
+
+    const c = MemWal.create({
+        key: new Uint8Array(32).fill(1),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        preflightTimeoutMs: 35,
+    });
+
+    await assert.rejects(
+        c.recall({ query: "allergies" }),
+        (err) => {
+            assert.ok(isRequestTimeout(err));
+            assert.equal(err.phase, "preflight SessionKey.create");
+            assert.equal(err.timeoutMs, 35);
+            assert.equal(err.status, 504);
+            return true;
+        },
+    );
+    assert.deepEqual(seen, ["/version", "/config"]);
+});
+
+test("MemWalManual buildSealSession rejects within preflightTimeoutMs when SessionKey.create stalls (#1367)", async () => {
+    SessionKey.create = () => new Promise((resolve) => setTimeout(resolve, 500));
+
+    const m = MemWalManual.create({
+        key: new Uint8Array(32).fill(1),
+        suiPrivateKey: new Uint8Array(32).fill(2),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        packageId: "0x123",
+        suiRpcUrl: "http://127.0.0.1:9999",
+        preflightTimeoutMs: 40,
+    });
+
+    await assert.rejects(
+        m.buildSealSession(),
+        (err) => {
+            assert.ok(isRequestTimeout(err));
+            assert.equal(err.phase, "preflight SessionKey.create");
+            assert.equal(err.timeoutMs, 40);
+            assert.equal(err.status, 504);
+            return true;
+        },
+    );
+});
+
+test("SessionKey.create timeout clears single-flight state and allows recovery (#1367)", async () => {
+    let callCount = 0;
+    const c = MemWal.create({
+        key: new Uint8Array(32).fill(1),
+        accountId: "0x1",
+        serverUrl: "https://relayer.example",
+        preflightTimeoutMs: 30,
+    });
+
+    globalThis.fetch = async (url) => {
+        const path = new URL(url).pathname;
+        if (path === "/version") return Response.json(VERSION_BODY);
+        if (path === "/config") {
+            return Response.json({
+                packageId: "0x123",
+                network: "testnet",
+                suiGrpcUrl: "http://127.0.0.1:9999",
+                suiTransport: "grpc",
+            });
+        }
+        if (path === "/api/recall") return Response.json({ results: [{ id: "mem1" }], total: 1 });
+        throw new Error(path);
+    };
+
+    SessionKey.create = async () => {
+        callCount++;
+        if (callCount === 1) {
+            return new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        return {
+            getPersonalMessage: () => new Uint8Array([1, 2, 3]),
+            setPersonalMessageSignature: async () => {},
+            export: () => ({ version: 1, bytes: "fake-seal-session" }),
+        };
+    };
+
+    // First call rejects with timeout
+    await assert.rejects(c.recall({ query: "first" }), (err) => {
+        assert.ok(isRequestTimeout(err));
+        assert.equal(err.phase, "preflight SessionKey.create");
+        assert.equal(err.status, 504);
+        assert.equal(err.timeoutMs, 30);
+        return true;
+    });
+
+    // Single-flight state must be cleared: second call succeeds
+    const recovered = await c.recall({ query: "second" });
+    assert.equal(recovered.total, 1);
+    assert.equal(recovered.results[0].id, "mem1");
 });
 
 test("RecallOptions and MemWalConfig declare the timeout knobs", () => {
