@@ -442,7 +442,7 @@ test("PostToolUse stops nudging a save after an error when the user answered no"
 test("a hook with saving off still exits 0 and never blocks the session", () => {
     const dir = freshCredsDir();
     writeSettings(dir, { autoSave: false });
-    for (const script of ["on_session_start.mjs", "on_user_prompt.mjs", "on_post_tool.mjs"]) {
+    for (const script of ["on_session_start.mjs", "on_user_prompt.mjs", "on_post_tool.mjs", "on_pre_compact.mjs"]) {
         const result = spawnSync(process.execPath, [join(SCRIPTS, script)], {
             input: JSON.stringify({ prompt: "a reasonably long prompt about pnpm" }),
             encoding: "utf8",

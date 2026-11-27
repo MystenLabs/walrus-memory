@@ -36,6 +36,18 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "name": "memwal-pre-compact",
+            "type": "command",
+            "command": "node \"${extensionPath}/scripts/on_pre_compact.mjs\" 2>/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

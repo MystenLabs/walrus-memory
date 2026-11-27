@@ -25,6 +25,7 @@ import {
     SECRET_EXCLUSION_SUMMARY,
     AUTO_SAVE_OPT_IN_RULE,
     MEMORY_POLICY_VERSION,
+    PRE_COMPACT_PROMPT,
 } from "../dist/memory-policy.js";
 import * as hookPolicy from "../plugin/scripts/lib/memory-policy.mjs";
 import {
@@ -98,6 +99,8 @@ test("the compiled client copy and the hook copy agree at runtime", () => {
     assert.equal(hookPolicy.SECRET_EXCLUSION_SUMMARY, SECRET_EXCLUSION_SUMMARY);
     assert.equal(hookPolicy.AUTO_SAVE_OPT_IN_RULE, AUTO_SAVE_OPT_IN_RULE);
     assert.equal(hookPolicy.MEMORY_POLICY_VERSION, MEMORY_POLICY_VERSION);
+    assert.equal(hookPolicy.PRE_COMPACT_PROMPT, PRE_COMPACT_PROMPT);
+    assert.ok(PRE_COMPACT_PROMPT.includes(SECRET_EXCLUSION_RULES));
 });
 
 test("the rules name every credential class the ticket lists", () => {

@@ -82,3 +82,17 @@ export const AUTO_SAVE_OPT_IN_RULE = [
 /** Bumped whenever the text above changes, so a stale copy is identifiable. */
 export const MEMORY_POLICY_VERSION = "2026-09-17.2";
 // ─── memwal:policy-block:end ─────────────────────────────────────────────────
+
+/**
+ * Prompt injected before context compaction when automatic memory is enabled.
+ * Instructs the assistant to review the session for durable facts, decisions,
+ * conventions, and resolved bugs before context is compacted, while strictly
+ * obeying the secret exclusion rules.
+ */
+export const PRE_COMPACT_PROMPT = [
+    "Before the conversation context is compacted, review the current session for any durable user preferences, architectural decisions, project conventions, or resolved bug root causes that have not yet been saved to Walrus Memory.",
+    "Save high-signal facts using memwal_remember or memwal_remember_bulk (preferring memwal_remember_bulk when storing multiple facts).",
+    "Skip ephemeral progress notes, raw command output, and anything already saved earlier in the session, and strictly obey SECRET_EXCLUSION_RULES.",
+    SECRET_EXCLUSION_RULES,
+].join(" ");
+

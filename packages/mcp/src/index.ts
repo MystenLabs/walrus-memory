@@ -839,4 +839,11 @@ export {
 export { askAutoSaveConsent, interpretConsentAnswer, CONSENT_PROMPT } from "./consent.js";
 export { loginFlow } from "./login.js";
 export { runBridge } from "./bridge.js";
+export {
+    runPreCompactSave,
+    isPreCompactAutoSaveEnabled,
+    resolvePreCompactCreds,
+    redactSecrets,
+} from "./pre-compact.js";
+export type { PreCompactInput, PreCompactResult } from "./pre-compact.js";
 export type { MemWalCredentials, CredsResolution, ProjectCredsDecision } from "./auth.js";

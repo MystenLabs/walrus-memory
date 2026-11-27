@@ -225,7 +225,7 @@ test("the hook reads nothing from the working directory at all", (t) => {
 test("a hook with no published state saves nothing and still exits 0", (t) => {
     const { home, repo } = sandbox(t);
     assert.equal(existsSync(join(home, ".memwal", "auto-save-state.json")), false);
-    for (const script of ["on_session_start.mjs", "on_user_prompt.mjs", "on_post_tool.mjs"]) {
+    for (const script of ["on_session_start.mjs", "on_user_prompt.mjs", "on_post_tool.mjs", "on_pre_compact.mjs"]) {
         const text = runHookIn(script, {
             cwd: repo,
             home,
