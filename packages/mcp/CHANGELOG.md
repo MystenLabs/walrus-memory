@@ -19,6 +19,7 @@
 
 ### Added
 
+- Add `memwal-mcp import [path]` CLI subcommand to preview and seed local project instruction and memory files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `MEMORY.md`) into Walrus Memory. Runs in dry-run preview mode by default without network calls, screens candidate sections and headings for secrets and opt-out markers locally, and requires explicit `--yes` consent before uploading via `/api/remember/bulk`. (#1374)
 - Add `memwal-mcp status` and `whoami` CLI subcommand to inspect current account, delegate, label, relayer, namespace, credentials file, and auto-save configuration without interactive prompts. (#1340)
 
 ## 0.0.18
