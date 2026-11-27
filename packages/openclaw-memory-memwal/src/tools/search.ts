@@ -1,5 +1,5 @@
 /**
- * memory_search tool — semantic recall.
+ * memory_search tool: semantic recall.
  *
  * Requires tools.allow config to be visible to the LLM.
  * Registered as a factory so the search is pinned to ctx.sessionKey.
@@ -9,15 +9,42 @@
 import type { MemWal } from "@mysten-incubation/memwal";
 import { Type } from "@sinclair/typebox";
 import { looksLikeInjection } from "../capture.js";
-import { resolveToolNamespace } from "../config.js";
+import { resolveScopedToolNamespace } from "../config.js";
 import { escapeForPrompt, relevancePercent, relevanceRatio, toolError, withTimeout } from "../format.js";
 import type { PluginConfig } from "../types.js";
 import { DEFAULT_SEARCH_LIMIT } from "../constants.js";
 
+export type SearchToolConfig = Pick<PluginConfig, "defaultNamespace"> &
+  Partial<Pick<PluginConfig, "isolateBySender" | "includeSharedNamespaceOnRecall" | "requestTimeoutMs">>;
+
+function normalizeSearchConfig(config: SearchToolConfig | string): {
+  defaultNamespace: string;
+  isolateBySender: boolean;
+  includeSharedNamespaceOnRecall: boolean;
+  requestTimeoutMs: number;
+} {
+  if (typeof config === "string") {
+    return {
+      defaultNamespace: config,
+      isolateBySender: false,
+      includeSharedNamespaceOnRecall: false,
+      requestTimeoutMs: 10_000,
+    };
+  }
+  return {
+    defaultNamespace: config.defaultNamespace ?? "default",
+    isolateBySender: Boolean(config.isolateBySender),
+    includeSharedNamespaceOnRecall: Boolean(config.includeSharedNamespaceOnRecall),
+    requestTimeoutMs: config.requestTimeoutMs ?? 10_000,
+  };
+}
+
 /** Register the memory_search agent tool. */
-export function registerSearchTool(api: any, client: MemWal, config: PluginConfig): void {
+export function registerSearchTool(api: any, client: MemWal, config: SearchToolConfig | string): void {
+  const normConfig = normalizeSearchConfig(config);
+
   api.registerTool(
-    (ctx?: { sessionKey?: string }) => ({
+    (ctx?: any) => ({
       name: "memory_search",
       label: "Memory Search",
       description:
@@ -38,18 +65,35 @@ export function registerSearchTool(api: any, client: MemWal, config: PluginConfi
       }),
       async execute(_id: string, params: any) {
         const { query, limit = DEFAULT_SEARCH_LIMIT, namespace } = params;
-        const ns = resolveToolNamespace(config.defaultNamespace, ctx?.sessionKey, namespace);
-        if (!ns) {
+        const resolved = resolveScopedToolNamespace(
+          normConfig,
+          ctx,
+          namespace,
+          { allowSharedRecall: true },
+        );
+
+        if (resolved.error || !resolved.namespace) {
+          const errCode = resolved.error ?? "namespace_rejected";
+          const message =
+            errCode === "cross_sender_namespace_forbidden"
+              ? "Cross-sender memory access is forbidden."
+              : errCode === "sender_identity_required"
+                ? "Sender identity is required when sender isolation is enabled."
+                : "Namespace is pinned to the calling agent.";
           return {
-            content: [{ type: "text", text: "Namespace is pinned to the calling agent." }],
-            details: { error: "namespace_rejected" },
+            error: errCode,
+            message,
+            content: [{ type: "text", text: message }],
+            details: { error: errCode, message },
           };
         }
+
+        const ns = resolved.namespace;
 
         try {
           const result = await withTimeout(
             () => client.recall(query, limit, ns),
-            config.requestTimeoutMs,
+            normConfig.requestTimeoutMs,
             "memory_search",
           );
 
@@ -63,7 +107,7 @@ export function registerSearchTool(api: any, client: MemWal, config: PluginConfi
           }
 
           // Filter out injection attempts and escape text before returning
-          // to the LLM — same protection as the recall hook path
+          // to the LLM: same protection as the recall hook path
           const safe = result.results.filter(
             (r: any) => !looksLikeInjection(r.text),
           );
@@ -77,8 +121,8 @@ export function registerSearchTool(api: any, client: MemWal, config: PluginConfi
             };
           }
 
-          // Cosine distance is [0, 2]; clamp so orthogonal/opposite hits
-          // cannot print a negative relevance % (WALM-441 / GH #798).
+          // Cosine distance is [0, 2]; clamp so orthogonal or opposite hits
+          // cannot print a negative relevance percentage (GH #798).
           const formatted = safe
             .map((r: any, i: number) => {
               const relevance = relevancePercent(r.distance);

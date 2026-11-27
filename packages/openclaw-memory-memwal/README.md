@@ -103,8 +103,10 @@ Optional settings you can add to the `config` block:
 | `maxRecallResults` | `5` | Max memories to inject per turn |
 | `minRelevance` | `0.3` | Relevance threshold (0-1) for memory injection |
 | `captureMaxMessages` | `10` | How many recent messages to analyze for facts |
+| `isolateBySender` | `false` | Isolate memories by sender or user ID into sub-namespaces |
+| `includeSharedNamespaceOnRecall` | `false` | Recall from both sender sub-namespace and base agent namespace |
 
-The defaults work well for most setups — you don't need to change them to get started.
+The defaults work well for most setups, so you do not need to change them to get started.
 
 ### 4. Start OpenClaw
 

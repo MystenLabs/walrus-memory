@@ -1,5 +1,5 @@
 /**
- * memory_store tool — explicit save.
+ * memory_store tool: explicit save.
  *
  * Uses analyze() instead of remember() so the server LLM extracts
  * individual facts from the text, producing cleaner, more searchable
@@ -9,15 +9,42 @@
 import type { MemWal } from "@mysten-incubation/memwal";
 import { Type } from "@sinclair/typebox";
 import { looksLikeInjection } from "../capture.js";
-import { resolveToolNamespace } from "../config.js";
+import { resolveScopedAgent, resolveScopedToolNamespace } from "../config.js";
 import { toolError, withTimeout } from "../format.js";
 import type { PluginConfig } from "../types.js";
 import { MIN_STORE_TEXT_LENGTH, MAX_FACT_PREVIEW_COUNT, MAX_TEXT_PREVIEW_LENGTH } from "../constants.js";
 
+export type StoreToolConfig = Pick<PluginConfig, "defaultNamespace"> &
+  Partial<Pick<PluginConfig, "isolateBySender" | "includeSharedNamespaceOnRecall" | "requestTimeoutMs">>;
+
+function normalizeStoreConfig(config: StoreToolConfig | string): {
+  defaultNamespace: string;
+  isolateBySender: boolean;
+  includeSharedNamespaceOnRecall: boolean;
+  requestTimeoutMs: number;
+} {
+  if (typeof config === "string") {
+    return {
+      defaultNamespace: config,
+      isolateBySender: false,
+      includeSharedNamespaceOnRecall: false,
+      requestTimeoutMs: 10_000,
+    };
+  }
+  return {
+    defaultNamespace: config.defaultNamespace ?? "default",
+    isolateBySender: Boolean(config.isolateBySender),
+    includeSharedNamespaceOnRecall: Boolean(config.includeSharedNamespaceOnRecall),
+    requestTimeoutMs: config.requestTimeoutMs ?? 10_000,
+  };
+}
+
 /** Register the memory_store agent tool. */
-export function registerStoreTool(api: any, client: MemWal, config: PluginConfig): void {
+export function registerStoreTool(api: any, client: MemWal, config: StoreToolConfig | string): void {
+  const normConfig = normalizeStoreConfig(config);
+
   api.registerTool(
-    (ctx?: { sessionKey?: string }) => ({
+    (ctx?: any) => ({
       name: "memory_store",
       label: "Memory Store",
       description:
@@ -46,21 +73,46 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
               "stores, pass the current time. For recounted past events " +
               "where the user is talking about something that happened " +
               "earlier (e.g. 'remember I called Alex last Friday'), OMIT " +
-              "this field — do NOT pass the recounted event date while " +
+              "this field, do NOT pass the recounted event date while " +
               "leaving relative wording in the text; that produces wrong " +
               "anchors. When unknown, omit; do not guess.",
           }),
         ),
+        sessionId: Type.Optional(
+          Type.String({
+            description: "Optional session identifier to associate with this memory.",
+          }),
+        ),
       }),
       async execute(_id: string, params: any) {
-        const { text, namespace, occurredAt } = params;
-        const ns = resolveToolNamespace(config.defaultNamespace, ctx?.sessionKey, namespace);
-        if (!ns) {
+        const { text, namespace, occurredAt, sessionId: paramSessionId } = params;
+        const resolved = resolveScopedToolNamespace(
+          normConfig,
+          ctx,
+          namespace,
+          { allowSharedRecall: false },
+        );
+
+        if (resolved.error || !resolved.namespace) {
+          const errCode = resolved.error ?? "namespace_rejected";
+          const message =
+            errCode === "cross_sender_namespace_forbidden"
+              ? "Cross-sender memory writes are forbidden."
+              : errCode === "sender_identity_required"
+                ? "Sender identity is required when sender isolation is enabled."
+                : "Namespace is pinned to the calling agent.";
           return {
-            content: [{ type: "text", text: "Namespace is pinned to the calling agent." }],
-            details: { error: "namespace_rejected" },
+            error: errCode,
+            message,
+            content: [{ type: "text", text: message }],
+            details: { error: errCode, message },
           };
         }
+
+        const ns = resolved.namespace;
+        const scoped = resolveScopedAgent(normConfig, ctx);
+        const effectiveSessionId =
+          (typeof paramSessionId === "string" && paramSessionId.trim()) || scoped.sessionId;
 
         // Defence in depth: reject injection on write, not just on read.
         // The recall hook filters on retrieval, but polluted data could
@@ -97,7 +149,7 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
                 occurredAt,
                 ...(signal ? { signal } : {}),
               }),
-            config.requestTimeoutMs,
+            normConfig.requestTimeoutMs,
             "memory_store",
           );
 
@@ -117,6 +169,7 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
                 namespace: ns,
                 factCount: 0,
                 facts: [],
+                ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
               },
             };
           }
@@ -154,21 +207,21 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
                 factCount,
                 jobIds,
                 facts,
+                ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
               },
             };
           }
 
-          // When the client provides `waitForRememberJobs`, poll the queued
-          // jobs within `requestTimeoutMs` so post-acceptance upload failures
-          // are surfaced and "Stored" is only reported once jobs reach `done`
-          // (GH #1101).
+          // When the client provides waitForRememberJobs, poll the queued
+          // jobs within requestTimeoutMs so post-acceptance upload failures
+          // are surfaced and Stored is only reported once jobs reach done (GH #1101).
           const waitFn = (client as any).waitForRememberJobs;
           if (jobIds.length > 0 && typeof waitFn === "function") {
             const settled = await waitFn.call(
               client,
               jobIds,
               jobIds.map(() => ns),
-              { timeoutMs: config.requestTimeoutMs },
+              { timeoutMs: normConfig.requestTimeoutMs },
             );
             const itemResults: any[] = Array.isArray(settled?.results)
               ? settled.results
@@ -215,6 +268,7 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
                   failed: failedItems.length,
                   jobIds,
                   facts: settledFacts,
+                  ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
                 },
               };
             }
@@ -237,12 +291,13 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
                   factCount,
                   jobIds,
                   facts: settledFacts,
+                  ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
                 },
               };
             }
           }
 
-          // Jobs are accepted (`status: "pending"`) and not yet stored on Walrus.
+          // Jobs are accepted (status: "pending") and not yet stored on Walrus.
           const jobIdSuffix = jobIds.length > 0 ? ` (not stored yet; job_ids=${jobIds.join(",")})` : " (not stored yet)";
           return {
             content: [
@@ -258,6 +313,7 @@ export function registerStoreTool(api: any, client: MemWal, config: PluginConfig
               factCount,
               jobIds,
               facts,
+              ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
             },
           };
         } catch (err) {

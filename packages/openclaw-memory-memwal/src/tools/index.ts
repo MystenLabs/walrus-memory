@@ -1,5 +1,5 @@
 /**
- * Agent-callable tools — require tools.allow config to be visible to the LLM.
+ * Agent-callable tools: require tools.allow config to be visible to the LLM.
  *
  * Registered as factories so each call is pinned to the calling agent's
  * namespace from ctx.sessionKey. An omitted namespace uses that agent.
