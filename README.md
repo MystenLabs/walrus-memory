@@ -120,6 +120,18 @@ openclaw plugins install @mysten-incubation/oc-memwal
 3. **Recall** - The relayer searches by owner plus namespace, resolves matching blobs, and returns plaintext results
 4. **Restore** - The relayer can incrementally rebuild missing indexed entries for one namespace
 
+## Architecture
+
+Walrus Memory has a Rust relayer with a Node.js sidecar for Seal and Walrus,
+a Sui indexer, a React dashboard and a local MCP connector. It keeps vectors
+and metadata in PostgreSQL with pgvector, uses Redis for replay protection and
+rate limits, and stores encrypted memories on Walrus.
+
+![Walrus Memory containers](docs/architecture/c4-container.png)
+
+See [docs/architecture](docs/architecture/README.md) for what each component
+does and its external dependencies.
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE)

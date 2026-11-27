@@ -111,7 +111,7 @@ The OAuth path and the header path reach the same tools through the same relayer
 Claude Desktop chat does not inject MCP `initialize.instructions` into the model, and write tools start at Ask. After the connector is connected, complete these three steps once. They are the same steps as [Claude Desktop](/mcp/claude-desktop#one-time-setup-required).
 
 1. **Native memory.** If you want portable memory across apps, turn off Claude native memory in Settings → Memory (or "Search and reference past chats"). That is reversible and does not delete existing native memories. If you keep native memory on, Walrus Memory is explicit-only: name memwal when you want a save.
-2. **Standing instruction.** Open Settings → Profile (or General) → Instructions for Claude / Personal Preferences. Paste the matching block below, then start a new chat.
+2. **Standing instruction.** Open Settings → Your Claude → Instructions. Paste the matching block below, then start a new chat.
 
     For portable memory across apps (native memory turned off):
 

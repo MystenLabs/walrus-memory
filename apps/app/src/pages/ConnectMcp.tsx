@@ -855,7 +855,7 @@ function ConsentSetupCard() {
                 </li>
                 <li>
                     Paste this standing instruction, then start a new chat. Claude: Settings →
-                    Profile (or General) → Instructions for Claude / Personal Preferences.
+                    Your Claude → Instructions.
                     Claude Code: <code className="mcp-code">~/.claude/CLAUDE.md</code>. Codex:{' '}
                     <code className="mcp-code">AGENTS.md</code>. Cursor: a rule file under{' '}
                     <code className="mcp-code">.cursor/rules</code>.

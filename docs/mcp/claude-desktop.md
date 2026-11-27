@@ -99,7 +99,7 @@ Ask. After the server is connected and you are signed in, do these three steps o
   <Step>
     ### Paste the standing instruction
 
-    Open **Settings → Profile (or General) → Instructions for Claude / Personal Preferences** (applies to every conversation), or a single **Project's instructions** (applies only inside that project), and paste the matching block below, then start a new chat:
+    Open **Settings → Your Claude → Instructions** (applies to every conversation), or a single **Project's instructions** (applies only inside that project), and paste the matching block below, then start a new chat:
 
     For portable memory across apps (native memory turned off):
 
@@ -128,7 +128,7 @@ Ask. After the server is connected and you are signed in, do these three steps o
   </Step>
 </Steps>
 
-The MCP prompt `memwal_enable_proactive` is a one-shot `/` fallback that returns the same standing instruction. It does not persist like Profile instructions. Paste the block above and choose Always allow. The prompt does not replace those steps.
+The MCP prompt `memwal_enable_proactive` is a one-shot `/` fallback that returns the same standing instruction. It does not persist like Settings → Your Claude → Instructions. Paste the block above and choose Always allow. The prompt does not replace those steps.
 
 ## Local MCP tools
 
